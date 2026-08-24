@@ -109,12 +109,23 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
 
     topo.n_layer       = static_cast<uint32_t>(get_kv_int(ctx0, block_count_key.c_str(), 0));
     topo.n_expert      = static_cast<uint32_t>(get_kv_int(ctx0, expert_count_key.c_str(), 0));
-    topo.n_expert_used = static_cast<uint32_t>(get_kv_int(ctx0, expert_used_key.c_str(), 0));
+        topo.n_expert_used = static_cast<uint32_t>(get_kv_int(ctx0, expert_used_key.c_str(), 0));
+
+    // Dynamically extract Context and Attention dimensions
+    std::string ctx_len_key   = topo.arch_name + ".context_length";
+    std::string embd_key      = topo.arch_name + ".embedding_length";
+    std::string head_key      = topo.arch_name + ".attention.head_count";
+    std::string head_kv_key   = topo.arch_name + ".attention.head_count_kv";
+    std::string head_dim_key  = topo.arch_name + ".attention.key_length";
+
+    topo.max_context_length = static_cast<uint32_t>(get_kv_int(ctx0, ctx_len_key.c_str(), 4096));
+    topo.embedding_length   = static_cast<uint32_t>(get_kv_int(ctx0, embd_key.c_str(), 2048));
+    topo.head_count         = static_cast<uint32_t>(get_kv_int(ctx0, head_key.c_str(), 32));
+    topo.head_count_kv      = static_cast<uint32_t>(get_kv_int(ctx0, head_kv_key.c_str(), topo.head_count));
+    topo.head_dim           = static_cast<uint32_t>(get_kv_int(ctx0, head_dim_key.c_str(), topo.head_count > 0 ? (topo.embedding_length / topo.head_count) : 64));
 
     if (topo.n_layer == 0) topo.n_layer = static_cast<uint32_t>(get_kv_int(ctx0, "block_count", 0));
-    if (topo.n_expert == 0) topo.n_expert = static_cast<uint32_t>(get_kv_int(ctx0, "expert_count", 0));
-
-    topo.shard_paths = discover_shards(main_gguf_path, ctx0);
+    if (topo.n_expert == 0) topo.n_expert = static_cast<uint32_t>(get_kv_int(ctx0, "expert_count", 0));topo.shard_paths = discover_shards(main_gguf_path, ctx0);
     gguf_free(ctx0);
 
     LOG_INFO("Parsed GGUF Topology: arch=" << topo.arch_name 

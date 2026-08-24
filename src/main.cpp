@@ -15,6 +15,7 @@
 #include <chrono>
 #include <iomanip>
 #include <filesystem>
+#include <thread>
 
 using namespace stream_moe;
 
@@ -22,12 +23,14 @@ struct cmd_params_t {
     std::string model_path;
     std::string draft_model_path;
     std::string stats_path;
-    std::string prompt = "Hello StreamMoE!";
-    int32_t     n_gpu_layers = 0;
+    std::string prompt;
+    bool        interactive      = false;
+    int32_t     n_gpu_layers     = 0;
     size_t      moe_vram_pool_mb = 4096;
-    size_t      moe_ram_pool_mb  = 8192;
+    size_t      moe_ram_pool_mb  = 0; // 0 = auto 75% available RAM
     std::string preload_policy   = "none"; // none | ram | vram | all
-    uint32_t    n_tokens         = 32;
+    uint32_t    n_ctx            = 4096;
+    uint32_t    n_tokens         = 64;
     uint32_t    threads          = 16;
 };
 
@@ -37,31 +40,44 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -m, --model <path>             Path to GGUF model (supports single or multi-shard)\n"
               << "  --draft-model <path>           Path to Dense draft model for speculative decoding\n"
+              << "  -i, --interactive              Interactive multi-turn continuous chat mode\n"
+              << "  -c, --ctx-size <N>             Context window size (default: 4096)\n"
               << "  -ngl, --gpu-layers <N>         Number of Dense layers to offload to GPU\n"
               << "  --moe-vram-pool <MB>           Pinned VRAM MoE Pool size in MB (default: 4096)\n"
-              << "  --moe-ram-pool <MB>            Pinned Host RAM MoE Pool size in MB (default: 8192)\n"
+              << "  --moe-ram-pool <MB|auto>       Pinned Host RAM MoE Pool size in MB (default: auto 75% available RAM)\n"
               << "  --moe-preload <policy>         Preload policy: none | ram | vram | all (default: none)\n"
               << "  --stats-file <path>            Path to expert frequency stats file (EST1)\n"
-              << "  -p, --prompt <text>            Input prompt\n"
-              << "  -n, --n-predict <N>            Number of tokens to predict (default: 32)\n"
-              << "  -t, --threads <N>              Number of CPU worker threads (default: 16)\n"
+              << "  -p, --prompt <text>            Input prompt for single-run mode\n"
+              << "  -n, --n-predict <N>            Number of tokens to predict (default: 64)\n"
+              << "  -t, --threads <N>              Number of CPU worker threads (default: 16 physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
 
 cmd_params_t parse_args(int argc, char** argv) {
     cmd_params_t params;
+    params.threads = get_default_threads();
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             params.model_path = argv[++i];
         } else if (arg == "--draft-model" && i + 1 < argc) {
             params.draft_model_path = argv[++i];
+        } else if (arg == "-i" || arg == "--interactive") {
+            params.interactive = true;
+        } else if ((arg == "-c" || arg == "--ctx-size") && i + 1 < argc) {
+            params.n_ctx = std::stoi(argv[++i]);
         } else if ((arg == "-ngl" || arg == "--gpu-layers") && i + 1 < argc) {
             params.n_gpu_layers = std::stoi(argv[++i]);
         } else if (arg == "--moe-vram-pool" && i + 1 < argc) {
             params.moe_vram_pool_mb = std::stoull(argv[++i]);
         } else if (arg == "--moe-ram-pool" && i + 1 < argc) {
-            params.moe_ram_pool_mb = std::stoull(argv[++i]);
+            std::string val = argv[++i];
+            if (val == "auto" || val == "75%") {
+                params.moe_ram_pool_mb = 0;
+            } else {
+                params.moe_ram_pool_mb = std::stoull(val);
+            }
         } else if (arg == "--moe-preload" && i + 1 < argc) {
             params.preload_policy = argv[++i];
         } else if (arg == "--stats-file" && i + 1 < argc) {
@@ -77,7 +93,68 @@ cmd_params_t parse_args(int argc, char** argv) {
             std::exit(0);
         }
     }
+
+    if (params.prompt.empty()) {
+        params.interactive = true;
+    }
+
     return params;
+}
+
+void run_generation_stream(
+    const std::string& prompt,
+    uint32_t n_tokens,
+    const moe_model_topology_t& topo,
+    moe_scheduler& scheduler,
+    speculative_engine& spec_engine,
+    expert_stats_tracker& stats,
+    state_machine& sm
+) {
+    std::cout << "\n[User]: " << prompt << "\n[StreamMoE]: ";
+    std::cout.flush();
+
+    uint32_t total_hits = 0;
+    uint32_t total_lookups = 0;
+    auto t_infer_start = std::chrono::steady_clock::now();
+
+    for (uint32_t step = 1; step <= n_tokens; ++step) {
+        // Forward through each MoE Layer
+        for (uint32_t l : topo.moe_layers) {
+            std::vector<uint32_t> routed_experts;
+            uint32_t top_k = topo.n_expert_used > 0 ? topo.n_expert_used : 4;
+            for (uint32_t k = 0; k < top_k; ++k) {
+                uint32_t exp_id = (step * 3 + l * 7 + k * 13) % topo.n_expert;
+                routed_experts.push_back(exp_id);
+            }
+
+            total_lookups += static_cast<uint32_t>(routed_experts.size());
+
+            auto req = scheduler.route_and_prefetch(l, routed_experts, step * 100 + l);
+            total_hits += static_cast<uint32_t>(req.hit_slots.size());
+
+            auto miss_slots = scheduler.wait_miss_ready(req, 5000);
+
+            std::vector<int32_t> all_layer_slots = req.hit_slots;
+            all_layer_slots.insert(all_layer_slots.end(), miss_slots.begin(), miss_slots.end());
+            scheduler.release_layer_slots(all_layer_slots);
+        }
+
+        stats.notify_tokens_generated(1);
+
+        // Streaming token output simulation
+        std::cout << "token_" << step << " " << std::flush;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto t_infer_end = std::chrono::steady_clock::now();
+    double infer_sec = std::chrono::duration_cast<std::chrono::milliseconds>(t_infer_end - t_infer_start).count() / 1000.0;
+    double tps = infer_sec > 0 ? (n_tokens / infer_sec) : 0.0;
+    double hit_rate = total_lookups > 0 ? (100.0 * total_hits / total_lookups) : 0.0;
+
+    std::cout << "\n\n[Stats: " << n_tokens << " tokens | "
+              << std::fixed << std::setprecision(2) << tps << " tok/s | Cache Hit: " 
+              << std::fixed << std::setprecision(1) << hit_rate << "% | Mode: " 
+              << sm.state_name(sm.current_state()) << "]\n";
 }
 
 int main(int argc, char** argv) {
@@ -94,14 +171,22 @@ int main(int argc, char** argv) {
 
     auto t_start = std::chrono::steady_clock::now();
 
-    // 1. Initialize Direct I/O Engine
+    // 1. Memory & Thread Discovery
+    size_t total_ram = get_total_ram_bytes();
+    size_t avail_ram = get_available_ram_bytes();
+    if (params.moe_ram_pool_mb == 0) {
+        // Auto: 75% of available RAM
+        params.moe_ram_pool_mb = static_cast<size_t>((avail_ram * 0.75) / (1024 * 1024));
+    }
+
+    // 2. Direct I/O Engine Initialization
     auto dio_engine = async_dio_engine::create(1024);
     if (!dio_engine) {
         LOG_ERROR("Failed to initialize Direct I/O Engine.");
         return 1;
     }
 
-    // 2. Parse GGUF Topology & Verify Homogeneity
+    // 3. Parse GGUF Topology
     LOG_INFO("Parsing GGUF Model Topology from: " << params.model_path);
     moe_model_topology_t topo;
     try {
@@ -110,6 +195,22 @@ int main(int argc, char** argv) {
         LOG_ERROR("Failed to parse GGUF topology: " << e.what());
         return 1;
     }
+
+    // Calculate KV Cache footprint
+    size_t kv_cache_bytes = topo.compute_kv_cache_bytes(params.n_ctx, 2);
+    double kv_cache_mb    = static_cast<double>(kv_cache_bytes) / (1024.0 * 1024.0);
+    double kv_cache_gb    = kv_cache_mb / 1024.0;
+
+    std::cout << "\n-------------------------------------------------------------------\n"
+              << " [System & Model Hardware Profile]\n"
+              << "  - Architecture:     " << topo.arch_name << " (" << topo.n_layer << " layers, " << topo.n_expert << " experts/layer, top-" << topo.n_expert_used << ")\n"
+              << "  - Total System RAM: " << std::fixed << std::setprecision(2) << (total_ram / (1024.0*1024.0*1024.0)) << " GB (Available: " << (avail_ram / (1024.0*1024.0*1024.0)) << " GB)\n"
+              << "  - Context Window:   " << params.n_ctx << " tokens (Max: " << topo.max_context_length << ")\n"
+              << "  - KV Cache Size:    " << std::fixed << std::setprecision(2) << (kv_cache_gb >= 1.0 ? kv_cache_gb : kv_cache_mb) << (kv_cache_gb >= 1.0 ? " GB" : " MB") << " (FP16)\n"
+              << "  - MoE RAM Pool:     " << params.moe_ram_pool_mb << " MB (" << (params.moe_ram_pool_mb >= 1024 ? (params.moe_ram_pool_mb / 1024) : params.moe_ram_pool_mb) << " GB Pinned Lock)\n"
+              << "  - Compute Threads:  " << params.threads << " Physical Cores\n"
+              << "  - Shards Count:     " << topo.shard_paths.size() << " GGUF file(s)\n"
+              << "-------------------------------------------------------------------\n\n";
 
     // Open all shard files with Direct I/O
     std::vector<dio_file_t*> shard_files;
@@ -122,7 +223,7 @@ int main(int argc, char** argv) {
         shard_files.push_back(f);
     }
 
-    // 3. Initialize Expert Stats Tracker (EST1)
+    // 4. Expert Stats (EST1)
     std::string stats_file = params.stats_path;
     if (stats_file.empty()) {
         std::filesystem::path p(params.model_path);
@@ -131,15 +232,12 @@ int main(int argc, char** argv) {
     expert_stats_tracker stats;
     stats.init(stats_file, topo.n_layer, topo.n_expert, 8192);
 
-    // 4. Calculate Pool Capacity & Allocate Pinned Host RAM Pool
+    // 5. Pinned Pool Allocation
     size_t slot_size = topo.expert_slot_size > 0 ? topo.expert_slot_size : (1024 * 1024 * 4);
     size_t pool_budget_bytes = params.moe_ram_pool_mb * 1024 * 1024;
     uint32_t num_slots = static_cast<uint32_t>(pool_budget_bytes / slot_size);
-    if (num_slots < 4) num_slots = 4; // Minimum safe floor
+    if (num_slots < 4) num_slots = 4;
 
-    LOG_INFO("Allocating Pinned RAM MoE Pool: " << num_slots << " slots (Budget: " 
-             << params.moe_ram_pool_mb << " MB, Slot size: " << (slot_size / 1024) << " KB)");
-    
     std::unique_ptr<expert_pool> pool;
     try {
         pool = std::make_unique<expert_pool>(slot_size, num_slots);
@@ -148,8 +246,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 5. Initialize Sub-Graph Executor, State Machine, and Speculative Engine
-    subgraph_executor executor(topo, *pool, 2048, 4096);
+    // 6. Engines & Scheduler
+    subgraph_executor executor(topo, *pool, topo.embedding_length, topo.embedding_length * 2);
     state_machine sm(params.threads);
     moe_scheduler scheduler(topo, *pool, stats, *dio_engine, shard_files);
     speculative_engine spec_engine(topo, sm, scheduler);
@@ -158,11 +256,8 @@ int main(int argc, char** argv) {
         spec_engine.load_draft_model(params.draft_model_path);
     }
 
-    // 6. Preload Strategy Execution
-    LOG_INFO("Applying MoE Preload Policy: [" << params.preload_policy << "]");
-    if (params.preload_policy == "none") {
-        LOG_INFO("Instant Startup Mode: Zero MoE weights preloaded. Dynamic on-demand DIO stream active.");
-    } else if (params.preload_policy == "ram" || params.preload_policy == "all") {
+    // Preload
+    if (params.preload_policy == "ram" || params.preload_policy == "all") {
         uint32_t preloaded = 0;
         for (uint32_t l = 0; l < topo.n_layer && preloaded < num_slots; ++l) {
             for (uint32_t e = 0; e < topo.n_expert && preloaded < num_slots; ++e) {
@@ -178,81 +273,41 @@ int main(int argc, char** argv) {
 
     auto t_ready = std::chrono::steady_clock::now();
     double startup_sec = std::chrono::duration_cast<std::chrono::milliseconds>(t_ready - t_start).count() / 1000.0;
-    LOG_INFO("Engine Ready in " << std::fixed << std::setprecision(3) << startup_sec << " seconds!\n");
+    LOG_INFO("Engine Ready in " << std::fixed << std::setprecision(3) << startup_sec << " seconds!");
 
-    // Start background scheduler worker
     scheduler.start();
 
-    // 7. Simulated Inference Execution Loop
-    std::cout << "-------------------------------------------------------------------\n";
-    std::cout << " Prompt: \"" << params.prompt << "\"\n";
-    std::cout << " Generating " << params.n_tokens << " tokens...\n";
-    std::cout << "-------------------------------------------------------------------\n";
-
-    uint32_t total_hits = 0;
-    uint32_t total_lookups = 0;
-    auto t_infer_start = std::chrono::steady_clock::now();
-
-    for (uint32_t step = 1; step <= params.n_tokens; ++step) {
-        uint32_t active_k = spec_engine.get_active_k();
-
-        // Forward through each MoE Layer
-        for (uint32_t l : topo.moe_layers) {
-            // Simulated top-K gating router output
-            std::vector<uint32_t> routed_experts;
-            uint32_t top_k = topo.n_expert_used > 0 ? topo.n_expert_used : 4;
-            for (uint32_t k = 0; k < top_k; ++k) {
-                uint32_t exp_id = (step * 3 + l * 7 + k * 13) % topo.n_expert;
-                routed_experts.push_back(exp_id);
+    // 7. Execution: Interactive REPL vs Single Run
+    if (params.interactive) {
+        std::cout << "\n===================================================================\n"
+                  << "   Interactive Multi-Turn StreamMoE Chat Session                   \n"
+                  << "   (Type '/exit' to quit, '/clear' to reset, '/stats' for metrics) \n"
+                  << "===================================================================\n";
+        
+        while (true) {
+            std::cout << "\n>>> ";
+            std::string user_input;
+            if (!std::getline(std::cin, user_input)) break;
+            if (user_input == "/exit" || user_input == "exit" || user_input == "quit") break;
+            if (user_input == "/clear" || user_input == "/reset") {
+                std::cout << "[Session Cleared]\n";
+                continue;
             }
+            if (user_input == "/stats") {
+                std::cout << "[Runtime State: " << sm.state_name(sm.current_state()) << " | EST1: " << stats_file << "]\n";
+                continue;
+            }
+            if (user_input.empty()) continue;
 
-            total_lookups += static_cast<uint32_t>(routed_experts.size());
-
-            // Double-thread overlap pipeline
-            auto req = scheduler.route_and_prefetch(l, routed_experts, step * 100 + l);
-            total_hits += static_cast<uint32_t>(req.hit_slots.size());
-
-            // 1. Immediately compute Hit GEMM concurrently with background DIO
-            // (In full model forward, executes GEMM on Hit Slots)
-
-            // 2. Wait for Miss Experts to complete asynchronously
-            auto miss_slots = scheduler.wait_miss_ready(req, 5000);
-
-            // 3. Compute Miss GEMM and unpin all layer slots
-            std::vector<int32_t> all_layer_slots = req.hit_slots;
-            all_layer_slots.insert(all_layer_slots.end(), miss_slots.begin(), miss_slots.end());
-            scheduler.release_layer_slots(all_layer_slots);
+            run_generation_stream(user_input, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
         }
-
-        // Notify tokens generated and trigger periodic stats sync if > 8192
-        stats.notify_tokens_generated(1);
-
-        if (step % 8 == 0 || step == params.n_tokens) {
-            double hit_rate = total_lookups > 0 ? (100.0 * total_hits / total_lookups) : 0.0;
-            std::cout << " Step " << std::setw(3) << step << "/" << params.n_tokens 
-                      << " | Cache Hit Rate: " << std::fixed << std::setprecision(1) << hit_rate << "%"
-                      << " | Active State: [" << sm.state_name(sm.current_state()) << "]"
-                      << " | Spec K: " << active_k << "\n";
-        }
+    } else {
+        run_generation_stream(params.prompt, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
     }
-
-    auto t_infer_end = std::chrono::steady_clock::now();
-    double infer_sec = std::chrono::duration_cast<std::chrono::milliseconds>(t_infer_end - t_infer_start).count() / 1000.0;
-    double tps = infer_sec > 0 ? (params.n_tokens / infer_sec) : 0.0;
 
     scheduler.stop();
     stats.flush();
 
-    std::cout << "\n===================================================================\n";
-    std::cout << "                     BENCHMARK SUMMARY                             \n";
-    std::cout << "===================================================================\n";
-    std::cout << "  Model Arch:           " << topo.arch_name << " (" << topo.n_layer << " layers, " << topo.n_expert << " experts)\n";
-    std::cout << "  Tokens Generated:     " << params.n_tokens << " tokens\n";
-    std::cout << "  Total Inference Time: " << std::fixed << std::setprecision(3) << infer_sec << " s\n";
-    std::cout << "  Throughput:           " << std::fixed << std::setprecision(2) << tps << " tokens/sec\n";
-    std::cout << "  Expert Cache Hit Rate:" << std::fixed << std::setprecision(2) << (100.0 * total_hits / total_lookups) << " %\n";
-    std::cout << "  Historical Stats:     " << stats_file << " (EST1)\n";
-    std::cout << "===================================================================\n";
-
+    std::cout << "\n[StreamMoE] Session terminated cleanly. Expert stats synced to " << stats_file << "\n";
     return 0;
 }

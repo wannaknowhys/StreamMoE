@@ -12,7 +12,7 @@ if "%1"=="clean" goto clean
 if "%1"=="help" goto help
 
 :build
-echo [StreamMoE] Building StreamMoE Engine (stream_moe.exe)...
+echo [StreamMoE] Building StreamMoE Binaries (stream_moe.exe, stream_moe_server.exe)...
 if not exist temp mkdir temp
 if not exist bin mkdir bin
 
@@ -57,12 +57,29 @@ echo [StreamMoE] Linking bin/stream_moe.exe...
     src/main.cpp ^
     -o bin/stream_moe.exe
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [-] stream_moe.exe build failed!
-    exit /b %ERRORLEVEL%
-)
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-echo [+] Build SUCCESS: bin\stream_moe.exe
+echo [StreamMoE] Linking bin/stream_moe_server.exe...
+"%CLANG_CXX%" %CXXFLAGS% ^
+    temp/ggml.o temp/ggml-quants.o temp/ggml-threading.o temp/ggml-backend.o temp/ggml-alloc.o temp/ggml-backend-meta.o temp/ggml-backend-reg.o temp/ggml-backend-dl.o ^
+    third_party/llama.cpp/ggml/src/gguf.cpp ^
+    src/io/async_dio_win.cpp ^
+    src/io/staging_reader.cpp ^
+    src/loader/moe_loader.cpp ^
+    src/pool/expert_stats.cpp ^
+    src/pool/expert_pool.cpp ^
+    src/scheduler/moe_scheduler.cpp ^
+    src/engine/subgraph_executor.cpp ^
+    src/engine/state_machine.cpp ^
+    src/engine/speculative_engine.cpp ^
+    src/server/http_server.cpp ^
+    src/server_main.cpp ^
+    -lws2_32 ^
+    -o bin/stream_moe_server.exe
+
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo [+] Build SUCCESS: bin\stream_moe.exe, bin\stream_moe_server.exe
 exit /b 0
 
 :test
@@ -200,7 +217,7 @@ exit /b 0
 :help
 echo StreamMoE Build Utility
 echo Usage:
-echo   build.bat build  - Build stream_moe.exe CLI application
+echo   build.bat build  - Build stream_moe.exe and stream_moe_server.exe
 echo   build.bat test   - Build and run all unit tests
 echo   build.bat clean  - Clean temporary and build directories
 echo   build.bat help   - Show this help message

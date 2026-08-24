@@ -32,6 +32,14 @@ struct moe_model_topology_t {
     uint32_t                 n_layer = 0;
     uint32_t                 n_expert = 0;
     uint32_t                 n_expert_used = 0;
+    
+    // Attention & Context metadata
+    uint32_t                 max_context_length = 4096;
+    uint32_t                 embedding_length   = 2048;
+    uint32_t                 head_count         = 32;
+    uint32_t                 head_count_kv      = 32;
+    uint32_t                 head_dim           = 64;
+
     std::vector<std::string> shard_paths; // All discovered GGUF shard paths
     
     // Homogeneous layout metadata
@@ -48,12 +56,22 @@ struct moe_model_topology_t {
         size_t idx = static_cast<size_t>(layer_idx) * n_expert + expert_idx;
         return experts[idx];
     }
+
+    // Calculate total KV Cache memory footprint in bytes for a given context length
+    // element_bytes: 2 for FP16/BF16/Q8_0, 1 for Q4_0
+    size_t compute_kv_cache_bytes(uint32_t n_ctx, size_t element_bytes = 2) const {
+        // KV Cache stores Key and Value tensors for all layers:
+        // Size = 2 * n_ctx * n_layer * head_count_kv * head_dim * element_bytes
+        uint32_t kv_heads = (head_count_kv > 0) ? head_count_kv : head_count;
+        uint32_t h_dim = (head_dim > 0) ? head_dim : (embedding_length / (head_count > 0 ? head_count : 1));
+        return 2ULL * n_ctx * n_layer * kv_heads * h_dim * element_bytes;
+    }
 };
 
 class moe_loader {
 public:
     // Parse GGUF header & metadata across single or multi-shard files
-    // Dynamically extracts MoE topology and performs homogeneity validation
+    // Dynamically extracts MoE topology, Attention metadata, and performs homogeneity validation
     static moe_model_topology_t parse_gguf_topology(const std::string& main_gguf_path);
 };
 
