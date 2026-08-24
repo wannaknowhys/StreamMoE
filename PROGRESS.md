@@ -25,22 +25,23 @@
 - [x] 引入 `third_party/llama.cpp` 子模块
 - [x] 深度调研 `llama.cpp` 算子库与 150+ 模型架构，确立“中心网关拦截”模式：[`LLAMA_CPP_ANALYSIS.md`](LLAMA_CPP_ANALYSIS.md)
 - [x] 建立进度跟踪与测试资产清单：[`PROGRESS.md`](PROGRESS.md)
-- [ ] 搭建项目标准构建工具链（`Makefile` + 基于 LLVM OpenMP 的 `build.bat`）
-- [ ] 设立隔离的临时编译输出区（`build/` 和 `temp/`）
+- [x] 搭建项目标准构建工具链（`Makefile` + 基于 LLVM OpenMP 的 `build.bat`）
+- [x] 设立隔离的临时编译输出区（`build/` 和 `temp/`）
 
 ### Phase 1: 异步 Direct I/O (DIO) 引擎与多 Tensor Staging 机制
-- [ ] **Windows IOCP 驱动实现** (`src/io/async_dio_win.cpp`):
-  - [ ] 封装 `CreateFileW(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)`
-  - [ ] 实现 `submit_batch(aio_req_t*, count)` 批量投递
-  - [ ] 实现 `wait_events()` 基于 `GetQueuedCompletionStatusEx` 批量收取
-- [ ] **多 Tensor 扇区对齐 Staging Buffer 组装器**:
-  - [ ] 动态计算单专家 $N$ 个 Sub-Tensor 的 `offset` / `size` 扇区对齐范围
-  - [ ] 批量异步 DIO 直刷入 `TotalSize + N*8KB` 临时缓冲区
-  - [ ] 有效载荷切片 `memcpy` 复制进 4KB 对齐的紧凑内存 Slot
-- [ ] **Linux `io_uring` 驱动骨架** (`src/io/async_dio_posix.cpp`)
-- [ ] **单元测试 (UT 1)** (`tests/test_async_dio.cpp`):
-  - [ ] Mock 文件测试：4KB 边界、跨扇区偏移、大块随机读写准确性校验
-  - [ ] 真实 DeepSeek MoE 分片文件无缓冲 Direct I/O 读取局部 Tensor 校验
+- [x] **Windows IOCP 驱动实现** (`src/io/async_dio_win.cpp`):
+  - [x] 封装 `CreateFileW(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)`
+  - [x] 实现 `submit_batch(aio_req_t*, count)` 批量投递
+  - [x] 实现 `wait_events()` 基于 `GetQueuedCompletionStatusEx` 批量收取
+- [x] **多 Tensor 扇区对齐 Staging Buffer 组装器** (`src/io/staging_reader.cpp`):
+  - [x] 动态计算单专家 $N$ 个 Sub-Tensor 的 `offset` / `size` 扇区对齐范围
+  - [x] 批量异步 DIO 直刷入 `TotalSize + N*8KB` 临时缓冲区
+  - [x] 有效载荷切片 `memcpy` 复制进 4KB 对齐的紧凑内存 Slot
+- [x] **Linux `io_uring` / POSIX 驱动骨架** (`src/io/async_dio_posix.cpp`)
+- [x] **单元测试 (UT 1)** (`tests/test_async_dio.cpp`):
+  - [x] Mock 文件测试：4KB 边界、跨扇区偏移、大块随机读写准确性校验
+  - [x] 真实 DeepSeek MoE 分片文件无缓冲 Direct I/O 读取局部 Tensor 校验
+  - [x] 16 批次并发异步 IO 投递与收取校验
 
 ### Phase 2: Pinned RAM / VRAM 专家槽位内存池
 - [ ] **Pinned Host RAM Pool 管理器** (`src/pool/expert_pool.cpp`):
