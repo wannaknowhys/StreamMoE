@@ -11,7 +11,7 @@ if "%1"=="clean" goto clean
 if "%1"=="help" goto help
 
 :test
-echo [StreamMoE] Building Phase 1, Phase 2 and Phase 3 Unit Tests...
+echo [StreamMoE] Building Phase 1, 2, 3 and 4 Unit Tests...
 if not exist temp mkdir temp
 if not exist build mkdir build
 
@@ -47,10 +47,7 @@ echo [StreamMoE] Compiling test_async_dio...
     tests/test_async_dio.cpp ^
     -o temp/test_async_dio.exe
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [-] test_async_dio build failed!
-    exit /b %ERRORLEVEL%
-)
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo [StreamMoE] Compiling test_expert_pool...
 "%CLANG_CXX%" %CXXFLAGS% ^
@@ -59,10 +56,7 @@ echo [StreamMoE] Compiling test_expert_pool...
     tests/test_expert_pool.cpp ^
     -o temp/test_expert_pool.exe
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [-] test_expert_pool build failed!
-    exit /b %ERRORLEVEL%
-)
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo [StreamMoE] Compiling test_moe_loader...
 "%CLANG_CXX%" %CXXFLAGS% ^
@@ -73,10 +67,20 @@ echo [StreamMoE] Compiling test_moe_loader...
     tests/test_moe_loader.cpp ^
     -o temp/test_moe_loader.exe
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [-] test_moe_loader build failed!
-    exit /b %ERRORLEVEL%
-)
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo [StreamMoE] Compiling test_scheduler...
+"%CLANG_CXX%" %CXXFLAGS% ^
+    src/io/async_dio_win.cpp ^
+    src/io/staging_reader.cpp ^
+    src/pool/expert_stats.cpp ^
+    src/pool/expert_pool.cpp ^
+    src/scheduler/moe_scheduler.cpp ^
+    src/engine/subgraph_executor.cpp ^
+    tests/test_scheduler.cpp ^
+    -o temp/test_scheduler.exe
+
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
 echo ========================================================
@@ -100,7 +104,14 @@ temp\test_moe_loader.exe
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
-echo [+] All Phase 1, Phase 2, and Phase 3 tests passed!
+echo ========================================================
+echo [StreamMoE] Executing Phase 4: Dual-Thread Pipeline and Pointer Rebind
+echo ========================================================
+temp\test_scheduler.exe
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo.
+echo [+] All Phase 1, 2, 3 and 4 tests passed!
 exit /b 0
 
 :clean
