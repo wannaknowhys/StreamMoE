@@ -1,0 +1,25 @@
+﻿# Build artifacts
+build/
+bin/
+out/
+temp/
+*.exe
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.ilk
+
+# VS Code / IDE
+.vscode/
+.vs/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Test & Log
+*.log
+scratch/
