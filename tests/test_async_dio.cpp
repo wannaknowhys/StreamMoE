@@ -119,9 +119,9 @@ bool test_multi_tensor_staging_reader() {
 
     // Define 3 unaligned sub-tensors inside an expert (e.g. SwiGLU: gate, up, down)
     sub_tensor_req_t tensors[3];
-    tensors[0] = { 1234,   54321,  0 };      // gate: offset 1234, size 54321
-    tensors[1] = { 78901,  32100,  54321 };  // up: offset 78901, size 32100
-    tensors[2] = { 200013, 65432,  86421 };  // down: offset 200013, size 65432
+    tensors[0] = { 0, 1234,   54321,  0 };      // gate: offset 1234, size 54321
+    tensors[1] = { 0, 78901,  32100,  54321 };  // up: offset 78901, size 32100
+    tensors[2] = { 0, 200013, 65432,  86421 };  // down: offset 200013, size 65432
 
     expert_read_plan_t plan = build_expert_read_plan(tensors, 3);
     TEST_ASSERT(plan.num_tensors == 3, "Plan num_tensors mismatch");

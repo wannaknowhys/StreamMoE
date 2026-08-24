@@ -233,9 +233,10 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
                 exp_info.sub_tensors.push_back(st);
                 exp_info.total_expert_bytes += slice_bytes;
 
-                sub_tensor_req_t req;
+                                sub_tensor_req_t req;
+                req.shard_idx   = tentry.shard_idx;
                 req.file_offset = slice_abs_offset;
-                req.byte_size = slice_bytes;
+                req.byte_size   = slice_bytes;
                 req.slot_offset = cur_slot_offset;
                 reqs.push_back(req);
 

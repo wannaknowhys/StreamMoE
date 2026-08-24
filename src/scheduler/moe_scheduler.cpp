@@ -60,18 +60,14 @@ layer_routing_req_t moe_scheduler::route_and_prefetch(
     std::vector<fetch_task_t> new_tasks;
 
     for (uint32_t exp_id : selected_experts) {
-        // Record access in stats tracker
         stats_.record_access(layer_idx, exp_id);
 
         int32_t slot = pool_.find_slot(static_cast<int32_t>(layer_idx), static_cast<int32_t>(exp_id));
         if (slot >= 0 && pool_.pin_slot(slot)) {
-            // Hit! Slot is present and protected
             req.hit_slots.push_back(slot);
         } else {
-            // Miss! Needs allocation & async fetch
             req.miss_experts.push_back(exp_id);
             int32_t target_slot = pool_.allocate_or_evict_slot(
-                
                 static_cast<int32_t>(layer_idx),
                 static_cast<int32_t>(exp_id),
                 stats_,
@@ -79,7 +75,6 @@ layer_routing_req_t moe_scheduler::route_and_prefetch(
             );
 
             if (target_slot >= 0) {
-                // Pin target slot immediately so other concurrent allocations don't re-evict it
                 pool_.pin_slot(target_slot);
                 fetch_task_t task;
                 task.layer_idx     = layer_idx;
@@ -93,7 +88,6 @@ layer_routing_req_t moe_scheduler::route_and_prefetch(
         }
     }
 
-    // Submit miss tasks to scheduler thread
     if (!new_tasks.empty()) {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         pending_tasks_.insert(pending_tasks_.end(), new_tasks.begin(), new_tasks.end());
@@ -116,12 +110,10 @@ std::vector<int32_t> moe_scheduler::wait_miss_ready(const layer_routing_req_t& r
         while (true) {
             slot_id = pool_.find_slot(static_cast<int32_t>(req.layer_idx), static_cast<int32_t>(exp_id));
             if (slot_id >= 0) {
-                // Verified ready
                 ready_slots.push_back(slot_id);
                 break;
             }
 
-            // Wait on sync CV
             std::unique_lock<std::mutex> lock(sync_mutex_);
             if (sync_cv_.wait_for(lock, std::chrono::milliseconds(50)) == std::cv_status::timeout) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -163,19 +155,10 @@ void moe_scheduler::scheduler_worker_loop() {
             const expert_info_t& exp_info = topo_.get_expert(task.layer_idx, task.expert_idx);
             expert_slot_t& slot = pool_.get_slot(task.assigned_slot);
 
-            // Determine which shard file to read from
-            dio_file_t* file = nullptr;
-            if (!exp_info.sub_tensors.empty()) {
-                uint32_t s_idx = exp_info.sub_tensors[0].shard_idx;
-                if (s_idx < shard_files_.size()) {
-                    file = shard_files_[s_idx];
-                }
-            }
-
-            if (file) {
+            if (!shard_files_.empty()) {
                 bool ok = read_expert_sync(
                     &dio_engine_,
-                    file,
+                    shard_files_,
                     exp_info.read_plan,
                     staging_buffer_.get(),
                     slot.raw_ptr
@@ -187,7 +170,6 @@ void moe_scheduler::scheduler_worker_loop() {
                     LOG_ERROR("Worker: failed to read Layer " << task.layer_idx << " Expert " << task.expert_idx);
                 }
             } else {
-                // If mocked or no file attached, mark ready directly
                 pool_.mark_ready(task.assigned_slot);
             }
         }

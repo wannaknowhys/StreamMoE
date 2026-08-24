@@ -14,6 +14,7 @@ namespace stream_moe {
 
 constexpr size_t DIO_SECTOR_SIZE = 4096;
 constexpr size_t DIO_ALIGN_MASK  = DIO_SECTOR_SIZE - 1;
+constexpr size_t MAX_SUB_TENSORS_PER_EXPERT = 8;
 
 // Round down value to alignment multiple
 template <typename T>
