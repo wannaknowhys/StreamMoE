@@ -23,3 +23,9 @@ Desktop.ini
 # Test & Log
 *.log
 scratch/
+*.bin
+
+# Design & Internal progress docs
+DESIGN.md
+LLAMA_CPP_ANALYSIS.md
+PROGRESS.md
