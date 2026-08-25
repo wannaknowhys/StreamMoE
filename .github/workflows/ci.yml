@@ -1,0 +1,47 @@
+﻿name: StreamMoE CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-linux:
+    name: Build & Test (Linux Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libomp-dev make
+
+      - name: Compile and Run All Unit Tests
+        run: |
+          make test
+
+  build-windows:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup LLVM / Clang
+        run: |
+          choco install llvm -y --no-progress
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: Build and Run Tests
+        shell: cmd
+        run: |
+          set CLANG_CXX=clang++.exe
+          set CLANG_CC=clang.exe
+          call build.bat test
