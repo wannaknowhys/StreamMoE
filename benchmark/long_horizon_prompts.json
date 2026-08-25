@@ -1,0 +1,53 @@
+﻿[
+  {
+    "name": "Context & Environment Ingestion",
+    "turn": 1,
+    "system": "You are StreamMoE, an expert AI systems engineer. You strictly adhere to the local machine environment profile and zero-dependency principles.",
+    "prompt": "Please read and internalize our host engineering guidelines from AGENTS.md:\n1. Stay lightweight and avoid bloated shell scripts; split complex tasks to Node.js or uv (Python).\n2. Native Win32 & Unicode Standard: Wide-character APIs ('W' suffix), #define UNICODE.\n3. Universal Windows Runner: Use \u0007gy-run.exe for Everything CLI (\u001bs.exe) and elevated tasks.\n4. Zero-Dependency Principle: Strictly prefer native Win32/POSIX standard libraries without unnecessary third-party bloat.\n\nConfirm your understanding of these constraints and explain how they guide the StreamMoE architecture."
+  },
+  {
+    "name": "Core MoE Offloading Principles",
+    "turn": 2,
+    "prompt": "Explain the fundamental hypotheses of StreamMoE:\n1. Why does MoE inference exhibit high expert routing locality during the decode phase?\n2. How does separating the Dense backbone (Attention / LayerNorm) from the MoE sparse feed-forward network allow running 150GB+ models on 32GB RAM?\n3. Define the Non-Inclusive Non-Exclusive Cache (NINEC) design across GPU VRAM, Host RAM, and NVMe SSD."
+  },
+  {
+    "name": "Direct I/O Sector Alignment & Staging Buffer",
+    "turn": 3,
+    "prompt": "In standard GGUF files, sub-tensors are aligned only to 32 bytes, whereas OS Direct I/O (DIO) requires 4096-byte alignment.\n1. Detail the sector arithmetic formulas: \u0007lign_floor(offset, 4096) and \u0007lign_ceil(offset + size, 4096).\n2. Explain why the Direct I/O staging buffer size is computed as \u001bxpert_size + 8KB * num_sub_tensors.\n3. How does StreamMoE handle sub-tensors of a single expert spanning across multiple GGUF shard files (e.g., DeepSeek-V4 split into 5 shards)?"
+  },
+  {
+    "name": "Dual-Thread Overlapping Pipeline & Pin Locking",
+    "turn": 4,
+    "prompt": "Analyze the concurrency model between the Compute Thread and Scheduler Thread:\n1. How does the Compute Thread immediately start GEMM on Hit experts while the Scheduler Thread asynchronously fetches Miss experts via Windows IOCP?\n2. Describe the slot pin-locking mechanism (PIN_LOCKED) that prevents in-use experts from being evicted mid-forward pass.\n3. How does static candidate subgraph pointer rebinding eliminate ggml graph recreation overhead?"
+  },
+  {
+    "name": "EST1 Frequency Lifecycle & Adaptive Decay",
+    "turn": 5,
+    "prompt": "Review the EST1 binary statistical format and adaptive frequency convergence:\n1. Why is global long-term frequency used for cold-boot slot initialization?\n2. Explain the exponential decay moving average formula that transitions eviction weights towards recent routing hotspots during long sessions.\n3. What are the triggers for flushing EST1 statistics back to disk (e.g. 8192-token sync threshold and clean engine exit)?"
+  },
+  {
+    "name": "5D Resource State Machine & Thrashing Reset",
+    "turn": 6,
+    "prompt": "Deep-dive into the 5D runtime state machine:\n1. Explain how telemetry monitors CPU, GPU, PCIe, NVMe Disk, and Speculative Decoding yield.\n2. Outline the transition conditions for states 1.0 (CPU_BOUND), 2.1 (PCIE_THRASHING), 3.0 (GPU_BOUND), 4.0 (DISK_BOUND), and 5.0 (STEADY_STATE).\n3. Under what conditions is State 5.1 (SYSTEM_THRASHING_EMERGENCY_RESET) triggered, and what actions does it take?"
+  },
+  {
+    "name": "DeepSeek Multi-Head Latent Attention (MLA) Analysis",
+    "turn": 7,
+    "prompt": "Compare DeepSeek Multi-Head Latent Attention (MLA) with standard MHA/GQA:\n1. Why does MLA not store a separate Value (V) tensor in the KV cache?\n2. How does the low-rank latent Key ({KV} = 512$) and decoupled RoPE Key ({pe} = 64$) compress the KV cache by > 93%?\n3. Calculate the exact memory footprint for a 4096 and 32768 context window on DeepSeek-V4 (43 layers)."
+  },
+  {
+    "name": "Zero-Copy GGUF Alignment Optimization (stream_moe_convert)",
+    "turn": 8,
+    "prompt": "Design the specification for stream_moe_convert:\n1. How can standard GGUF files be repacked so that headers, dense weights, and all expert arrays start on strict 4096-byte sector boundaries?\n2. How does 4KB sector alignment eliminate the intermediate staging buffer and memcpy, enabling true Zero-Copy DMA from NVMe disk directly into VirtualAlloc locked RAM slots?"
+  },
+  {
+    "name": "Dynamic Chunked KV Cache Scaling (4k to 200k+)",
+    "turn": 9,
+    "prompt": "Explain how StreamMoE handles long-context scaling up to 200k+ tokens:\n1. Why does static 1M pre-allocation waste ~48GB of RAM, and how does dynamic chunked expansion (allocating in 4096-token blocks) preserve RAM for the expert pool?\n2. Describe how the SMKV snapshot module persists both conversation prompt history and KV cache tensors to disk for instant resume."
+  },
+  {
+    "name": "Personal Coding Agent Performance Tuning Strategy",
+    "turn": 10,
+    "prompt": "Synthesize a performance optimization recommendation for personal coding agent workloads:\n1. Given a host with 128GB RAM, 16 physical CPU cores, and an NVIDIA RTX GPU, what is the optimal allocation ratio for VRAM Dense offload, Pinned RAM Pool, and Dynamic KV Cache?\n2. How should speculative decoding step size $ be dynamically tuned between interactive fast-typing REPL and large batch codebase refactoring?"
+  }
+]

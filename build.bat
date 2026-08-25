@@ -54,6 +54,7 @@ echo [StreamMoE] Linking bin/stream_moe.exe...
     src/engine/subgraph_executor.cpp ^
     src/engine/state_machine.cpp ^
     src/engine/speculative_engine.cpp ^
+    src/kv/kv_cache_manager.cpp ^
     src/main.cpp ^
     -o bin/stream_moe.exe
 
@@ -72,6 +73,7 @@ echo [StreamMoE] Linking bin/stream_moe_server.exe...
     src/engine/subgraph_executor.cpp ^
     src/engine/state_machine.cpp ^
     src/engine/speculative_engine.cpp ^
+    src/kv/kv_cache_manager.cpp ^
     src/server/http_server.cpp ^
     src/server_main.cpp ^
     -lws2_32 ^
@@ -83,7 +85,7 @@ echo [+] Build SUCCESS: bin\stream_moe.exe, bin\stream_moe_server.exe
 exit /b 0
 
 :test
-echo [StreamMoE] Building Phase 1, 2, 3, 4 and 5 Unit Tests...
+echo [StreamMoE] Building Unit Tests...
 if not exist temp mkdir temp
 if not exist bin mkdir bin
 
@@ -168,6 +170,18 @@ echo [StreamMoE] Compiling test_state_machine...
 
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
+echo [StreamMoE] Compiling test_kv_cache...
+"%CLANG_CXX%" %CXXFLAGS% ^
+    temp/ggml.o temp/ggml-quants.o temp/ggml-threading.o temp/ggml-backend.o temp/ggml-alloc.o temp/ggml-backend-meta.o temp/ggml-backend-reg.o temp/ggml-backend-dl.o ^
+    third_party/llama.cpp/ggml/src/gguf.cpp ^
+    src/io/staging_reader.cpp ^
+    src/loader/moe_loader.cpp ^
+    src/kv/kv_cache_manager.cpp ^
+    tests/test_kv_cache.cpp ^
+    -o temp/test_kv_cache.exe
+
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
 echo.
 echo ========================================================
 echo [StreamMoE] Executing Phase 1: Async Direct I/O Tests
@@ -204,7 +218,14 @@ temp\test_state_machine.exe
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
-echo [+] All Phase 1, 2, 3, 4, and 5 tests passed!
+echo ========================================================
+echo [StreamMoE] Executing KV Cache Persistence and Expansion Tests
+echo ========================================================
+temp\test_kv_cache.exe
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo.
+echo [+] All Phase 1-5 and KV Cache tests passed!
 exit /b 0
 
 :clean
