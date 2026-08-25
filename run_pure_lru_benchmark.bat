@@ -4,7 +4,7 @@ title StreamMoE Pure-LRU Cold-Start Benchmark (No Prior Stats, No KV Snapshot)
 
 echo ===================================================================
 echo   StreamMoE Pure-LRU Cold-Start Benchmark
-echo   (Eviction: PURE LRU | Zero Prior Knowledge | No KV Snapshot)
+echo   [Eviction: PURE LRU - Zero Prior Knowledge - No KV Snapshot]
 echo ===================================================================
 echo.
 
