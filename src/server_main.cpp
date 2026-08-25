@@ -1,3 +1,4 @@
+#include "tokenizer/tokenizer.h"
 #include "common/types.h"
 #include "common/logger.h"
 #include "io/async_dio.h"
@@ -197,6 +198,8 @@ int main(int argc, char** argv) {
         spec_engine.load_draft_model(params.draft_model_path);
     }
 
+    gguf_tokenizer tokenizer;
+    tokenizer.init_from_gguf(params.model_path);
     scheduler.start();
 
     // 5. Start HTTP Server
@@ -206,7 +209,7 @@ int main(int argc, char** argv) {
     s_cfg.n_ctx = params.n_ctx;
     s_cfg.threads = params.threads;
 
-    http_server server(s_cfg, topo, *pool, stats, scheduler, spec_engine, sm);
+    http_server server(s_cfg, topo, *pool, stats, scheduler, spec_engine, sm, tokenizer);
     if (!server.start()) {
         LOG_ERROR("Failed to start HTTP server.");
         scheduler.stop();

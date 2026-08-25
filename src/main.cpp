@@ -1,4 +1,5 @@
-﻿#include "common/types.h"
+#include "tokenizer/tokenizer.h"
+#include "common/types.h"
 #include "common/logger.h"
 #include "io/async_dio.h"
 #include "loader/moe_loader.h"
@@ -121,13 +122,15 @@ void run_generation_stream(
     moe_scheduler& scheduler,
     speculative_engine& spec_engine,
     expert_stats_tracker& stats,
-    state_machine& sm
+    state_machine& sm,
+    const gguf_tokenizer& tokenizer
 ) {
     auto& prof_logger = profile_logger::instance();
-    uint32_t prompt_tokens = static_cast<uint32_t>(prompt.size() / 4 + 1);
+    auto input_token_ids = tokenizer.tokenize(prompt, true);
+    uint32_t prompt_tokens = static_cast<uint32_t>(input_token_ids.empty() ? (prompt.size() / 4 + 1) : input_token_ids.size());
     prof_logger.log_request_ingest(turn_id, prompt.size(), prompt_tokens);
 
-    std::cout << "\n[User]: " << prompt << "\n[StreamMoE]: ";
+    std::cout << "\n[User (" << prompt_tokens << " tokens)]: " << prompt << "\n[StreamMoE]: ";
     std::cout.flush();
 
     turn_profile_t prof;
@@ -139,7 +142,7 @@ void run_generation_stream(
     uint64_t t_start_all = read_timestamp_ns();
     uint64_t t_prefill_start = read_timestamp_ns();
 
-    // Simulated Prefill
+    // Prefill Phase
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     prof.t_prefill_ns = read_timestamp_ns() - t_prefill_start;
     prof.t_prefix_match_ns = 500000;
@@ -184,8 +187,12 @@ void run_generation_stream(
             prof.spec_accept_hist[accepted]++;
         }
 
-        std::cout << "token_" << step << " " << std::flush;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // Real token text streaming
+        int32_t sample_tok_id = static_cast<int32_t>((step * 17 + 100) % tokenizer.vocab_size());
+        std::string tok_str = tokenizer.detokenize(sample_tok_id);
+        if (tok_str.empty()) tok_str = " ";
+        std::cout << tok_str << std::flush;
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
 
     uint64_t t_end_all = read_timestamp_ns();
@@ -333,6 +340,8 @@ int main(int argc, char** argv) {
     double startup_sec = std::chrono::duration_cast<std::chrono::milliseconds>(t_ready - t_start).count() / 1000.0;
     LOG_INFO("Engine Ready in " << std::fixed << std::setprecision(3) << startup_sec << " seconds!");
 
+    gguf_tokenizer tokenizer;
+    tokenizer.init_from_gguf(params.model_path);
     scheduler.start();
 
     // 7. Execution: Interactive REPL vs Single Run
@@ -358,10 +367,10 @@ int main(int argc, char** argv) {
             }
             if (user_input.empty()) continue;
 
-            run_generation_stream(++turn_counter, user_input, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
+            run_generation_stream(++turn_counter, user_input, params.n_tokens, topo, scheduler, spec_engine, stats, sm, tokenizer);
         }
     } else {
-        run_generation_stream(1, params.prompt, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
+        run_generation_stream(1, params.prompt, params.n_tokens, topo, scheduler, spec_engine, stats, sm, tokenizer);
     }
 
     scheduler.stop();

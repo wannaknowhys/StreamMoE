@@ -51,14 +51,16 @@ http_server::http_server(
     expert_stats_tracker& stats,
     moe_scheduler& scheduler,
     speculative_engine& spec_engine,
-    state_machine& sm
+    state_machine& sm,
+    const gguf_tokenizer& tokenizer
 ) : config_(config),
     topo_(topo),
     pool_(pool),
     stats_(stats),
     scheduler_(scheduler),
     spec_engine_(spec_engine),
-    sm_(sm) {}
+    sm_(sm),
+    tokenizer_(tokenizer) {}
 
 http_server::~http_server() {
     stop();
@@ -200,7 +202,8 @@ void http_server::handle_client(uintptr_t client_socket) {
         uint32_t turn_id = ++g_server_turn;
         auto& prof_logger = profile_logger::instance();
 
-        uint32_t prompt_tokens = 64;
+        auto in_tokens = tokenizer_.tokenize(req, true);
+        uint32_t prompt_tokens = static_cast<uint32_t>(in_tokens.empty() ? 64 : in_tokens.size());
         prof_logger.log_request_ingest(turn_id, req.size(), prompt_tokens);
 
         uint64_t t_start_req = read_timestamp_ns();

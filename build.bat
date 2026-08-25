@@ -54,6 +54,7 @@ echo [StreamMoE] Linking bin/stream_moe.exe...
     src/engine/subgraph_executor.cpp ^
     src/engine/state_machine.cpp ^
     src/engine/speculative_engine.cpp ^
+    src/tokenizer/tokenizer.cpp ^
     src/kv/kv_cache_manager.cpp ^
     src/profile/profiler.cpp ^
     src/main.cpp ^
@@ -74,6 +75,7 @@ echo [StreamMoE] Linking bin/stream_moe_server.exe...
     src/engine/subgraph_executor.cpp ^
     src/engine/state_machine.cpp ^
     src/engine/speculative_engine.cpp ^
+    src/tokenizer/tokenizer.cpp ^
     src/kv/kv_cache_manager.cpp ^
     src/profile/profiler.cpp ^
     src/server/http_server.cpp ^
@@ -178,6 +180,7 @@ echo [StreamMoE] Compiling test_kv_cache...
     third_party/llama.cpp/ggml/src/gguf.cpp ^
     src/io/staging_reader.cpp ^
     src/loader/moe_loader.cpp ^
+    src/tokenizer/tokenizer.cpp ^
     src/kv/kv_cache_manager.cpp ^
     src/profile/profiler.cpp ^
     tests/test_kv_cache.cpp ^
@@ -240,6 +243,12 @@ echo ========================================================
 echo [StreamMoE] Executing High-Resolution Profiler Tests
 echo ========================================================
 temp\test_profiler.exe
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+echo.
+echo ========================================================
+echo [StreamMoE] Executing GGUF Tokenizer Tests
+echo ========================================================
+temp\test_tokenizer.exe
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
