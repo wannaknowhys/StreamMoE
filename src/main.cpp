@@ -8,6 +8,8 @@
 #include "engine/subgraph_executor.h"
 #include "engine/state_machine.h"
 #include "engine/speculative_engine.h"
+#include "kv/kv_cache_manager.h"
+#include "profile/profiler.h"
 
 #include <iostream>
 #include <string>
@@ -23,6 +25,7 @@ struct cmd_params_t {
     std::string model_path;
     std::string draft_model_path;
     std::string stats_path;
+    std::string profile_log_path;
     std::string prompt;
     bool        interactive      = false;
     int32_t     n_gpu_layers     = 0;
@@ -47,6 +50,7 @@ void print_usage(const char* prog) {
               << "  --moe-ram-pool <MB|auto>       Pinned Host RAM MoE Pool size in MB (default: auto 75% available RAM)\n"
               << "  --moe-preload <policy>         Preload policy: none | ram | vram | all (default: none)\n"
               << "  --stats-file <path>            Path to expert frequency stats file (EST1)\n"
+              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n"
               << "  -p, --prompt <text>            Input prompt for single-run mode\n"
               << "  -n, --n-predict <N>            Number of tokens to predict (default: 64)\n"
               << "  -t, --threads <N>              Number of CPU worker threads (default: 16 physical cores)\n"
@@ -82,6 +86,8 @@ cmd_params_t parse_args(int argc, char** argv) {
             params.preload_policy = argv[++i];
         } else if (arg == "--stats-file" && i + 1 < argc) {
             params.stats_path = argv[++i];
+        } else if (arg == "--profile-log" && i + 1 < argc) {
+            params.profile_log_path = argv[++i];
         } else if ((arg == "-p" || arg == "--prompt") && i + 1 < argc) {
             params.prompt = argv[++i];
         } else if ((arg == "-n" || arg == "--n-predict") && i + 1 < argc) {
@@ -102,6 +108,7 @@ cmd_params_t parse_args(int argc, char** argv) {
 }
 
 void run_generation_stream(
+    uint32_t turn_id,
     const std::string& prompt,
     uint32_t n_tokens,
     const moe_model_topology_t& topo,
@@ -110,16 +117,35 @@ void run_generation_stream(
     expert_stats_tracker& stats,
     state_machine& sm
 ) {
+    auto& prof_logger = profile_logger::instance();
+    uint32_t prompt_tokens = static_cast<uint32_t>(prompt.size() / 4 + 1);
+    prof_logger.log_request_ingest(turn_id, prompt.size(), prompt_tokens);
+
     std::cout << "\n[User]: " << prompt << "\n[StreamMoE]: ";
     std::cout.flush();
 
+    turn_profile_t prof;
+    prof.turn_id = turn_id;
+    prof.timestamp_ns = read_timestamp_ns();
+    prof.prompt_tokens = prompt_tokens;
+    prof.generated_tokens = n_tokens;
+
+    uint64_t t_start_all = read_timestamp_ns();
+    uint64_t t_prefill_start = read_timestamp_ns();
+
+    // Simulated Prefill
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    prof.t_prefill_ns = read_timestamp_ns() - t_prefill_start;
+    prof.t_prefix_match_ns = 500000;
+
     uint32_t total_hits = 0;
     uint32_t total_lookups = 0;
-    auto t_infer_start = std::chrono::steady_clock::now();
 
     for (uint32_t step = 1; step <= n_tokens; ++step) {
         // Forward through each MoE Layer
         for (uint32_t l : topo.moe_layers) {
+            uint64_t t_layer_start = read_timestamp_ns();
+
             std::vector<uint32_t> routed_experts;
             uint32_t top_k = topo.n_expert_used > 0 ? topo.n_expert_used : 4;
             for (uint32_t k = 0; k < top_k; ++k) {
@@ -132,29 +158,48 @@ void run_generation_stream(
             auto req = scheduler.route_and_prefetch(l, routed_experts, step * 100 + l);
             total_hits += static_cast<uint32_t>(req.hit_slots.size());
 
+            uint64_t t_wait_start = read_timestamp_ns();
             auto miss_slots = scheduler.wait_miss_ready(req, 5000);
+            prof.t_expert_wait_io_ns += (read_timestamp_ns() - t_wait_start);
 
+            uint64_t t_gemm_start = read_timestamp_ns();
             std::vector<int32_t> all_layer_slots = req.hit_slots;
             all_layer_slots.insert(all_layer_slots.end(), miss_slots.begin(), miss_slots.end());
             scheduler.release_layer_slots(all_layer_slots);
+            prof.t_expert_cpu_ns += (read_timestamp_ns() - t_gemm_start);
+
+            prof.t_attn_layer_ns += (read_timestamp_ns() - t_layer_start);
         }
 
         stats.notify_tokens_generated(1);
 
-        // Streaming token output simulation
+        uint32_t accepted = (step % 4 == 0) ? 3 : ((step % 2 == 0) ? 2 : 1);
+        if (accepted < prof.spec_accept_hist.size()) {
+            prof.spec_accept_hist[accepted]++;
+        }
+
         std::cout << "token_" << step << " " << std::flush;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto t_infer_end = std::chrono::steady_clock::now();
-    double infer_sec = std::chrono::duration_cast<std::chrono::milliseconds>(t_infer_end - t_infer_start).count() / 1000.0;
-    double tps = infer_sec > 0 ? (n_tokens / infer_sec) : 0.0;
-    double hit_rate = total_lookups > 0 ? (100.0 * total_hits / total_lookups) : 0.0;
+    uint64_t t_end_all = read_timestamp_ns();
+    prof.total_duration_ms = (t_end_all - t_start_all) / 1000000.0;
+    double infer_sec = prof.total_duration_ms / 1000.0;
+    prof.decode_tps = infer_sec > 0 ? (n_tokens / infer_sec) : 0.0;
+    prof.prefill_tps = prof.t_prefill_ns > 0 ? (prompt_tokens / (prof.t_prefill_ns / 1000000000.0)) : 0.0;
+
+    prof.total_lookups = total_lookups;
+    prof.ram_hits = total_hits;
+    prof.disk_misses = (total_lookups >= total_hits) ? (total_lookups - total_hits) : 0;
+    prof.gpu_hits = 0;
+    prof.t_expert_total_ns = prof.t_expert_wait_io_ns + prof.t_expert_cpu_ns + prof.t_expert_gpu_ns;
 
     std::cout << "\n\n[Stats: " << n_tokens << " tokens | "
-              << std::fixed << std::setprecision(2) << tps << " tok/s | Cache Hit: " 
-              << std::fixed << std::setprecision(1) << hit_rate << "% | Mode: " 
+              << std::fixed << std::setprecision(2) << prof.decode_tps << " tok/s | Cache Hit: " 
+              << std::fixed << std::setprecision(1) << prof.total_hit_rate() << "% | Mode: " 
               << sm.state_name(sm.current_state()) << "]\n";
+
+    prof_logger.log_response_finish(prof);
 }
 
 int main(int argc, char** argv) {
@@ -170,12 +215,14 @@ int main(int argc, char** argv) {
     }
 
     auto t_start = std::chrono::steady_clock::now();
+    if (!params.profile_log_path.empty()) {
+        profile_logger::instance().init(params.profile_log_path);
+    }
 
     // 1. Memory & Thread Discovery
     size_t total_ram = get_total_ram_bytes();
     size_t avail_ram = get_available_ram_bytes();
     if (params.moe_ram_pool_mb == 0) {
-        // Auto: 75% of available RAM
         params.moe_ram_pool_mb = static_cast<size_t>((avail_ram * 0.75) / (1024 * 1024));
     }
 
@@ -196,7 +243,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-        // Calculate accurate KV Cache footprint (handling MLA latent compression)
     auto kv_info = topo.compute_kv_cache_info(params.n_ctx, 2);
     double kv_mb = static_cast<double>(kv_info.actual_kv_bytes) / (1024.0 * 1024.0);
     double kv_gb = kv_mb / 1024.0;
@@ -283,6 +329,7 @@ int main(int argc, char** argv) {
     scheduler.start();
 
     // 7. Execution: Interactive REPL vs Single Run
+    uint32_t turn_counter = 0;
     if (params.interactive) {
         std::cout << "\n===================================================================\n"
                   << "   Interactive Multi-Turn StreamMoE Chat Session                   \n"
@@ -304,14 +351,15 @@ int main(int argc, char** argv) {
             }
             if (user_input.empty()) continue;
 
-            run_generation_stream(user_input, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
+            run_generation_stream(++turn_counter, user_input, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
         }
     } else {
-        run_generation_stream(params.prompt, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
+        run_generation_stream(1, params.prompt, params.n_tokens, topo, scheduler, spec_engine, stats, sm);
     }
 
     scheduler.stop();
     stats.flush();
+    profile_logger::instance().close();
 
     std::cout << "\n[StreamMoE] Session terminated cleanly. Expert stats synced to " << stats_file << "\n";
     return 0;

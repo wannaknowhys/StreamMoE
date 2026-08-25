@@ -1,4 +1,4 @@
-﻿#include "common/types.h"
+#include "common/types.h"
 #include "common/logger.h"
 #include "io/async_dio.h"
 #include "loader/moe_loader.h"
@@ -8,6 +8,8 @@
 #include "engine/subgraph_executor.h"
 #include "engine/state_machine.h"
 #include "engine/speculative_engine.h"
+#include "kv/kv_cache_manager.h"
+#include "profile/profiler.h"
 #include "server/http_server.h"
 
 #include <iostream>
@@ -31,6 +33,7 @@ struct server_cmd_params_t {
     std::string model_path;
     std::string draft_model_path;
     std::string stats_path;
+    std::string profile_log_path;
     std::string host = "127.0.0.1";
     uint16_t    port = 8080;
     size_t      moe_ram_pool_mb = 0; // 0 = auto 75% available RAM
@@ -49,6 +52,7 @@ void print_server_usage(const char* prog) {
               << "  -c, --ctx-size <N>             Context window size (default: 4096)\n"
               << "  --moe-ram-pool <MB|auto>       Pinned Host RAM Pool size in MB (default: auto 75% available RAM)\n"
               << "  --stats-file <path>            Path to expert frequency stats file (EST1)\n"
+              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n"
               << "  -t, --threads <N>              Number of CPU worker threads (default: 16 physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
@@ -78,6 +82,8 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
             }
         } else if (arg == "--stats-file" && i + 1 < argc) {
             params.stats_path = argv[++i];
+        } else if (arg == "--profile-log" && i + 1 < argc) {
+            params.profile_log_path = argv[++i];
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             params.threads = std::stoi(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -103,6 +109,10 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    if (!params.profile_log_path.empty()) {
+        profile_logger::instance().init(params.profile_log_path);
+    }
+
     // 1. RAM Discovery
     size_t total_ram = get_total_ram_bytes();
     size_t avail_ram = get_available_ram_bytes();
@@ -127,7 +137,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-        auto kv_info = topo.compute_kv_cache_info(params.n_ctx, 2);
+    auto kv_info = topo.compute_kv_cache_info(params.n_ctx, 2);
     double kv_mb = static_cast<double>(kv_info.actual_kv_bytes) / (1024.0 * 1024.0);
     double kv_gb = kv_mb / 1024.0;
     double uncomp_mb = static_cast<double>(kv_info.uncompressed_mha_bytes) / (1024.0 * 1024.0);
@@ -205,6 +215,7 @@ int main(int argc, char** argv) {
     server.stop();
     scheduler.stop();
     stats.flush();
+    profile_logger::instance().close();
 
     std::cout << "[StreamMoE Server] Clean shutdown complete.\n";
     return 0;
