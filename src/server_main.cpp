@@ -127,16 +127,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    size_t kv_cache_bytes = topo.compute_kv_cache_bytes(params.n_ctx, 2);
-    double kv_cache_mb    = static_cast<double>(kv_cache_bytes) / (1024.0 * 1024.0);
-    double kv_cache_gb    = kv_cache_mb / 1024.0;
+        auto kv_info = topo.compute_kv_cache_info(params.n_ctx, 2);
+    double kv_mb = static_cast<double>(kv_info.actual_kv_bytes) / (1024.0 * 1024.0);
+    double kv_gb = kv_mb / 1024.0;
+    double uncomp_mb = static_cast<double>(kv_info.uncompressed_mha_bytes) / (1024.0 * 1024.0);
+    double uncomp_gb = uncomp_mb / 1024.0;
 
     std::cout << "\n-------------------------------------------------------------------\n"
               << " [Server Hardware & Model Profile]\n"
               << "  - Architecture:     " << topo.arch_name << " (" << topo.n_layer << " layers, " << topo.n_expert << " experts/layer)\n"
+              << "  - Attention Type:   " << (topo.is_mla ? "DeepSeek MLA (Multi-Head Latent Attention)" : "Standard MHA / GQA") << "\n"
               << "  - Host RAM:         " << std::fixed << std::setprecision(2) << (total_ram / (1024.0*1024.0*1024.0)) << " GB (Available: " << (avail_ram / (1024.0*1024.0*1024.0)) << " GB)\n"
               << "  - Context Window:   " << params.n_ctx << " tokens\n"
-              << "  - KV Cache Size:    " << std::fixed << std::setprecision(2) << (kv_cache_gb >= 1.0 ? kv_cache_gb : kv_cache_mb) << (kv_cache_gb >= 1.0 ? " GB" : " MB") << "\n"
+              << "  - KV Cache Memory:  " << std::fixed << std::setprecision(2) 
+              << (kv_gb >= 1.0 ? kv_gb : kv_mb) << (kv_gb >= 1.0 ? " GB" : " MB")
+              << (topo.is_mla ? (" [MLA " + std::to_string(static_cast<int>((1.0 - kv_info.compression_ratio) * 100.0)) + "% Compressed from " + (uncomp_gb >= 1.0 ? std::to_string(uncomp_gb) + " GB" : std::to_string(uncomp_mb) + " MB") + "]") : "") << "\n"
               << "  - MoE RAM Pool:     " << params.moe_ram_pool_mb << " MB (75% Available RAM)\n"
               << "  - Compute Threads:  " << params.threads << " Physical Cores\n"
               << "  - Server Endpoint:  http://" << params.host << ":" << params.port << "\n"

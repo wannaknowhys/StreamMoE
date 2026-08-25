@@ -118,13 +118,30 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
     std::string head_kv_key   = topo.arch_name + ".attention.head_count_kv";
     std::string head_dim_key  = topo.arch_name + ".attention.key_length";
 
-    topo.max_context_length = static_cast<uint32_t>(get_kv_int(ctx0, ctx_len_key.c_str(), 4096));
+        topo.max_context_length = static_cast<uint32_t>(get_kv_int(ctx0, ctx_len_key.c_str(), 4096));
     topo.embedding_length   = static_cast<uint32_t>(get_kv_int(ctx0, embd_key.c_str(), 2048));
     topo.head_count         = static_cast<uint32_t>(get_kv_int(ctx0, head_key.c_str(), 32));
     topo.head_count_kv      = static_cast<uint32_t>(get_kv_int(ctx0, head_kv_key.c_str(), topo.head_count));
     topo.head_dim           = static_cast<uint32_t>(get_kv_int(ctx0, head_dim_key.c_str(), topo.head_count > 0 ? (topo.embedding_length / topo.head_count) : 64));
 
-    if (topo.n_layer == 0) topo.n_layer = static_cast<uint32_t>(get_kv_int(ctx0, "block_count", 0));
+    // Multi-Head Latent Attention (MLA) detection (DeepSeek V2/V3/V4, Kimi-K3, etc.)
+    std::string kv_lora_key   = topo.arch_name + ".attention.kv_lora_rank";
+    std::string q_lora_key    = topo.arch_name + ".attention.q_lora_rank";
+    std::string rope_dim_key  = topo.arch_name + ".rope.dimension_count";
+    std::string key_len_key   = topo.arch_name + ".attention.key_length";
+
+    topo.kv_lora_rank = static_cast<uint32_t>(get_kv_int(ctx0, kv_lora_key.c_str(), 0));
+    topo.q_lora_rank  = static_cast<uint32_t>(get_kv_int(ctx0, q_lora_key.c_str(), 0));
+    topo.qk_rope_dim  = static_cast<uint32_t>(get_kv_int(ctx0, rope_dim_key.c_str(), 64));
+
+    // If key_length is 512 and head_count_kv == 1 (e.g. DeepSeek-V4), it uses MLA latent representation
+    uint32_t key_len = static_cast<uint32_t>(get_kv_int(ctx0, key_len_key.c_str(), 0));
+    if (topo.kv_lora_rank > 0 || (topo.head_count_kv == 1 && key_len == 512) || topo.arch_name.find("deepseek") != std::string::npos) {
+        topo.is_mla = true;
+        if (topo.kv_lora_rank == 0) {
+            topo.kv_lora_rank = (key_len > 0) ? key_len : 512;
+        }
+    }if (topo.n_layer == 0) topo.n_layer = static_cast<uint32_t>(get_kv_int(ctx0, "block_count", 0));
     if (topo.n_expert == 0) topo.n_expert = static_cast<uint32_t>(get_kv_int(ctx0, "expert_count", 0));topo.shard_paths = discover_shards(main_gguf_path, ctx0);
     gguf_free(ctx0);
 
