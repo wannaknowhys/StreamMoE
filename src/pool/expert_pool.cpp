@@ -1,47 +1,45 @@
 ﻿#include "pool/expert_pool.h"
 #include "common/logger.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <algorithm>
+
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <sys/mman.h>
-#include <cstdlib>
 #endif
-
-#include <cassert>
-#include <algorithm>
-#include <limits>
 
 namespace stream_moe {
 
-expert_pool::expert_pool(size_t slot_size, uint32_t num_slots)
-    : slot_size_(align_ceil(slot_size, DIO_SECTOR_SIZE)),
-      num_slots_(num_slots) {
+expert_pool::expert_pool(size_t slot_size, uint32_t num_slots, eviction_policy_t policy)
+    : slot_size_(slot_size),
+      num_slots_(num_slots),
+      policy_(policy),
+      slots_(std::make_unique<expert_slot_t[]>(num_slots)) {
     
     total_allocated_bytes_ = slot_size_ * num_slots_;
-    slots_ = std::make_unique<expert_slot_t[]>(num_slots_);
-
-    if (total_allocated_bytes_ == 0) {
-        return;
-    }
 
 #if defined(_WIN32)
-    // Allocate contiguous pinned host memory using VirtualAlloc
     base_ptr_ = static_cast<uint8_t*>(VirtualAlloc(
         NULL,
         total_allocated_bytes_,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_READWRITE
     ));
+
     if (!base_ptr_) {
-        DWORD err = GetLastError();
-        throw std::runtime_error("VirtualAlloc failed for Pinned Pool, err: " + std::to_string(err));
+        LOG_ERROR("VirtualAlloc failed for " << (total_allocated_bytes_ / (1024 * 1024)) << " MB");
+        throw std::bad_alloc();
     }
-    // Attempt page locking (best effort, ignore failure if working set quota exceeded)
+
+    // Try to lock pages in physical RAM (ignore error if process working set quota is reached)
     VirtualLock(base_ptr_, total_allocated_bytes_);
 #else
-    if (posix_memalign(reinterpret_cast<void**>(&base_ptr_), DIO_SECTOR_SIZE, total_allocated_bytes_) != 0) {
+    if (posix_memalign(reinterpret_cast<void**>(&base_ptr_), 4096, total_allocated_bytes_) != 0) {
+        LOG_ERROR("posix_memalign failed for " << (total_allocated_bytes_ / (1024 * 1024)) << " MB");
         throw std::bad_alloc();
     }
     mlock(base_ptr_, total_allocated_bytes_);
@@ -53,12 +51,14 @@ expert_pool::expert_pool(size_t slot_size, uint32_t num_slots)
         slots_[i].expert_idx      = -1;
         slots_[i].flags.store(SLOT_EMPTY, std::memory_order_relaxed);
         slots_[i].last_access_seq = 0;
+        slots_[i].session_hits    = 0;
         slots_[i].raw_ptr         = base_ptr_ + i * slot_size_;
     }
 
     LOG_INFO("Initialized Pinned Expert Pool: " << num_slots_ << " slots of " 
              << (slot_size_ / 1024) << " KB each (Total: " 
-             << (total_allocated_bytes_ / (1024 * 1024)) << " MB)");
+             << (total_allocated_bytes_ / (1024 * 1024)) << " MB, Policy: " 
+             << eviction_policy_name(policy_) << ")");
 }
 
 expert_pool::~expert_pool() {
@@ -121,6 +121,7 @@ int32_t expert_pool::allocate_or_evict_slot(
     if (it != lookup_map_.end()) {
         int32_t slot_id = it->second;
         slots_[slot_id].last_access_seq = current_seq;
+        slots_[slot_id].session_hits++;
         return slot_id;
     }
 
@@ -131,44 +132,66 @@ int32_t expert_pool::allocate_or_evict_slot(
             slots_[i].layer_idx       = layer_idx;
             slots_[i].expert_idx      = expert_idx;
             slots_[i].last_access_seq = current_seq;
+            slots_[i].session_hits    = 1;
             slots_[i].flags.store(SLOT_IO_INFLIGHT, std::memory_order_release);
             lookup_map_[key] = static_cast<int32_t>(i);
             return static_cast<int32_t>(i);
         }
     }
 
-    // 3. Find victim slot using Hybrid LRU + Adaptive Frequency
+    // 3. Find victim slot according to policy
     int32_t victim_slot = -1;
-    double  min_score   = std::numeric_limits<double>::infinity();
 
-    // Calculate max LRU age for normalization
-    uint64_t min_seq = current_seq;
-    uint64_t max_seq = current_seq;
-    for (uint32_t i = 0; i < num_slots_; ++i) {
-        uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
-        if (!(f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT))) {
-            if (slots_[i].last_access_seq < min_seq) min_seq = slots_[i].last_access_seq;
-            if (slots_[i].last_access_seq > max_seq) max_seq = slots_[i].last_access_seq;
+    if (policy_ == eviction_policy_t::PURE_LRU) {
+        // Pure LRU: strictly find the unlocked slot with oldest last_access_seq (ignore stats)
+        uint64_t oldest_seq = std::numeric_limits<uint64_t>::max();
+        for (uint32_t i = 0; i < num_slots_; ++i) {
+            uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
+            if (f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT)) continue;
+
+            if (slots_[i].last_access_seq < oldest_seq) {
+                oldest_seq = slots_[i].last_access_seq;
+                victim_slot = static_cast<int32_t>(i);
+            }
         }
-    }
-    double seq_range = (max_seq > min_seq) ? static_cast<double>(max_seq - min_seq) : 1.0;
+    } else if (policy_ == eviction_policy_t::PURE_LFU) {
+        // Pure LFU: find slot with lowest session hits
+        uint32_t min_hits = std::numeric_limits<uint32_t>::max();
+        for (uint32_t i = 0; i < num_slots_; ++i) {
+            uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
+            if (f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT)) continue;
 
-    for (uint32_t i = 0; i < num_slots_; ++i) {
-        uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
-        
-        // Skip locked or in-flight slots (protected!)
-        if (f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT)) {
-            continue;
+            if (slots_[i].session_hits < min_hits) {
+                min_hits = slots_[i].session_hits;
+                victim_slot = static_cast<int32_t>(i);
+            }
         }
+    } else {
+        // Hybrid EST1: combine normalized LRU age + adaptive frequency
+        double min_score = std::numeric_limits<double>::infinity();
+        uint64_t min_seq = current_seq;
+        uint64_t max_seq = current_seq;
+        for (uint32_t i = 0; i < num_slots_; ++i) {
+            uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
+            if (!(f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT))) {
+                if (slots_[i].last_access_seq < min_seq) min_seq = slots_[i].last_access_seq;
+                if (slots_[i].last_access_seq > max_seq) max_seq = slots_[i].last_access_seq;
+            }
+        }
+        double seq_range = (max_seq > min_seq) ? static_cast<double>(max_seq - min_seq) : 1.0;
 
-        // Calculate score: Higher score = more valuable, Lower score = victim
-        double lru_norm = static_cast<double>(slots_[i].last_access_seq - min_seq) / seq_range; // [0, 1]
-        double freq_val = stats.get_adaptive_frequency(slots_[i].layer_idx, slots_[i].expert_idx);
-        
-        double score = w_lru * lru_norm + w_freq * freq_val;
-        if (score < min_score) {
-            min_score   = score;
-            victim_slot = static_cast<int32_t>(i);
+        for (uint32_t i = 0; i < num_slots_; ++i) {
+            uint32_t f = slots_[i].flags.load(std::memory_order_relaxed);
+            if (f & (SLOT_PIN_LOCKED | SLOT_IO_INFLIGHT)) continue;
+
+            double lru_norm = static_cast<double>(slots_[i].last_access_seq - min_seq) / seq_range;
+            double freq_val = stats.get_adaptive_frequency(slots_[i].layer_idx, slots_[i].expert_idx);
+            double score = w_lru * lru_norm + w_freq * freq_val;
+
+            if (score < min_score) {
+                min_score = score;
+                victim_slot = static_cast<int32_t>(i);
+            }
         }
     }
 
@@ -184,6 +207,7 @@ int32_t expert_pool::allocate_or_evict_slot(
     slots_[victim_slot].layer_idx       = layer_idx;
     slots_[victim_slot].expert_idx      = expert_idx;
     slots_[victim_slot].last_access_seq = current_seq;
+    slots_[victim_slot].session_hits    = 1;
     slots_[victim_slot].flags.store(SLOT_IO_INFLIGHT, std::memory_order_release);
 
     lookup_map_[key] = victim_slot;

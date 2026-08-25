@@ -34,6 +34,8 @@ struct server_cmd_params_t {
     std::string draft_model_path;
     std::string stats_path;
     std::string profile_log_path;
+    std::string output_file_path;
+    std::string eviction_policy = "hybrid";
     std::string host = "127.0.0.1";
     uint16_t    port = 8080;
     size_t      moe_ram_pool_mb = 0; // 0 = auto 75% available RAM
@@ -52,7 +54,7 @@ void print_server_usage(const char* prog) {
               << "  -c, --ctx-size <N>             Context window size (default: 4096)\n"
               << "  --moe-ram-pool <MB|auto>       Pinned Host RAM Pool size in MB (default: auto 75% available RAM)\n"
               << "  --stats-file <path>            Path to expert frequency stats file (EST1)\n"
-              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n"
+              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n  --eviction-policy <policy>     Eviction policy: hybrid | lru | lfu (default: hybrid)\n  --output-file <path>           Save generated conversation text to file\n"
               << "  -t, --threads <N>              Number of CPU worker threads (default: 16 physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
@@ -84,6 +86,10 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
             params.stats_path = argv[++i];
         } else if (arg == "--profile-log" && i + 1 < argc) {
             params.profile_log_path = argv[++i];
+        } else if (arg == "--eviction-policy" && i + 1 < argc) {
+            params.eviction_policy = argv[++i];
+        } else if (arg == "--output-file" && i + 1 < argc) {
+            params.output_file_path = argv[++i];
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             params.threads = std::stoi(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -181,7 +187,8 @@ int main(int argc, char** argv) {
     uint32_t num_slots = static_cast<uint32_t>(pool_budget_bytes / slot_size);
     if (num_slots < 4) num_slots = 4;
 
-    std::unique_ptr<expert_pool> pool = std::make_unique<expert_pool>(slot_size, num_slots);
+    eviction_policy_t ep = parse_eviction_policy(params.eviction_policy);
+    std::unique_ptr<expert_pool> pool = std::make_unique<expert_pool>(slot_size, num_slots, ep);
     state_machine sm(params.threads);
     moe_scheduler scheduler(topo, *pool, stats, *dio_engine, shard_files);
     speculative_engine spec_engine(topo, sm, scheduler);

@@ -26,6 +26,8 @@ struct cmd_params_t {
     std::string draft_model_path;
     std::string stats_path;
     std::string profile_log_path;
+    std::string output_file_path;
+    std::string eviction_policy = "hybrid";
     std::string prompt;
     bool        interactive      = false;
     int32_t     n_gpu_layers     = 0;
@@ -50,7 +52,7 @@ void print_usage(const char* prog) {
               << "  --moe-ram-pool <MB|auto>       Pinned Host RAM MoE Pool size in MB (default: auto 75% available RAM)\n"
               << "  --moe-preload <policy>         Preload policy: none | ram | vram | all (default: none)\n"
               << "  --stats-file <path>            Path to expert frequency stats file (EST1)\n"
-              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n"
+              << "  --profile-log <path>           Enable fine-grained hardware profiling to JSONL file\n  --eviction-policy <policy>     Eviction policy: hybrid | lru | lfu (default: hybrid)\n  --output-file <path>           Save generated conversation text to file\n"
               << "  -p, --prompt <text>            Input prompt for single-run mode\n"
               << "  -n, --n-predict <N>            Number of tokens to predict (default: 64)\n"
               << "  -t, --threads <N>              Number of CPU worker threads (default: 16 physical cores)\n"
@@ -88,6 +90,10 @@ cmd_params_t parse_args(int argc, char** argv) {
             params.stats_path = argv[++i];
         } else if (arg == "--profile-log" && i + 1 < argc) {
             params.profile_log_path = argv[++i];
+        } else if (arg == "--eviction-policy" && i + 1 < argc) {
+            params.eviction_policy = argv[++i];
+        } else if (arg == "--output-file" && i + 1 < argc) {
+            params.output_file_path = argv[++i];
         } else if ((arg == "-p" || arg == "--prompt") && i + 1 < argc) {
             params.prompt = argv[++i];
         } else if ((arg == "-n" || arg == "--n-predict") && i + 1 < argc) {
@@ -291,7 +297,8 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<expert_pool> pool;
     try {
-        pool = std::make_unique<expert_pool>(slot_size, num_slots);
+        eviction_policy_t ep = parse_eviction_policy(params.eviction_policy);
+        pool = std::make_unique<expert_pool>(slot_size, num_slots, ep);
     } catch (const std::exception& e) {
         LOG_ERROR("Failed to allocate Pinned Expert Pool: " << e.what());
         return 1;
