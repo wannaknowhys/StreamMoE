@@ -116,3 +116,13 @@ build\<tag>\
 2. 文档改动进 main；补丁进 patches/（不入 main 逻辑）。
 3. 临时文件/产物进 `build\<tag>\` 或系统 %TEMP%，严禁散落根目录。
 4. 删除文件用 `git rm`（保留历史），不要直接 `Remove-Item` 后失联。
+
+## 10. 临时代码规范（已修复 bug 的打桩/诊断代码）
+
+- **统一宏**：`STREAM_MOE_TEMP`（编译期条件）。
+- **规则**：
+  - 短期诊断/打桩代码一律 `#ifdef STREAM_MOE_TEMP ... #endif` 包裹，默认编译不带该宏。
+  - **长期有意义的诊断** → 做成 `patches/` 里的独立 patch（如 memwatch），不入主线。
+  - **短期一次性** → `STREAM_MOE_TEMP` 宏包裹 + 产物路径写 `build\<tag>\` 或 `%TEMP%`。
+  - 已修复 bug 的验证代码用完即删（`git rm`），或移入宏保护，不残留裸代码。
+- 命名：`STREAM_MOE_TEMP` 为总开关；需要细化时用 `STREAM_MOE_TEMP_<NAME>` 子宏，但必须同时受总开关约束。
