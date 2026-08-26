@@ -22,6 +22,21 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
   - 顺带修：expert buft 记账 size 余量、ACCEL buft 被 dense 选走（supports_op 只认 `_exps` 的 MUL_MAT_ID）、g_threads 接入 ggml_backend_cpu_set_n_threads、pin_expert FAILED 防御。
   - **实测状态**：`--expert-backend`（8GB 池）5-token prefill 已跑到第 20/43 层，gate/up/down 全算通、无误导；但**冷 N: 顺序 DIO 装载是性能瓶颈**（~70s/层 → 全程约 1h）。卡死印象 = 慢，非死锁。
 - **待办（下一个会话）**：① 并行化专家装载（pin 循环当前逐个阻塞，scheduler 单 worker 一次一个请求）；② 更大的池/预热页缓存；③ 跑通完整 prefill + decode 验证正确性（对比非 expert-backend 输出）；④ 数值等价回归；⑤ 移除 [moe] 调试日志。
+
+### 正确性调试现场（2026-08-26 晚，下一个会话从这里续）
+
+- **已确认**：
+  - DIO 装载 `read_expert_sync` → 槽字节**与 GGUF 文件逐字节全等**（`temp/verify_dio.cpp`：layer0/expert0 三切片 ALL MATCH；注意校验必须传全部分片 + 对齐缓冲）。
+  - pin 生命周期**泄漏已修**（gate/up/down 是 3 次独立 graph_compute 调用，旧逻辑每层 +30 pin → 21 层池满卡死；现改为 executor 内跨调用状态：首次 non-down pin、后续复用、down 释放全部）。
+  - 70G 池贪婪测试：EXIT=0、43 层全过、8 token 生成。
+- **未解**：贪婪输出错误。基线（无 expert-backend）`--temp 0` → `Hi! How can I help you today`；expert-backend → `## Final answer\nSay hi.`。说明 mini-graph 委托数值不等价。
+- **下一会话排查假设（按嫌疑排序）**：
+  1. `b_leaf` 包装 src1：up/gate 的 cur 是 reshape view（[ne00,1,n_tok]）；down 的 act 是 [ne00,n_ids,n_tok]。核对 b_leaf->data/nb 与主图 src1 完全一致、且 src1 确实连续。
+  2. `w3d` 量化类型 row stride（nb[1]）与槽内切片布局（GGUF row-major）一致。
+  3. `dst`（主图节点输出）在 graph_compute 时 data/nb 有效（host buft 分配），`mm->data=dst->data` 与 mm 的 nb 匹配。
+  4. ids_slot 翻译：up/gate 用 pin 槽号、down 用 slot_of；三者必须同槽（同 ids → 同专家 → 同槽）。
+  5. 内核 `i11 = id % ne11`：id 是 matrix_rows 存的**槽位 k**（非 ids 值），ne11=src1 的 ne[1]；确认 b_leaf 的 ne[1] 与主图一致。
+- 调试手段：给 minigraph_exec 加"对照模式"——同一节点用官方路径（mmap 权重）与委托路径各算一次、逐元素 diff 首个差异位置。
 - **route B 骨架模块（细节，均已编译 + UT 通过）**：
   - `src/backend/slot.h`：跨平台控制面——`slot_meta` 64 位原子字（state/refcount/generation + CAS pin/unpin/evict/reload/failed）、`expert_directory`（二维原子数组+版本号）、有界 MPSC 分配队列；等待唤醒走 Windows WaitOnAddress / Linux futex，无忙等。UT：`tests/test_slot.cpp`（4/4 通过）。
   - `src/backend/scheduler.h/.cpp`：**专家调度器（本轮新增）**——固定大小提交内存池（`pool_bytes` 硬上限，初始即提交 = 70G 保证）、后台线程从 MPSC 取请求、复用 `io/async_dio` + `staging_reader::read_expert_sync` + `loader/moe_loader` read plan 装载专家切片进槽、EST1/LRU 驱逐（READY+refcount==0）、计算侧 `pin_expert`（阻塞装载+refcount++）/`wait_ready`（down 角色不 pin）/`unpin`、命中/缺失遥测（喂 profiler hits）。UT：`tests/test_scheduler.cpp`（合成拓扑 + 临时文件，装载/驱逐/遥测，2/2 通过）。
