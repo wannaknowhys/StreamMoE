@@ -6,6 +6,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-cpu.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -43,7 +44,7 @@ ggml_backend_buffer_t expert_buft_alloc_buffer(ggml_backend_buffer_type_t buft, 
     iface.set_tensor    = [](ggml_backend_buffer_t, ggml_tensor*, const void*, size_t, size_t) {};
     iface.get_tensor    = [](ggml_backend_buffer_t, const ggml_tensor*, void*, size_t, size_t) {};
     iface.clear = [](ggml_backend_buffer_t, uint8_t) {};
-    return ggml_backend_buffer_init(buft, iface, ctx, size);
+    return ggml_backend_buffer_init(buft, iface, ctx, ctx->size);
 }
 
 size_t expert_buft_get_alignment(ggml_backend_buffer_type_t) { return 64; }
@@ -139,17 +140,13 @@ static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
         if (!nd || nd->op != GGML_OP_MUL_MAT_ID) continue;
-        const ggml_tensor* w  = nd->src[0];
-        const ggml_tensor* cur = nd->src[1];
-        const ggml_tensor* ids = nd->src[2];
-        // weights are re-pointed to slot memory but ggml still reserves their
-        // bytes in the arena context; count them
-        need += ggml_nbytes(w);
-        // gathered (f32) + out (f32) + idx tensors + per-tensor overhead
-        size_t n_pairs = static_cast<size_t>(ids->ne[0]) * ids->ne[1];
-        need += n_pairs * (2 * 4 + (w->ne[0] + w->ne[1]) * 4) * 2;
-        need += 8 * ggml_tensor_overhead() * (n_pairs + 8);
-        (void)cur;
+        const ggml_tensor* w = nd->src[0];
+        // leaf-only mini-graph: w3d reserves one expert slice, ids_slot small,
+        // b_leaf small, result = dst bytes
+        need += ggml_row_size(w->type, w->ne[0]) * w->ne[1];
+        need += ggml_nbytes(nd);          // result written into dst
+        need += 4 * ggml_tensor_overhead() * 8;
+        need += 1 * 1024 * 1024;
     }
     return need * 2;
 }
@@ -183,6 +180,9 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     backend->context = new moe_backend_ctx();
     static_cast<moe_backend_ctx*>(backend->context)->cpu =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (static_cast<moe_backend_ctx*>(backend->context)->cpu) {
+        ggml_backend_cpu_set_n_threads(static_cast<moe_backend_ctx*>(backend->context)->cpu, g_threads);
+    }
     backend->iface.get_name = [](ggml_backend_t) { return "STREAMMOE"; };
     backend->iface.free     = [](ggml_backend_t b) {
         auto* c = static_cast<moe_backend_ctx*>(b->context);
@@ -224,20 +224,14 @@ bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t bu
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
-    // Take ownership ONLY of MoE weight ops (routed `*_exps` / shared `*_shexp`).
-    // Dense weights must stay on llama.cpp defaults - otherwise the loader would
-    // place them in our ACCEL buft and their ops would land here.
+    // Take ownership ONLY of routed-expert MUL_MAT_ID (`*_exps`). Everything
+    // else (dense, shared `*_shexp`, embeddings, ...) must stay on llama.cpp
+    // defaults - otherwise the loader would select our ACCEL buft for them.
     if (!op || !op->src[0] || !op->src[0]->name) return false;
     const char* n = op->src[0]->name;
     if (!n[0]) return false;
-    switch (op->op) {
-        case GGML_OP_MUL_MAT_ID:
-            return std::strstr(n, "_exps") != nullptr;  // routed expert weights
-        case GGML_OP_MUL_MAT:
-            return std::strstr(n, "_shexp") != nullptr; // shared experts (future milestone)
-        default:
-            return false;
-    }
+    if (op->op != GGML_OP_MUL_MAT_ID) return false;
+    return std::strstr(n, "_exps") != nullptr;
 }
 
 bool moe_dev_offload_op(ggml_backend_dev_t, const ggml_tensor*) { return false; }

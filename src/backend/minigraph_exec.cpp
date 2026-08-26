@@ -1,8 +1,8 @@
 #include "backend/minigraph_exec.h"
 #include "common/logger.h"
+#include "ggml-impl.h"
 
 #include <cstring>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -33,8 +33,25 @@ parsed_node_t parse_weight_name(const char* name) {
     return r;
 }
 
+struct keyed_expert_t {
+    uint32_t layer, expert;
+};
+
 } // namespace
 
+// Route B delegation: the compact slot pool is one contiguous block with a
+// uniform stride (slot e at pool_base + e*slot_size). So each original
+// MUL_MAT_ID node can be executed by the OFFICIAL ggml_mul_mat_id kernel using
+// a weight leaf [ne00, ne01, num_slots] whose nb[2] = slot_size, plus an ids
+// tensor translated (in OUR private mini-graph) from expert ids to slot indices.
+//
+// All mini-graph tensors are leaf wrappers (op == NONE, data copied from the
+// main graph / slot memory) - we NEVER view/reshape main-graph op nodes, which
+// would drag the whole upstream chain into the mini-graph.
+//
+// Pin lifecycle (docs/LLAMA_MOE_NO_MMAP_RESEARCH.md §4.8, role-based):
+//   - split with only non-down nodes: pin experts here (no release)
+//   - split with a down node: wait_ready, compute, then release
 enum ggml_status moe_exec_mul_mat_id(
     ggml_context* ctx,
     ggml_backend_t cpu_backend,
@@ -46,13 +63,17 @@ enum ggml_status moe_exec_mul_mat_id(
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 
     const moe_model_topology_t& topo = sched.topology();
+    const int32_t n_slots = static_cast<int32_t>(sched.num_slots());
 
-    // ---- phase 1: parse nodes, group experts per role ----
-    // key = layer * n_expert + expert
-    std::vector<uint32_t> pin_keys;    // non-down nodes
-    std::vector<uint32_t> down_keys;   // down node
-    bool has_non_down = false, has_down = false;
-    int32_t ids_ne0 = -1, ids_ne1 = -1;
+    // ---- phase 1: parse + pin (non-down) / wait (down) ----
+    std::vector<keyed_expert_t> pin_keys, down_keys;
+    std::vector<expert_handle_t> pins;
+    bool has_down = false;
+
+    auto add_key = [&](std::vector<keyed_expert_t>& v, uint32_t l, uint32_t e) {
+        for (const auto& x : v) if (x.layer == l && x.expert == e) return;
+        v.push_back({l, e});
+    };
 
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
@@ -68,129 +89,91 @@ enum ggml_status moe_exec_mul_mat_id(
             return GGML_STATUS_FAILED;
         }
         const ggml_tensor* ids = nd->src[2];
-        ids_ne0 = static_cast<int32_t>(ids->ne[0]);
-        ids_ne1 = static_cast<int32_t>(ids->ne[1]);
         const int32_t* ids_data = static_cast<const int32_t*>(ids->data);
         if (!ids_data) return GGML_STATUS_FAILED;
-
-        auto add_key = [&](std::vector<uint32_t>& v, uint32_t e) {
-            uint32_t key = pn.layer * topo.n_expert + e;
-            for (uint32_t k : v) if (k == key) return;
-            v.push_back(key);
-        };
-        for (int t = 0; t < ids_ne1; ++t)
-            for (int k = 0; k < ids_ne0; ++k) {
-                int32_t e = ids_data[static_cast<size_t>(t) * ids_ne0 + k];
+        for (int t = 0; t < ids->ne[1]; ++t)
+            for (int k = 0; k < ids->ne[0]; ++k) {
+                int32_t e = ids_data[static_cast<size_t>(t) * ids->ne[0] + k];
                 if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) return GGML_STATUS_FAILED;
-                if (pn.down) add_key(down_keys, static_cast<uint32_t>(e));
-                else         add_key(pin_keys, static_cast<uint32_t>(e));
+                if (pn.down) add_key(down_keys, pn.layer, static_cast<uint32_t>(e));
+                else         add_key(pin_keys,  pn.layer, static_cast<uint32_t>(e));
             }
-        if (pn.down) has_down = true; else has_non_down = true;
+        if (pn.down) has_down = true;
     }
 
-    // ---- phase 2: pin (non-down role) / wait (down role) ----
-    std::vector<expert_handle_t> pins;
     pins.reserve(pin_keys.size());
-    for (uint32_t key : pin_keys) {
-        uint32_t l = key / topo.n_expert, e = key % topo.n_expert;
-        pins.push_back(sched.pin_expert(l, e));
-    }
-    for (uint32_t key : down_keys) {
-        uint32_t l = key / topo.n_expert, e = key % topo.n_expert;
-        sched.wait_ready(l, e);
-    }
+    LOG_INFO("[moe] phase1: " << pin_keys.size() << " pin, " << down_keys.size() << " down");
+    for (const auto& k : pin_keys) pins.push_back(sched.pin_expert(k.layer, k.expert));
+    LOG_INFO("[moe] phase1 pins done");
+    for (const auto& k : down_keys) sched.wait_ready(k.layer, k.expert);
+    LOG_INFO("[moe] phase1 wait done");
 
-    // ---- phase 3: build + run mini-graph per node ----
+    // ---- phase 2: one official mul_mat_id per node, in a leaf-only mini-graph ----
     bool ok = true;
     for (int i = 0; i < n_nodes && ok; ++i) {
         const ggml_tensor* nd = nodes[i];
-        const ggml_tensor* w = nd->src[0];
+        const ggml_tensor* w   = nd->src[0];
         const ggml_tensor* cur = nd->src[1];
         const ggml_tensor* ids = nd->src[2];
         const ggml_tensor* dst = nd;
-        ggml_tensor* w_nc = const_cast<ggml_tensor*>(w);
-
         parsed_node_t pn = parse_weight_name(w->name);
         const int32_t* ids_data = static_cast<const int32_t*>(ids->data);
-        const int n_ids = ids_ne0, n_tok = ids_ne1;
 
-        // group (k, t) by expert, preserving order
-        std::map<uint32_t, std::vector<std::pair<int32_t, int32_t>>> groups;
-        for (int t = 0; t < n_tok; ++t)
-            for (int k = 0; k < n_ids; ++k) {
-                uint32_t e = static_cast<uint32_t>(ids_data[static_cast<size_t>(t) * n_ids + k]);
-                groups[e].push_back({k, t});
+        // branch layout (compact slot offset, uniform across experts)
+        size_t off = 0, bytes = 0;
+        if (!sched.branch_layout(pn.layer, 0, w->name, off, bytes)) {
+            LOG_ERROR("stream_moe: no slot layout for " << w->name);
+            ok = false; break;
+        }
+
+        // w3d leaf: [ne00, ne01, num_slots], data = pool + branch offset, nb[2] = slot stride
+        ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+        w3d->ne[2] = n_slots;
+        w3d->nb[2] = sched.slot_size();
+        w3d->nb[3] = w3d->nb[2] * n_slots;
+        w3d->data  = sched.pool_base() + off;
+
+        // ids_slot: translate expert ids -> slot indices (private, main graph untouched)
+        ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+        auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+        for (int t = 0; t < ids->ne[1] && ok; ++t)
+            for (int k = 0; k < ids->ne[0] && ok; ++k) {
+                int32_t e = ids_data[static_cast<size_t>(t) * ids->ne[0] + k];
+                int32_t slot = -1;
+                if (pn.down) {
+                    slot = sched.slot_of(pn.layer, static_cast<uint32_t>(e));
+                } else {
+                    for (const auto& h : pins)
+                        if (h.layer == pn.layer && h.expert == static_cast<uint32_t>(e)) { slot = h.slot; break; }
+                }
+                if (slot < 0 || slot >= n_slots) { ok = false; break; }
+                ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
             }
+        if (!ok) break;
 
-        // flat dst column = k*n_tok + t
-        ggml_tensor* dst_flat = ggml_view_2d(ctx, const_cast<ggml_tensor*>(dst),
-                                             dst->ne[0], dst->ne[1] * dst->ne[2],
-                                             dst->nb[1], 0);
-        // cur may be 3D [ne00, 1, n_tok]; flatten then gather the token columns
-        // ggml_get_rows(a, idx) -> [a->ne[0], idx->ne[0]] (column gather)
-        ggml_tensor* cur2 = ggml_reshape_2d(ctx, const_cast<ggml_tensor*>(cur), cur->ne[0], cur->ne[1] * cur->ne[2]);
+        // b_leaf: wrap the main graph's activation (contiguous CPU buffer)
+        ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+        b_leaf->data = cur->data;
+        std::memcpy(b_leaf->nb, cur->nb, sizeof(b_leaf->nb));
 
+        // leaf-only graph; result written straight into the main node's output
         ggml_cgraph* gf = ggml_new_graph(ctx);
+        ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_slot);
+        mm->data = dst->data; // nb of mm == nb of dst (same shape, both contiguous)
 
-        for (const auto& g : groups) {
-            uint32_t e = g.first;
-            const auto& pairs = g.second;
-            size_t off = 0, bytes = 0;
-            if (!sched.branch_layout(pn.layer, e, w->name, off, bytes)) {
-                LOG_ERROR("stream_moe: no layout for " << w->name << " L" << pn.layer << " E" << e);
-                ok = false; break;
-            }
-            int32_t slot = -1;
-            if (pn.down) {
-                slot = sched.slot_of(pn.layer, e);
-            } else {
-                // find matching handle
-                for (const auto& h : pins)
-                    if (h.layer == pn.layer && h.expert == e) { slot = h.slot; break; }
-            }
-            uint8_t* wmem = sched.slot_mem(slot);
-            if (!wmem) { ok = false; break; }
-
-            // weight view over the slot slice
-            ggml_tensor* w2d = ggml_new_tensor_2d(ctx, w->type, w->ne[0], w->ne[1]);
-            w2d->data = wmem + off;
-            {
-                const uint8_t* probe = static_cast<const uint8_t*>(w2d->data);
-                LOG_INFO("[moe] wdata@" << (void*)probe << " first8="
-                         << std::hex << (int)probe[0] << " " << (int)probe[1] << " " << (int)probe[2] << " " << (int)probe[3]
-                         << " " << (int)probe[4] << " " << (int)probe[5] << " " << (int)probe[6] << " " << (int)probe[7] << std::dec);
-            }
-
-            // input: cur columns for this expert's (k,t) pairs
-            size_t count = pairs.size();
-            ggml_tensor* idx_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<int64_t>(count));
-            auto* idx_t_data = static_cast<int32_t*>(idx_t->data);
-            ggml_tensor* idx_c = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<int64_t>(count));
-            auto* idx_c_data = static_cast<int32_t*>(idx_c->data);
-            for (size_t j = 0; j < count; ++j) {
-                idx_t_data[j] = pairs[j].second;                       // token index
-                idx_c_data[j] = pairs[j].first * n_tok + pairs[j].second; // dst column
-            }
-            ggml_tensor* gathered = ggml_get_rows(ctx, cur2, idx_t);   // [ne00, count]
-            LOG_INFO("[moe] L" << pn.layer << " " << w->name << " w=[" << w->ne[0] << "," << w->ne[1]
-                     << "] gathered=[" << gathered->ne[0] << "," << gathered->ne[1] << "] count=" << count);
-            ggml_tensor* out = ggml_mul_mat(ctx, w2d, gathered);       // [ne01, count]
-            ggml_tensor* scat = ggml_set_rows(ctx, dst_flat, out, idx_c);
-
-            ggml_build_forward_expand(gf, scat);
+        ggml_build_forward_expand(gf, mm);
+        LOG_INFO("[moe] node " << w->name << " computing (" << gf->n_nodes << " nodes)");
+        if (ggml_backend_graph_compute(cpu_backend, gf) != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("stream_moe: mini-graph compute failed for " << w->name);
+            ok = false;
         }
-
-        if (ok) {
-            enum ggml_status st = ggml_backend_graph_compute(cpu_backend, gf);
-            if (st != GGML_STATUS_SUCCESS) { ok = false; }
-        }
+        LOG_INFO("[moe] node " << w->name << " done");
     }
 
-    // ---- phase 4: release (down role only) ----
+    // ---- phase 3: release (down role only) ----
     if (has_down) {
-        for (uint32_t key : down_keys) {
-            uint32_t l = key / topo.n_expert, e = key % topo.n_expert;
-            int32_t slot = sched.slot_of(l, e);
+        for (const auto& k : down_keys) {
+            int32_t slot = sched.slot_of(k.layer, k.expert);
             if (slot >= 0) sched.unpin_slot(slot);
         }
     }

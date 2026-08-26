@@ -139,7 +139,7 @@ void expert_scheduler::scheduler_loop() {
 expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
     n_lookups_.fetch_add(1, std::memory_order_relaxed);
     bool waited_for_load = false;
-    for (;;) {
+    for (int retries = 0; retries < 100000; ++retries) {
         uint32_t s = dir_->find(layer, expert);
         if (s == SLOT_UNASSIGNED) {
             waited_for_load = true;
@@ -147,6 +147,11 @@ expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
             requests_.push({layer, expert, static_cast<uint32_t>(seq_.fetch_add(1, std::memory_order_relaxed))});
             dir_->wait_version(layer, expert, v);
             continue;
+        }
+        uint32_t st = slot_word_state(slots_[s].load());
+        if (st == SLOT_FAILED) {
+            LOG_ERROR("expert_scheduler: pin_expert FAILED for L" << layer << " E" << expert);
+            return {-1, 0, layer, expert, false};
         }
         int64_t gen = slots_[s].try_pin();
         if (gen >= 0) {
@@ -157,6 +162,8 @@ expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
         }
         std::this_thread::yield(); // transient (evicting); retry
     }
+    LOG_ERROR("expert_scheduler: pin_expert retry limit hit for L" << layer << " E" << expert);
+    return {-1, 0, layer, expert, false};
 }
 
 void expert_scheduler::wait_ready(uint32_t layer, uint32_t expert) {

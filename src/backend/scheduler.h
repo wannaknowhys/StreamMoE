@@ -69,6 +69,7 @@ public:
         return (slot >= 0 && slot < static_cast<int32_t>(num_slots_))
             ? pool_base_ + static_cast<size_t>(slot) * slot_size_ : nullptr;
     }
+    uint8_t* pool_base() const { return pool_base_; }
     // Current slot index for (layer, expert), or -1 if not resident.
     int32_t slot_of(uint32_t layer, uint32_t expert) const {
         uint32_t s = dir_->find(layer, expert);
