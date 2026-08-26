@@ -79,6 +79,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ## 6. 环境与坑（记住）
 
+- **测试约定（2026-08-26 起）**：所有 route B 池测试统一 `--moe-ram-pool 71680`（70GB）。不用小池子。
 - 模型盘 N: = **USB 转接 NVMe**（非 iSCSI）；162GB 冷页拉取慢（decode 0.3~2 tok/s）。
 - GPU = Radeon RX 590 8GB（Vulkan only，无 CUDA）。
 - RAM 128GB（空闲约 99GB），70GB 池参数可行。
