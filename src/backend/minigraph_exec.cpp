@@ -1,9 +1,7 @@
-#include "backend/minigraph_exec.h"
+﻿#include "backend/minigraph_exec.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
 
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -18,6 +16,12 @@ struct parsed_node_t {
     bool     down  = false;
     bool     ok    = false;
 };
+
+// Read an ids element honoring the tensor's real row stride. The routing ids
+// tensor is NOT guaranteed contiguous: hash layers (L0-2) are compact, but
+// argsort layers (L3+) use a large nb[1] (e.g. 1024 bytes) with sparse rows.
+#define MOE_ID_AT(ids, t, k) \
+    (*(const int32_t*)((const char*)(ids)->data + (size_t)(t) * (ids)->nb[1] + (size_t)(k) * (ids)->nb[0]))
 
 parsed_node_t parse_weight_name(const char* name) {
     parsed_node_t r;
@@ -39,11 +43,10 @@ struct keyed_expert_t {
     uint32_t layer, expert;
 };
 
-// Cross-call pin state for the route B pin lifecycle (§4.8): the scheduler
-// delivers a layer's gate / up / down MUL_MAT_ID nodes as SEPARATE graph_compute
-// calls. Pin on the first non-down call, reuse on later non-down calls, and
-// release ALL of the layer's pins on the down call. Single decode thread per
-// context, so a static state is safe here.
+// Cross-call pin state for the route B pin lifecycle (docs/LLAMA_MOE_NO_MMAP_RESEARCH.md §4.8,
+// role-based): the scheduler delivers a layer's gate / up / down MUL_MAT_ID nodes as SEPARATE
+// graph_compute calls. Pin on the first non-down call, reuse on later non-down calls, and
+// release ALL of the layer's pins on the down call. Single decode thread per context.
 struct pin_state_t {
     int32_t layer = -1;
     std::vector<expert_handle_t> pins;
@@ -65,15 +68,15 @@ expert_handle_t pin_state_find(const pin_state_t& st, uint32_t layer, uint32_t e
 
 } // namespace
 
-// Route B delegation: the compact slot pool is one contiguous block with a
-// uniform stride (slot e at pool_base + e*slot_size). So each original
-// MUL_MAT_ID node can be executed by the OFFICIAL ggml_mul_mat_id kernel using
-// a weight leaf [ne00, ne01, num_slots] whose nb[2] = slot_size, plus an ids
-// tensor translated (in OUR private mini-graph) from expert ids to slot indices.
+// Route B delegation: the compact slot pool is one contiguous block with a uniform stride
+// (slot e at pool_base + e*slot_size). So each original MUL_MAT_ID node can be executed by
+// the OFFICIAL ggml_mul_mat_id kernel using a weight leaf [ne00, ne01, num_slots] whose
+// nb[2] = slot_size, plus an ids tensor translated (in OUR private mini-graph) from expert
+// ids to slot indices.
 //
-// All mini-graph tensors are leaf wrappers (op == NONE, data copied from the
-// main graph / slot memory) - we NEVER view/reshape main-graph op nodes, which
-// would drag the whole upstream chain into the mini-graph.
+// All mini-graph tensors are leaf wrappers (op == NONE, data copied from the main graph /
+// slot memory) - we NEVER view/reshape main-graph op nodes, which would drag the whole
+// upstream chain into the mini-graph.
 //
 // Pin lifecycle (docs/LLAMA_MOE_NO_MMAP_RESEARCH.md §4.8, role-based):
 //   - split with only non-down nodes: pin experts here (no release)
@@ -115,11 +118,10 @@ enum ggml_status moe_exec_mul_mat_id(
             return GGML_STATUS_FAILED;
         }
         const ggml_tensor* ids = nd->src[2];
-        const int32_t* ids_data = static_cast<const int32_t*>(ids->data);
-        if (!ids_data) return GGML_STATUS_FAILED;
+        if (!ids->data) return GGML_STATUS_FAILED;
         for (int t = 0; t < ids->ne[1]; ++t)
             for (int k = 0; k < ids->ne[0]; ++k) {
-                int32_t e = ids_data[static_cast<size_t>(t) * ids->ne[0] + k];
+                int32_t e = MOE_ID_AT(ids, t, k);
                 if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) return GGML_STATUS_FAILED;
                 if (pn.down) add_key(down_keys, pn.layer, static_cast<uint32_t>(e));
                 else         add_key(pin_keys,  pn.layer, static_cast<uint32_t>(e));
@@ -151,7 +153,6 @@ enum ggml_status moe_exec_mul_mat_id(
         const ggml_tensor* ids = nd->src[2];
         const ggml_tensor* dst = nd;
         parsed_node_t pn = parse_weight_name(w->name);
-        const int32_t* ids_data = static_cast<const int32_t*>(ids->data);
 
         // branch layout (compact slot offset, uniform across experts)
         size_t off = 0, bytes = 0;
@@ -166,17 +167,13 @@ enum ggml_status moe_exec_mul_mat_id(
         w3d->nb[2] = sched.slot_size();
         w3d->nb[3] = w3d->nb[2] * n_slots;
         w3d->data  = sched.pool_base() + off;
-#ifdef STREAM_MOE_TEMP
-        std::fprintf(stderr, "[w3d] %s off=%zu nb1=%zu nb2=%zu nslots=%d pool=%p type=%d ne0=%d ne1=%d\n",
-                     w->name, off, w3d->nb[1], w3d->nb[2], n_slots, (void*)w3d->data, (int)w->type, (int)w->ne[0], (int)w->ne[1]);
-#endif
 
         // ids_slot: translate expert ids -> slot indices (private, main graph untouched)
         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
         auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
         for (int t = 0; t < ids->ne[1] && ok; ++t)
             for (int k = 0; k < ids->ne[0] && ok; ++k) {
-                int32_t e = ids_data[static_cast<size_t>(t) * ids->ne[0] + k];
+                int32_t e = MOE_ID_AT(ids, t, k);
                 int32_t slot = -1;
                 if (pn.down) {
                     slot = sched.slot_of(pn.layer, static_cast<uint32_t>(e));
@@ -189,35 +186,6 @@ enum ggml_status moe_exec_mul_mat_id(
             }
         if (!ok) break;
 
-#ifdef STREAM_MOE_TEMP
-        {
-            std::fprintf(stderr, "[ids] %s:", w->name);
-            for (int t = 0; t < ids->ne[1]; ++t) {
-                std::fprintf(stderr, " |t%d", t);
-                for (int k = 0; k < ids->ne[0]; ++k)
-                    std::fprintf(stderr, " k%d=e%d->s%d", k,
-                                 ids_data[static_cast<size_t>(t) * ids->ne[0] + k],
-                                 ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k]);
-            }
-            std::fprintf(stderr, "\n[slot] %s:", w->name);
-            for (int t = 0; t < ids->ne[1] && ok; ++t)
-                for (int k = 0; k < ids->ne[0] && ok; ++k) {
-                    int32_t s = ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k];
-                    if (s < 0) continue;
-                    const uint8_t* p = static_cast<const uint8_t*>(w3d->data) + static_cast<size_t>(s) * w3d->nb[2];
-                    // checksum over the whole gate slice for the FIRST slot only
-                    if (k == 0 && t == 0) {
-                        uint64_t sum = 1469598103934665603ull;
-                        for (size_t i = 0; i < bytes; ++i) { sum ^= p[i]; sum *= 1099511628211ull; }
-                        std::fprintf(stderr, " s%d chk=%016llX nbytes=%zu", s, (unsigned long long)sum, bytes);
-                    } else {
-                        std::fprintf(stderr, " s%d[%02X%02X%02X%02X]", s, p[0], p[1], p[2], p[3]);
-                    }
-                }
-            std::fprintf(stderr, "\n");
-        }
-#endif
-
         // b_leaf: wrap the main graph's activation (contiguous CPU buffer)
         ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
         b_leaf->data = cur->data;
@@ -226,14 +194,6 @@ enum ggml_status moe_exec_mul_mat_id(
         // leaf-only graph; result written straight into the main node's output
         ggml_cgraph* gf = ggml_new_graph(ctx);
         ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_slot);
-#ifdef STREAM_MOE_TEMP
-        std::fprintf(stderr, "[nb] %s mm_ne=[%d,%d,%d] mm_nb=[%zu,%zu,%zu] dst_ne=[%d,%d,%d] dst_nb=[%zu,%zu,%zu] b_leaf_nb=[%zu,%zu,%zu]\n",
-                     w->name, (int)mm->ne[0], (int)mm->ne[1], (int)mm->ne[2],
-                     mm->nb[0], mm->nb[1], mm->nb[2],
-                     (int)dst->ne[0], (int)dst->ne[1], (int)dst->ne[2],
-                     dst->nb[0], dst->nb[1], dst->nb[2],
-                     b_leaf->nb[0], b_leaf->nb[1], b_leaf->nb[2]);
-#endif
         mm->data = dst->data; // nb of mm == nb of dst (same shape, both contiguous)
 
         ggml_build_forward_expand(gf, mm);

@@ -43,6 +43,11 @@ bool stream_moe_trace_cb(struct ggml_tensor* t, bool ask, void* ud) {
         char idname[256];
         std::snprintf(idname, sizeof(idname), "%s#ids", t->src[0]->name ? t->src[0]->name : "?");
         dump(idname, t->src[2]);
+        // dump the gate/up/down input (src1) so baseline vs expert-backend can be
+        // compared directly - catches a wrong/partially-copied activation.
+        char curname[256];
+        std::snprintf(curname, sizeof(curname), "%s#cur", t->src[0]->name ? t->src[0]->name : "?");
+        dump(curname, t->src[1]);
     }
     std::fflush(f);
     return true;
