@@ -102,12 +102,8 @@ enum ggml_status moe_exec_mul_mat_id(
     }
 
     pins.reserve(pin_keys.size());
-    LOG_INFO("[moe] phase1: " << pin_keys.size() << " pin, " << down_keys.size() << " down");
     for (const auto& k : pin_keys) pins.push_back(sched.pin_expert(k.layer, k.expert));
-    LOG_INFO("[moe] phase1 pins done");
     for (const auto& k : down_keys) sched.wait_ready(k.layer, k.expert);
-    LOG_INFO("[moe] phase1 wait done");
-
     // ---- phase 2: one official mul_mat_id per node, in a leaf-only mini-graph ----
     bool ok = true;
     for (int i = 0; i < n_nodes && ok; ++i) {
@@ -162,13 +158,11 @@ enum ggml_status moe_exec_mul_mat_id(
         mm->data = dst->data; // nb of mm == nb of dst (same shape, both contiguous)
 
         ggml_build_forward_expand(gf, mm);
-        LOG_INFO("[moe] node " << w->name << " computing (" << gf->n_nodes << " nodes)");
         if (ggml_backend_graph_compute(cpu_backend, gf) != GGML_STATUS_SUCCESS) {
             LOG_ERROR("stream_moe: mini-graph compute failed for " << w->name);
             ok = false;
         }
-        LOG_INFO("[moe] node " << w->name << " done");
-    }
+        }
 
     // ---- phase 3: release (down role only) ----
     if (has_down) {
