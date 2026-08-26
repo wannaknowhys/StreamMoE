@@ -80,8 +80,8 @@ GGUF 鍏冩暟鎹?澶氬垎鐗囧彂鐜般�乸er-expert offset/read plan銆?KB sector staging 
 ## 性能基准记录（2026-08-26）
 
 ### 环境事实
-- 模型盘 N: 为 **iSCSI 网络存储**（LIO-ORG target，200GB），随机小读延迟高。
-- 模型 162GB 无法整体放入任何本地盘剩余空间（F: 剩 279GB 但模型目录含草稿共 ~173GB，且拷贝成本高）。
+- 模型盘 N: 为 **USB 转接 NVMe**（早期 CIM 探测误判为 iSCSI，已纠正）。冷页拉取慢，页缓存随运行变热。
+- 模型 162GB + 草稿 10GB 放在 N:（USB-NVMe）。
 
 ### 实测（70GB RAM 参数 / mmap 页缓存基线 / 16 线程 CPU / temp=0.6 top_p=0.95）
 | 轮次 | prompt tok | decode TPS | 备注 |
@@ -94,3 +94,11 @@ GGUF 鍏冩暟鎹?澶氬垎鐗囧彂鐜般�乸er-expert offset/read plan銆?KB sector staging 
 - 输出正确性与可读性：**EN/ZH 双语均达标**（见 benchmark/conversation_real_en3.txt / _zh3.txt）。
 - 当前 decode TPS 由 N: 盘冷专家页拉取主导；页缓存随运行逐渐变热。
 - Backend.md 自定义槽池（DIO 预取 + EST1 驻留）正是针对此瓶颈的架构解；mmap 基线为其对照组。
+### INC-3: memwatch 哨兵实测 —— 内存爆满真因 = file-backed working set（诊断分支 debug/memguard）
+- **方法**：在 vendored llama.cpp 的 4 个 ggml 分配点插桩，记录每次分配 size + 进程 WS/PRIV/COMMIT/FILEBK + 系统可用内存，WS>90GB 自动 ExitProcess。日志写 %TEMP%\memwatch_<pid>.log，节流 flush。
+- **实测（单 prompt 24 token decode 全程）**：
+  - 107,369 条插桩记录；max WS = **42.1 GB**，max PRIV = **1.7 GB**，max FILEBK = **41.5 GB**。
+  - 全程无一次 WS>90GB 触发（该次运行未爆）。
+- **结论**：内存增长几乎全部是 **mmap 模型的 file-backed 页驻留**（被访问过的专家页留在进程工作集，128GB 机器无内存压力、系统不回收），私有大拷贝/泄漏排除（PRIV 恒定 1.7GB）。
+- **推论**：多轮长任务会持续触碰新专家页 → WS 逼近 162GB 模型全量 → 物理内存爆满 = 用户观察到的"提交又爆了"。
+- **主线修复方向**：进程 WorkingSet 上限（SetProcessWorkingSetSizeEx 封顶）+ 定期 trim，或 Backend.md 有界槽池（DIO staging 常驻有界）。修复后合并回本分支用哨兵验证 FILEBK 是否受控。
