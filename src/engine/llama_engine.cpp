@@ -14,10 +14,14 @@ llama_engine::~llama_engine() {
 }
 
 static std::string read_meta_str(const llama_model* model, const char* key) {
-    char buf[1024];
-    int32_t n = llama_model_meta_val_str(model, key, buf, sizeof(buf));
+    // Two-pass: query required length first - templates can exceed any fixed buffer
+    int32_t need = llama_model_meta_val_str(model, key, nullptr, 0);
+    if (need <= 0) return "";
+    std::string buf(static_cast<size_t>(need), '\0');
+    int32_t n = llama_model_meta_val_str(model, key, buf.data(), static_cast<int32_t>(need + 1));
     if (n <= 0) return "";
-    return std::string(buf, static_cast<size_t>(std::min<int32_t>(n, sizeof(buf) - 1)));
+    buf.resize(static_cast<size_t>(std::min<int32_t>(n, need)));
+    return buf;
 }
 
 static float parse_float_or(const std::string& s, float fallback) {
@@ -39,15 +43,29 @@ bool llama_engine::init(const llama_engine_params& p) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = p.n_gpu_layers;
-    // mmap keeps expert weights file-backed: the OS page cache streams hot experts
-    // from NVMe, which is what makes a >RAM model (e.g. 162GB on 128GB) runnable.
-    // Explicit mlock only for models that fit in RAM.
+    // Repack extra bufts fully copy every repack-eligible tensor (Q4_K/Q5_K/Q6_K/Q2_K)
+    // into private buffers at load - fatal for >RAM models like UD-Q8_K_XL (162GB).
+    // Disabling keeps all weights zero-copy over mmap (OS page cache streams them).
+    mparams.use_extra_bufts = false;
+    // Explicit mlock only for models that fit in RAM; mmap stays the default so
+    // expert weights stream from NVMe through the page cache.
     if (p.use_mlock) {
         mparams.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
     }
 
     LOG_INFO("Loading model (this streams all shards once): " << p.model_path);
     auto t0 = std::chrono::steady_clock::now();
+    struct progress_ctx { std::chrono::steady_clock::time_point last; } pctx{std::chrono::steady_clock::now()};
+    mparams.progress_callback_user_data = &pctx;
+    mparams.progress_callback = [](float progress, void* ud) {
+        auto* ctx = static_cast<progress_ctx*>(ud);
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - ctx->last).count() >= 2.0) {
+            ctx->last = now;
+            LOG_INFO("[load] " << static_cast<int>(progress * 100.0f) << "%");
+        }
+        return true;
+    };
     model_ = llama_model_load_from_file(p.model_path.c_str(), mparams);
     if (!model_) {
         LOG_ERROR("llama_model_load_from_file failed for " << p.model_path);
@@ -134,10 +152,11 @@ int64_t llama_engine::common_prefix_len(const std::vector<llama_token>& a, const
 
 bool llama_engine::decode_tokens(const std::vector<llama_token>& tokens, int64_t pos_begin, bool need_logits_last) {
     llama_batch batch = llama_batch_init(n_batch_, 0, 1);
-    llama_seq_id* seqs = new llama_seq_id[1]{0};
+    // seq_id slots are pre-allocated by llama_batch_init - only fill values,
+    // never replace the pointers (llama_batch_free owns them)
     for (uint32_t bi = 0; bi < n_batch_; ++bi) {
         batch.n_seq_id[bi] = 1;
-        batch.seq_id[bi] = seqs;
+        if (batch.seq_id[bi]) batch.seq_id[bi][0] = 0;
     }
 
     bool ok = true;
@@ -160,7 +179,6 @@ bool llama_engine::decode_tokens(const std::vector<llama_token>& tokens, int64_t
         if (!ok) break;
     }
 
-    delete[] seqs;
     llama_batch_free(batch);
     return ok;
 }
@@ -246,7 +264,7 @@ llama_turn_metrics llama_engine::chat(
             metrics.truncated = true;
             break;
         }
-        llama_token next = llama_sampler_sample(sampler_, ctx_, 0);
+        llama_token next = llama_sampler_sample(sampler_, ctx_, -1);
         if (llama_vocab_is_eog(vocab_, next)) break;
 
         char piece_buf[96];
@@ -261,15 +279,13 @@ llama_turn_metrics llama_engine::chat(
         if (produced >= max_tokens) break;
 
         llama_batch batch = llama_batch_init(1, 0, 1);
-        llama_seq_id* seqs = new llama_seq_id[1]{0};
         batch.n_tokens   = 1;
         batch.token[0]   = next;
         batch.pos[0]     = next_pos - 1;
         batch.n_seq_id[0] = 1;
-        batch.seq_id[0]  = seqs;
+        if (batch.seq_id[0]) batch.seq_id[0][0] = 0;
         batch.logits[0]  = true;
         int32_t rc = llama_decode(ctx_, batch);
-        delete[] seqs;
         llama_batch_free(batch);
         if (rc != 0) {
             LOG_ERROR("llama_decode failed during generation");
