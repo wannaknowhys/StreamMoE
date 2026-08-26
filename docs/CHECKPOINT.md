@@ -13,24 +13,24 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 - **真实推理引擎**（vendored libllama @ f280b2698 完整 deepseek4 前向）：`build\main\bin\stream_moe.exe`（CLI）+ `stream_moe_server.exe`（OpenAI 兼容 SSE）。
   - 双语 long-horizon 输出已验证可读（`benchmark/results/conversation_real_*.txt`）。
-- **内存问题根因已定位**（INC-1/2/3，见 `docs/BUG_TRACKER.md`）：
-  - INC-1 repack extra bufts 整体拷贝 → 已关（`use_extra_bufts=false`，mmap 零拷贝）。
-  - INC-2 llama_batch.seq_id 指针覆盖堆损坏 → 已修。
-  - INC-3 file-backed working set 增长是真凶（WS 42GB / PRIV 1.7GB）→ route B 私有池为解。
+- **内存问题根因已定位**（INC-1/2/3，见 `docs/BUG_TRACKER.md`）：INC-1 repack 已关；INC-2 seq_id 已修；INC-3 file-backed working set 是真凶 → route B 私有池为解。
 - **memwatch 变补丁**（分支已删）：`patches/`，用 `build.bat build memwatch` 出特殊版，见 `patches/README.md`。
 - **仓库重组完成**：docs/ scripts/ benchmark/{prompts,results}/ patches/ build/<tag>/；废弃模块已删。见 `docs/PROJECT_STRUCTURE.md`。
-- **route B 设计定稿**（未实现）：`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §3-§6 + `docs/Backend.md`。关键结论：
-  - 紧凑槽 + 自定义 backend，零 llama.cpp 改动（tensor_buft_overrides + buft 轻量句柄 + cb 就绪等待；实际就绪在 graph_compute 内）。
-  - pin 生命周期 = **首触 pin、末触 unpin**（§4.8，角色式无状态表）；shexp 纳入 buft、backend 支持 MUL_MAT（§4.9）。
-  - mini-graph 委托用预分配 scratch arena（§4.5）；GPU 组委托 vulkan backend、unpin 挂 split 边界（§4.6/4.7）。
+- **route B 骨架（本轮新增，已编译+UT 通过）**：
+  - `src/backend/slot.h`：跨平台控制面——`slot_meta` 64 位原子字（state/refcount/generation + CAS pin/unpin/evict/reload/failed）、`expert_directory`（二维原子数组+版本号）、有界 MPSC 分配队列；等待唤醒走 Windows WaitOnAddress / Linux futex，无忙等。UT：`tests/test_slot.cpp`（4/4 通过）。
+  - `src/backend/moe_backend.h/.cpp`：自定义 ggml backend 注册（`stream_moe`，ACCEL 设备，`ggml_backend_register`），轻量 expert buft（记账句柄 + no-op set_tensor）+ host compute buft；`graph_compute` 目前**拒绝执行（GGML_STATUS_FAILED）**——mini-graph 委托未接。
+  - `src/backend/minigraph.h`：scratch arena（固定 buffer ggml context，reset 复用免 malloc）+ 外部指针 2D 权重包装。
+  - `src/backend/alloc.h`：跨平台对齐分配（Win `_aligned_malloc` / POSIX `posix_memalign`）。
+  - `--expert-backend` 开关（main + server），`llama_engine` 接线 `tensor_buft_overrides`（pattern 覆盖 `ffn_*_exps` + `ffn_*_shexp`，模型无关；dense 无匹配自动无影响）。**默认 OFF**，开启后加载会走自定义 buft 但 decode 会因 graph_compute 未实现而失败——这是预期。
+- **profiler 核对**：JSONL schema 完整（hits/speculative_hist/timings_ns 全在序列化中），每轮 2 次 flush（turn 级，低频率无性能影响）；expert 相关值等 route B 填充。
 
 ## 3. 你可以跑的验证
 
 | 动作 | 命令 |
 |---|---|
 | 构建（先 llamalibs 一次） | `build.bat llamalibs main` 然后 `build.bat build main` |
-| 单元测试 | `build.bat test main`（3/3 通过）|
-| 单 prompt 冒烟 | `build\main\bin\stream_moe.exe -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" --moe-ram-pool 71680 -c 4096 -t 16 -p "Say hi in three words." -n 16` |
+| 单元测试（含 slot 控制面） | `build.bat test main`（4/4 通过）|
+| 单 prompt 冒烟 | `build\main\bin\stream_moe.exe -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" --moe-ram-pool 71680 -c 4096 -t 16 -p "Say hi." -n 8` |
 | 整轮 long-horizon（手动盯内存） | `scripts\run_long_horizon_test.bat en` / `zh` |
 | 内存诊断版 | 应用 `patches/` 后 `build.bat build memwatch`，看 `%TEMP%\memwatch_*.log` |
 | 看性能 profile | `benchmark\results\profile_real_<tag>.jsonl`（每轮 prompt/gen/prefill_tps/decode_tps）|
@@ -39,12 +39,12 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ## 4. 下一步（route B 实施，按序）
 
-1. `src/backend/` 骨架：`moe_backend`（设备+supports_op+graph_compute）+ `moe_expert_buft`（轻量句柄+set_tensor no-op）+ `slot`（64 位原子字+expert_directory+MPSC）+ `scheduler`（DIO+EST1）+ `minigraph`（scratch arena）。
-2. 接线 `tensor_buft_overrides`：`blk\..*\.ffn_.*_exps\.weight` + `ffn_.*_shexp` → 自定义 buft。
-3. graph_compute 实现 MUL_MAT_ID + MUL_MAT（mini-graph 委托 ggml-cpu，先单专家后批处理）。
-4. pin 生命周期 §4.8（首触 pin / 末触 unpin）。
-5. 数值等价回归（全命中/混合 vs 官方图逐元素 diff）。
-6. Phase B：GPU 混合池（Vulkan，dispatch 线程 park+转发；unpin 挂 split 边界）。
+1. ✅ `src/backend/` 骨架（slot 控制面 + backend/buft 注册 + minigraph arena + 开关接线）——**已完成**。
+2. **scheduler**：DIO 调度线程（复用 `io/async_dio` + `loader/moe_loader` read plan），装载专家切片进槽内存；slot_meta 状态机驱动（EMPTY→IO_INFLIGHT→READY/FAILED）。
+3. **graph_compute 实现**：MUL_MAT_ID / MUL_MAT 的 mini-graph 委托（scratch arena + 外部指针权重包装 → ggml-cpu 执行），先单专家后 k 专家批处理；就绪等待接 scheduler。
+4. **pin 生命周期 §4.8**：首触 pin（非 down 角色）末触 unpin（down 角色），同 ids 自洽。
+5. 开启 `--expert-backend` 端到端跑通 + **数值等价回归**（全命中/混合 vs 官方图逐元素 diff）。
+6. Phase B：GPU 混合池（backend 抽象为 cpu/vulkan/cuda 委托，unpin 挂 split 边界事件）。
 7. 收尾：B11 投机解码（libllama draft）、TODO.md 基准矩阵。
 
 ## 5. 关键文档速查
