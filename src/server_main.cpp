@@ -35,6 +35,7 @@ struct server_cmd_params_t {
     float       top_p = -1.0f;
     int32_t     top_k = -1;
     bool        use_mlock = false;
+    bool        use_expert_backend = false;
     std::string profile_log_path;
 };
 
@@ -87,6 +88,8 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
             ++i;
         } else if (arg == "--mlock") {
             params.use_mlock = true;
+        } else if (arg == "--expert-backend") {
+            params.use_expert_backend = true;
         } else if (arg == "--kv-placement" && i + 1 < argc) {
             std::string v = argv[++i];
             std::string vl;
@@ -180,6 +183,7 @@ int main(int argc, char** argv) {
     eparams.n_gpu_layers   = params.n_gpu_layers;
     eparams.ram_pool_mb    = ram_pool_mb;
     eparams.use_mlock      = params.use_mlock;
+    eparams.use_expert_backend = params.use_expert_backend;
     eparams.kv_on_gpu      = params.kv_on_gpu;
     eparams.threads        = params.threads;
     eparams.temp           = params.temp;

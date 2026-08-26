@@ -20,6 +20,7 @@ struct cmd_params_t {
     float       top_p = -1.0f;
     int32_t     top_k = -1;
     bool        use_mlock = false;
+    bool        use_expert_backend = false;
     std::string prompt;
     bool        interactive = false;
 };
@@ -70,6 +71,8 @@ cmd_params_t parse_args(int argc, char** argv) {
             ++i;
         } else if (arg == "--mlock") {
             params.use_mlock = true;
+        } else if (arg == "--expert-backend") {
+            params.use_expert_backend = true;
         } else if (arg == "--kv-placement" && i + 1 < argc) {
             std::string v = argv[++i];
             std::string vl;
@@ -143,6 +146,7 @@ int main(int argc, char** argv) {
         ? params.moe_ram_pool_mb
         : static_cast<size_t>((get_available_ram_bytes() * 0.75) / (1024 * 1024));
     eparams.use_mlock    = params.use_mlock;
+    eparams.use_expert_backend = params.use_expert_backend;
     eparams.kv_on_gpu    = params.kv_on_gpu;
     eparams.threads      = params.threads;
     eparams.temp         = params.temp;

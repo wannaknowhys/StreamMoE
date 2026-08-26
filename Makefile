@@ -31,21 +31,22 @@ $(LLAMA_BUILD)/src/libllama.a:
 
 llamalibs: $(LLAMA_BUILD)/src/libllama.a
 
-$(BIN)/stream_moe: $(LLAMA_BUILD)/src/libllama.a src/main.cpp src/engine/llama_engine.cpp src/profile/profiler.cpp
+$(BIN)/stream_moe: $(LLAMA_BUILD)/src/libllama.a src/main.cpp src/engine/llama_engine.cpp src/profile/profiler.cpp src/backend/moe_backend.cpp
 	@mkdir -p $(BIN)
-	$(CXX) $(CXXFLAGS) src/engine/llama_engine.cpp src/main.cpp src/profile/profiler.cpp \
+	$(CXX) $(CXXFLAGS) src/backend/moe_backend.cpp src/engine/llama_engine.cpp src/main.cpp src/profile/profiler.cpp \
 	    $(LLAMA_LIBS) -lopenmp -o $@
 
-$(BIN)/stream_moe_server: $(LLAMA_BUILD)/src/libllama.a src/server_main.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp src/io/staging_reader.cpp src/profile/profiler.cpp
+$(BIN)/stream_moe_server: $(LLAMA_BUILD)/src/libllama.a src/server_main.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp src/io/staging_reader.cpp src/profile/profiler.cpp src/backend/moe_backend.cpp
 	@mkdir -p $(BIN)
-	$(CXX) $(CXXFLAGS) src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp \
+	$(CXX) $(CXXFLAGS) src/backend/moe_backend.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp \
 	    src/io/staging_reader.cpp src/profile/profiler.cpp src/server_main.cpp \
 	    $(LLAMA_LIBS) -lopenmp -lpthread -o $@
 
-test: $(OBJ)/test_async_dio $(OBJ)/test_moe_loader $(OBJ)/test_profiler
+test: $(OBJ)/test_async_dio $(OBJ)/test_moe_loader $(OBJ)/test_profiler $(OBJ)/test_slot
 	./$(OBJ)/test_async_dio
 	./$(OBJ)/test_moe_loader
 	./$(OBJ)/test_profiler
+	./$(OBJ)/test_slot
 
 $(OBJ)/test_async_dio: tests/test_async_dio.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp
 	@mkdir -p $(OBJ)
@@ -58,6 +59,10 @@ $(OBJ)/test_moe_loader: $(LLAMA_BUILD)/src/libllama.a tests/test_moe_loader.cpp 
 $(OBJ)/test_profiler: tests/test_profiler.cpp src/profile/profiler.cpp
 	@mkdir -p $(OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
+
+$(OBJ)/test_slot: tests/test_slot.cpp
+	@mkdir -p $(OBJ)
+	$(CXX) $(CXXFLAGS) -lpthread $^ -o $@
 
 clean:
 	rm -rf build

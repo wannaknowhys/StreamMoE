@@ -65,6 +65,7 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
 
 echo [StreamMoE] Linking %BIN%\stream_moe.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
+    src/backend/moe_backend.cpp ^
     src/engine/llama_engine.cpp ^
     src/main.cpp ^
     src/profile/profiler.cpp ^
@@ -74,6 +75,7 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
+    src/backend/moe_backend.cpp ^
     src/engine/llama_engine.cpp ^
     src/server/http_server.cpp ^
     src/loader/moe_loader.cpp ^
@@ -123,6 +125,13 @@ echo [StreamMoE] Compiling test_profiler...
     -o "%OBJ%\test_profiler.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
+echo [StreamMoE] Compiling test_slot (route B control plane)...
+"%CLANG_CXX%" %CXXFLAGS% ^
+    tests/test_slot.cpp ^
+    -lsynchronization ^
+    -o "%OBJ%\test_slot.exe"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
 rem OpenMP runtime next to test exes (test_moe_loader links ggml-cpu)
 copy /Y "F:\Dev\LLVM\bin\libomp.dll" "%OBJ%\libomp.dll" >nul
 
@@ -145,6 +154,13 @@ echo ========================================================
 echo [StreamMoE] Executing Profiler Tests
 echo ========================================================
 "%OBJ%\test_profiler.exe"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo.
+echo ========================================================
+echo [StreamMoE] Executing Slot Control Plane Tests (route B)
+echo ========================================================
+"%OBJ%\test_slot.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.

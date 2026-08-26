@@ -1,5 +1,6 @@
 #include "engine/llama_engine.h"
 #include "common/logger.h"
+#include "backend/moe_backend.h"
 
 #include <chrono>
 #include <cstring>
@@ -43,6 +44,28 @@ bool llama_engine::init(const llama_engine_params& p) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = p.n_gpu_layers;
+
+    // Route B: when opted in, register the stream_moe backend and point the
+    // standard MoE expert tensor patterns at our expert-pool buft. Patterns are
+    // model-agnostic (llama.cpp MoE schema); dense models have no matching
+    // tensors so this is a no-op for them. Dense weights stay on defaults.
+    static llama_model_tensor_buft_override moe_overrides[] = {
+        {"blk\\..*\\.ffn_.*_exps\\.weight", nullptr},
+        {"blk\\..*\\.ffn_.*_shexp\\.weight", nullptr},
+        {nullptr, nullptr},
+    };
+    if (p.use_expert_backend) {
+        stream_moe_register_backend();
+        ggml_backend_buffer_type_t eb = stream_moe_register_backend_helper_expert_buft();
+        if (eb) {
+            moe_overrides[0].buft = eb;
+            moe_overrides[1].buft = eb;
+            mparams.tensor_buft_overrides = moe_overrides;
+            LOG_INFO("Expert backend enabled: MoE exps/shexp tensors routed to stream_moe pool");
+        } else {
+            LOG_WARN("Expert backend requested but stream_moe buft unavailable - using llama.cpp defaults");
+        }
+    }
     // Repack extra bufts fully copy every repack-eligible tensor (Q4_K/Q5_K/Q6_K/Q2_K)
     // into private buffers at load - fatal for >RAM models like UD-Q8_K_XL (162GB).
     // Disabling keeps all weights zero-copy over mmap (OS page cache streams them).

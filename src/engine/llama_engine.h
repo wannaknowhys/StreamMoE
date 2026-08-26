@@ -32,6 +32,11 @@ struct llama_engine_params {
     float    top_p           = -1.0f;
     int32_t  top_k           = -1;   // <=0 disables top-k
     uint32_t seed            = LLAMA_DEFAULT_SEED;
+
+    // Route B opt-in: route MoE expert tensors (ffn_*_exps / ffn_*_shexp) to the
+    // stream_moe expert-pool backend. Dense tensors keep llama.cpp defaults.
+    // Default OFF - the backend's graph_compute delegation is not wired yet.
+    bool     use_expert_backend = false;
 };
 
 struct llama_turn_metrics {
