@@ -40,7 +40,6 @@ $(BIN)/stream_moe_server: $(LLAMA_BUILD)/src/libllama.a src/server_main.cpp src/
 	@mkdir -p $(BIN)
 	$(CXX) $(CXXFLAGS) src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp \
 	    src/io/staging_reader.cpp src/profile/profiler.cpp src/server_main.cpp \
-	    third_party/llama.cpp/ggml/src/gguf.cpp \
 	    $(LLAMA_LIBS) -lopenmp -lpthread -o $@
 
 test: $(OBJ)/test_async_dio $(OBJ)/test_moe_loader $(OBJ)/test_profiler
@@ -52,7 +51,7 @@ $(OBJ)/test_async_dio: tests/test_async_dio.cpp src/io/staging_reader.cpp src/io
 	@mkdir -p $(OBJ)
 	$(CXX) $(CXXFLAGS) -D_FILE_OFFSET_BITS=64 $^ -o $@
 
-$(OBJ)/test_moe_loader: $(LLAMA_BUILD)/src/libllama.a tests/test_moe_loader.cpp third_party/llama.cpp/ggml/src/gguf.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp
+$(OBJ)/test_moe_loader: $(LLAMA_BUILD)/src/libllama.a tests/test_moe_loader.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp
 	@mkdir -p $(OBJ)
 	$(CXX) $(CXXFLAGS) $(LLAMA_LIBS) -lopenmp $^ -o $@
 

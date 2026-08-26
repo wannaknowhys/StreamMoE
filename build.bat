@@ -35,7 +35,7 @@ goto help
 :llamalibs
 echo [StreamMoE] Building vendored libllama static libs into %LLAMA_BUILD% ...
 if not exist "%LLAMA_BUILD%" mkdir "%LLAMA_BUILD%"
-& F:\Dev\cmake\bin\cmake.exe -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
+"F:\Dev\cmake\bin\cmake.exe" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=F:/Dev/cmake/bin/ninja.exe ^
     -DCMAKE_C_COMPILER=F:/Dev/LLVM/bin/clang.exe ^
     -DCMAKE_CXX_COMPILER=F:/Dev/LLVM/bin/clang++.exe ^
@@ -48,7 +48,7 @@ if not exist "%LLAMA_BUILD%" mkdir "%LLAMA_BUILD%"
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=F:/Dev/LLVM/lib/libomp.lib
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-& F:\Dev\cmake\bin\ninja.exe -C "%LLAMA_BUILD%" llama llama-common-base
+"F:\Dev\cmake\bin\ninja.exe" -C "%LLAMA_BUILD%" llama llama-common-base
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [+] llamalibs done for tag %TAG%
 exit /b 0
@@ -59,9 +59,8 @@ if not exist "%BIN%" mkdir "%BIN%"
 if not exist "%OBJ%" mkdir "%OBJ%"
 
 if not exist "%LLAMA_BUILD%\src\llama.lib" (
-    echo [-] libllama libs missing for tag %TAG%, building them first...
-    call %~f0 llamalibs %TAG%
-    if !ERRORLEVEL! NEQ 0 exit /b !ERRORLEVEL!
+    echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
+    exit /b 1
 )
 
 echo [StreamMoE] Linking %BIN%\stream_moe.exe (real inference core)...
@@ -81,7 +80,6 @@ echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
     src/io/staging_reader.cpp ^
     src/profile/profiler.cpp ^
     src/server_main.cpp ^
-    third_party/llama.cpp/ggml/src/gguf.cpp ^
     %LLAMA_LIBS% %LIBOMP% ^
     -lws2_32 -ladvapi32 ^
     -o "%BIN%\stream_moe_server.exe"
@@ -94,11 +92,11 @@ exit /b 0
 :test
 echo [StreamMoE] Building Unit Tests for tag [%TAG%] ...
 if not exist "%OBJ%" mkdir "%OBJ%"
+if not exist temp mkdir temp
 
 if not exist "%LLAMA_BUILD%\src\llama.lib" (
-    echo [-] libllama libs missing for tag %TAG%, building them first...
-    call %~f0 llamalibs %TAG%
-    if !ERRORLEVEL! NEQ 0 exit /b !ERRORLEVEL!
+    echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
+    exit /b 1
 )
 
 echo [StreamMoE] Compiling test_async_dio...
@@ -114,7 +112,6 @@ echo [StreamMoE] Compiling test_moe_loader...
     %LLAMA_LIBS% %LIBOMP% -ladvapi32 ^
     src/io/staging_reader.cpp ^
     src/loader/moe_loader.cpp ^
-    third_party/llama.cpp/ggml/src/gguf.cpp ^
     tests/test_moe_loader.cpp ^
     -o "%OBJ%\test_moe_loader.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
@@ -125,6 +122,9 @@ echo [StreamMoE] Compiling test_profiler...
     tests/test_profiler.cpp ^
     -o "%OBJ%\test_profiler.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+rem OpenMP runtime next to test exes (test_moe_loader links ggml-cpu)
+copy /Y "F:\Dev\LLVM\bin\libomp.dll" "%OBJ%\libomp.dll" >nul
 
 echo.
 echo ========================================================
