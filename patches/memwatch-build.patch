@@ -1,0 +1,31 @@
+diff --git a/build.bat b/build.bat
+index da25765..56de6a8 100644
+--- a/build.bat
++++ b/build.bat
+@@ -69,7 +69,7 @@ echo [StreamMoE] Linking %BIN%\stream_moe.exe (real inference core)...
+     src/engine/llama_engine.cpp ^
+     src/main.cpp ^
+     src/profile/profiler.cpp ^
+-    %LLAMA_LIBS% %LIBOMP% -ladvapi32 ^
++    %LLAMA_LIBS% %LIBOMP% -ladvapi32 -lpsapi ^
+     -o "%BIN%\stream_moe.exe"
+ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+ 
+@@ -83,7 +83,7 @@ echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
+     src/server_main.cpp ^
+     third_party/llama.cpp/ggml/src/gguf.cpp ^
+     %LLAMA_LIBS% %LIBOMP% ^
+-    -lws2_32 -ladvapi32 ^
++    -lws2_32 -ladvapi32 -lpsapi ^
+     -o "%BIN%\stream_moe_server.exe"
+ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+ 
+@@ -111,7 +111,7 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+ 
+ echo [StreamMoE] Compiling test_moe_loader...
+ "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
+-    %LLAMA_LIBS% %LIBOMP% -ladvapi32 ^
++    %LLAMA_LIBS% %LIBOMP% -ladvapi32 -lpsapi ^
+     src/io/staging_reader.cpp ^
+     src/loader/moe_loader.cpp ^
+     third_party/llama.cpp/ggml/src/gguf.cpp ^

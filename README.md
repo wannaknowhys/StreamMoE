@@ -1,4 +1,4 @@
-﻿[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 # StreamMoE (OffloadMoE)
 
@@ -21,14 +21,16 @@
 
 ## Toolchain & Roadmap
 
-See [`LLAMA_EXE_ROADMAP.md`](LLAMA_EXE_ROADMAP.md) for the full architecture comparison with upstream `llama.cpp` tools (`llama-cli`, `llama-server`, `llama-bench`, `llama-quantize`).
+See [`docs/LLAMA_EXE_ROADMAP.md`](docs/LLAMA_EXE_ROADMAP.md) for the full architecture comparison with upstream `llama.cpp` tools (`llama-cli`, `llama-server`, `llama-bench`, `llama-quantize`).
+
+Project layout, build sub-path pattern, and test/result archiving conventions: [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md).
 
 | Binary | Description | Status |
 | :--- | :--- | :--- |
-| **`bin/stream_moe.exe`** | Interactive REPL CLI & Single-shot prompt runner | **Ready** |
-| **`bin/stream_moe_server.exe`** | OpenAI-compatible HTTP/SSE API server | **Ready** |
-| **`bin/stream_moe_bench.exe`** | Multi-dimensional MoE benchmark suite | Planned |
-| **`bin/stream_moe_convert.exe`** | 4KB sector-aligned zero-copy GGUF optimizer | Planned |
+| **`build/main/bin/stream_moe.exe`** | Interactive REPL CLI & Single-shot prompt runner | **Ready** |
+| **`build/main/bin/stream_moe_server.exe`** | OpenAI-compatible HTTP/SSE API server | **Ready** |
+| **`build/main/bin/stream_moe_bench.exe`** | Multi-dimensional MoE benchmark suite | Planned |
+| **`build/main/bin/stream_moe_convert.exe`** | 4KB sector-aligned zero-copy GGUF optimizer | Planned |
 
 ---
 
@@ -40,13 +42,13 @@ See [`LLAMA_EXE_ROADMAP.md`](LLAMA_EXE_ROADMAP.md) for the full architecture com
 
 ### Windows Build
 ```powershell
-# Build all binaries (stream_moe.exe, stream_moe_server.exe)
+# Build all binaries into build\main\bin\
 .\build.bat build
 
-# Run all Phase 1-5 unit test suites
+# Run unit test suites
 .\build.bat test
 
-# Clean artifacts
+# Clean build artifacts (all tags)
 .\build.bat clean
 ```
 
@@ -62,7 +64,7 @@ make test
 ### 1. Interactive Multi-Turn CLI Mode
 ```powershell
 # Launch interactive REPL with auto 75% available RAM pool allocation and 16 physical cores
-bin\stream_moe.exe `
+build\main\bin\stream_moe.exe `
     -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
     --draft-model "path/to/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" `
     --moe-ram-pool auto `
@@ -74,7 +76,7 @@ bin\stream_moe.exe `
 ### 2. OpenAI-Compatible API Server Mode
 ```powershell
 # Start HTTP/SSE API server on port 8080
-bin\stream_moe_server.exe `
+build\main\bin\stream_moe_server.exe `
     -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
     --host 127.0.0.1 `
     --port 8080 `

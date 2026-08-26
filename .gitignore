@@ -1,8 +1,8 @@
-﻿# Build artifacts
+﻿# Build artifacts (versioned under build\<tag>\)
 build/
-bin/
 out/
-temp/
+
+# Compiled binaries / objects
 *.exe
 *.obj
 *.o
@@ -10,6 +10,7 @@ temp/
 *.a
 *.pdb
 *.ilk
+*.dll
 
 # VS Code / IDE
 .vscode/
@@ -24,10 +25,7 @@ Desktop.ini
 *.log
 scratch/
 *.bin
+memwatch_*.log
 
-# Design & Internal progress docs
-DESIGN.md
-LLAMA_CPP_ANALYSIS.md
-PROGRESS.md
-LLAMA_EXE_ROADMAP.md
-TODO.md
+# Runtime data
+temp/

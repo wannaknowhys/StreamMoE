@@ -1,0 +1,170 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 3d6310f3f..94687f443 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#include "ggml-memwatch.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+@@ -41,7 +42,9 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t
+         // return a dummy buffer for zero-sized allocations
+         return ggml_backend_buffer_init(buft, {}, NULL, 0);
+     }
+-    return buft->iface.alloc_buffer(buft, size);
++    ggml_backend_buffer_t buf = buft->iface.alloc_buffer(buft, size);
++    ggml_memwatch_log("ggml_backend_buft_alloc_buffer", ggml_backend_buft_name(buft), size, buf);
++    return buf;
+ }
+ 
+ size_t ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) {
+@@ -64,8 +67,10 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
+     if (buft->iface.get_alloc_size) {
+         size_t size = buft->iface.get_alloc_size(buft, tensor);
+         assert(size >= ggml_nbytes(tensor));
++        ggml_memwatch_log("ggml_backend_buft_get_alloc_size", tensor->name, size, NULL);
+         return size;
+     }
++    ggml_memwatch_log("ggml_backend_buft_get_alloc_size", tensor->name, ggml_nbytes(tensor), NULL);
+     return ggml_nbytes(tensor);
+ }
+ 
+@@ -108,6 +113,7 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+     if (buffer == NULL) {
+         return;
+     }
++    ggml_memwatch_log("ggml_backend_buffer_free", ggml_backend_buffer_name(buffer), buffer->size, buffer);
+ 
+     if (buffer->iface.free_buffer != NULL) {
+         buffer->iface.free_buffer(buffer);
+@@ -617,7 +623,9 @@ ggml_backend_buffer_type_t ggml_backend_dev_host_buffer_type(ggml_backend_dev_t
+ 
+ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size) {
+     GGML_ASSERT(device);
+-    return device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size);
++    ggml_backend_buffer_t buf = device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size);
++    ggml_memwatch_log("ggml_backend_dev_buffer_from_host_ptr", ggml_backend_dev_name(device), size, ptr);
++    return buf;
+ }
+ 
+ bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
+diff --git a/ggml/src/ggml-memwatch.h b/ggml/src/ggml-memwatch.h
+new file mode 100644
+index 000000000..503afe350
+--- /dev/null
++++ b/ggml/src/ggml-memwatch.h
+@@ -0,0 +1,111 @@
++// ggml-memwatch.h - memory watchdog + allocator instrumentation for StreamMoE
++// diagnostic branch (debug/memguard). Header-only so no build system changes.
++//
++// Logs every instrumentation point to memwatch_<pid>.log in the working dir and
++// hard-exits the process once the process working set exceeds the limit.
++// Purpose: tell apart (a) real private allocations / copies vs (b) file-backed
++// page-cache residency of the mmap'd model.
++
++#ifndef GGML_MEMWATCH_H
++#define GGML_MEMWATCH_H
++
++#include <stdint.h>
++#include <string.h>
++
++#ifndef GGML_MEMWATCH_ENABLED
++#define GGML_MEMWATCH_ENABLED 1
++#endif
++
++#define GGML_MEMWATCH_LIMIT_BYTES (90ULL * 1024ULL * 1024ULL * 1024ULL)
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if defined(_WIN32) && GGML_MEMWATCH_ENABLED
++#include <windows.h>
++#include <psapi.h>
++
++static void ggml_memwatch_log(const char * caller, const char * tag, uint64_t size, const void * ptr) {
++    static volatile LONG g_init = 0;
++    static HANDLE g_file = INVALID_HANDLE_VALUE;
++    static volatile LONG g_writes_since_flush = 0;
++    static volatile LONGLONG g_last_flush_ms = 0;
++    if (InterlockedCompareExchange(&g_init, 1, 0) == 0) {
++        // write into the OS temp dir, never into the workspace (avoid HDD flushes)
++        char tmp[MAX_PATH];
++        if (GetTempPathA(sizeof(tmp), tmp) == 0) {
++            tmp[0] = '.';
++            tmp[1] = 0;
++        }
++        char path[MAX_PATH];
++        _snprintf(path, sizeof(path), "%smemwatch_%lu.log", tmp, (unsigned long) GetCurrentProcessId());
++        g_file = CreateFileA(path, GENERIC_WRITE,
++                             FILE_SHARE_READ | FILE_SHARE_WRITE,
++                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++        if (g_file != INVALID_HANDLE_VALUE) {
++            SetFilePointer(g_file, 0, NULL, FILE_END);
++        }
++    }
++
++    PROCESS_MEMORY_COUNTERS_EX pmc;
++    memset(&pmc, 0, sizeof(pmc));
++    pmc.cb = sizeof(pmc);
++    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pmc, sizeof(pmc));
++
++    MEMORYSTATUSEX ms;
++    memset(&ms, 0, sizeof(ms));
++    ms.dwLength = sizeof(ms);
++    GlobalMemoryStatusEx(&ms);
++
++    // WS includes file-backed (mapped model) pages + private; PRIV is private only.
++    // WS - PRIV approximates file-backed resident footprint.
++    char line[512];
++    int n = _snprintf(line, sizeof(line),
++        "%s|%s|size=%llu|ptr=%p|WS=%llu|PRIV=%llu|COMMIT=%llu|FILEBK=%lld|SYS_AVAIL=%llu|SYS_TOTAL=%llu\n",
++        caller, tag,
++        (unsigned long long) size, ptr,
++        (unsigned long long) pmc.WorkingSetSize,
++        (unsigned long long) pmc.PrivateUsage,
++        (unsigned long long) pmc.PagefileUsage,
++        (long long) ((pmc.WorkingSetSize > pmc.PrivateUsage) ? (pmc.WorkingSetSize - pmc.PrivateUsage) : 0),
++        (unsigned long long) ms.ullAvailPhys,
++        (unsigned long long) ms.ullTotalPhys);
++    if (g_file != INVALID_HANDLE_VALUE && n > 0) {
++        DWORD wr = 0;
++        WriteFile(g_file, line, (DWORD) n, &wr, NULL);
++        // throttle flush: every 256 writes or >= 500ms - keeps disk quiet while the
++        // log stays fresh enough for live inspection
++        LONG count = InterlockedIncrement(&g_writes_since_flush);
++        LONGLONG now = GetTickCount64();
++        LONGLONG last = g_last_flush_ms;
++        if (count >= 256 || now - last >= 500) {
++            FlushFileBuffers(g_file);
++            InterlockedExchange(&g_writes_since_flush, 0);
++            InterlockedExchange64(&g_last_flush_ms, now);
++        }
++    }
++
++    if (pmc.WorkingSetSize > GGML_MEMWATCH_LIMIT_BYTES) {
++        if (g_file != INVALID_HANDLE_VALUE) {
++            const char * msg = "MEMWATCH LIMIT HIT: WS > 90GB, exiting\n";
++            DWORD wr = 0;
++            WriteFile(g_file, msg, (DWORD) strlen(msg), &wr, NULL);
++            FlushFileBuffers(g_file);
++            CloseHandle(g_file);
++            g_file = INVALID_HANDLE_VALUE;
++        }
++        ExitProcess(1);
++    }
++}
++#else
++static void ggml_memwatch_log(const char * caller, const char * tag, uint64_t size, const void * ptr) {
++    (void) caller; (void) tag; (void) size; (void) ptr;
++}
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // GGML_MEMWATCH_H

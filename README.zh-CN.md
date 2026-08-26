@@ -1,4 +1,4 @@
-﻿[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 # StreamMoE (OffloadMoE) 极致内存优化 MoE 推理引擎
 
@@ -21,14 +21,14 @@
 
 ## 工具链矩阵与路线图
 
-详见 [`LLAMA_EXE_ROADMAP.md`](LLAMA_EXE_ROADMAP.md)，对标 `llama.cpp` 工具链体系（`llama-cli`, `llama-server`, `llama-bench`, `llama-quantize`）。
+详见 [`docs/LLAMA_EXE_ROADMAP.md`](docs/LLAMA_EXE_ROADMAP.md)，对标 `llama.cpp` 工具链体系（`llama-cli`, `llama-server`, `llama-bench`, `llama-quantize`）。
 
 | 可执行程序 | 职责说明 | 状态 |
 | :--- | :--- | :--- |
-| **`bin/stream_moe.exe`** | 交互式多轮对话 REPL & 单次提示词运行器 | **已就绪** |
-| **`bin/stream_moe_server.exe`** | OpenAI 兼容流式 HTTP/SSE API 服务端 | **已就绪** |
-| **`bin/stream_moe_bench.exe`** | MoE 专属多维基准评测工具 | 规划中 |
-| **`bin/stream_moe_convert.exe`** | 4KB 扇区对齐零拷贝 GGUF 转换优化器 | 规划中 |
+| **`build/main/bin/stream_moe.exe`** | 交互式多轮对话 REPL & 单次提示词运行器 | **已就绪** |
+| **`build/main/bin/stream_moe_server.exe`** | OpenAI 兼容流式 HTTP/SSE API 服务端 | **已就绪** |
+| **`build/main/bin/stream_moe_bench.exe`** | MoE 专属多维基准评测工具 | 规划中 |
+| **`build/main/bin/stream_moe_convert.exe`** | 4KB 扇区对齐零拷贝 GGUF 转换优化器 | 规划中 |
 
 ---
 
@@ -40,13 +40,13 @@
 
 ### Windows 编译
 ```powershell
-# 编译所有程序 (stream_moe.exe, stream_moe_server.exe)
+# 编译所有程序 (stream_moe.exe, stream_moe_server.exe) 到 build\main\bin\
 .\build.bat build
 
-# 执行 Phase 1 ~ 5 全部单元测试套件
+# 执行单元测试套件
 .\build.bat test
 
-# 清理编译缓存
+# 清理编译产物（全部 tag）
 .\build.bat clean
 ```
 
@@ -62,7 +62,7 @@ make test
 ### 1. 交互式多轮对话 CLI 模式
 ```powershell
 # 启动交互式 REPL，自动分配 75% 可用内存并使用 16 物理核心
-bin\stream_moe.exe `
+build\main\bin\stream_moe.exe `
     -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
     --draft-model "path/to/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" `
     --moe-ram-pool auto `
@@ -74,7 +74,7 @@ bin\stream_moe.exe `
 ### 2. 启动 OpenAI 兼容 API 服务端
 ```powershell
 # 在 8080 端口启动 API 服务
-bin\stream_moe_server.exe `
+build\main\bin\stream_moe_server.exe `
     -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
     --host 127.0.0.1 `
     --port 8080 `
@@ -92,3 +92,5 @@ bin\stream_moe_server.exe `
 
 ## 许可证
 MIT License.
+
+项目布局、构建子路径模式与测试/结果归档约定：**[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)**。

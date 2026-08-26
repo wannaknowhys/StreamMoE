@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -6,10 +6,10 @@ const path = require('path');
 const args = process.argv.slice(2);
 let serverHost = '127.0.0.1';
 let serverPort = 8999;
-let promptsFile = path.join(__dirname, '..', 'benchmark', 'long_horizon_prompts.jsonl');
+let promptsFile = path.join(__dirname, '..', 'benchmark', 'prompts', 'long_horizon_prompts.jsonl');
 let profileLog = path.join(__dirname, '..', 'temp', 'agent_benchmark_profile.jsonl');
-let reportFile = path.join(__dirname, '..', 'benchmark', 'BENCHMARK_REPORT.md');
-let outputFile = path.join(__dirname, '..', 'benchmark', 'conversation_output.txt');
+let reportFile = path.join(__dirname, '..', 'benchmark', 'results', 'BENCHMARK_REPORT_REAL.md');
+let outputFile = path.join(__dirname, '..', 'benchmark', 'results', 'conversation_output.txt');
 
 for (let i = 0; i < args.length; ++i) {
     if (args[i] === '--host' && i + 1 < args.length) serverHost = args[++i];

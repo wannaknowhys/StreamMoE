@@ -1,49 +1,64 @@
-﻿CXX ?= clang++
-CXXFLAGS ?= -std=c++17 -O3 -fopenmp -D_CRT_SECURE_NO_WARNINGS -I src -I third_party/llama.cpp/ggml/include -I third_party/llama.cpp/ggml/src -I third_party/llama.cpp/include -Wall -Wextra -Wno-unused-parameter
+﻿# StreamMoE Linux build (mirrors build.bat layout)
+#   make llamalibs TAG=main   - build vendored libllama into build/$(TAG)/llama-build
+#   make                       - build stream_moe + stream_moe_server
+#   make test                  - build + run unit tests
+#   make clean                 - remove build/
 
-BUILD_DIR = build
-TEMP_DIR = temp
+TAG      ?= main
+OUT      := build/$(TAG)
+LLAMA_BUILD := $(OUT)/llama-build
+BIN      := $(OUT)/bin
+OBJ      := $(OUT)/obj
+CXX      ?= clang++
+CXXFLAGS ?= -std=c++17 -O3 -fopenmp -D_CRT_SECURE_NO_WARNINGS \
+            -I src -I third_party/llama.cpp/ggml/include -I third_party/llama.cpp/ggml/src \
+            -I third_party/llama.cpp/include -I third_party/llama.cpp/vendor \
+            -Wall -Wextra -Wno-unused-parameter
+LLAMA_LIBS := $(LLAMA_BUILD)/src/libllama.a $(LLAMA_BUILD)/ggml/src/libggml.a \
+              $(LLAMA_BUILD)/ggml/src/libggml-base.a $(LLAMA_BUILD)/ggml/src/libggml-cpu.a
 
-.PHONY: all test clean
+.PHONY: all llamalibs test clean
 
-all: test
+all: $(BIN)/stream_moe $(BIN)/stream_moe_server
 
-test: $(TEMP_DIR)/test_async_dio $(TEMP_DIR)/test_expert_pool $(TEMP_DIR)/test_moe_loader $(TEMP_DIR)/test_scheduler $(TEMP_DIR)/test_state_machine $(TEMP_DIR)/test_kv_cache $(TEMP_DIR)/test_profiler
-	./$(TEMP_DIR)/test_async_dio
-	./$(TEMP_DIR)/test_expert_pool
-	./$(TEMP_DIR)/test_moe_loader
-	./$(TEMP_DIR)/test_scheduler
-	./$(TEMP_DIR)/test_state_machine
-	./$(TEMP_DIR)/test_kv_cache
-	./$(TEMP_DIR)/test_profiler
+$(LLAMA_BUILD)/src/libllama.a:
+	@mkdir -p $(LLAMA_BUILD)
+	cmake -S third_party/llama.cpp -B $(LLAMA_BUILD) -G Ninja \
+	    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+	    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+	    -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON
+	cmake --build $(LLAMA_BUILD) --target llama llama-common-base -j
 
-$(TEMP_DIR)/test_async_dio: tests/test_async_dio.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp
-	@mkdir -p $(TEMP_DIR)
+llamalibs: $(LLAMA_BUILD)/src/libllama.a
+
+$(BIN)/stream_moe: $(LLAMA_BUILD)/src/libllama.a src/main.cpp src/engine/llama_engine.cpp src/profile/profiler.cpp
+	@mkdir -p $(BIN)
+	$(CXX) $(CXXFLAGS) src/engine/llama_engine.cpp src/main.cpp src/profile/profiler.cpp \
+	    $(LLAMA_LIBS) -lopenmp -o $@
+
+$(BIN)/stream_moe_server: $(LLAMA_BUILD)/src/libllama.a src/server_main.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp src/io/staging_reader.cpp src/profile/profiler.cpp
+	@mkdir -p $(BIN)
+	$(CXX) $(CXXFLAGS) src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp \
+	    src/io/staging_reader.cpp src/profile/profiler.cpp src/server_main.cpp \
+	    third_party/llama.cpp/ggml/src/gguf.cpp \
+	    $(LLAMA_LIBS) -lopenmp -lpthread -o $@
+
+test: $(OBJ)/test_async_dio $(OBJ)/test_moe_loader $(OBJ)/test_profiler
+	./$(OBJ)/test_async_dio
+	./$(OBJ)/test_moe_loader
+	./$(OBJ)/test_profiler
+
+$(OBJ)/test_async_dio: tests/test_async_dio.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp
+	@mkdir -p $(OBJ)
 	$(CXX) $(CXXFLAGS) -D_FILE_OFFSET_BITS=64 $^ -o $@
 
-$(TEMP_DIR)/test_expert_pool: tests/test_expert_pool.cpp src/pool/expert_stats.cpp src/pool/expert_pool.cpp
-	@mkdir -p $(TEMP_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+$(OBJ)/test_moe_loader: $(LLAMA_BUILD)/src/libllama.a tests/test_moe_loader.cpp third_party/llama.cpp/ggml/src/gguf.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp
+	@mkdir -p $(OBJ)
+	$(CXX) $(CXXFLAGS) $(LLAMA_LIBS) -lopenmp $^ -o $@
 
-$(TEMP_DIR)/test_moe_loader: tests/test_moe_loader.cpp third_party/llama.cpp/ggml/src/gguf.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp
-	@mkdir -p $(TEMP_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(TEMP_DIR)/test_scheduler: tests/test_scheduler.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/io/staging_reader.cpp src/pool/expert_stats.cpp src/pool/expert_pool.cpp src/scheduler/moe_scheduler.cpp src/engine/subgraph_executor.cpp
-	@mkdir -p $(TEMP_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(TEMP_DIR)/test_state_machine: tests/test_state_machine.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/io/staging_reader.cpp src/pool/expert_stats.cpp src/pool/expert_pool.cpp src/scheduler/moe_scheduler.cpp src/engine/state_machine.cpp src/engine/speculative_engine.cpp
-	@mkdir -p $(TEMP_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(TEMP_DIR)/test_kv_cache: tests/test_kv_cache.cpp third_party/llama.cpp/ggml/src/gguf.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp src/kv/kv_cache_manager.cpp src/profile/profiler.cpp
-	@mkdir -p $(TEMP_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(TEMP_DIR)/test_profiler: tests/test_profiler.cpp src/profile/profiler.cpp
-	@mkdir -p $(TEMP_DIR)
+$(OBJ)/test_profiler: tests/test_profiler.cpp src/profile/profiler.cpp
+	@mkdir -p $(OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
 clean:
-	rm -rf $(BUILD_DIR) $(TEMP_DIR)
+	rm -rf build
