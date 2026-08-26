@@ -1,25 +1,15 @@
-#pragma once
+// Temporary per-layer tensor trace (SMT1 binary format) - SHORT-TERM DIAGNOSTIC.
+// Not part of the normal build; compile explicitly for trace binaries.
+// Compare two runs with tools/compare_trace.js.
 
-// Temporary per-layer tensor trace for baseline-vs-expert-backend comparison.
-// Guarded by STREAM_MOE_TEMP (see docs/PROJECT_STRUCTURE.md §10). Short-term
-// diagnostic only; not part of the normal build.
+#include "trace_dump.h"
 
-// Hooks llama_context_params.cb_eval: the sched fires cb_eval(node, ask=false)
-// AFTER the batch containing the node has been computed and synchronized, so
-// node->data holds the computed output. We dump:
-//   - ffn_norm / ffn_out / attn_* outputs (per-layer X values)
-//   - MUL_MAT_ID nodes' src[2] (selected expert ids = routing result)
-// Record format (binary, append-only):
-//   u32 magic("SMT1") | u32 name_len | name | i32 ne[4] | u32 elem | u64 nbytes | nbytes data
-
-#ifdef STREAM_MOE_TEMP
-#include "ggml.h"
 #include <cstdio>
 #include <cstring>
 
 namespace stream_moe {
 
-inline bool trace_dump_cb(struct ggml_tensor* t, bool ask, void* ud) {
+bool stream_moe_trace_cb(struct ggml_tensor* t, bool ask, void* ud) {
     FILE* f = static_cast<FILE*>(ud);
     if (ask) {
         // isolate target nodes so their batch is synchronized before the dump
@@ -55,4 +45,3 @@ inline bool trace_dump_cb(struct ggml_tensor* t, bool ask, void* ud) {
 }
 
 } // namespace stream_moe
-#endif // STREAM_MOE_TEMP

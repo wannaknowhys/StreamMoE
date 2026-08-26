@@ -119,10 +119,9 @@ build\<tag>\
 
 ## 10. 临时代码规范（已修复 bug 的打桩/诊断代码）
 
-- **统一宏**：`STREAM_MOE_TEMP`（编译期条件）。
-- **规则**：
-  - 短期诊断/打桩代码一律 `#ifdef STREAM_MOE_TEMP ... #endif` 包裹，默认编译不带该宏。
-  - **长期有意义的诊断** → 做成 `patches/` 里的独立 patch（如 memwatch），不入主线。
-  - **短期一次性** → `STREAM_MOE_TEMP` 宏包裹 + 产物路径写 `build\<tag>\` 或 `%TEMP%`。
-  - 已修复 bug 的验证代码用完即删（`git rm`），或移入宏保护，不残留裸代码。
-- 命名：`STREAM_MOE_TEMP` 为总开关；需要细化时用 `STREAM_MOE_TEMP_<NAME>` 子宏，但必须同时受总开关约束。
+- **优先：独立文件夹 + 独立 .cpp**——短期诊断代码放 `diagnostics/` 下自成一文件（如 `trace_dump.cpp`），单独编译、不进入主构建、不污染 `src/`。该文件夹的代码可直接进 git 跟踪。
+- **次选：宏包裹**——只有**必须写进主体代码文件**的（如 llama_engine 里 1 行 cb_eval 钩子），才用 `STREAM_MOE_TEMP` 宏包裹（`#ifdef STREAM_MOE_TEMP`），默认编译不带该宏。
+- **长期有意义的诊断** → 做成 `patches/` 里的独立 patch（如 memwatch），不入主线。
+- 已修复 bug 的验证代码用完即删（`git rm`）。
+- 命名：`STREAM_MOE_TEMP` 为总开关；细化用 `STREAM_MOE_TEMP_<NAME>` 子宏，受总开关约束。
+- 诊断编译：`diagnostics/README.md` 说明各自的构建命令。

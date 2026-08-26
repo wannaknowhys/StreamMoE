@@ -5,7 +5,7 @@
 #include "backend/scheduler.h"
 #include "io/async_dio.h"
 #include "loader/moe_loader.h"
-#include "profile/trace_dump.h"
+#include "../diagnostics/trace_dump.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -142,7 +142,7 @@ bool llama_engine::init(const llama_engine_params& p) {
         const char* tf = std::getenv("STREAM_MOE_TRACE_FILE");
         static FILE* g_trace = std::fopen(tf ? tf : "stream_moe_trace.bin", "wb");
         if (g_trace) {
-            cparams.cb_eval = trace_dump_cb;
+            cparams.cb_eval = stream_moe_trace_cb;
             cparams.cb_eval_user_data = g_trace;
             LOG_INFO("TRACE: per-layer tensor dump enabled -> " << (tf ? tf : "stream_moe_trace.bin"));
         } else {
