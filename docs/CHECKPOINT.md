@@ -16,10 +16,16 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **内存问题根因已定位**（INC-1/2/3，见 `docs/BUG_TRACKER.md`）：INC-1 repack 已关；INC-2 seq_id 已修；INC-3 file-backed working set 是真凶 → route B 私有池为解。
 - **memwatch 变补丁**（分支已删）：`patches/`，用 `build.bat build memwatch` 出特殊版，见 `patches/README.md`。
 - **仓库重组完成**：docs/ scripts/ benchmark/{prompts,results}/ patches/ build/<tag>/；废弃模块已删。见 `docs/PROJECT_STRUCTURE.md`。
-- **route B 骨架（本轮新增，已编译+UT 通过）**：
+- **route B 骨架 + graph_compute 委托（本轮：官方 mul_mat_id 第三条路）**：
+  - 采纳第三路径：槽池是单块连续内存 + 均匀 stride → 每个原始 MUL_MAT_ID 节点直接用**官方 `ggml_mul_mat_id` 内核**执行：权重叶子 `[ne00,ne01,num_slots]` data=pool+branch_off、`nb[2]=slot_size`；ids 在私有 mini-graph 里由专家 id 翻译成槽号；b_leaf 包装主图激活；结果直写主图 dst。**数值与官方逐位一致**，删掉了 per-expert gather/scatter 重建。
+  - 崩溃根因已修：`ggml_build_forward_expand` 会递归捕获主图祖先（ggml.c:7165）——旧实现 view/reshape 了主图节点把原始 MUL_MAT_ID 拖进 mini-graph，CPU backend 执行它读到 buft 的悬空 sentinel → OpenMP AV。新实现全部用**叶子包装**（op==NONE + 手动 data/nb），gf->n_nodes==1 验证无捕获。
+  - 顺带修：expert buft 记账 size 余量、ACCEL buft 被 dense 选走（supports_op 只认 `_exps` 的 MUL_MAT_ID）、g_threads 接入 ggml_backend_cpu_set_n_threads、pin_expert FAILED 防御。
+  - **实测状态**：`--expert-backend`（8GB 池）5-token prefill 已跑到第 20/43 层，gate/up/down 全算通、无误导；但**冷 N: 顺序 DIO 装载是性能瓶颈**（~70s/层 → 全程约 1h）。卡死印象 = 慢，非死锁。
+- **待办（下一个会话）**：① 并行化专家装载（pin 循环当前逐个阻塞，scheduler 单 worker 一次一个请求）；② 更大的池/预热页缓存；③ 跑通完整 prefill + decode 验证正确性（对比非 expert-backend 输出）；④ 数值等价回归；⑤ 移除 [moe] 调试日志。
+- **route B 骨架模块（细节，均已编译 + UT 通过）**：
   - `src/backend/slot.h`：跨平台控制面——`slot_meta` 64 位原子字（state/refcount/generation + CAS pin/unpin/evict/reload/failed）、`expert_directory`（二维原子数组+版本号）、有界 MPSC 分配队列；等待唤醒走 Windows WaitOnAddress / Linux futex，无忙等。UT：`tests/test_slot.cpp`（4/4 通过）。
   - `src/backend/scheduler.h/.cpp`：**专家调度器（本轮新增）**——固定大小提交内存池（`pool_bytes` 硬上限，初始即提交 = 70G 保证）、后台线程从 MPSC 取请求、复用 `io/async_dio` + `staging_reader::read_expert_sync` + `loader/moe_loader` read plan 装载专家切片进槽、EST1/LRU 驱逐（READY+refcount==0）、计算侧 `pin_expert`（阻塞装载+refcount++）/`wait_ready`（down 角色不 pin）/`unpin`、命中/缺失遥测（喂 profiler hits）。UT：`tests/test_scheduler.cpp`（合成拓扑 + 临时文件，装载/驱逐/遥测，2/2 通过）。
-  - `src/backend/moe_backend.h/.cpp`：自定义 ggml backend 注册（`stream_moe`，ACCEL 设备）+ 轻量 expert buft（记账句柄 + no-op set_tensor）+ host compute buft；`graph_compute` 目前**拒绝执行**——mini-graph 委托未接。
+  - `src/backend/moe_backend.h/.cpp`：自定义 ggml backend 注册（`stream_moe`，ACCEL 设备）+ 轻量 expert buft（记账句柄 + no-op set_tensor）+ host compute buft；`graph_compute` **已实现**（官方 mul_mat_id 委托，见上）。
   - `src/backend/minigraph.h`（scratch arena）+ `alloc.h`（跨平台对齐分配）。
   - `--expert-backend` 开关（main + server），`llama_engine` 接线 `tensor_buft_overrides`（pattern 覆盖 `ffn_*_exps` + `ffn_*_shexp`，模型无关；dense 无匹配自动无影响）。**默认 OFF**。
 - **profiler 核对**：JSONL schema 完整（hits/speculative_hist/timings_ns 全在序列化中），每轮 2 次 flush（turn 级，低频率无性能影响）；expert 相关值等 route B 填充（scheduler 的 total_lookups/ram_hits/disk_misses 已就绪）。
