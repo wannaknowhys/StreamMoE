@@ -76,3 +76,21 @@ GGUF 元数�?多分片发现、per-expert offset/read plan�?KB sector staging 
 ### INC-1: 加载 162GB 模型把内存占满（已修复）
 - **现象**：stream_moe.exe 加载 UD-Q8_K_XL 全量分片后提交内存冲�?128GB 物理内存�?- **根因 1（主�?*：`llama_model_default_params().use_extra_bufts=true` �?ggml-cpu repack buffer type �?Q4_K/Q5_K/Q6_K/Q2_K/Q4_0 张量在加载时**整体物理拷贝**进私�?buffer。UD 动态量化正是这些类型的混合体，命中部分达数�?GB�?- **修复**：引擎强�?`mparams.use_extra_bufts=false`，全部权重走默认 CPU buft �?`buffer_from_host_ptr` 零拷�?mmap 路径（实�?162GB 模型加载 6.3s、工作集 52MB）。注意：这满�?Backend.md "保留" 一节——但用户要求�?ffn_*_exps 强制�?pool buft 跳过物理载入"的独立优先判断逻辑属于 Backend.md 自定�?buft 阶段（见 EXPERT_OFFLOAD_INTEGRATION.md L1），当前 mmap 零拷贝是等价�?OS 级实现，EST1/DIO 控制随后续阶段接入�?
 ### INC-2: llama_batch.seq_id 指针覆盖 -> 堆损�?c0000374（已修复�?- **现象**：首�?decode �?`RtlFreeHeap` �?heap corruption 进程崩溃�?- **根因**：`llama_batch_init` 已为每个槽位 `calloc` �?`seq_id[i]` 数组；我方代码用单个共享数组指针覆盖全部槽位，`llama_batch_free` 逐槽 `free()` 时重复释放同一地址�?- **教训**：llama_batch 的所有权归上游，调用方只填值不换指针。最小复现程序因漏调 llama_batch_free 而未暴露，cdb 符号化栈定位�?decode_tokens:183�?
+
+## ���ܻ�׼��¼��2026-08-26��
+
+### ������ʵ
+- ģ���� N: Ϊ **iSCSI ����洢**��LIO-ORG target��200GB�������С���ӳٸߡ�
+- ģ�� 162GB �޷���������κα�����ʣ��ռ䣨F: ʣ 279GB ��ģ��Ŀ¼���ݸ干 ~173GB���ҿ����ɱ��ߣ���
+
+### ʵ�⣨70GB RAM ���� / mmap ҳ������� / 16 �߳� CPU / temp=0.6 top_p=0.95��
+| �ִ� | prompt tok | decode TPS | ��ע |
+|------|-----------|-----------|------|
+| EN turn1��ȫ�䣩| 154 | ~2.0 tok/s | �� token ǰ�� 77s prefill����ҳ��ȡ��|
+| EN turn2 | 298 | ~1.8 tok/s | |
+| ZH turn1-3 | 154-487 | 0.3-2.0 tok/s | �����뵱������δפ��ר�ҵ���ҳ�������� |
+
+### ����
+- �����ȷ����ɶ��ԣ�**EN/ZH ˫������**���� benchmark/conversation_real_en3.txt / _zh3.txt����
+- ��ǰ decode TPS �� N: ����ר��ҳ��ȡ������ҳ�����������𽥱��ȡ�
+- Backend.md �Զ���۳أ�DIO Ԥȡ + EST1 פ����������Դ�ƿ���ļܹ��⣻mmap ����Ϊ������顣
