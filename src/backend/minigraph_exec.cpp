@@ -37,6 +37,30 @@ struct keyed_expert_t {
     uint32_t layer, expert;
 };
 
+// Cross-call pin state for the route B pin lifecycle (§4.8): the scheduler
+// delivers a layer's gate / up / down MUL_MAT_ID nodes as SEPARATE graph_compute
+// calls. Pin on the first non-down call, reuse on later non-down calls, and
+// release ALL of the layer's pins on the down call. Single decode thread per
+// context, so a static state is safe here.
+struct pin_state_t {
+    int32_t layer = -1;
+    std::vector<expert_handle_t> pins;
+};
+pin_state_t& pin_state() {
+    static pin_state_t s;
+    return s;
+}
+bool pin_state_has(const pin_state_t& st, uint32_t layer, uint32_t expert) {
+    for (const auto& h : st.pins)
+        if (h.layer == layer && h.expert == expert) return true;
+    return false;
+}
+expert_handle_t pin_state_find(const pin_state_t& st, uint32_t layer, uint32_t expert) {
+    for (const auto& h : st.pins)
+        if (h.layer == layer && h.expert == expert) return h;
+    return {-1, 0, layer, expert, false};
+}
+
 } // namespace
 
 // Route B delegation: the compact slot pool is one contiguous block with a
@@ -101,9 +125,21 @@ enum ggml_status moe_exec_mul_mat_id(
         if (pn.down) has_down = true;
     }
 
-    pins.reserve(pin_keys.size());
-    for (const auto& k : pin_keys) pins.push_back(sched.pin_expert(k.layer, k.expert));
-    for (const auto& k : down_keys) sched.wait_ready(k.layer, k.expert);
+    if (has_down) {
+        for (const auto& k : down_keys) sched.wait_ready(k.layer, k.expert);
+    } else {
+        uint32_t layer = pin_keys.empty() ? 0 : pin_keys[0].layer;
+        if (pin_state().layer != static_cast<int32_t>(layer)) {
+            for (const auto& h : pin_state().pins) sched.unpin(h); // safety: stray from prior layer
+            pin_state().layer = static_cast<int32_t>(layer);
+            pin_state().pins.clear();
+        }
+        for (const auto& k : pin_keys) {
+            if (!pin_state_has(pin_state(), k.layer, k.expert)) {
+                pin_state().pins.push_back(sched.pin_expert(k.layer, k.expert));
+            }
+        }
+    }
     // ---- phase 2: one official mul_mat_id per node, in a leaf-only mini-graph ----
     bool ok = true;
     for (int i = 0; i < n_nodes && ok; ++i) {
@@ -139,8 +175,8 @@ enum ggml_status moe_exec_mul_mat_id(
                 if (pn.down) {
                     slot = sched.slot_of(pn.layer, static_cast<uint32_t>(e));
                 } else {
-                    for (const auto& h : pins)
-                        if (h.layer == pn.layer && h.expert == static_cast<uint32_t>(e)) { slot = h.slot; break; }
+                    expert_handle_t h = pin_state_find(pin_state(), pn.layer, static_cast<uint32_t>(e));
+                    if (h.pinned) slot = h.slot;
                 }
                 if (slot < 0 || slot >= n_slots) { ok = false; break; }
                 ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
@@ -164,12 +200,11 @@ enum ggml_status moe_exec_mul_mat_id(
         }
         }
 
-    // ---- phase 3: release (down role only) ----
+    // ---- phase 3: release all of the layer's pins (down role) ----
     if (has_down) {
-        for (const auto& k : down_keys) {
-            int32_t slot = sched.slot_of(k.layer, k.expert);
-            if (slot >= 0) sched.unpin_slot(slot);
-        }
+        for (const auto& h : pin_state().pins) sched.unpin(h);
+        pin_state().pins.clear();
+        pin_state().layer = -1;
     }
 
     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
