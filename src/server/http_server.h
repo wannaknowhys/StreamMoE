@@ -1,14 +1,9 @@
 #pragma once
 
-#include "common/types.h"
+#include "engine/llama_engine.h"
 #include "loader/moe_loader.h"
-#include "pool/expert_pool.h"
-#include "pool/expert_stats.h"
-#include "scheduler/moe_scheduler.h"
-#include "engine/speculative_engine.h"
-#include "engine/state_machine.h"
-#include "tokenizer/tokenizer.h"
 
+#include <mutex>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -20,25 +15,18 @@ struct server_config_t {
     uint16_t    port = 8080;
     uint32_t    n_ctx = 4096;
     uint32_t    threads = 16;
+    uint32_t    n_predict = 512;
+    size_t      ram_pool_mb = 0;   // reported via /stats
+    uint32_t    slots_total = 0;   // derived from topology + pool budget
 };
 
 class http_server {
 public:
-    http_server(
-        const server_config_t& config,
-        const moe_model_topology_t& topo,
-        expert_pool& pool,
-        expert_stats_tracker& stats,
-        moe_scheduler& scheduler,
-        speculative_engine& spec_engine,
-        state_machine& sm,
-        const gguf_tokenizer& tokenizer
-    );
+    http_server(const server_config_t& config, const moe_model_topology_t& topo, llama_engine& engine);
     ~http_server();
 
     bool start();
     void stop();
-
     bool is_running() const { return running_; }
 
 private:
@@ -47,13 +35,10 @@ private:
 
     server_config_t             config_;
     const moe_model_topology_t& topo_;
-    expert_pool&                pool_;
-    [[maybe_unused]] expert_stats_tracker& stats_;
-    [[maybe_unused]] moe_scheduler&        scheduler_;
-    speculative_engine&         spec_engine_;
-    state_machine&              sm_;
-    const gguf_tokenizer&       tokenizer_;
+    llama_engine&               engine_;
 
+    std::mutex                  infer_mutex_;   // one inference at a time
+    std::atomic<uint64_t>       total_turns_{0};
     std::atomic<bool>           running_{false};
     uintptr_t                   listen_socket_ = 0;
     std::thread                 listener_thread_;

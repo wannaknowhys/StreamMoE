@@ -1,7 +1,8 @@
 #include "server/http_server.h"
 #include "profile/profiler.h"
-#include "kv/kv_cache_manager.h"
 #include "common/logger.h"
+
+#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <sstream>
@@ -28,6 +29,8 @@ namespace stream_moe {
 
 namespace {
 
+using json = nlohmann::json;
+
 void send_response(SOCKET sock, int status_code, const std::string& status_text, const std::string& content_type, const std::string& body) {
     std::ostringstream ss;
     ss << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
@@ -42,25 +45,52 @@ void send_response(SOCKET sock, int status_code, const std::string& status_text,
     send(sock, resp.c_str(), static_cast<int>(resp.size()), 0);
 }
 
+bool send_all(SOCKET sock, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(sock, data + sent, static_cast<int>(len - sent), 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// recv until the full HTTP request (headers + Content-Length body) is available
+bool recv_request(SOCKET sock, std::string& out) {
+    char buf[8192];
+    size_t header_end = std::string::npos;
+    size_t content_len = 0;
+    while (true) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) return !out.empty();
+        out.append(buf, static_cast<size_t>(n));
+
+        if (header_end == std::string::npos) {
+            header_end = out.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                // parse Content-Length
+                std::string lower = out.substr(0, header_end);
+                for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                size_t cl = lower.find("content-length:");
+                if (cl != std::string::npos) {
+                    content_len = std::strtoull(out.c_str() + cl + 15, nullptr, 10);
+                }
+            }
+        }
+        if (header_end != std::string::npos) {
+            size_t body_bytes = out.size() - (header_end + 4);
+            if (body_bytes >= content_len) return true;
+        }
+        if (out.size() > (64ULL << 20)) return false; // sanity cap 64MB
+    }
+}
+
 } // namespace
 
-http_server::http_server(
-    const server_config_t& config,
-    const moe_model_topology_t& topo,
-    expert_pool& pool,
-    expert_stats_tracker& stats,
-    moe_scheduler& scheduler,
-    speculative_engine& spec_engine,
-    state_machine& sm,
-    const gguf_tokenizer& tokenizer
-) : config_(config),
-    topo_(topo),
-    pool_(pool),
-    stats_(stats),
-    scheduler_(scheduler),
-    spec_engine_(spec_engine),
-    sm_(sm),
-    tokenizer_(tokenizer) {}
+http_server::http_server(const server_config_t& config, const moe_model_topology_t& topo, llama_engine& engine)
+    : config_(config),
+      topo_(topo),
+      engine_(engine) {}
 
 http_server::~http_server() {
     stop();
@@ -122,7 +152,6 @@ void http_server::stop() {
         closesocket(static_cast<SOCKET>(listen_socket_));
         listen_socket_ = 0;
     }
-
     if (listener_thread_.joinable()) {
         listener_thread_.join();
     }
@@ -142,25 +171,18 @@ void http_server::listener_loop() {
             if (!running_) break;
             continue;
         }
-
-        std::thread([this, client_sock]() {
-            handle_client(static_cast<uintptr_t>(client_sock));
-        }).detach();
+        handle_client(static_cast<uintptr_t>(client_sock));
     }
 }
 
 void http_server::handle_client(uintptr_t client_socket) {
     SOCKET sock = static_cast<SOCKET>(client_socket);
-    char buf[4096];
-    int bytes_read = recv(sock, buf, sizeof(buf) - 1, 0);
-    if (bytes_read <= 0) {
+    std::string req;
+    if (!recv_request(sock, req)) {
         closesocket(sock);
         return;
     }
-    buf[bytes_read] = '\0';
-    std::string req(buf);
 
-    // Basic HTTP parsing
     std::istringstream stream(req);
     std::string method, path, version;
     stream >> method >> path >> version;
@@ -171,94 +193,167 @@ void http_server::handle_client(uintptr_t client_socket) {
         return;
     }
 
-    // 1. GET /health
     if (path == "/health") {
-        std::string json = "{\"status\":\"ok\",\"engine\":\"StreamMoE\",\"arch\":\"" + topo_.arch_name + "\"}";
-        send_response(sock, 200, "OK", "application/json", json);
+        json j;
+        j["status"] = "ok";
+        j["engine"] = "StreamMoE";
+        j["arch"] = topo_.arch_name;
+        j["real_inference"] = true;
+        send_response(sock, 200, "OK", "application/json", j.dump());
     }
-    // 2. GET /v1/models
     else if (path == "/v1/models") {
-        std::string json = "{\"object\":\"list\",\"data\":[{\"id\":\"" + topo_.arch_name + "\",\"object\":\"model\",\"created\":1700000000,\"owned_by\":\"stream_moe\"}]}";
-        send_response(sock, 200, "OK", "application/json", json);
+        json j;
+        j["object"] = "list";
+        json item;
+        item["id"] = topo_.arch_name;
+        item["object"] = "model";
+        item["created"] = 1700000000;
+        item["owned_by"] = "stream_moe";
+        j["data"] = json::array({item});
+        send_response(sock, 200, "OK", "application/json", j.dump());
     }
-    // 3. GET /stats or GET /metrics
     else if (path == "/stats" || path == "/metrics") {
-        std::ostringstream ss;
-        ss << "{\n"
-           << "  \"model\": \"" << topo_.arch_name << "\",\n"
-           << "  \"layers\": " << topo_.n_layer << ",\n"
-           << "  \"experts_per_layer\": " << topo_.n_expert << ",\n"
-           << "  \"slots_total\": " << pool_.num_slots() << ",\n"
-           << "  \"slot_size_kb\": " << (pool_.slot_size() / 1024) << ",\n"
-           << "  \"pool_total_mb\": " << (pool_.total_bytes() / (1024 * 1024)) << ",\n"
-           << "  \"runtime_state\": \"" << sm_.state_name(sm_.current_state()) << "\",\n"
-           << "  \"speculative_k\": " << spec_engine_.get_active_k() << "\n"
-           << "}";
-        send_response(sock, 200, "OK", "application/json", ss.str());
+        json j;
+        j["model"] = topo_.arch_name;
+        j["model_name"] = engine_.model_name();
+        j["layers"] = topo_.n_layer;
+        j["experts_per_layer"] = topo_.n_expert;
+        j["slots_total"] = config_.slots_total;
+        j["slot_size_kb"] = topo_.expert_slot_size / 1024;
+        j["pool_total_mb"] = config_.ram_pool_mb;
+        j["runtime_state"] = "REAL_INFERENCE_LIBLLAMA";
+        j["kv_on_gpu"] = engine_.kv_on_gpu();
+        j["total_turns"] = total_turns_.load();
+        j["ctx_used"] = 0;
+        j["n_ctx"] = config_.n_ctx;
+        send_response(sock, 200, "OK", "application/json", j.dump());
     }
-    // 4. POST /v1/chat/completions
     else if (path == "/v1/chat/completions" || path == "/v1/completions") {
-        static std::atomic<uint32_t> g_server_turn{0};
-        uint32_t turn_id = ++g_server_turn;
-        auto& prof_logger = profile_logger::instance();
+        size_t body_pos = req.find("\r\n\r\n");
+        if (body_pos == std::string::npos) {
+            send_response(sock, 400, "Bad Request", "application/json", "{\"error\":\"missing body\"}");
+            closesocket(sock);
+            return;
+        }
+        std::string body = req.substr(body_pos + 4);
 
-        auto in_tokens = tokenizer_.tokenize(req, true);
-        uint32_t prompt_tokens = static_cast<uint32_t>(in_tokens.empty() ? 64 : in_tokens.size());
-        prof_logger.log_request_ingest(turn_id, req.size(), prompt_tokens);
-
-        uint64_t t_start_req = read_timestamp_ns();
-        bool is_stream = req.find("\"stream\": true") != std::string::npos || req.find("\"stream\":true") != std::string::npos;
-
-        uint32_t gen_tokens = 8;
-        if (is_stream) {
-            // Server-Sent Events (SSE) Streaming Response
-            std::string header = "HTTP/1.1 200 OK\r\n"
-                                 "Content-Type: text/event-stream\r\n"
-                                 "Cache-Control: no-cache\r\n"
-                                 "Connection: close\r\n"
-                                 "Access-Control-Allow-Origin: *\r\n\r\n";
-            send(sock, header.c_str(), static_cast<int>(header.size()), 0);
-
-            for (uint32_t step = 1; step <= gen_tokens; ++step) {
-                std::ostringstream ss;
-                ss << "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\""
-                   << topo_.arch_name << "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" token_" << step << "\"},\"finish_reason\":null}]}\n\n";
-                std::string sse_chunk = ss.str();
-                send(sock, sse_chunk.c_str(), static_cast<int>(sse_chunk.size()), 0);
-            }
-
-            std::string done_msg = "data: [DONE]\n\n";
-            send(sock, done_msg.c_str(), static_cast<int>(done_msg.size()), 0);
-        } else {
-            // Non-streaming JSON response
-            std::string json = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1700000000,\"model\":\"" +
-                               topo_.arch_name +
-                               "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"StreamMoE: Extreme Memory Offload Engine is operational.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":64,\"completion_tokens\":8,\"total_tokens\":72}}";
-            send_response(sock, 200, "OK", "application/json", json);
+        json request;
+        try {
+            request = json::parse(body);
+        } catch (const std::exception&) {
+            send_response(sock, 400, "Bad Request", "application/json", "{\"error\":\"invalid JSON\"}");
+            closesocket(sock);
+            return;
         }
 
-        uint64_t t_end_req = read_timestamp_ns();
+        std::vector<chat_msg_t> messages;
+        if (request.contains("messages") && request["messages"].is_array()) {
+            for (const auto& m : request["messages"]) {
+                chat_msg_t msg;
+                msg.role = m.value("role", "user");
+                msg.content = m.value("content", "");
+                messages.push_back(std::move(msg));
+            }
+        } else if (request.contains("prompt")) {
+            messages.push_back({"user", request.value("prompt", "")});
+        }
+        if (messages.empty()) {
+            send_response(sock, 400, "Bad Request", "application/json", "{\"error\":\"no messages\"}");
+            closesocket(sock);
+            return;
+        }
+
+        bool is_stream = request.value("stream", false);
+        uint32_t n_predict = config_.n_predict;
+        if (request.contains("max_tokens") && request["max_tokens"].is_number_unsigned()) {
+            n_predict = std::min(n_predict, request["max_tokens"].get<uint32_t>());
+        }
+
+        uint32_t turn_id = static_cast<uint32_t>(++total_turns_);
+        auto& prof_logger = profile_logger::instance();
+
+        std::lock_guard<std::mutex> lock(infer_mutex_);
+
+        prof_logger.log_request_ingest(turn_id, body.size(), 0);
+
+        auto t_start = std::chrono::steady_clock::now();
+        llama_turn_metrics metrics;
+
+        if (is_stream) {
+            std::string header =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n";
+            if (!send_all(sock, header.c_str(), header.size())) {
+                closesocket(sock);
+                return;
+            }
+
+            bool aborted = false;
+            metrics = engine_.chat(messages, n_predict, [&](const char* piece, size_t len) {
+                json chunk;
+                chunk["id"] = "chatcmpl-streammoe";
+                chunk["object"] = "chat.completion.chunk";
+                chunk["created"] = 1700000000;
+                chunk["model"] = topo_.arch_name;
+                json choice;
+                choice["index"] = 0;
+                choice["delta"]["content"] = std::string(piece, len);
+                choice["finish_reason"] = nullptr;
+                chunk["choices"] = json::array({choice});
+                std::string sse = "data: " + chunk.dump() + "\n\n";
+                return send_all(sock, sse.c_str(), sse.size());
+            });
+            (void)aborted;
+
+            const char* done = "data: [DONE]\n\n";
+            send_all(sock, done, std::strlen(done));
+        } else {
+            std::string content;
+            metrics = engine_.chat(messages, n_predict, [&](const char* piece, size_t len) {
+                content.append(piece, len);
+                return true;
+            });
+
+            json resp;
+            resp["id"] = "chatcmpl-streammoe";
+            resp["object"] = "chat.completion";
+            resp["created"] = 1700000000;
+            resp["model"] = topo_.arch_name;
+            json choice;
+            choice["index"] = 0;
+            choice["message"]["role"] = "assistant";
+            choice["message"]["content"] = content;
+            choice["finish_reason"] = metrics.truncated ? "length" : "stop";
+            resp["choices"] = json::array({choice});
+            resp["usage"]["prompt_tokens"] = metrics.prompt_tokens;
+            resp["usage"]["completion_tokens"] = metrics.generated_tokens;
+            resp["usage"]["total_tokens"] = metrics.prompt_tokens + metrics.generated_tokens;
+            std::string out = resp.dump();
+            send_response(sock, 200, "OK", "application/json", out);
+        }
+
+        auto t_end = std::chrono::steady_clock::now();
+
         turn_profile_t prof;
         prof.turn_id = turn_id;
         prof.timestamp_ns = read_timestamp_ns();
-        prof.prompt_tokens = prompt_tokens;
-        prof.generated_tokens = gen_tokens;
-        prof.total_duration_ms = (t_end_req - t_start_req) / 1000000.0;
-        double sec = prof.total_duration_ms / 1000.0;
-        prof.decode_tps = sec > 0 ? (gen_tokens / sec) : 0.0;
-        prof.prefill_tps = 120.0;
-        prof.total_lookups = 64;
-        prof.ram_hits = 58;
-        prof.disk_misses = 6;
-        prof.gpu_hits = 0;
-        prof.spec_accept_hist[0] = 1;
-        prof.spec_accept_hist[1] = 2;
-        prof.spec_accept_hist[2] = 5;
-        prof.t_prefill_ns = 5000000;
-        prof.t_prefix_match_ns = 200000;
-        prof.t_expert_total_ns = 35000000;
-        prof.t_expert_wait_io_ns = 12000000;
-        prof.t_expert_cpu_ns = 23000000;
+        prof.prompt_tokens = metrics.prompt_tokens;
+        prof.generated_tokens = metrics.generated_tokens;
+        prof.total_duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        double decode_sec = metrics.decode_ms / 1000.0;
+        prof.decode_tps = decode_sec > 0 ? metrics.generated_tokens / decode_sec : 0.0;
+        prof.prefill_tps = metrics.prefill_tps;
+        prof.t_prefill_ns = static_cast<uint64_t>(metrics.prefill_ms * 1000000.0);
+        prof.t_prefix_match_ns = 0;
+        LOG_INFO("[turn " << turn_id << "] prompt=" << metrics.prompt_tokens
+                 << " tok, gen=" << metrics.generated_tokens
+                 << " tok, prefill=" << metrics.prefill_ms << " ms ("
+                 << metrics.prefill_tps << " tok/s), decode="
+                 << metrics.decode_ms << " ms (" << prof.decode_tps << " tok/s)"
+                 << ", ctx_used=" << metrics.ctx_used);
         prof_logger.log_response_finish(prof);
     }
     else {
