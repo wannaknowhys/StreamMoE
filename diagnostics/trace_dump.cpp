@@ -38,7 +38,11 @@ bool stream_moe_trace_cb(struct ggml_tensor* t, bool ask, void* ud) {
 
     dump(t->name, t);                              // computed node output (X values)
     if (t->op == GGML_OP_MUL_MAT_ID && t->src[2]) {
-        dump(t->src[2]->name, t->src[2]);          // selected expert ids (routing)
+        // stable name for the ids (routing) so baseline and expert-backend align:
+        // sched may hand us a COPY of ids with an empty name in the expert-backend
+        char idname[256];
+        std::snprintf(idname, sizeof(idname), "%s#ids", t->src[0]->name ? t->src[0]->name : "?");
+        dump(idname, t->src[2]);
     }
     std::fflush(f);
     return true;
