@@ -5,6 +5,7 @@
 > 修订记录：
 > - §7 v2（2026-08-26）：根据"自定义 backend 接管 MUL_MAT_ID"的设计修正结论——紧凑槽方案可行且零 llama.cpp 改动，代价是**必须自行实现 MUL_MAT_ID 计算路径**（mini-graph 委托给 ggml-cpu 或原生内核）。
 > - 编码修复（2026-08-26）：整文件重写为纯 UTF-8；此前 PowerShell 追加段落导致编码混合。
+> - v3（2026-08-26）：pin 生命周期定案 §4.8（首触 pin、末触 unpin，角色式无状态表）；shexp 纳入 buft 定案 §4.9（backend 支持 MUL_MAT）；§4.6 图按实际节点序修正（加权求和在 down 之后）；§4.2 数字澄清。
 
 ---
 
@@ -127,7 +128,7 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 | MUL_MAT_ID 执行 | 官方 ggml-cpu 内核 | **我们实现**（mini-graph 委托或原生内核）| 官方内核（stride view 适配）|
 | 专家物理布局 | 大区域三区域 slice（非紧凑）| 紧凑 [gate\|up\|down] 槽 | 紧凑槽 |
 | ids | 专家 id，无需翻译 | 专家 id，图内不翻译（graph_compute 内私下查表）| 需翻译成 slot 索引（有 get_rows 冲突）|
-| 虚拟地址 | RESERVE 147GB（免费）| 池大小（预算）| 池大小 |
+| 虚拟地址 | RESERVE 147GB（真实 VA 预留，免费）| 无 VA 预留；147GB 仅是 buffer size 记账值 | 池大小 |
 | 实现工作量 | 小（buft + cb_eval + scheduler）| **中-大**（backend 骨架 + MUL_MAT_ID 计算实现）| 中（改 llama.cpp + 翻译）|
 | 正确性风险 | 无（全官方内核）| 我们的 compute 需数值等价 | 翻译 hack 风险 |
 
@@ -145,8 +146,10 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 
 `ggml-backend-impl.h` 的 buffer/buft iface 契约：
 
-- `alloc_buffer(buft, size)` 不必真正申请 `size` 字节。返回一个 buffer，`size` 字段 = 请求的总大小（147GB 的"虚拟值"），`get_base` 返回**非空** dummy 指针（`ggml_backend_buffer_get_base` 断言 base!=NULL），`set_tensor`/`memset_tensor`/`get_tensor` 全部 no-op。
+- `alloc_buffer(buft, size)` 不必真正申请 `size` 字节。返回一个 buffer，`size` 字段 = 请求的总大小（**纯记账整数**，如 147GB），`get_base` 返回**非空** dummy 指针（`ggml_backend_buffer_get_base` 断言 base!=NULL），`set_tensor`/`memset_tensor`/`get_tensor` 全部 no-op。
 - `ggml_backend_tensor_alloc`（gallocr 调用）的断言：`addr >= get_base`、`addr + alloc_size <= base + size` → 用 dummy base + size=总大小即可全部满足。张量 `data` 变为悬空指针，**只有我们的 backend 会碰它**（实际我们不读 `data`，走槽内存）。
+
+> **数字澄清（与 §3 表格区分）**：§4.2 的 147GB 只是满足 ggml 内部断言的**记账值**，不对应任何真实地址空间或内存开销——route B **没有** `VirtualAlloc`/mmap 预留这段地址，`get_base` 的 dummy 指针无人解引用。它比 route A 的 `RESERVE 147GB`（那是一次真实的系统级地址空间预留）更"免费"。route B 真正的资源开销**只有一个数字：槽池预算**（如 70GB 物理，按需 commit）。
 
 ### 4.3 MUL_MAT_ID 的计算实现：mini-graph 委托（真正的成本所在）
 
@@ -189,24 +192,52 @@ mini-graph 节点的**张量形状是动态的**：按 token 分组（每专家�
 
 主图 → sched 先给每个节点定 backend（带权重的跟权重走；逐元素无权重跟输入走）→ **把连续同 backend 的节点打包成一段 = split** → `graph_compute` **按 split 被调用**（每次拿到一个子图，含该 split 的连续节点）。跨界处插事件同步/输入拷贝。
 
-DeepSeek4 一层（示意，最终以实际图序核实）：
+DeepSeek4 一层（按 llama-graph.cpp `build_moe_ffn` 实际节点序，L2138/L2151/L2179-98/L2255/L2268/L2279-95）：
 
 ```text
-attn/MLA/DSA + router/weights     → CPU    ┐ 合并成 split A（CPU）
-mul_mat_id(up_exps)                → 我们   │
-mul_mat_id(gate_exps)              → 我们   ├─ split B（我们）→ 一次 graph_compute 拿到 gate+up
-swiglu/clamp + 加权求和            → CPU    ┐ split C（CPU）
-mul_mat_id(down_exps)              → 我们   ├─ split D（我们）→ 一次 graph_compute 单独拿 down
+attn/MLA/DSA + router(gate_inp) + weights  → CPU  ┐ split A（CPU）
+mul_mat_id(up_exps)                          → 我们 │
+mul_mat_id(gate_exps)                        → 我们 ├─ split B（我们）→ 一次 graph_compute 拿到 [up, gate]（注意顺序 up 在前 gate 在后）
+swiglu / clamp（逐元素）                     → CPU  ┐ split C（CPU）
+mul_mat_id(down_exps)                        → 我们 ├─ split D（我们）→ 一次 graph_compute 单独拿 down
+mul(experts, weights) + view + 跨专家相加    → CPU  │ split E（CPU）
++ shared expert(ffn_shexp, 普通 MUL_MAT)     → CPU  ┘  加权求和/聚合在 down 之后（L2268/2279 在 L2255 之后）
 ```
 
-即：**每层预期 2 次调用我们**（gate+up 一次、down 一次），不是 1 次也不是 3 次；具体切法照实际节点序核实。
+即：**每层预期 2 次调用我们**（up+gate 一次、down 一次），不是 1 次也不是 3 次；具体切法照实际节点序核实。
 
-**unpin 挂 split 边界**：我们 split 的输出被后续 CPU split 消费 → sched 在边界做事件同步保证"我们的 split 真算完" → **unpin 挂在这个边界确认点上**（搭 sched 的便车），不是我们 dispatch 返回那一刻。
+**unpin 挂 split 边界**：我们 split 的输出被后续 CPU split 消费 → sched 在边界做事件同步保证"我们的 split 真算完" → **unpin 挂在这个边界确认点上**（搭 sched 的便车），不是我们 dispatch 返回那一刻。注意：这里的"unpin"指的是**末触释放**（见 §4.8），不是每个我们 split 完成就释放。
 
 ### 4.7 GPU 委托目标与完成时机
 
 - **GPU 组必须委托给已注册的 Vulkan backend 的 graph_compute，不是 cpu_backend**——否则 GPU 池名存实亡（显存白放、矩阵却在 CPU 算、还多一次隐式搬运）。CPU 组委托 cpu_backend，GPU 组委托 vulkan backend，两组在同一个我们的 graph_compute 里并发处理（与 Backend.md §1"同一次调用 CPU/GPU 双池并发"对齐）。
 - **完成时机**：Vulkan 的 graph_compute 语义是"提交命令、返回，不保证跑完"。unpin 不能挂函数返回。方案：① 简单版：`ggml_backend_synchronize(vulkan_backend)` 等真完成再 unpin（同步等待，牺牲异步收益）；② 正解：unpin 挂 sched 的 **split 边界事件**（下一个消费我们输出的 split 开始前的 event wait 即确认我们 split 已完成）——不额外 synchronize、真正异步。GPU 组的异步收益靠②拿到。
+
+### 4.8 pin 生命周期：首触 pin、末触 unpin（角色式，无状态表）【已定案】
+
+**问题**：专家 e 的同一个槽被 split B（up/gate）和 split D（down）**两次消费**，中间隔着 CPU 的 split C（swiglu）。若在 B 完成边界就释放，split C 期间 refcount=0 → 可被驱逐 → D 时槽已换人（generation 能抓到错误但白算一层）。这是真实正确性缺口，不是风格问题。
+
+**根因**：gate/up/down 三个 `mul_mat_id` 吃**同一份 ids** → 在 split B 第一次摸到专家 e 时，就已确定"本层本次前向还会被 split D 再用"。数据生命周期跨越两次 graph_compute 调用。
+
+**定案方案（角色式，无需状态表）**：
+```text
+split B（非 down 角色）：对 ids 里每个专家 pin（ref 0→1），【不 unpin】
+split D（down 角色）：  【不重复 pin】，直接验证 READY + generation 后计算，
+                       计算完对该 ids 集合 unpin（ref 1→0）
+```
+- 角色识别：节点权重名含 `down_exps` → down 角色；否则 pin 角色。
+- 为何不需要状态表：B 和 D 读的是同一份 ids 张量，D 重读 ids 即得同一集合，不需要 B 传状态。
+- 为何无空窗：refcount 在 B..D 全程 ≥1（只有 D 的末触释放把它归零），驱逐不可能介入。
+- 跨 pass / 并发多 seq：refcount 自然叠加（pass1 的 D 与 pass2 的 B 交错时 ref≥1），各 pass 内 B..D 自洽。
+- 防御：若某 split 同时含 down 与非 down 节点（理论上不会，swiglu 隔开），则"先 pin 全量 → 计算 → 只对 down 节点引用的专家 unpin"。
+- 与 Backend.md 的 refcount（非 bool）设计天然吻合。
+
+### 4.9 shared expert（shexp）：纳入我们的 buft，backend 支持普通 MUL_MAT【已定案】
+
+- 事实：deepseek4.cpp:1303-1310，`ffn_shexp = build_ffn(cur, ffn_*_shexp, ...)` 用**普通 `ggml_mul_mat`**（2D 固定权重、非 mul_mat_id、全 token 计算），再 `add(moe_out, ffn_shexp)`。
+- 定案：`tensor_buft_overrides` 同时覆盖 `blk\..*\.ffn_.*_shexp\.weight` → 我们的 buft。这些 `MUL_MAT` 节点也会派给我们 → **backend 必须额外支持 `GGML_OP_MUL_MAT`**（比 MUL_MAT_ID 简单：无 ids、固定权重、每 token 都算）。
+- 理由（用户确认）：LRU 保证最近用过的专家留在池里，池子比 shexp 还小的场景本就不成立；纳入后"MoE 无 mmap"才彻底。
+- shexp 的槽 pin：整层计算期间 pin，层内最后一个引用（`add` 之前的 `mul_mat`）完成后 unpin；不涉及 ids，固定专家集合。
 
 ---
 
@@ -214,9 +245,9 @@ mul_mat_id(down_exps)              → 我们   ├─ split D（我们）→ �
 
 - **Phase A（CPU-only 自定义 backend）**：
   1. 注册 backend + weight buft（轻量句柄，no-op set_tensor）。
-  2. `tensor_buft_overrides` 指向 weight buft。
-  3. `graph_compute` 实现 MUL_MAT_ID（scratch arena + mini-graph 委托 ggml-cpu，先单专家，再 k 专家批处理）。
-  4. scheduler（DIO + EST1）+ 槽控制面（slot_meta/expert_directory/MPSC）。
+  2. `tensor_buft_overrides` 指向 weight buft（覆盖 `ffn_.*_exps` 与 `ffn_.*_shexp`）。
+  3. `graph_compute` 实现 MUL_MAT_ID 与 MUL_MAT（shexp）：scratch arena + mini-graph 委托 ggml-cpu，先单专家，再 k 专家批处理。
+  4. 槽控制面：`slot_meta`/`expert_directory`/MPSC + DIO + EST1；**pin 按 §4.8 角色式（首触 pin、末触 unpin）**。
   5. 数值等价回归 vs 官方图。
 - **Phase B（GPU 混合池）**：Backend.md §1——graph_compute 内 CPU/GPU 双池并发（Vulkan 先行，dispatch 线程 park+转发；ReBAR/CUDA stream-wait 后置）。GPU 组委托 vulkan backend，unpin 挂 split 边界事件。
 - 主线合并后：`git merge main` 进 `debug/memguard` 用 memwatch 验证槽池提交内存有界。
