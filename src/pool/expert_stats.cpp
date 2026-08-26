@@ -169,7 +169,20 @@ bool expert_stats_tracker::flush() {
 double expert_stats_tracker::get_adaptive_frequency(uint32_t layer_idx, uint32_t expert_idx) const {
     if (layer_idx >= n_layer_ || expert_idx >= n_expert_) return 0.0;
     std::lock_guard<std::mutex> lock(mutex_);
-    return adaptive_scores_[index(layer_idx, expert_idx)];
+
+    // Normalize against the current maximum so the value always lies in [0, 1].
+    // Raw scores are unbounded decaying counters (session hits + persisted-history seed);
+    // without normalization a hot expert would drown out the LRU term in hybrid eviction.
+    double score = adaptive_scores_[index(layer_idx, expert_idx)];
+    if (score <= 0.0) return 0.0;
+
+    double max_score = 0.0;
+    for (double s : adaptive_scores_) {
+        if (s > max_score) max_score = s;
+    }
+    if (max_score <= 0.0) return 0.0;
+
+    return score / max_score;
 }
 
 uint64_t expert_stats_tracker::get_global_count(uint32_t layer_idx, uint32_t expert_idx) const {

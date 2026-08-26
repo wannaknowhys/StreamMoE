@@ -21,7 +21,6 @@ expert_pool::expert_pool(size_t slot_size, uint32_t num_slots, eviction_policy_t
       slots_(std::make_unique<expert_slot_t[]>(num_slots)) {
     
     total_allocated_bytes_ = slot_size_ * num_slots_;
-
 #if defined(_WIN32)
     base_ptr_ = static_cast<uint8_t*>(VirtualAlloc(
         NULL,
@@ -35,14 +34,34 @@ expert_pool::expert_pool(size_t slot_size, uint32_t num_slots, eviction_policy_t
         throw std::bad_alloc();
     }
 
-    // Try to lock pages in physical RAM (ignore error if process working set quota is reached)
-    VirtualLock(base_ptr_, total_allocated_bytes_);
+    // Raise the process working set quota so VirtualLock can actually pin the pool
+    SIZE_T min_ws = total_allocated_bytes_;
+    SIZE_T max_ws = total_allocated_bytes_ + (256ULL * 1024 * 1024);
+    if (!SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws)) {
+        DWORD ws_err = GetLastError();
+        LOG_WARN("SetProcessWorkingSetSize failed (err=" << ws_err << "), falling back to default quota");
+    }
+
+    if (!VirtualLock(base_ptr_, total_allocated_bytes_)) {
+        is_pinned_ = false;
+        DWORD lock_err = GetLastError();
+        LOG_WARN("VirtualLock FAILED (err=" << lock_err << ") for " << (total_allocated_bytes_ / (1024 * 1024))
+                << " MB - pool is NOT pinned, pages may be paged out under memory pressure");
+    } else {
+        is_pinned_ = true;
+    }
 #else
     if (posix_memalign(reinterpret_cast<void**>(&base_ptr_), 4096, total_allocated_bytes_) != 0) {
         LOG_ERROR("posix_memalign failed for " << (total_allocated_bytes_ / (1024 * 1024)) << " MB");
         throw std::bad_alloc();
     }
-    mlock(base_ptr_, total_allocated_bytes_);
+    if (mlock(base_ptr_, total_allocated_bytes_) != 0) {
+        is_pinned_ = false;
+        LOG_WARN("mlock FAILED (errno=" << errno << ") for " << (total_allocated_bytes_ / (1024 * 1024))
+                << " MB - pool is NOT pinned, check RLIMIT_MEMLOCK");
+    } else {
+        is_pinned_ = true;
+    }
 #endif
 
     // Initialize slot descriptors

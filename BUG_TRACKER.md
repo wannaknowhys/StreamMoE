@@ -27,27 +27,27 @@
 
 | ID | 状态 | 问题 | 位置 | 处置 |
 |----|------|------|------|------|
-| B14 | OPEN | `--moe-preload ram/all` 未读 GGUF 即 mark_ready，空内存被当合法权重且后续 find_slot 永久 hit、永不触发磁盘读 | src/main.cpp:325-337 | 修复：preload 改为走 scheduler 真实读取路径 |
-| B15 | OPEN | IO 失败后 worker 只 LOG 不复位 slot -> 永久 IO_INFLIGHT\|PIN_LOCKED，泄漏且永不驱逐，可耗尽整池 | src/scheduler/moe_scheduler.cpp:158-175 | 修复：失败时 abort_io/复位 slot 状态 |
-| B16 | OPEN | wait_miss_ready 超时的 miss 不进返回列表但 slot 已 pin -> 永久 PIN_LOCKED 泄漏 | src/scheduler/moe_scheduler.cpp:100-130, src/main.cpp:171-177 | 修复：超时也返回 slot 引用供 release |
-| B17 | OPEN | timeout_ms 被每个 miss 单独消耗，非整体 deadline | 同 B16 | 修复：共享 deadline |
-| B18 | OPEN | VirtualLock/mlock 返回值忽略，"pinned" 只是尝试而非确认，误导 benchmark | src/pool/expert_pool.cpp:39,45 | 修复：检查并告警/降级说明 |
-| B19 | OPEN | shard 缺失仅 WARN 继续，150GB 模型静默缺数据 | src/loader/moe_loader.cpp:186-190 | 修复：split.count 存在时严格校验分片完整性 |
-| B20 | OPEN | expert 切片假设等大连续布局，未校验 shape/quant block 对齐 | src/loader/moe_loader.cpp:249-250 | 修复：校验 total_size % n_expert == 0 且 slice 为 block 整数倍 |
-| B21 | OPEN | route_and_prefetch 对重复 expert id 会 double-pin 并重复入队 | src/scheduler/moe_scheduler.cpp:62-89 | 修复：请求内去重 |
-| B22 | OPEN | POSIX "async DIO" 实为同步 pread，README 宣称 io_uring 不实（Windows IOCP 为真） | src/io/async_dio_posix.cpp | 文档修正；io_uring 另行规划 |
-| B23 | OPEN | POSIX completed_queue_ 无锁非线程安全；max_in_flight_ 未使用 | src/io/async_dio_posix.cpp | 修复：加 mutex |
-| B24 | OPEN | scheduler 单 worker：expert 内 batch 并发、expert 间串行，无跨 expert 流水 | src/scheduler/moe_scheduler.cpp:30-34 | Phase B 再评估（多 worker/队列深度参数化）|
-| B25 | OPEN | compute/IO 重叠未接入主路径（executor 从未被 generation loop 调用） | src/main.cpp | Phase A/B |
-| B26 | OPEN | `-ngl/--gpu-layers`、`--moe-vram-pool` 解析后完全未接线 | src/main.cpp:34-35 | Phase A: 映射到 libllama 参数 |
+| B14 | SUPERSEDED | `--moe-preload ram/all` 未读 GGUF 即 mark_ready，空内存被当合法权重且后续 find_slot 永久 hit、永不触发磁盘读 | src/main.cpp:325-337 | 旧 main/pool/scheduler 将被新引擎+Backend.md 控制面整体替换，不再单独修补 |
+| B15 | SUPERSEDED | IO 失败后 worker 只 LOG 不复位 slot -> 永久 IO_INFLIGHT\|PIN_LOCKED，泄漏且永不驱逐，可耗尽整池 | src/scheduler/moe_scheduler.cpp:158-175 | 同上：Backend.md slot_meta(含 FAILED 态) 替代 |
+| B16 | SUPERSEDED | wait_miss_ready 超时的 miss 不进返回列表但 slot 已 pin -> 永久 PIN_LOCKED 泄漏 | src/scheduler/moe_scheduler.cpp:100-130, src/main.cpp:171-177 | 同上：Backend.md refcount/generation 设计替代 |
+| B17 | SUPERSEDED | timeout_ms 被每个 miss 单独消耗，非整体 deadline | 同 B16 | 同上 |
+| B18 | FIXED | VirtualLock/mlock 返回值忽略，"pinned" 只是尝试而非确认，误导 benchmark | src/pool/expert_pool.cpp:39,45 | ✅ 检查返回值；Windows 先提升工作集配额；失败时明确告警 pool 未 pin；新增 is_pinned() |
+| B19 | FIXED | shard 缺失仅 WARN 继续，150GB 模型静默缺数据 | src/loader/moe_loader.cpp:186-190 | ✅ 分片缺失/打不开/数量与 split.count 不符一律 throw |
+| B20 | FIXED | expert 切片假设等大连续布局，未校验 shape/quant block 对齐 | src/loader/moe_loader.cpp:249-250 | ✅ 三重校验：total_size 整除 n_expert、ne[2]==n_expert 交叉验证、slice 按 quant block 对齐 |
+| B21 | SUPERSEDED | route_and_prefetch 对重复 expert id 会 double-pin 并重复入队 | src/scheduler/moe_scheduler.cpp:62-89 | Backend.md MPSC/directory 设计替代 |
+| B22 | OPEN | POSIX "async DIO" 实为同步 pread，README 宣称 io_uring 不实（Windows IOCP 为真） | src/io/async_dio_posix.cpp | Backend.md Phase A 规划 io_uring/io_submit fallback |
+| B23 | FIXED | POSIX completed_queue_ 无锁非线程安全；max_in_flight_ 未使用 | src/io/async_dio_posix.cpp | ✅ completed_mutex_ 保护队列 |
+| B24 | SUPERSEDED | scheduler 单 worker：expert 内 batch 并发、expert 间串行，无跨 expert 流水 | src/scheduler/moe_scheduler.cpp:30-34 | Backend.md 调度线程设计替代 |
+| B25 | SUPERSEDED | compute/IO 重叠未接入主路径（executor 从未被 generation loop 调用） | src/main.cpp | 新引擎 + Backend.md 双池并发设计替代 |
+| B26 | OPEN | `-ngl/--gpu-layers`、`--moe-vram-pool` 解析后完全未接线 | src/main.cpp:34-35 | 新引擎参数映射中接线 |
 
 ## P2 统计与测试可信度
 
 | ID | 状态 | 问题 | 位置 | 处置 |
 |----|------|------|------|------|
-| B27 | OPEN | hybrid 打分 freq_val 无 [0,1] 归一化，可到 ~50，LRU 项失效退化为 frequency dominance | src/pool/expert_pool.cpp:187-189, src/pool/expert_stats.cpp | 修复：归一化 adaptive frequency |
-| B28 | OPEN | 历史 global_counts 初始化与 session 自增分数尺度不一致，无重归一化 | src/pool/expert_stats.cpp | 与 B27 一并修 |
-| B29 | OPEN | "EMA" 实为 score *= pow(0.999,n) 再 +1 的累加衰减，语义混叠 | src/pool/expert_stats.cpp | 修复为标准 decayed counter |
+| B27 | FIXED | hybrid 打分 freq_val 无 [0,1] 归一化，可到 ~50，LRU 项失效退化为 frequency dominance | src/pool/expert_pool.cpp:187-189, src/pool/expert_stats.cpp | ✅ get_adaptive_frequency 读时按当前最大分归一化到 [0,1] |
+| B28 | FIXED | 历史 global_counts 初始化与 session 自增分数尺度不一致，无重归一化 | src/pool/expert_stats.cpp | ✅ 与 B27 同一机制解决（读时归一化，冷启动种子仍来自持久化计数）|
+| B29 | FIXED | "EMA" 实为 score *= pow(0.999,n) 再 +1 的累加衰减，语义混叠 | src/pool/expert_stats.cpp | ✅ 语义澄清：确认为 recency-weighted decaying counter（合法），头文件注释已更正；配合读时归一化后 hybrid 打分数学成立 |
 | B30 | OPEN | cache hit rate 基于 fake routing，只能回答"人工访问模式下缓存表现" | src/main.cpp | Phase A 后自动转为真实 routing 数据 |
 | B31 | OPEN | 测试断言过弱：tokenizer 只验 roundtrip 含子串；scheduler 测试空 shard_files 时 miss 直接 mark_ready 不做 IO；overlap 测试无时间验证 | tests/test_tokenizer.cpp, tests/test_scheduler.cpp | 修复：加入参考 token IDs 黄金用例 + 真实小 GGUF IO 用例 |
 | B32 | OPEN | prompt_tokens 分母不可信（依赖 B01），污染全部 TPS 统计 | src/main.cpp:130 | Phase A |
@@ -62,4 +62,5 @@ GGUF 元数据/多分片发现、per-expert offset/read plan、4KB sector stagin
 
 | 批次 | Commit | 内容 | 关联 Bug |
 |------|--------|------|----------|
-| 0 | (本文件) | 建立追踪清单 + 架构分析文档 | - |
+| 0 | 92ff91d | 建立追踪清单 + 架构分析文档 | - |
+| 1 | (本批) | 保留模块修复：pool pin 校验、shard 严格校验、切片三重验证、POSIX 队列加锁、EST1 读时归一化；旧 pool/scheduler 缺陷标记 SUPERSEDED（由 Backend.md 控制面替代）| B18 B19 B20 B23 B27 B28 B29；B14-B17/B21/B24/B25 标记 SUPERSEDED |

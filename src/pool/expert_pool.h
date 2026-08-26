@@ -110,6 +110,8 @@ public:
     uint8_t*           base_ptr() { return base_ptr_; }
     eviction_policy_t  policy() const { return policy_; }
     void               set_policy(eviction_policy_t p) { policy_ = p; }
+    // True only if the OS confirmed the whole pool is locked into physical RAM
+    bool               is_pinned() const { return is_pinned_; }
 
 private:
     uint64_t make_key(int32_t l, int32_t e) const {
@@ -120,6 +122,7 @@ private:
     uint32_t                              num_slots_ = 0;
     size_t                                total_allocated_bytes_ = 0;
     uint8_t*                              base_ptr_ = nullptr;
+    bool                                  is_pinned_ = false;
     eviction_policy_t                     policy_ = eviction_policy_t::HYBRID_EST1;
     std::unique_ptr<expert_slot_t[]>      slots_;
 

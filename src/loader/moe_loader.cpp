@@ -55,14 +55,29 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
         int total_shards = std::stoi(match[3].str());
         std::string suffix = match[4].str();
 
+        if (split_count > 0 && static_cast<int>(split_count) != total_shards) {
+            throw std::runtime_error(
+                "Shard count mismatch: filename says " + std::to_string(total_shards)
+                + " but GGUF metadata split.count=" + std::to_string(split_count));
+        }
+
         shards.clear();
+        std::vector<std::string> missing;
         for (int i = 1; i <= total_shards; ++i) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%05d-of-%05d", i, total_shards);
             std::string shard_path = prefix + buf + suffix;
             if (std::filesystem::exists(shard_path)) {
                 shards.push_back(shard_path);
+            } else {
+                missing.push_back(shard_path);
             }
+        }
+        if (!missing.empty()) {
+            // A partial shard set silently produces a broken model - fail hard
+            throw std::runtime_error(
+                "Incomplete GGUF shard set: missing " + std::to_string(missing.size())
+                + " of " + std::to_string(total_shards) + " shards, first missing: " + missing.front());
         }
     } else if (split_count > 1) {
         // Fallback for numbered shards if named differently
@@ -78,6 +93,9 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
             std::string shard_path = (dir.empty() ? "" : dir + "/") + buf;
             if (std::filesystem::exists(shard_path)) {
                 shards.push_back(shard_path);
+            } else {
+                throw std::runtime_error("Incomplete GGUF shard set: missing shard " + std::to_string(i)
+                                         + "/" + std::to_string(split_count) + ": " + shard_path);
             }
         }
     }
@@ -185,8 +203,8 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
     for (uint32_t s = 0; s < topo.shard_paths.size(); ++s) {
         struct gguf_context* s_ctx = gguf_init_from_file(topo.shard_paths[s].c_str(), params);
         if (!s_ctx) {
-            LOG_WARN("Could not open shard " << s << ": " << topo.shard_paths[s]);
-            continue;
+            // Fail hard: continuing with a partial shard set silently corrupts the model
+            throw std::runtime_error("Failed to open GGUF shard: " + topo.shard_paths[s]);
         }
 
         uint64_t data_offset = gguf_get_data_offset(s_ctx);
@@ -246,7 +264,34 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
             uint64_t cur_slot_offset = 0;
 
             for (const auto& tentry : layer_sub_tensors) {
-                size_t slice_bytes = tentry.total_size / topo.n_expert;
+                // Validate the homogeneous equal-slice assumption before using it:
+                // 1) tensor must divide evenly across experts
+                if (topo.n_expert == 0 || tentry.total_size % topo.n_expert != 0) {
+                    std::ostringstream err;
+                    err << "Expert tensor '" << tentry.name << "' size " << tentry.total_size
+                        << " is not divisible by expert count " << topo.n_expert;
+                    throw std::runtime_error(err.str());
+                }
+                // 2) 3D exps tensors declare n_expert as ne[2] - cross-check against metadata
+                if (tentry.ne[2] > 0 && static_cast<uint32_t>(tentry.ne[2]) != topo.n_expert) {
+                    std::ostringstream err;
+                    err << "Expert tensor '" << tentry.name << "' declares ne[2]=" << tentry.ne[2]
+                        << " but metadata expert_count=" << topo.n_expert
+                        << " - per-expert slicing offset math would be invalid";
+                    throw std::runtime_error(err.str());
+                }
+                // 3) slice must be a whole multiple of the quantization block size
+                uint32_t blck = static_cast<uint32_t>(ggml_blck_size(tentry.dtype));
+                if (blck == 0) blck = 1;
+                size_t slice_bytes_probe = tentry.total_size / topo.n_expert;
+                if (slice_bytes_probe % blck != 0) {
+                    std::ostringstream err;
+                    err << "Expert slice of '" << tentry.name << "' (" << slice_bytes_probe
+                        << " bytes) is not aligned to quantization block size " << blck;
+                    throw std::runtime_error(err.str());
+                }
+
+                size_t slice_bytes = slice_bytes_probe;
                 uint64_t slice_abs_offset = tentry.abs_file_offset + e * slice_bytes;
 
                 sub_tensor_info_t st;

@@ -26,7 +26,8 @@ public:
     // Record an access to a specific expert
     void record_access(uint32_t layer_idx, uint32_t expert_idx);
 
-    // Apply exponential moving decay towards recent window frequency
+    // Apply multiplicative decay to all scores (recency-weighted decaying counter:
+    // score = sum over hits of decay^(age_in_tokens); NOT a normalized EMA)
     void apply_decay(double factor = 0.999);
 
     // Notify tokens generated; triggers auto-save if cumulative tokens > sync_threshold
@@ -36,6 +37,8 @@ public:
     bool flush();
 
     // Query metrics
+    // Returns the decaying recency-weighted access score, normalized to [0, 1] against
+    // the current maximum score. Cold-boot values derive from persisted global counts.
     double   get_adaptive_frequency(uint32_t layer_idx, uint32_t expert_idx) const;
     uint64_t get_global_count(uint32_t layer_idx, uint32_t expert_idx) const;
 

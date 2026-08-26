@@ -107,6 +107,7 @@ public:
                 req.error_code   = 0;
                 req.is_completed = true;
                 submitted++;
+                std::lock_guard<std::mutex> lock(completed_mutex_);
                 completed_queue_.push_back(&req);
             } else {
                 req.error_code   = errno;
@@ -118,9 +119,17 @@ public:
 
     uint32_t wait_events(aio_req_t** out_completed, uint32_t max_events, uint32_t min_complete, uint32_t timeout_ms) override {
         uint32_t n = 0;
-        while (n < max_events && !completed_queue_.empty()) {
-            out_completed[n++] = completed_queue_.front();
-            completed_queue_.erase(completed_queue_.begin());
+        while (n < max_events) {
+            aio_req_t* req = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(completed_mutex_);
+                if (!completed_queue_.empty()) {
+                    req = completed_queue_.front();
+                    completed_queue_.erase(completed_queue_.begin());
+                }
+            }
+            if (!req) break;
+            out_completed[n++] = req;
         }
         return n;
     }
@@ -129,6 +138,7 @@ private:
     uint32_t                 max_in_flight_ = 1024;
     std::mutex               files_mutex_;
     std::vector<dio_file_t*> open_files_;
+    std::mutex               completed_mutex_;
     std::vector<aio_req_t*>  completed_queue_;
 };
 
