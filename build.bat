@@ -66,16 +66,23 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
 echo [StreamMoE] Linking %BIN%\stream_moe.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
     src/backend/moe_backend.cpp ^
+    src/backend/scheduler.cpp ^
+    src/io/async_dio_win.cpp ^
+    src/io/staging_reader.cpp ^
+    src/pool/expert_stats.cpp ^
     src/engine/llama_engine.cpp ^
     src/main.cpp ^
     src/profile/profiler.cpp ^
-    %LLAMA_LIBS% %LIBOMP% -ladvapi32 ^
+    %LLAMA_LIBS% %LIBOMP% -ladvapi32 -lsynchronization ^
     -o "%BIN%\stream_moe.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
     src/backend/moe_backend.cpp ^
+    src/backend/scheduler.cpp ^
+    src/io/async_dio_win.cpp ^
+    src/pool/expert_stats.cpp ^
     src/engine/llama_engine.cpp ^
     src/server/http_server.cpp ^
     src/loader/moe_loader.cpp ^
@@ -83,7 +90,7 @@ echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
     src/profile/profiler.cpp ^
     src/server_main.cpp ^
     %LLAMA_LIBS% %LIBOMP% ^
-    -lws2_32 -ladvapi32 ^
+    -lws2_32 -ladvapi32 -lsynchronization ^
     -o "%BIN%\stream_moe_server.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
@@ -125,6 +132,17 @@ echo [StreamMoE] Compiling test_profiler...
     -o "%OBJ%\test_profiler.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
+echo [StreamMoE] Compiling test_scheduler (route B pool + DIO)...
+"%CLANG_CXX%" %CXXFLAGS% ^
+    src/backend/scheduler.cpp ^
+    src/io/staging_reader.cpp ^
+    src/io/async_dio_win.cpp ^
+    src/pool/expert_stats.cpp ^
+    tests/test_scheduler.cpp ^
+    -lsynchronization ^
+    -o "%OBJ%\test_scheduler.exe"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
 echo [StreamMoE] Compiling test_slot (route B control plane)...
 "%CLANG_CXX%" %CXXFLAGS% ^
     tests/test_slot.cpp ^
@@ -154,6 +172,13 @@ echo ========================================================
 echo [StreamMoE] Executing Profiler Tests
 echo ========================================================
 "%OBJ%\test_profiler.exe"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+echo.
+echo ========================================================
+echo [StreamMoE] Executing Scheduler Tests (route B pool + DIO)
+echo ========================================================
+"%OBJ%\test_scheduler.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
