@@ -35,4 +35,8 @@ void stream_moe_register_backend();
 ggml_backend_buffer_type_t stream_moe_register_backend_helper_expert_buft();
 ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft();
 
+// Give the backend its scheduler + compute threads (engine calls before load).
+void stream_moe_backend_set_scheduler(class expert_scheduler* sched);
+void stream_moe_backend_set_threads(int threads);
+
 } // namespace stream_moe

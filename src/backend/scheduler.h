@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -62,6 +63,32 @@ public:
 
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
+
+    // Raw slot memory for a pinned/resident slot (compute side).
+    uint8_t* slot_mem(int32_t slot) const {
+        return (slot >= 0 && slot < static_cast<int32_t>(num_slots_))
+            ? pool_base_ + static_cast<size_t>(slot) * slot_size_ : nullptr;
+    }
+    // Current slot index for (layer, expert), or -1 if not resident.
+    int32_t slot_of(uint32_t layer, uint32_t expert) const {
+        uint32_t s = dir_->find(layer, expert);
+        return s == SLOT_UNASSIGNED ? -1 : static_cast<int32_t>(s);
+    }
+    void unpin_slot(int32_t slot) {
+        if (slot >= 0 && slot < static_cast<int32_t>(num_slots_)) slots_[slot].unpin();
+    }
+    // Sub-tensor layout inside a compact slot for a branch name
+    // (e.g. "blk.5.ffn_gate_exps.weight"). Returns true + offset/size if found.
+    bool branch_layout(uint32_t layer, uint32_t expert, const std::string& name,
+                       size_t& slot_offset, size_t& byte_size) const {
+        if (!topo_ || layer >= topo_->n_layer || expert >= topo_->n_expert) return false;
+        const expert_info_t& info = topo_->get_expert(layer, expert);
+        for (const auto& st : info.sub_tensors) {
+            if (st.name == name) { slot_offset = st.slot_offset; byte_size = st.byte_size; return true; }
+        }
+        return false;
+    }
+    const moe_model_topology_t& topology() const { return *topo_; }
 
     // Telemetry (feeds profiler hits).
     uint64_t total_lookups() const { return n_lookups_.load(std::memory_order_relaxed); }

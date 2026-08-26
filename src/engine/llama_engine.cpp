@@ -1,12 +1,18 @@
 #include "engine/llama_engine.h"
+#include "common/types.h"
 #include "common/logger.h"
 #include "backend/moe_backend.h"
+#include "backend/scheduler.h"
+#include "io/async_dio.h"
+#include "loader/moe_loader.h"
 
 #include <chrono>
 #include <cstring>
 #include <algorithm>
 
 namespace stream_moe {
+
+llama_engine::llama_engine() = default;
 
 llama_engine::~llama_engine() {
     if (sampler_) llama_sampler_free(sampler_);
@@ -51,7 +57,8 @@ bool llama_engine::init(const llama_engine_params& p) {
     // tensors so this is a no-op for them. Dense weights stay on defaults.
     static llama_model_tensor_buft_override moe_overrides[] = {
         {"blk\\..*\\.ffn_.*_exps\\.weight", nullptr},
-        {"blk\\..*\\.ffn_.*_shexp\\.weight", nullptr},
+        // shared experts (ffn_*_shexp) use plain MUL_MAT; routed to the pool in a
+        // later milestone once the backend supports it.
         {nullptr, nullptr},
     };
     if (p.use_expert_backend) {
@@ -59,14 +66,12 @@ bool llama_engine::init(const llama_engine_params& p) {
         ggml_backend_buffer_type_t eb = stream_moe_register_backend_helper_expert_buft();
         if (eb) {
             moe_overrides[0].buft = eb;
-            moe_overrides[1].buft = eb;
             mparams.tensor_buft_overrides = moe_overrides;
-            LOG_INFO("Expert backend enabled: MoE exps/shexp tensors routed to stream_moe pool");
+            LOG_INFO("Expert backend enabled: routed MoE exps tensors -> stream_moe pool (shared experts stay default)");
         } else {
             LOG_WARN("Expert backend requested but stream_moe buft unavailable - using llama.cpp defaults");
         }
     }
-    // Repack extra bufts fully copy every repack-eligible tensor (Q4_K/Q5_K/Q6_K/Q2_K)
     // into private buffers at load - fatal for >RAM models like UD-Q8_K_XL (162GB).
     // Disabling keeps all weights zero-copy over mmap (OS page cache streams them).
     mparams.use_extra_bufts = false;
@@ -74,6 +79,31 @@ bool llama_engine::init(const llama_engine_params& p) {
     // expert weights stream from NVMe through the page cache.
     if (p.use_mlock) {
         mparams.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
+    }
+
+    // Route B expert pool: parse topology, open shards via DIO, allocate the
+    // bounded pool, and hand the scheduler to the backend before model load.
+    if (p.use_expert_backend) {
+        topo_ = std::make_unique<moe_model_topology_t>(moe_loader::parse_gguf_topology(p.model_path));
+        dio_ = async_dio_engine::create(1024);
+        for (const auto& shard : topo_->shard_paths) {
+            dio_file_t* f = dio_->open_file(shard);
+            if (!f) {
+                LOG_ERROR("expert backend: cannot DIO-open shard " << shard);
+                return false;
+            }
+            shard_files_.push_back(f);
+        }
+        size_t pool_bytes = p.ram_pool_mb > 0
+            ? p.ram_pool_mb * 1024ull * 1024ull
+            : (get_available_ram_bytes() * 3 / 4);
+        scheduler_ = std::make_unique<expert_scheduler>();
+        if (!scheduler_->init(*topo_, *dio_, shard_files_, pool_bytes)) return false;
+        scheduler_->start();
+        stream_moe_backend_set_scheduler(scheduler_.get());
+        stream_moe_backend_set_threads(static_cast<int>(p.threads));
+        LOG_INFO("Expert pool active: " << (pool_bytes / (1024ull * 1024ull * 1024ull))
+                 << " GB cap, " << scheduler_->num_slots() << " slots");
     }
 
     LOG_INFO("Loading model (this streams all shards once): " << p.model_path);

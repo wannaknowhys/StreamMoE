@@ -7,10 +7,16 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace stream_moe {
+
+class expert_scheduler;
+class async_dio_engine;
+struct dio_file_t;
+struct moe_model_topology_t;
 
 struct chat_msg_t {
     std::string role;
@@ -52,7 +58,7 @@ struct llama_turn_metrics {
 
 class llama_engine {
 public:
-    llama_engine() = default;
+    llama_engine();
     ~llama_engine();
 
     llama_engine(const llama_engine&) = delete;
@@ -83,6 +89,12 @@ private:
     std::vector<llama_token> tokenize_prompt(const std::string& text);
     int64_t common_prefix_len(const std::vector<llama_token>& a, const std::vector<llama_token>& b) const;
     bool decode_tokens(const std::vector<llama_token>& tokens, int64_t pos_begin, bool need_logits_last);
+
+    // Route B expert pool (valid only when use_expert_backend)
+    std::unique_ptr<expert_scheduler>  scheduler_;
+    std::unique_ptr<async_dio_engine>  dio_;
+    std::vector<dio_file_t*>           shard_files_;
+    std::unique_ptr<moe_model_topology_t> topo_;
 
     llama_model*            model_   = nullptr;
     llama_context*          ctx_     = nullptr;

@@ -1,11 +1,15 @@
 #include "backend/moe_backend.h"
+#include "backend/minigraph.h"
+#include "backend/minigraph_exec.h"
+#include "backend/scheduler.h"
 #include "common/logger.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 
 #include <cstdlib>
-#include "backend/alloc.h"
 #include <cstring>
+#include <vector>
 
 namespace stream_moe {
 
@@ -27,7 +31,9 @@ const char* expert_buft_get_name(ggml_backend_buffer_type_t) { return "STREAMMOE
 
 ggml_backend_buffer_t expert_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto* ctx = static_cast<expert_buf_ctx*>(std::calloc(1, sizeof(expert_buf_ctx)));
-    ctx->size = size;
+    // size is pure bookkeeping: gallocr pads each tensor to the buft alignment, so
+    // keep a generous margin to satisfy the bounds assert without allocating.
+    ctx->size = size + 16u * 1024u * 1024u;
     ggml_backend_buffer_i iface = {};
     iface.free_buffer = [](ggml_backend_buffer_t b) { std::free(b->context); };
     // get_base: non-null sentinel (assert in ggml_backend_buffer_get_base);
@@ -117,7 +123,36 @@ struct moe_dev_ctx {
     ggml_backend_buffer_type_t host_buft   = nullptr;
 };
 
-struct moe_backend_ctx {};
+struct moe_backend_ctx {
+    scratch_arena arena;
+    ggml_backend_t cpu = nullptr; // stock CPU backend for mini-graph delegation
+};
+
+// Single scheduler for the (single) expert backend, set by the engine before
+// model load so the device-init path can reach it. One instance per process is
+// the model-agnostic contract for route B.
+expert_scheduler* g_scheduler = nullptr;
+int               g_threads   = 1;
+
+static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
+    size_t need = 16 * 1024 * 1024; // base + graph/overhead margin
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* nd = nodes[i];
+        if (!nd || nd->op != GGML_OP_MUL_MAT_ID) continue;
+        const ggml_tensor* w  = nd->src[0];
+        const ggml_tensor* cur = nd->src[1];
+        const ggml_tensor* ids = nd->src[2];
+        // weights are re-pointed to slot memory but ggml still reserves their
+        // bytes in the arena context; count them
+        need += ggml_nbytes(w);
+        // gathered (f32) + out (f32) + idx tensors + per-tensor overhead
+        size_t n_pairs = static_cast<size_t>(ids->ne[0]) * ids->ne[1];
+        need += n_pairs * (2 * 4 + (w->ne[0] + w->ne[1]) * 4) * 2;
+        need += 8 * ggml_tensor_overhead() * (n_pairs + 8);
+        (void)cur;
+    }
+    return need * 2;
+}
 
 const char* moe_dev_get_name(ggml_backend_dev_t) { return "STREAMMOE"; }
 const char* moe_dev_get_desc(ggml_backend_dev_t) {
@@ -145,18 +180,36 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     auto* backend = static_cast<ggml_backend*>(std::calloc(1, sizeof(ggml_backend)));
     std::memcpy(&backend->guid, &guid, sizeof(ggml_guid_t));
     backend->device = dev;
-    backend->context = std::calloc(1, sizeof(moe_backend_ctx));
+    backend->context = new moe_backend_ctx();
+    static_cast<moe_backend_ctx*>(backend->context)->cpu =
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     backend->iface.get_name = [](ggml_backend_t) { return "STREAMMOE"; };
     backend->iface.free     = [](ggml_backend_t b) {
-        std::free(b->context);
+        auto* c = static_cast<moe_backend_ctx*>(b->context);
+        if (c->cpu) ggml_backend_free(c->cpu);
+        delete c;
         std::free(b);
     };
     backend->iface.synchronize = [](ggml_backend_t) {};
-    backend->iface.graph_compute = [](ggml_backend_t, ggml_cgraph*) -> enum ggml_status {
-        // Skeleton: per-expert mini-graph delegation not implemented yet.
-        LOG_ERROR("stream_moe backend graph_compute: not implemented - "
-                  "route B delegation is not wired; disable the expert backend flag.");
-        return GGML_STATUS_FAILED;
+    backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
+        auto* bctx = static_cast<moe_backend_ctx*>(b->context);
+        if (!g_scheduler) {
+            LOG_ERROR("stream_moe: graph_compute without a scheduler (expert backend not wired)");
+            return GGML_STATUS_FAILED;
+        }
+        // collect our nodes (weights in our buft)
+        std::vector<const ggml_tensor*> nodes;
+        nodes.reserve(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; ++i) nodes.push_back(cgraph->nodes[i]);
+
+        if (!bctx->arena.ensure(estimate_scratch(nodes.data(), static_cast<int>(nodes.size())))) {
+            LOG_ERROR("stream_moe: scratch arena alloc failed");
+            return GGML_STATUS_FAILED;
+        }
+        if (!bctx->arena.reset()) return GGML_STATUS_FAILED;
+
+        return moe_exec_mul_mat_id(bctx->arena.ctx(), bctx->cpu, *g_scheduler,
+                                   nodes.data(), static_cast<int>(nodes.size()), g_threads);
     };
     return backend;
 }
@@ -171,12 +224,17 @@ bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t bu
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
-    // Take ownership of MoE weight ops. Quant types: any ggml_type is accepted;
-    // delegation will run them on the CPU backend's stock kernels.
+    // Take ownership ONLY of MoE weight ops (routed `*_exps` / shared `*_shexp`).
+    // Dense weights must stay on llama.cpp defaults - otherwise the loader would
+    // place them in our ACCEL buft and their ops would land here.
+    if (!op || !op->src[0] || !op->src[0]->name) return false;
+    const char* n = op->src[0]->name;
+    if (!n[0]) return false;
     switch (op->op) {
         case GGML_OP_MUL_MAT_ID:
+            return std::strstr(n, "_exps") != nullptr;  // routed expert weights
         case GGML_OP_MUL_MAT:
-            return true;
+            return std::strstr(n, "_shexp") != nullptr; // shared experts (future milestone)
         default:
             return false;
     }
@@ -265,5 +323,8 @@ ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft() {
     ggml_backend_dev_t dev = reg->iface.get_device(reg, 0);
     return dev ? static_cast<moe_dev_ctx*>(dev->context)->host_buft : nullptr;
 }
+
+void stream_moe_backend_set_scheduler(expert_scheduler* sched) { g_scheduler = sched; }
+void stream_moe_backend_set_threads(int threads) { g_threads = threads > 0 ? threads : 1; }
 
 } // namespace stream_moe

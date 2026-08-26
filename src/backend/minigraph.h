@@ -47,6 +47,14 @@ public:
     ggml_context* ctx() const { return ctx_; }
     size_t size() const { return size_; }
 
+    // Grow to at least `bytes` (frees + reallocates + re-inits the context).
+    // Rare: only fires when a larger prefill batch needs more scratch.
+    bool ensure(size_t bytes, size_t alignment = 64) {
+        if (bytes <= size_) return reset();
+        release();
+        return init(bytes, alignment) && reset();
+    }
+
     void release() {
         release_ctx();
         aligned_free_ptr(mem_);

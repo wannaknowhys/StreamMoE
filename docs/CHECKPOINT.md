@@ -48,9 +48,22 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 7. Phase B：GPU 混合池（backend 抽象为 cpu/vulkan/cuda 委托，unpin 挂 split 边界事件）。
 8. 收尾：B11 投机解码（libllama draft）、TODO.md 基准矩阵、长程 10 轮实测。
 
-## 5. 关键文档速查
+## 5. 已记录的未来任务（设计确认后实施）
 
-- `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` — route B 设计（§3 路线对比、§4 实现要点、§5 阶段）
+### 任务一：专家访问历史采集 patch + 策略模拟器
+- 目的：不改现有调度/缓存逻辑，在特殊编译版本里记录一次完整 prompt→generation 的**实际专家访问路径**（token、layer、expert ID），存成独立 trace 文件；用独立策略模拟器读该历史，**不重跑模型**即可测试不同池大小 / LRU/其他淘汰策略 / 预取策略 / 专家分布下的预期命中率，得到 cache size ↔ hit rate 关系曲线。
+- 形态：独立 patch（不入主线，类似 memwatch），编译出"采集历史专用版本"。
+- 前置：route B 跑通（能真实推理出路由 ids）。
+
+### 任务二：Prefill 交叉验证基准（llama.cpp vs StreamMoE）
+- 目的：以超长真实 Agent 对话记录为固定输入，在**标准 llama.cpp** 和 **StreamMoE** 上分别做大规模 Prefill（忽略首字延迟，允许大 batch），逐 token 导出 **LM Head 输入向量 + 对应 KV Cache** 到文件；独立验证程序按 token/位置对齐，算余弦相似度、最大绝对误差、MSE，定位首个明显差异的 token 和位置。
+- 若两套在长上下文范围高度一致 → 证明 StreamMoE 在 Prefill 的模型加载/权重读取/专家调度/计算/KV 写入与 llama.cpp 基本一致 → 把后续问题收敛到 Decode/调度/缓存/性能。
+- 形态：两个互相独立的 patch（改造 llama.cpp 导出；改造 StreamMoE 同样导出）+ 独立验证程序。
+- 前置：route B 端到端跑通 + 数值等价回归。
+
+> 注意：上述两个任务都依赖 route B 主线先跑通。当前正卡在 graph_compute mini-graph 委托的 OpenMP 崩溃（见 §4 第 3 步）。
+
+## 6. 关键文档速查- `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` — route B 设计（§3 路线对比、§4 实现要点、§5 阶段）
 - `docs/Backend.md` — 原始架构（slot 位分配、eviction 顺序、MPSC 三信道）
 - `docs/PROJECT_STRUCTURE.md` — 目录/产物规范
 - `docs/BUG_TRACKER.md` — bug 清单 + INC 事故记录
