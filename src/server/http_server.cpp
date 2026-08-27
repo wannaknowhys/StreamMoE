@@ -237,6 +237,20 @@ void http_server::handle_client(uintptr_t client_socket) {
         }
         std::string body = req.substr(body_pos + 4);
 
+        // optional prompt backup: append every request body to a file
+        if (!config_.prompt_log_path.empty()) {
+            FILE* pf = std::fopen(config_.prompt_log_path.c_str(), "ab");
+            if (pf) {
+                char ts[32];
+                const std::time_t now = std::time(nullptr);
+                std::tm tmv;
+                localtime_s(&tmv, &now);
+                std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+                std::fprintf(pf, "=== %s ===\n%s\n", ts, body.c_str());
+                std::fclose(pf);
+            }
+        }
+
         json request;
         try {
             request = json::parse(body);

@@ -1,5 +1,6 @@
 #include "common/types.h"
 #include "common/logger.h"
+#include "common/crash.h"
 #include "loader/moe_loader.h"
 #include "engine/llama_engine.h"
 #include "server/http_server.h"
@@ -37,6 +38,7 @@ struct server_cmd_params_t {
     bool        use_mlock = false;
     bool        use_expert_backend = false;
     std::string profile_log_path;
+    std::string prompt_log_path;
 };
 
 void print_server_usage(const char* prog) {
@@ -56,6 +58,7 @@ void print_server_usage(const char* prog) {
               << "  --top-p <F>                    Nucleus sampling override\n"
               << "  --top-k <N>                    Top-K override (<=0 disables)\n"
               << "  --profile-log <path>           Per-turn telemetry JSONL log\n"
+              << "  --prompt-log <path>             Append every /v1/chat/completions request body here\n"
               << "  -t, --threads <N>              CPU threads (default: physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
@@ -105,6 +108,8 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
             params.top_k = std::stoi(argv[++i]);
         } else if (arg == "--profile-log" && i + 1 < argc) {
             params.profile_log_path = argv[++i];
+        } else if (arg == "--prompt-log" && i + 1 < argc) {
+            params.prompt_log_path = argv[++i];
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             params.threads = std::stoul(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -116,6 +121,7 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    stream_moe::install_crash_handlers(); // log SEH/signal/terminate to temp\stream_moe_fatal.log
     std::cout << "===================================================================\n"
               << "   StreamMoE: OpenAI-Compatible Streaming API Server (real core)   \n"
               << "===================================================================\n";
@@ -204,6 +210,7 @@ int main(int argc, char** argv) {
     s_cfg.n_predict = params.n_predict;
     s_cfg.ram_pool_mb = ram_pool_mb;
     s_cfg.slots_total = slots_total;
+    s_cfg.prompt_log_path = params.prompt_log_path;
 
     http_server server(s_cfg, topo, engine);
     if (!server.start()) {

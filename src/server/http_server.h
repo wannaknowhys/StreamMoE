@@ -18,6 +18,7 @@ struct server_config_t {
     uint32_t    n_predict = 512;
     size_t      ram_pool_mb = 0;   // reported via /stats
     uint32_t    slots_total = 0;   // derived from topology + pool budget
+    std::string prompt_log_path;   // if set, append every /v1/chat/completions request body here
 };
 
 class http_server {

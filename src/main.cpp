@@ -1,5 +1,6 @@
 #include "common/types.h"
 #include "common/logger.h"
+#include "common/crash.h"
 #include "engine/llama_engine.h"
 
 #include <iostream>
@@ -127,6 +128,7 @@ static void run_turn(
 }
 
 int main(int argc, char** argv) {
+    stream_moe::install_crash_handlers(); // log SEH/signal/terminate to temp\stream_moe_fatal.log
     std::cout << "===================================================================\n"
               << "   StreamMoE: MoE Inference Engine (real libllama core)            \n"
               << "===================================================================\n";

@@ -65,6 +65,7 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
 
 echo [StreamMoE] Linking %BIN%\stream_moe.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
+    src/common/crash.cpp ^
     src/backend/moe_backend.cpp ^
     src/backend/minigraph_exec.cpp ^
     src/backend/scheduler.cpp ^
@@ -81,6 +82,7 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo [StreamMoE] Linking %BIN%\stream_moe_server.exe (real inference core)...
 "%CLANG_CXX%" %CXXFLAGS% %LLAMA_INC% ^
+    src/common/crash.cpp ^
     src/backend/moe_backend.cpp ^
     src/backend/minigraph_exec.cpp ^
     src/backend/scheduler.cpp ^
