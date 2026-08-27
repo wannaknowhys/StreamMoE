@@ -12,7 +12,8 @@ const model = 'N:\\AI_LLM\\DeepSeek-V4-Flash-0731\\DeepSeek-V4-Flash-0731-UD-Q8_
 const exe = 'build\\main\\bin\\stream_moe.exe';
 const jsonl = lang === 'zh' ? 'benchmark\\prompts\\long_horizon_prompts_zh.jsonl' : 'benchmark\\prompts\\long_horizon_prompts.jsonl';
 
-const lines = fs.readFileSync(jsonl, 'utf8').split(/\r?\n/).filter((l) => l.trim());
+const raw = fs.readFileSync(jsonl, 'utf8').replace(/^\uFEFF/, ''); // strip UTF-8 BOM
+const lines = raw.split(/\r?\n/).filter((l) => l.trim());
 const prompts = lines.map((l) => JSON.parse(l).prompt).slice(0, nLimit);
 console.log(`[run_export_batch] lang=${lang} jsonl=${jsonl} prompts=${prompts.length}`);
 

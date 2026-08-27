@@ -125,7 +125,8 @@ async function runBenchmark() {
         process.exit(1);
     }
 
-    const lines = fs.readFileSync(promptsFile, 'utf8').trim().split('\n');
+    const raw = fs.readFileSync(promptsFile, 'utf8').replace(/^\uFEFF/, ''); // strip UTF-8 BOM
+    const lines = raw.trim().split('\n');
     const conversationHistory = [];
     let conversationTextOutput = `===================================================================\n` +
                                  ` StreamMoE 10-Turn Agent Conversation Output Record\n` +
