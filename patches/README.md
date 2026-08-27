@@ -3,13 +3,15 @@
 > 用法：这些是**一次性补丁**，不入主线。需要时临时应用 → 构建特殊版本 → 用完后 `git apply -R` 还原。
 > 不再用分支承载（历史教训：分支长期干扰合并）。遇内存问题时：应用补丁 → `build.bat build memwatch` → 跑测试 → 还原。
 
-## prefill-export（Prefill 交叉验证导出）
+## prefill-export（Prefill 交叉验证导出 + 专家访问历史）
 
-任务二（`docs/PREFILL_CROSS_VALIDATION.md`）：在 `llama_context` 累积每步 LM head 输入（`result_norm`）+ hidden state（`t_h_nextn`），析构时一次性导出到 `LLM_EXPORT_DIR/prefill_export.bin`（含最终 KV 全部子缓存逐层张量）。配合 `tools/verify_prefill.js`（cos+maxAbs 双门槛）对比标准 vs `--expert-backend`。
+任务二（`docs/PREFILL_CROSS_VALIDATION.md`）+ 任务一（`docs/EXPERT_TRACE_SIMULATION.md`）：在 `llama_context` 累积每步 LM head 输入（`result_norm`）+ hidden state（`t_h_nextn`）与**专家访问历史**，析构时一次性导出：
+- `LLM_EXPORT_DIR/prefill_export.bin`：LM head 输入 + hidden + 最终 KV 全部子缓存逐层张量（`tools/verify_prefill.js` 双门槛对比）。
+- `LLM_EXPORT_DIR/expert_history.bin`：逐 token/层/专家的路由访问序列（`tools/simulate_cache.js` 策略命中率曲线）。
 
 | 文件 | 内容 |
 |---|---|
-| `prefill-export-llama.patch` | vendored llama.cpp：`llama-kv-cache.h/.cpp` 加 `get_v_storage`；`llama-context.h/.cpp` 加累积成员 + 析构导出 `export_prefill_final()` + decode 循环内累积；`LLM_EXPORT_DIR` 时强制 `embeddings_nextn`（导出 `t_h_nextn`）|
+| `prefill-export-llama.patch` | vendored llama.cpp：`llama-kv-cache.h/.cpp` 加 `get_v_storage`；`llama-context.h/.cpp` 加累积成员 + 析构导出 `export_prefill_final()` / `export_expert_history_final()` + decode 循环内累积（embd/hidden/专家历史）；`LLM_EXPORT_DIR` 时强制 `embeddings_nextn` |
 | `prefill-export-streammoe.patch` | StreamMoE `llama_engine.cpp`：`LLM_EXPORT_DIR` 时 prefill 全部 token `logits=true`（LM head 输入覆盖全部 token）|
 
 **应用/还原**：
