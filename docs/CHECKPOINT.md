@@ -20,29 +20,28 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
   - 采纳第三路径：槽池是单块连续内存 + 均匀 stride → 每个原始 MUL_MAT_ID 节点直接用**官方 `ggml_mul_mat_id` 内核**执行：权重叶子 `[ne00,ne01,num_slots]` data=pool+branch_off、`nb[2]=slot_size`；ids 在私有 mini-graph 里由专家 id 翻译成槽号；b_leaf 包装主图激活；结果直写主图 dst。**数值与官方逐位一致**，删掉了 per-expert gather/scatter 重建。
   - 崩溃根因已修：`ggml_build_forward_expand` 会递归捕获主图祖先（ggml.c:7165）——旧实现 view/reshape 了主图节点把原始 MUL_MAT_ID 拖进 mini-graph，CPU backend 执行它读到 buft 的悬空 sentinel → OpenMP AV。新实现全部用**叶子包装**（op==NONE + 手动 data/nb），gf->n_nodes==1 验证无捕获。
   - 顺带修：expert buft 记账 size 余量、ACCEL buft 被 dense 选走（supports_op 只认 `_exps` 的 MUL_MAT_ID）、g_threads 接入 ggml_backend_cpu_set_n_threads、pin_expert FAILED 防御。
-  - **实测状态**：`--expert-backend`（8GB 池）5-token prefill 已跑到第 20/43 层，gate/up/down 全算通、无误导；但**冷 N: 顺序 DIO 装载是性能瓶颈**（~70s/层 → 全程约 1h）。卡死印象 = 慢，非死锁。
-- **待办（下一个会话）**：① 并行化专家装载（pin 循环当前逐个阻塞，scheduler 单 worker 一次一个请求）；② 更大的池/预热页缓存；③ 跑通完整 prefill + decode 验证正确性（对比非 expert-backend 输出）；④ 数值等价回归；⑤ 移除 [moe] 调试日志。
+  - **实测状态**：`--expert-backend`（70G 池）43 层 prefill + decode 完整跑通，输出与基线逐字一致；数值等价回归（`tools/compare_trace.js`）1247 条记录逐位 IDENTICAL。冷 N: DIO 装载仍是性能瓶颈（非正确性）。
+- **待办（进行中）**：① 并行化专家装载（pin 循环当前逐个阻塞，scheduler 单 worker 一次一个请求）；② 更大的池/预热页缓存；③ 长上下文/多轮命中率曲线（任务一模拟器已就绪，待长历史数据）；④ 清理/还原一次性 patch。
 
-### 正确性调试现场（2026-08-26 晚，下一个会话从这里续）
+### 数值等价根因已解决（2026-08-26）
 
-- **已确认**：
-  - DIO 装载 `read_expert_sync` → 槽字节**与 GGUF 文件逐字节全等**（`temp/verify_dio.cpp`：layer0/expert0 三切片 ALL MATCH；注意校验必须传全部分片 + 对齐缓冲）。
-  - pin 生命周期**泄漏已修**（gate/up/down 是 3 次独立 graph_compute 调用，旧逻辑每层 +30 pin → 21 层池满卡死；现改为 executor 内跨调用状态：首次 non-down pin、后续复用、down 释放全部）。
-  - 70G 池贪婪测试：EXIT=0、43 层全过、8 token 生成。
-- **未解**：贪婪输出错误。基线（无 expert-backend）`--temp 0` → `Hi! How can I help you today`；expert-backend → `## Final answer\nSay hi.`。说明 mini-graph 委托数值不等价。
-- **下一会话排查假设（按嫌疑排序）**：
-  0. **已排除（本会话逐步验证）**：DIO 装载字节全等（含运行时槽整段校验和 `BCFB9B786148910B` 与文件一致）、w3d 参数（off=0/nb1=2176/nb2=slot_size/pool 基址）、专家→槽映射（e235→s86 且 s86 确为 e235）、路由 ids 与 baseline 逐位一致、`ggml_graph_plan` 的 MUL_MAT_ID work size 按 n_as 正确计算（无溢出）、`mm->nb==dst->nb`（[4,8192,49152]）。
-  1. **唯一未排除**：layer0-2（hash）委托输出逐字节=baseline，layer3+（argsort 路由）委托输出 80% 元素分歧——同代码、同 n_as=5621、数据全对，差异只可能是**特定数据下 kernel 的隐藏行为**。下一会话从"layer0 vs layer3 的 delegation 输入有什么数据级差异"入手：a) 逐列 dump cur 与 baseline 的 ffn_norm-3 精确字节（已确认匹配，但可再核）；b) 用 n_as=256 实验（slots<256 时）验证 n_as 是否影响；c) 对照官方 kernel 在 n_as=5621 下的 matrix_rows/chunking 行为。
-  2. `b_leaf` 包装 src1（view/nb/连续）。
-  3. `dst` 主图节点输出 data/nb。
-- 调试手段：`diagnostics/trace_dump.cpp`（cb_eval 转储 ffn/attn X + `<权重名>#ids` 稳定路由记录）+ minigraph_exec 内 `STREAM_MOE_TEMP` 的 w3d/slot 校验/ids/nb 打印 + `tools/compare_trace.js` 逐记录对比。
-- **route B 骨架模块（细节，均已编译 + UT 通过）**：
-  - `src/backend/slot.h`：跨平台控制面——`slot_meta` 64 位原子字（state/refcount/generation + CAS pin/unpin/evict/reload/failed）、`expert_directory`（二维原子数组+版本号）、有界 MPSC 分配队列；等待唤醒走 Windows WaitOnAddress / Linux futex，无忙等。UT：`tests/test_slot.cpp`（4/4 通过）。
-  - `src/backend/scheduler.h/.cpp`：**专家调度器（本轮新增）**——固定大小提交内存池（`pool_bytes` 硬上限，初始即提交 = 70G 保证）、后台线程从 MPSC 取请求、复用 `io/async_dio` + `staging_reader::read_expert_sync` + `loader/moe_loader` read plan 装载专家切片进槽、EST1/LRU 驱逐（READY+refcount==0）、计算侧 `pin_expert`（阻塞装载+refcount++）/`wait_ready`（down 角色不 pin）/`unpin`、命中/缺失遥测（喂 profiler hits）。UT：`tests/test_scheduler.cpp`（合成拓扑 + 临时文件，装载/驱逐/遥测，2/2 通过）。
-  - `src/backend/moe_backend.h/.cpp`：自定义 ggml backend 注册（`stream_moe`，ACCEL 设备）+ 轻量 expert buft（记账句柄 + no-op set_tensor）+ host compute buft；`graph_compute` **已实现**（官方 mul_mat_id 委托，见上）。
-  - `src/backend/minigraph.h`（scratch arena）+ `alloc.h`（跨平台对齐分配）。
-  - `--expert-backend` 开关（main + server），`llama_engine` 接线 `tensor_buft_overrides`（pattern 覆盖 `ffn_*_exps` + `ffn_*_shexp`，模型无关；dense 无匹配自动无影响）。**默认 OFF**。
-- **profiler 核对**：JSONL schema 完整（hits/speculative_hist/timings_ns 全在序列化中），每轮 2 次 flush（turn 级，低频率无性能影响）；expert 相关值等 route B 填充（scheduler 的 total_lookups/ram_hits/disk_misses 已就绪）。
+- **根因**：`minigraph_exec.cpp` 的 delegate 用紧凑索引 `ids_data[t*n_ids+k]` 读路由 ids，但 argsort 层（L3+）的 ids 张量 `nb[1]=1024`（稀疏，nbytes=4120），t≥1 读到 t0 行 padding 假值 → 选错专家 → 输出错。L0-2（hash）ids 紧凑（nb[1]=24）→ 正常；t0 两种布局重叠 → 永远对。
+- **修复**：`MOE_ID_AT(ids,t,k)` 按 `ids->nb[1]` 真实行步长读（gate/up/down 三处统一）。
+- **验证**：`--expert-backend --temp 0 -p "Say hi." -n 8` 输出 `Hi! How can I help you today`（与基线逐字一致）；`compare_trace.js` base vs moe **IDENTICAL**；完整跑通诗 prompt 24 token 与基线一致。
+- 排查全记录：`docs/DEBUG_DELEGATION.md`；方法论：`docs/BUG_TRACKER.md` §0。
+
+### 任务一/二完成（2026-08-26）
+
+- **任务一（专家访问历史 + 策略模拟器）**：`docs/EXPERT_TRACE_SIMULATION.md`。decode 主线程遍历执行后主图 MUL_MAT_ID 节点读路由 ids（nb[1] stride），累积 `(layer, token, expert)`，析构写 `LLM_EXPORT_DIR/expert_history.bin`；`tools/simulate_cache.js` 重放历史，扫描池大小输出 LRU/LFU/EST1/OPT 命中率曲线（不重跑模型）。短对话实测：4644 条、43 层、1148 唯一专家；OPT 略优于 LRU/LFU（理论界）。
+- **任务二（Prefill 交叉验证）**：`docs/PREFILL_CROSS_VALIDATION.md`。`LLM_EXPORT_DIR` 时析构导出 LM head 输入（result_norm）+ hidden（t_h_nextn）+ 最终 dsv4 KV 逐层张量；`tools/verify_prefill.js` 按 token 对齐，cos+maxAbs 双门槛对比。实测 std vs `--expert-backend` **IDENTICAL**。
+- 实现均为一次性 patch：`patches/prefill-export-llama.patch`（vendored）+ `patches/prefill-export-streammoe.patch`（llama_engine 全 token output）；`LLM_EXPORT_DIR` 触发，无 env 零开销。
+- 批跑：`scripts/run_prefill_verify.bat [en|zh] [n]`（jsonl 批量）；`scripts/verify_prefill.bat ["prompt"]`（单 prompt 快速验证）。
+
+### 此前已确认（route B 骨架，未变）
+
+- DIO 装载字节全等（layer3 全部 256 专家 + 运行时槽整段校验和 `BCFB9B786148910B`）；pin 生命周期泄漏已修（首触 pin、末触 unpin，§4.8 角色式）。
+- route B 骨架模块（slot 控制面 / scheduler / backend / minigraph arena / `--expert-backend` 开关）均已编译 + UT 通过（`tests/test_slot.cpp` 4/4、`tests/test_scheduler.cpp` 2/2）。
+- profiler JSONL schema 完整；expert 命中遥测等 route B 填充（scheduler 的 total_lookups/ram_hits/disk_misses 已就绪）。
 
 ## 3. 你可以跑的验证
 
@@ -56,32 +55,35 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 | 看性能 profile | `benchmark\results\profile_real_<tag>.jsonl`（每轮 prompt/gen/prefill_tps/decode_tps）|
 | 看输出正确性 | `benchmark\results\conversation_real_<tag>.txt`（转写，合法 UTF-8）|
 | 重生成报告 | `node tools/regenerate_report.js <tag>` |
+| Prefill 交叉验证（单 prompt） | `scripts\verify_prefill.bat "Say hi."`（std vs moe 导出 + verify_prefill）|
+| Prefill/专家历史批量验证（jsonl） | `scripts\run_prefill_verify.bat en 1` / `zh 1`（读 `benchmark\prompts\long_horizon_prompts*.jsonl`，需先应用导出 patch）|
+| 策略模拟器（命中率曲线） | `node tools\simulate_cache.js temp\export_std\expert_history.bin 11008`（LRU/LFU/EST1/OPT × 池大小）|
 
 ## 4. 下一步（route B 实施，按序）
 
 1. ✅ `src/backend/` 骨架（slot 控制面 + backend/buft 注册 + minigraph arena + 开关接线）——**已完成**。
 2. ✅ **scheduler**：DIO 调度线程 + 有界池 + EST1 驱逐 + pin/wait_ready/unpin + 遥测——**已完成**（UT 通过）。
-3. **graph_compute 实现**：MUL_MAT_ID / MUL_MAT 的 mini-graph 委托（scratch arena + 外部指针权重包装 → ggml-cpu 执行），先单专家后 k 专家批处理；就绪等待接 scheduler（pin_expert）。**（当前主路径瓶颈）**
-4. **pin 生命周期 §4.8**：首触 pin（非 down 角色）末触 unpin（down 角色），同 ids 自洽。
-5. 开启 `--expert-backend` 端到端跑通 + **数值等价回归**（全命中/混合 vs 官方图逐元素 diff）。
-6. **内存验证**：memwatch 版确认 PRIV ≤ 池预算 + libllama（dense/KV/图缓冲）——预期一旦 graph_compute 只从槽读、且池固定提交即达成。
-7. Phase B：GPU 混合池（backend 抽象为 cpu/vulkan/cuda 委托，unpin 挂 split 边界事件）。
-8. 收尾：B11 投机解码（libllama draft）、TODO.md 基准矩阵、长程 10 轮实测。
+3. ✅ **graph_compute 委托**（官方 mul_mat_id 叶子 mini-graph）——**已完成**；数值等价回归 IDENTICAL、端到端输出与基线一致。
+4. ✅ **pin 生命周期 §4.8**（首触 pin 末触 unpin）——**已完成**。
+5. ✅ **数值等价回归**（`compare_trace.js` 逐层 IDENTICAL）——**已完成**。
+6. ✅ **任务一（专家历史 + 策略模拟器）**、**任务二（Prefill 交叉验证）**——**已完成**（一次性 patch，见 `patches/README.md`）。
+7. **并行化专家装载**：pin 循环当前逐个阻塞（scheduler 单 worker），改为多请求并发 DIO（IOCP QD）——**下一步**。
+8. **长上下文命中率曲线**：用 `scripts\run_prefill_verify.bat en/zh` + `long_horizon_prompts*.jsonl` 采长历史，跑 `simulate_cache.js` 出 LRU/LFU/EST1/OPT 曲线——**下一步**。
+9. **内存验证**：memwatch 版确认 PRIV ≤ 池预算（预期已达成，待复跑）。
+10. Phase B：GPU 混合池（backend 抽象 cpu/vulkan/cuda 委托，unpin 挂 split 边界事件）。
+11. 收尾：B11 投机解码（libllama draft）、TODO.md 基准矩阵、长程 10 轮实测；清理/还原一次性 patch。
 
 ## 5. 已记录的未来任务（设计确认后实施）
 
-### 任务一：专家访问历史采集 patch + 策略模拟器
-- 目的：不改现有调度/缓存逻辑，在特殊编译版本里记录一次完整 prompt→generation 的**实际专家访问路径**（token、layer、expert ID），存成独立 trace 文件；用独立策略模拟器读该历史，**不重跑模型**即可测试不同池大小 / LRU/其他淘汰策略 / 预取策略 / 专家分布下的预期命中率，得到 cache size ↔ hit rate 关系曲线。
-- 形态：独立 patch（不入主线，类似 memwatch），编译出"采集历史专用版本"。
-- 前置：route B 跑通（能真实推理出路由 ids）。
+### 任务一（已完成）→ 后续：长上下文数据 + 策略对比
+- 采集 + 模拟器已落地（`docs/EXPERT_TRACE_SIMULATION.md`、`tools/simulate_cache.js`，LRU/LFU/EST1/OPT）。
+- 下一步：长 prompt/多轮对话采集真实专家访问历史，得到"池容量 ↔ 命中率"完整曲线，指导池预算/驱逐策略选择。
 
-### 任务二：Prefill 交叉验证基准（llama.cpp vs StreamMoE）
-- 目的：以超长真实 Agent 对话记录为固定输入，在**标准 llama.cpp** 和 **StreamMoE** 上分别做大规模 Prefill（忽略首字延迟，允许大 batch），逐 token 导出 **LM Head 输入向量 + 对应 KV Cache** 到文件；独立验证程序按 token/位置对齐，算余弦相似度、最大绝对误差、MSE，定位首个明显差异的 token 和位置。
-- 若两套在长上下文范围高度一致 → 证明 StreamMoE 在 Prefill 的模型加载/权重读取/专家调度/计算/KV 写入与 llama.cpp 基本一致 → 把后续问题收敛到 Decode/调度/缓存/性能。
-- 形态：两个互相独立的 patch（改造 llama.cpp 导出；改造 StreamMoE 同样导出）+ 独立验证程序。
-- 前置：route B 端到端跑通 + 数值等价回归。
+### 任务二（已完成）→ 后续：超长上下文 prefill 交叉验证
+- 导出 + 验证已落地（`docs/PREFILL_CROSS_VALIDATION.md`、`tools/verify_prefill.js`，cos+maxAbs 双门槛）。
+- 下一步：用超长 Agent 对话记录（大 batch prefill）验证长上下文一致性，把后续问题收敛到 Decode/调度/缓存/性能。
 
-> 注意：上述两个任务都依赖 route B 主线先跑通。当前正卡在 graph_compute mini-graph 委托的 OpenMP 崩溃（见 §4 第 3 步）。
+> 两个任务的前置（route B 跑通 + 数值等价回归）均已达成。
 
 ## 6. 关键文档速查- `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` — route B 设计（§3 路线对比、§4 实现要点、§5 阶段）
 - `docs/Backend.md` — 原始架构（slot 位分配、eviction 顺序、MPSC 三信道）

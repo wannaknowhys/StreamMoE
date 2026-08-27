@@ -18,8 +18,35 @@ for (let i = 0; i < n * 3; i++) recs[i] = b.readUInt32LE(12 + i * 4);
 console.log(`records: ${n}  layers:${[...new Set(Array.from({length:n},(_,i)=>recs[i*3]))].length} uniqueExperts:${new Set(Array.from({length:n},(_,i)=>recs[i*3]*256+recs[i*3+2])).size}`);
 
 const maxSlots = process.argv[3] ? parseInt(process.argv[3]) : 4096;
-const steps = [32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096];
+const steps = [32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
+for (let s = 4096 + 256; s <= 11008; s += 256) steps.push(s);
 const sizes = [...new Set([...steps, maxSlots].filter(s => s <= 11008 && s >= 1))].sort((a, b) => a - b);
+
+// OPT (Belady): offline - evict the key whose NEXT access is furthest in the
+// future (or never). Needs the whole sequence, so it is a theoretical upper bound.
+const optNext = new Int32Array(n);
+const optLast = new Map();
+for (let i = n - 1; i >= 0; i--) {
+    const key = recs[i * 3] * 256 + recs[i * 3 + 2];
+    optNext[i] = optLast.has(key) ? optLast.get(key) : 2147483647;
+    optLast.set(key, i);
+}
+function replayOpt(slots) {
+    let hit = 0;
+    const cache = new Map(); // key -> next access position
+    for (let i = 0; i < n; i++) {
+        const key = recs[i * 3] * 256 + recs[i * 3 + 2];
+        if (cache.has(key)) { hit++; cache.set(key, optNext[i]); }
+        else if (cache.size < slots) { cache.set(key, optNext[i]); }
+        else {
+            let maxK = null, maxP = -1;
+            for (const [k, p] of cache) if (p > maxP) { maxP = p; maxK = k; }
+            cache.delete(maxK);
+            cache.set(key, optNext[i]);
+        }
+    }
+    return hit / n;
+}
 
 function replay(policy, slots) {
     let hit = 0;
@@ -58,8 +85,8 @@ function replay(policy, slots) {
     return hit / n;
 }
 
-console.log('\npool_slots  LRU       LFU       EST1');
+console.log('\npool_slots  LRU       LFU       EST1      OPT');
 for (const s of sizes) {
-    const r = [replay('lru', s), replay('lfu', s), replay('est1', s)].map(v => v.toFixed(4));
+    const r = [replay('lru', s), replay('lfu', s), replay('est1', s), replayOpt(s)].map(v => v.toFixed(4));
     console.log(`${String(s).padStart(10)}  ${r.join('   ')}`);
 }
