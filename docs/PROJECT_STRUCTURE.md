@@ -37,6 +37,7 @@ StreamMoE/
 | `TEST_FLOW.md` | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）|
 | `PROJECT_STRUCTURE.md` | 本文件 |
 | `DEPENDENCY_MAP.md` | vendored llama.cpp 使用情况（编译/冗余/未用）+ 自研文件功能表 |
+| `UPSTREAM_TOOLS_MIGRATION.md` | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入）|
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md` | 待办 / 可执行程序路线图 |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
