@@ -36,6 +36,7 @@
 - [ ] **不预加载参数**：`--moe-preload` 是 mock 时代参数（真实引擎无）。route B 专家按需 DIO 已实现"不预加载"；如需预热选项（`--moe-warmup <topk热专家>`）再议。
 - [ ] **deepseek 快速启动优化**：N: USB-NVMe 冷盘是首启瓶颈（5-10 分钟）。候选：专家热度预热（复用 simulate_cache 结果）、DIO 并行装载、`--mlock`（dense 部分，RAM 不够则免）、或提示权重放快盘。
 - [ ] **短程测试统一 `-c 8192`**（小模型 gemma/Qwen），见 `docs/SMOKE_TESTING.md`。
+- [ ] **KV 集合（multi-replica）**：`--kv-placement RAM,VRAM0,VRAM1` 语法已支持，但**只走第一个元素**（多元素 warning）。多副本镜像需 Phase B（多后端并行 attention）才合理——写放大 N×、读单份，纯镜像无收益；推荐实现路径为**按层分片/分层**（hot 层 VRAM，冷层 RAM，每层一份）。参数落地见 common.cpp `common_context_params_to_llama`。
 
 ---
 
