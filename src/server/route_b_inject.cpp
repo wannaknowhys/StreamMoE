@@ -1,4 +1,5 @@
 #include "server/route_b_inject.h"
+#include "../../third_party/llama.cpp/src/tsc_timer.h"
 
 #include "backend/moe_backend.h"
 #include "backend/scheduler.h"
@@ -31,6 +32,7 @@ llama_model_tensor_buft_override g_overrides[] = {
 } // namespace
 
 llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t ram_pool_mb, int threads) {
+    sm_tmr::timer _t("route_b_setup");
     if (g_sched) {
         return g_overrides; // already initialized (e.g. draft/MTP second context)
     }
@@ -46,6 +48,10 @@ llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t r
 
     try {
         g_topo = std::make_unique<moe_model_topology_t>(moe_loader::parse_gguf_topology(model_path));
+        if (g_topo->n_expert == 0) {
+            std::fprintf(stderr, "route B: dense model - expert backend is a no-op\n");
+            return nullptr;
+        }
         g_dio  = async_dio_engine::create(1024);
         for (const auto& shard : g_topo->shard_paths) {
             dio_file_t* f = g_dio->open_file(shard);
@@ -63,6 +69,7 @@ llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t r
         g_sched = std::make_unique<expert_scheduler>();
         if (!g_sched->init(*g_topo, *g_dio, g_shards, pool_bytes)) {
             std::fprintf(stderr, "route B: scheduler init failed\n");
+            g_sched.reset();
             return nullptr;
         }
         g_sched->start();

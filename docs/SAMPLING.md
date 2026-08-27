@@ -13,7 +13,9 @@ DeepSeek official deployment guidance:
 ## Where it is applied
 
 - `scripts/start_server.bat`: runs the upstream `llama-server` with
-  `--temp 1.0 --top-p 0.95 --n-predict 384000`.
+  `--temp 1.0 --top-p 0.95 --n-predict 384000 --no-warmup` (`--no-warmup`
+  skips the empty startup forward pass - for MoE this avoids cold-disk expert
+  loading at boot; experts load on the first request instead).
 - The per-request `max_tokens` field can only **lower** the server cap
   (`min(server --n-predict, request.max_tokens)`).
 - `scripts/run_long_horizon_test.bat` / `scripts/run_prefill_verify.bat` also use

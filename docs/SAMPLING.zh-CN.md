@@ -11,7 +11,7 @@ StreamMoE 面向 **agentic / 长推理** 用途；以下遵循 DeepSeek 官方�
 
 ## 落地位置
 
-- `scripts/start_server.bat`：运行**上游 llama-server**，以 `--temp 1.0 --top-p 0.95 --n-predict 384000`。
+- `scripts/start_server.bat`：运行**上游 llama-server**，以 `--temp 1.0 --top-p 0.95 --n-predict 384000 --no-warmup`（`--no-warmup` 跳过启动时空跑前向——MoE 下避免启动时冷盘专家装载，专家改为首次请求时装载）。
 - 请求里的 `max_tokens` 只能**下调**服务端上限（`min(server --n-predict, request.max_tokens)`）。
 - `scripts/run_long_horizon_test.bat` / `scripts/run_prefill_verify.bat` 同样用 `--temp 1.0 --top-p 0.95`。
 

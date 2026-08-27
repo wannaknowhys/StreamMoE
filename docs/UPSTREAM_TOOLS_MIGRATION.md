@@ -55,7 +55,7 @@ stream_moe_server.exe   = llama-server（原版）+ route B 插件
 
 > **重要发现**：原版 `common_params.swa_full` 默认 **false（windowed）**，`--swa-full` 显式开启（arg.cpp:1679）。我们自研 server 用 `llama_context_default_params()`（swa_full=true）**默认反而比原版大**。迁移后默认即回到原版 windowed 行为（KV 更小），无需 `--no-swa-full`。
 >
-> **默认推荐参数**（SAMPLING.md/start_server.bat 同步改为原版）：`--temp 1.0 --top-p 0.95 -c 1048576 -n 384000 --cache-type-k q8_0 --cache-type-v q8_0`（不加 `--swa-full` = windowed）。
+> **默认推荐参数**（SAMPLING.md/start_server.bat 同步改为原版）：`--temp 1.0 --top-p 0.95 -c 1048576 -n 384000 --cache-type-k q8_0 --cache-type-v q8_0 --no-warmup`（不加 `--swa-full` = windowed；`--no-warmup` 跳过空跑前向，MoE 下避免启动时冷盘专家装载）。
 
 ---
 

@@ -70,6 +70,14 @@ struct moe_model_topology_t {
     // Map from (layer_idx * n_expert + expert_idx) to expert_info_t
     std::vector<expert_info_t> experts;
 
+    // Dense vs expert weight accounting, computed at parse time. Everything that
+    // is NOT an expert tensor (`_exps` in name) stays on llama.cpp defaults
+    // (mmap). For big MoE models the dense part is usually small - this drives
+    // the "no-mmap" feasibility reasoning.
+    std::vector<std::string> dense_tensor_names;
+    uint64_t dense_total_bytes  = 0;
+    uint64_t expert_total_bytes = 0;
+
     const expert_info_t& get_expert(uint32_t layer_idx, uint32_t expert_idx) const {
         size_t idx = static_cast<size_t>(layer_idx) * n_expert + expert_idx;
         return experts[idx];

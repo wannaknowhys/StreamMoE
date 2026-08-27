@@ -1,4 +1,10 @@
 // chat_cli.js - interactive multi-turn chat client for the StreamMoE server.
+// This is a CLIENT - it does not start the server. Start the server with
+// --no-warmup (skip the empty startup forward pass; for MoE this avoids cold
+// disk expert loading at boot), e.g.:
+//   build\main\llama-build\bin\llama-server.exe -m <model> --host 127.0.0.1
+//     --port 8992 -c 8192 -t 16 --expert-backend --moe-ram-pool 71680
+//     --cache-type-k q8_0 --cache-type-v q8_0 --fit off --no-warmup --no-webui
 // Usage: node tools/chat_cli.js [--host 127.0.0.1] [--port 8992]
 // Commands:
 //   /quit | /exit | /bye   quit (after any in-flight request completes)

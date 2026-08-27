@@ -12,11 +12,11 @@
 ## 验证命令（原版 llama-server，M1 起可用）
 
 ```bat
-rem MoE（gemma-4-26B-A4B）
-build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 2048 -t 16 --no-webui
+rem MoE（gemma-4-26B-A4B）；--no-warmup 跳过空跑预热（MoE 下避免启动时冷盘专家装载）
+build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --fit off --no-warmup --no-webui
 
 rem Dense（Qwen3-VL-2B）
-build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 2048 -t 16 --no-webui
+build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --no-warmup --no-webui
 ```
 
 然后 `/health`（200）就绪后 POST `/v1/chat/completions`（`{"messages":[{"role":"user","content":"Say hi in one short sentence."}],"stream":false}`）。
@@ -68,6 +68,6 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 
 ```bat
 build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf ^
-    --mmproj F:\Dev\computer-use\mmproj-F16.gguf --host 127.0.0.1 --port 8997 -c 2048 -t 16 --no-webui
+    --mmproj F:\Dev\computer-use\mmproj-F16.gguf --host 127.0.0.1 --port 8997 -c 4096 -t 16 --no-warmup --no-webui
 rem chat body: content = [{type:text,text:"What is in this image?"},{type:image_url,image_url:{url:"data:image/png;base64,<b64>"}}]
 ```

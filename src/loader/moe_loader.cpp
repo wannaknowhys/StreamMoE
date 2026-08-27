@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <sstream>
 #include <iostream>
@@ -229,6 +230,21 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
     }
 
     LOG_INFO("Total unique tensors found across all shards: " << global_tensors.size());
+
+    // Dense vs expert accounting at parse time: `_exps` tensors are the routed
+    // experts (pooled); everything else stays on llama.cpp defaults (mmap).
+    for (const auto& [name, e] : global_tensors) {
+        const bool is_expert = std::strstr(name.c_str(), "_exps") != nullptr;
+        if (is_expert) {
+            topo.expert_total_bytes += e.total_size;
+        } else {
+            topo.dense_tensor_names.push_back(name);
+            topo.dense_total_bytes += e.total_size;
+        }
+    }
+    LOG_INFO("Weight breakdown: dense=" << (topo.dense_total_bytes / (1024.0 * 1024.0 * 1024.0))
+             << " GB, expert=" << (topo.expert_total_bytes / (1024.0 * 1024.0 * 1024.0))
+             << " GB (" << topo.dense_tensor_names.size() << " dense tensors)");
 
     std::vector<uint32_t> detected_moe_layers;
     size_t expected_expert_size = 0;

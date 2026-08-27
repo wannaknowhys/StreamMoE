@@ -1,3 +1,7 @@
+// bench_agent.js - multi-turn benchmark client against a StreamMoE server.
+// This is a CLIENT - it does not start the server. Start the server with
+// --no-warmup (skip the empty startup forward pass; for MoE this avoids cold
+// disk expert loading at boot), see docs/SMOKE_TESTING.md / scripts/*.bat.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');

@@ -75,6 +75,7 @@ public:
     // Group index owning `layer`, or (uint32_t)-1.
     uint32_t group_of(uint32_t layer) const;
     const subpool_t& subpool(uint32_t gidx) const { return subpools_[gidx]; }
+    size_t subpools_count() const { return subpools_.size(); }
 
     // Raw slot memory for a pinned/resident slot (compute side).
     uint8_t* slot_mem(int32_t slot) const {
