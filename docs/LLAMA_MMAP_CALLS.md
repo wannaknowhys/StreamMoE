@@ -64,4 +64,25 @@ lldb -- build/main/llama-build/bin/llama-server.exe -m <model> ... --expert-back
 (lldb) thread list / frame select N / frame variable  # 看调用上下文
 ```
 
-断点 #1（`llama_mmap` 构造）能确认：mmap 只发生在 `llama_model_loader::get_mapping`，且只对 dense 分片（专家 buft 的 `set_tensor` no-op 不 fault 映射页）。
+## 5. 调试工具
+
+### VMMap（进程内存占用分类）
+
+```bat
+rem 用法（输出 CSV 到文件）：
+F:\Tools\软件\VMMap\vmmap.exe -p <pid> F:\path\memory.csv
+rem 或按进程名：
+F:\Tools\软件\VMMap\vmmap.exe -p <pid> memory.csv
+```
+分类列：Image / Private / Mapped File / Shareable / Heap / Stack / Page Table / ...——可看出 mmap 模型页是否驻留、池/私有内存占多少。
+
+## 6. 未来自研格式（stream_moe_convert 规划）对 mmap 的意义
+
+- **现状结论**：标准 GGUF（32 字节对齐，dense/expert 按层交织、无分区）下——dense 张量多数是小张量且非 4K 对齐，**集中 DIO 不划算**；dense 用普通 read（读入确定大小 buffer）最优，专家池 DIO（按需 + staging）维持。
+- **自研 4K 对齐格式**（`stream_moe_convert` 规划）后：
+  - 所有 tensor 强制 **4K 对齐**；
+  - **dense 段与 expert 段分区**（各自连续大块）；
+  - 收益：dense 段**一次大 DIO 读入**（无 staging、绕过页缓存）；专家段整块 DIO。
+- **落地决策（2026-08-27）**：moe 模型 `use_mmap=false`（只在主体、不碰 draft/mmproj）；dense 普通 read；专家池 DIO；将来自研格式再全面 DIO。
+
+
