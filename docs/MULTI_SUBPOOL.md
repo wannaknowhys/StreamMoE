@@ -79,4 +79,11 @@ deepseek4 只有一个组（全同质）→ 单子池 = 现行为，零改动路
 
 ## 4. 验证记录
 
-（gemma-4-26B-A4B 多子池跑通后在此追加。）
+**2026-08-27**：gemma-4-26B-A4B-it-UD-Q4_K_M + `--expert-backend --moe-ram-pool 8192` ✅
+
+- 组识别：2 组（group 0 = 29 层 Q4_K+Q5_1 3630KB；group 1 = layer 29 Q8_0 4235KB）。
+- 池分配：2297 slots / 8187MB（组 0 2221 槽 7.88GB，组 1 76 槽 0.31GB）——槽数与池大小均按源模型专家组成比例。
+- 全层（含异构 layer 29）进池，无排除；chat 正常返回。
+- 修复记录：
+  - 预算乘法 uint64 溢出（8GB×总字节）→ double 计算。
+  - per-group staging 用组内 **max** 专家布局（文件偏移对齐导致 per-expert staging 需求不同，E0 的偏小会越界 NOACCESS）。
