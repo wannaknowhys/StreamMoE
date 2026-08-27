@@ -110,3 +110,4 @@ READY  --CAS-->  EVICTING  ----->  清空 expert_directory  ----->  等 refcount
   - §2 slot 64 位原子字 = 研究文档 §4.4（slot_meta/expert_directory 复用）。
   - §4.5 pin 生命周期：**首触 pin、末触 unpin**（split B pin、split D unpin，同一份 ids 自洽，无状态表）见研究文档 §4.8。
   - §4.9 shared expert：`ffn_*_shexp` 纳入 buft，backend 额外支持普通 `MUL_MAT`。
+* 2026-08-26 落地修正（第三路径定案）：**数据布局最终为"单块连续池 + 均匀 stride"**，每个 MUL_MAT_ID 用官方 `ggml_mul_mat_id` 内核直接执行（叶子权重 `[ne00,ne01,num_slots]`、`nb[2]=slot_size`、ids 在私有 mini-graph 内翻译成槽号、b_leaf 包装主图激活）。§2 的 `slot_meta`/`expert_directory` 控制面原样成立，仅"槽"指 stride 区域的三元组（gate/up/down 三个 branch offset）。详见 `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7 与 `docs/CHECKPOINT.md` §2。

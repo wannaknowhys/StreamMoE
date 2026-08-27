@@ -7,12 +7,16 @@
 
 ## §1 槽数据布局：Backend.md 与 llama.cpp 图需求不兼容 ⚠️ 最重要
 
+> ✅ **已定案（2026-08-26 落地）**：最终采纳**第三路径**——槽池 = 单块连续内存 + 均匀 stride（`nb[2]=slot_size`），每个 MUL_MAT_ID 用官方 `ggml_mul_mat_id` 内核直接执行（叶子 `[ne00,ne01,num_slots]` + ids 槽号翻译 + b_leaf 包装）。槽 = stride 区域三元组（gate/up/down 三个 branch offset），装载 = 3 次 DIO。`expert_directory`/`slot_meta`/`refcount` 控制面原样成立。详见 `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7。
+
 - **Backend.md §3**：槽 = 每个专家 gate+up+down **紧凑拼接**（与旧 StreamMoE `moe_loader` 的 `expert_slot_size` 布局一致）。
 - **llama.cpp 现实**（LLAMA_MOE_NO_MMAP_RESEARCH §3.1）：`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` 是**三个独立连续 3D 张量**，各含全部 256 专家；图内核按 `e*nb[2]` 索引。自定义 buft 只能提供"连续大张量"，无法提供"每专家紧凑三合一"。
 - **后果**：Backend.md 的 slot 语义必须重定义为"**三层三区域的 (gate[e], up[e], down[e]) 逻辑三元组**"，装载 = 3 次并行 DIO 到 3 个区域偏移。旧 `moe_loader` 的紧凑 read plan 废弃，需新布局。
 - **问题**：确认接受此布局修正？`expert_directory`/`slot_meta`/`refcount` 控制面（Backend.md §4）可在新布局上原样成立，仅"slot"指三元组。
 
 ## §2 Backend.md 要求自定义 ggml_backend，研究显示 CPU-only 可更薄
+
+> ✅ **已定案（2026-08-26 落地）**：route B 采用自定义 backend（`src/backend/`：moe_backend + minigraph_exec + scheduler），CPU-only 阶段即走自定义 backend 路线；GPU 混合池为 Phase B。
 
 - **Backend.md §1**：必须实现自定义 backend 的 `supports_op(MUL_MAT_ID)` + `graph_compute`，以支持"同一次调用 CPU/GPU 双池并发"。
 - **LLAMA_MOE_NO_MMAP_RESEARCH §1.6**：CPU-only 阶段只需**自定义 buft + cb_eval 钩子**，CPU backend 直接消费 host buffer，**无需自定义 backend**；自定义 backend 只在 GPU 混合池阶段（Backend.md Phase A 目标）才需要。

@@ -4,6 +4,7 @@
 > 基于 vendored llama.cpp @ f280b2698。
 > 修订记录：
 > - §7 v2（2026-08-26）：根据"自定义 backend 接管 MUL_MAT_ID"的设计修正结论——紧凑槽方案可行且零 llama.cpp 改动，代价是**必须自行实现 MUL_MAT_ID 计算路径**（mini-graph 委托给 ggml-cpu 或原生内核）。
+> - §7 第三路径定案（2026-08-26 落地）：最终采纳**官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽**（单块连续池），既不需要自研计算路径，也不需要改 llama.cpp——详见 §7。
 > - 编码修复（2026-08-26）：整文件重写为纯 UTF-8；此前 PowerShell 追加段落导致编码混合。
 > - v3（2026-08-26）：pin 生命周期定案 §4.8（首触 pin、末触 unpin，角色式无状态表）；shexp 纳入 buft 定案 §4.9（backend 支持 MUL_MAT）；§4.6 图按实际节点序修正（加权求和在 down 之后）；§4.2 数字澄清。
 
@@ -262,3 +263,39 @@ split D（down 角色）：  【不重复 pin】，直接验证 READY + generati
 4. **子模块锁定**：vendored llama.cpp 固定 f280b2698；升级需评审 buft/backend 接口签名。
 5. **数值等价是硬门槛**：mini-graph 的精度必须与官方 `build_moe_ffn` 一致（含 swiglu clamp、权重缩放、per-token 聚合）。
 6. **文档编辑纪律**：追加文档段落一律用 write/edit 工具（UTF-8）；严禁用 PowerShell `Set-Content` 追加中文（默认 ANSI/CP936 编码会破坏 UTF-8 文件）。
+
+---
+
+## 7. 最终定案：第三路径（官方 `ggml_mul_mat_id` 内核 + stride 槽）【2026-08-26 定案，已落地】
+
+> 实施后对 §3 三路线（A/B/C）的超越：**既不用我们实现 MUL_MAT_ID 计算（路线 B 的代价），也不用改 llama.cpp 建 view（路线 C）**。核心洞察是——只要槽池是**单块连续内存 + 均匀 stride**，官方 `ggml_mul_mat_id` 内核就可以在完全不改动的情况下直接消费它。
+
+### 7.1 布局与执行形态
+
+```text
+槽池：单块连续 VirtualAlloc 内存，均匀 stride（每槽 slot_size 字节）
+每个 MUL_MAT_ID 节点执行时构造"叶子权重张量"：
+  shape = [ne00, ne01, num_slots]          // 第三维是槽号，不是专家号
+  data  = pool + branch_off                 // gate/up/down 各自的区域偏移
+  nb[2] = slot_size                         // 均匀步长
+路由 ids 翻译：私有 mini-graph 里把专家 id（0..n_expert-1）查表翻译成槽号（0..num_slots-1）
+b_leaf：用 op==NONE + 手动 data/nb 的叶子包装主图激活（cur），防止主图祖先被递归捕获
+结果直写主图 dst；mini-graph gf->n_nodes==1 验证无祖先捕获
+```
+
+### 7.2 关键工程点
+
+- **官方内核零改动**：槽号作为权重第三维索引（`e*nb[2]` 正好命中官方内核的索引语义），逐 token/expert 语义与 `build_moe_ffn` 完全一致。
+- **防祖先捕获**：`ggml_build_forward_expand` 会递归捕获主图祖先（ggml.c:7165）——旧实现 view/reshape 主图节点把原始 MUL_MAT_ID 拖进 mini-graph，CPU backend 执行读到 buft 悬空 sentinel → OpenMP AV。第三路径全部用叶子包装（op==NONE + 手动 data/nb），无捕获。
+- **数值等价**：`--expert-backend` 输出与基线逐字一致；`tools/compare_trace.js` 1247 条记录逐位 IDENTICAL（修复 stride 读取 `MOE_ID_AT` 后）。
+- **路由 ids 读取**：必须按张量真实 stride（`ids->nb[1]`），argsort 层（L3+）ids 是非紧凑布局（`nb[1]=1024`）——完整排查见 `docs/DEBUG_DELEGATION.md`。
+
+### 7.3 与 §3 三路线的关系
+
+| 路线 | 本路径（第三路径）相对 |
+|---|---|
+| 路线 A（RESERVE + 官方内核 + cb_eval）| 无 147GB VA 预留；槽池按预算 commit |
+| 路线 B（紧凑槽 + 我们实现 MUL_MAT_ID）| **不需要我们实现计算路径**，官方内核直接执行 |
+| 路线 C（改 llama.cpp 建 view + 槽号翻译）| **零 llama.cpp 改动**，ids 翻译在私有 mini-graph 内 |
+
+代价：槽池必须是"单块连续 + 均匀 stride"布局（不能按专家分片独立分配）；每个专家 gate/up/down 是**三个逻辑区域（branch offset）**，装载 = 3 次 DIO 到各自区域。

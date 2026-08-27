@@ -1,27 +1,43 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-# StreamMoE (OffloadMoE)
+# StreamMoE
 
-**StreamMoE** is a high-performance, memory-optimized Mixture-of-Experts (MoE) inference engine designed to execute massive MoE models (e.g. 100GB+ DeepSeek-V4 / Qwen2-MoE / Mixtral) on physically memory-constrained hardware (e.g., 32GB RAM / 8GB VRAM).
+**StreamMoE** is a memory-bounded Mixture-of-Experts (MoE) inference engine. For
+large MoE models (DeepSeek-V4 / Qwen2-MoE / Mixtral) it keeps physical memory
+bounded by routing **expert weights away from `mmap`** into a compact private
+slot pool (custom ggml backend handling `MUL_MAT_ID`), while dense layers keep
+the default `llama.cpp` behavior.
 
 ---
 
 ## Key Features
 
-1. **Extreme Memory Offload**: Run 150GB+ models on 4GB-32GB RAM systems via Sector-Aligned Direct I/O (DIO) and Non-Inclusive Non-Exclusive Cache (NINEC) pools.
-2. **Instant Engine Startup (< 0.15s)**: Zero heavy upfront weight loading (`--moe-preload none`).
-3. **Dual-Thread Overlapping Pipeline**: Compute thread immediately executes Hit Expert GEMM while Scheduler thread asynchronously streams Miss Experts via IOCP / `io_uring`.
-4. **Adaptive Frequency Cache Eviction (`EST1`)**: Combines LRU with exponential decay moving averages towards recent routing hotspots.
-5. **Zero-Overhead Subgraph Pointer Rebinding**: Pre-allocated static computation graphs with in-place pointer swapping.
-6. **5D Adaptive Resource State Machine**: Dynamic self-tuning across CPU, GPU, PCIe, Disk, and Speculative Decoding yield with automatic Thrashing Emergency Reset.
-7. **OpenAI-Compatible Streaming API Server (`stream_moe_server`)**: Lightweight C++ HTTP server supporting `/v1/chat/completions` (SSE streaming), `/v1/models`, `/health`, and `/stats`.
-8. **Interactive REPL CLI (`stream_moe`)**: Multi-turn conversation chat with real-time streaming output, context size, and exact KV cache footprint calculation.
+1. **Real inference engine**: vendored libllama (deepseek4 architecture, 43
+   layers / 256 experts) drives the full forward pass — MLA, DSA indexer,
+   hyper-connections, Sinkhorn, hash + argsort routing, shared expert.
+2. **MoE without mmap (route B)**: expert weights live in a self-managed slot
+   pool backed by Direct I/O (DIO); physical memory is bounded by the pool
+   budget (`--moe-ram-pool`, e.g. 70 GB on a 128 GB host). Numerically
+   identical to the stock graph (verified per-element).
+3. **Fast startup**: weights are `mmap`-mapped, not copied; experts are streamed
+   on demand via DIO. First-token latency is dominated by cold N: disk reads,
+   not model load (model load ~1.5 s).
+4. **On-demand expert loading + adaptive eviction (EST1)**: hit experts compute
+   immediately; miss experts are prefetched asynchronously; LRU/LFU/EST1 policy
+   with bounded pool residency.
+5. **OpenAI-compatible API server (`stream_moe_server`)**: lightweight C++
+   HTTP server with `/v1/chat/completions` (SSE streaming), `/v1/models`,
+   `/health`, `/stats`.
+6. **Interactive REPL CLI (`stream_moe`)**: multi-turn streaming chat with
+   exact KV cache footprint reporting.
+7. **Speculative decoding (draft model)**: planned (see `docs/BUG_TRACKER.md`
+   B11); the draft model file is used once implemented.
 
 ---
 
 ## Toolchain & Roadmap
 
-See [`docs/LLAMA_EXE_ROADMAP.md`](docs/LLAMA_EXE_ROADMAP.md) for the full architecture comparison with upstream `llama.cpp` tools (`llama-cli`, `llama-server`, `llama-bench`, `llama-quantize`).
+Architecture comparison with upstream `llama.cpp` tools: [`docs/LLAMA_EXE_ROADMAP.md`](docs/LLAMA_EXE_ROADMAP.md).
 
 Project layout, build sub-path pattern, and test/result archiving conventions: [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md).
 
@@ -63,11 +79,10 @@ make test
 
 ### 1. Interactive Multi-Turn CLI Mode
 ```powershell
-# Launch interactive REPL with auto 75% available RAM pool allocation and 16 physical cores
+# Launch interactive REPL with a 70 GB expert pool and 16 physical cores
 build\main\bin\stream_moe.exe `
-    -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
-    --draft-model "path/to/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" `
-    --moe-ram-pool auto `
+    -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
+    --moe-ram-pool 71680 `
     -c 4096 `
     -t 16 `
     -i
@@ -77,10 +92,10 @@ build\main\bin\stream_moe.exe `
 ```powershell
 # Start HTTP/SSE API server on port 8080
 build\main\bin\stream_moe_server.exe `
-    -m "path/to/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
+    -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
     --host 127.0.0.1 `
     --port 8080 `
-    --moe-ram-pool auto `
+    --moe-ram-pool 71680 `
     -t 16
 ```
 
@@ -88,7 +103,7 @@ build\main\bin\stream_moe_server.exe `
 - `POST /v1/chat/completions` (OpenAI format, supports `"stream": true`)
 - `GET /v1/models`
 - `GET /health`
-- `GET /stats` / `GET /metrics` (real-time Cache Hit Rate, Pool usage, and state machine mode)
+- `GET /stats` (real-time pool usage, hit counters)
 
 ---
 

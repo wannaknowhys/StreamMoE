@@ -44,17 +44,19 @@ StreamMoE/
 
 | 文件 | 用途 |
 |---|---|
+| `start_server.bat` | 启动 API server（`--temp 1.0 --top-p 0.95 -n 384000 -c 1048576`，见 docs/SAMPLING.md），`--prompt-log temp\server_prompts.log` |
 | `run_long_horizon_test.bat` | 整轮 long-horizon 基准（en/zh），用户手动运行、盯内存 |
+| `run_prefill_verify.bat` | 批量 Prefill/专家历史验证（std → moe 连续跑 jsonl → verify_prefill → simulate_cache）|
+| `verify_prefill.bat` | 单 prompt 快速 Prefill 交叉验证（std vs moe 导出 + verify_prefill）|
 
 其余 mock 时代 runner（run_benchmark_experiments / run_chinese_benchmark / run_pure_lru_benchmark）已删除——统一收敛为 `run_long_horizon_test.bat [en|zh] [build-tag]`。
 
 ## 4. benchmark/（prompts 与 results 分离）
 
 - `benchmark/prompts/*.jsonl`：输入数据集（`long_horizon_prompts.jsonl` / `_zh.jsonl`）。
-- `benchmark/results/`：每次运行的三件套按 `_<tag>` 后缀命名，同一次运行的产物同后缀：
+- `benchmark/results/`：每次运行的两件套按 `_<tag>` 后缀命名，同一次运行的产物同后缀：
   - `conversation_real_<tag>.txt`（完整对话转写）
   - `profile_real_<tag>.jsonl`（逐轮遥测）
-  - `BENCHMARK_REPORT_REAL_<tag>.md`（报告，可 `node tools/regenerate_report.js <tag>` 从 profile 重新生成）
 - 过期的 mock 时代结果已删除（BENCHMARK_REPORT*.md / conversation_* / profile_70G_ram* 等）。
 
 ## 5. patches/（一次性补丁）
@@ -70,6 +72,7 @@ src/
 ├── main.cpp               CLI 入口（llama_engine）
 ├── server_main.cpp        API server 入口
 ├── common/                types.h（对齐/内存发现）、logger.h
+├── backend/               route B：moe_backend（buft/backend 注册）、minigraph_exec（MUL_MAT_ID 委托）、scheduler（槽控制面/DIO/EST1）
 ├── engine/                llama_engine（真实推理核心）
 ├── io/                    async_dio（Win IOCP 真异步）、staging_reader（扇区对齐读计划）
 ├── loader/                moe_loader（GGUF 拓扑 + 专家 read plan）
@@ -78,13 +81,13 @@ src/
 └── server/                http_server（OpenAI 兼容 + SSE）
 ```
 
-已删除 mock/废弃模块：subgraph_executor、speculative_engine、state_machine、tokenizer、kv_cache_manager、moe_scheduler、expert_pool。可救逻辑（驱逐算法、状态策略表、SMKV、槽重绑定概念）见 docs/CODEBASE_AUDIT.md。route B 将新增 `src/backend/`（自定义 ggml backend + slot 控制面 + 调度线程 + minigraph），落地时按 docs/LLAMA_MOE_NO_MMAP_RESEARCH.md §4/§5 实施。
+已删除 mock/废弃模块：`src/scheduler/`、`src/kv/`、`src/tokenizer/`、`engine/subgraph_executor`、`engine/speculative_engine`、`engine/state_machine`、`pool/expert_pool`。可救逻辑（驱逐算法、状态策略表、SMKV、槽重绑定概念）见 docs/CODEBASE_AUDIT.md §3。
 
 ## 7. tests/（UT）
 
-- `test_async_dio.cpp` / `test_moe_loader.cpp` / `test_profiler.cpp`（保留模块的 UT）。
+- `test_async_dio.cpp` / `test_moe_loader.cpp` / `test_profiler.cpp` / `test_scheduler.cpp` / `test_slot.cpp`。
 - 已删除 mock 时代模块的 UT（pool/scheduler/state_machine/tokenizer/kv）。
-- 运行：`build.bat test <tag>`（产物在 `build\<tag>\obj\`）。
+- 运行：`build.bat test <tag>`（CMake/ctest，产物在 `build\<tag>\bin\`，5/5 通过）。
 
 ## 8. build/（产物，多版本共存）
 
@@ -101,7 +104,7 @@ src/
 ```text
 build\<tag>\
 ├── bin\            可执行文件 + libomp.dll
-├── obj\            UT 等编译中间产物
+├── cmake\          构建中间产物（CMake/Ninja，含 ctest）
 ├── llama-build\    vendored libllama 的 CMake 构建目录（.lib 等）
 └── server_<tag>.log  （runner 落 server 日志于此）
 ```

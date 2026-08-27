@@ -32,14 +32,13 @@ git apply -R patches\prefill-export-streammoe.patch
 | 文件 | 内容 |
 |---|---|
 | `memwatch-ggml.patch` | vendored llama.cpp 内：新增 `ggml/src/ggml-memwatch.h` + 在 `ggml-backend.cpp` 的 4 个分配点插桩（`buft_alloc_buffer` / `buft_get_alloc_size` / `buffer_free` / `dev_buffer_from_host_ptr`）|
-| `memwatch-build.patch` | 仓库根：`build.bat` 链接参数加 `-lpsapi`（`GetProcessMemoryInfo` 需要）|
+| `memwatch-build.patch` | ~~改 build.bat 加 `-lpsapi`~~ **已失效**：build.bat 重构为 CMake 薄壳后不再含链接参数。如需 psapi（`GetProcessMemoryInfo`），临时在 `CMakeLists.txt` 的链接列表加 `psapi`（`target_link_libraries(... PRIVATE psapi)`）|
 
 **应用**：
 ```bat
 rem 1) vendored llama.cpp 内应用 ggml 补丁
 git -C third_party/llama.cpp apply patches\memwatch-ggml.patch
-rem 2) 仓库根应用 build 补丁（若 build.bat 已有 -lpsapi 则跳过）
-git apply patches\memwatch-build.patch
+rem 2) （如需 psapi）临时改 CMakeLists.txt 链接列表加 psapi；memwatch-build.patch 已失效
 rem 3) 构建 memwatch 版（独立产物目录，不碰 main 版）
 build.bat llamalibs memwatch
 build.bat build memwatch

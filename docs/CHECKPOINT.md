@@ -54,7 +54,6 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 | 内存诊断版 | 应用 `patches/` 后 `build.bat build memwatch`，看 `%TEMP%\memwatch_*.log` |
 | 看性能 profile | `benchmark\results\profile_real_<tag>.jsonl`（每轮 prompt/gen/prefill_tps/decode_tps）|
 | 看输出正确性 | `benchmark\results\conversation_real_<tag>.txt`（转写，合法 UTF-8）|
-| 重生成报告 | `node tools/regenerate_report.js <tag>` |
 | Prefill 交叉验证（单 prompt） | `scripts\verify_prefill.bat "Say hi."`（std vs moe 导出 + verify_prefill）|
 | Prefill/专家历史批量验证（jsonl） | `scripts\run_prefill_verify.bat en 1` / `zh 1`（读 `benchmark\prompts\long_horizon_prompts*.jsonl`，需先应用导出 patch）|
 | 策略模拟器（命中率曲线） | `node tools\simulate_cache.js temp\export_std\expert_history.bin 11008`（LRU/LFU/EST1/OPT × 池大小）|

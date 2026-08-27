@@ -37,7 +37,7 @@
 | B08 | FIXED | KV cache 只有 storage/snapshot，与前向零集成 | src/kv/* | ✅ libllama KV 管理（含 dsv4 SWA/压缩 KV）+ 跨轮前缀复用 |
 | B09 | FIXED | MLA 仅 metadata 识别，无推理实现 | src/loader/moe_loader.cpp:139-143 | ✅ 上游 deepseek4 MLA/DSA indexer/hyper-connections/Sinkhorn |
 | B10 | PARTIAL | GPU 执行不存在：`prof.gpu_hits=0` 写死；无任何 GPU kernel | src/main.cpp:207 | `-ngl/--kv-placement/--moe-vram-pool` 已接线；Vulkan 后端待接入（route B Phase B）|
-| B11 | OPEN | speculative decoding 仅接口模拟 | src/engine/speculative_engine.cpp | 待接 libllama --model-draft (dflash/MTP)；上游已支持 |
+| B11 | OPEN | speculative decoding 未实现（mock 引擎已删）| 已删（原 src/engine/speculative_engine.cpp）| 待接 libllama --model-draft (dflash/MTP)；上游已支持，草稿模型在 N:\AI_LLM\DeepSeek-V4-Flash-0731\dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf |
 | B12 | FIXED | 遥测硬编码 cpu_load=0.70/gpu_load=0.40/cache_hit_rate=0.85 | src/engine/state_machine.cpp | ✅ /stats 与 profile JSONL 全部真实计时计数 |
 | B13 | FIXED | state machine 无遥测闭环 | src/main.cpp | ✅ 真实引擎路径不再依赖状态机模拟 |
 
@@ -53,17 +53,17 @@
 
 | ID | 状态 | 问题 | 位置 | 处置 |
 |----|------|------|------|------|
-| B14 | SUPERSEDED | `--moe-preload` 未读 GGUF 即 mark_ready，空内存当合法权重 | src/main.cpp:325-337 | route B 槽控制面替代 |
-| B15 | SUPERSEDED | IO 失败后 slot 永久 IO_INFLIGHT\|PIN_LOCKED | src/scheduler/moe_scheduler.cpp | Backend.md slot_meta 含 FAILED 态替代 |
-| B16 | SUPERSEDED | wait_miss_ready 超时 slot 永久 PIN | src/scheduler/moe_scheduler.cpp | Backend.md refcount/generation 替代 |
+| B14 | SUPERSEDED | `--moe-preload` 未读 GGUF 即 mark_ready，空内存当合法权重 | 已删（原 src/main.cpp:325-337）| route B 槽控制面替代 |
+| B15 | SUPERSEDED | IO 失败后 slot 永久 IO_INFLIGHT\|PIN_LOCKED | 已删（原 src/scheduler/moe_scheduler.cpp）| Backend.md slot_meta 含 FAILED 态替代 |
+| B16 | SUPERSEDED | wait_miss_ready 超时 slot 永久 PIN | 已删（原 src/scheduler/moe_scheduler.cpp）| Backend.md refcount/generation 替代 |
 | B17 | SUPERSEDED | timeout 按 expert 各自消耗 | 同 B16 | 同上 |
 | B18 | FIXED | VirtualLock/mlock 返回值忽略 | src/pool/expert_pool.cpp:39,45 | ✅ 检查返回值+提升工作集配额+is_pinned() |
 | B19 | FIXED | shard 缺失仅 WARN 继续 | src/loader/moe_loader.cpp:186-190 | ✅ 分片缺失/打不开/数量不符一律 throw |
 | B20 | FIXED | expert 切片假设等大连续布局未校验 | src/loader/moe_loader.cpp:249-250 | ✅ 三重校验（整除/ne[2]/quant block 对齐）|
-| B21 | SUPERSEDED | route_and_prefetch 重复专家 double-pin | src/scheduler/moe_scheduler.cpp | Backend.md MPSC/directory 替代 |
+| B21 | SUPERSEDED | route_and_prefetch 重复专家 double-pin | 已删（原 src/scheduler/moe_scheduler.cpp）| Backend.md MPSC/directory 替代 |
 | B22 | OPEN | POSIX "async DIO" 实为同步 pread，无 io_uring | src/io/async_dio_posix.cpp | route B 规划 io_uring/io_submit fallback |
 | B23 | FIXED | POSIX completed_queue_ 无锁非线程安全 | src/io/async_dio_posix.cpp | ✅ completed_mutex_ |
-| B24 | SUPERSEDED | scheduler 单 worker，expert 间串行 | src/scheduler/moe_scheduler.cpp | Backend.md 调度线程替代 |
+| B24 | SUPERSEDED | scheduler 单 worker，expert 间串行 | 已删（原 src/scheduler/moe_scheduler.cpp）| Backend.md 调度线程替代 |
 | B25 | FIXED | compute/IO 重叠未接入主路径 | src/main.cpp | ✅ 真实引擎替换 mock 主路径；双池并发由 Backend.md 阶段实现 |
 | B26 | FIXED | `-ngl/--gpu-layers`/`--moe-vram-pool` 未接线 | src/main.cpp:34-35 | ✅ -ngl/offload_kqv/load_mode 已映射；--moe-vram-pool 待 GPU 池 |
 
@@ -117,6 +117,7 @@ GGUF 元数据/多分片发现、per-expert offset/read plan、4KB sector stagin
 - 模型 162GB + 草稿 10GB 放在 N:。
 
 ### 实测（70GB RAM 参数 / mmap 页缓存基线 / 16 线程 CPU / temp=0.6 top_p=0.95）
+> 注：temp=0.6 为早期实测采样设置；当前建议遵循 `docs/SAMPLING.md`（agentic：temp=1.0 top_p=0.95）。
 - EN/ZH 双语输出正确且可读（`benchmark/results/conversation_real_*.txt`）。
 - decode TPS 0.3~2 tok/s，由 N: 冷专家页拉取主导；页缓存随运行变热。
 - route B 槽池（DIO 预取 + EST1 驻留）正是针对此瓶颈的架构解；mmap 基线为其对照组。
