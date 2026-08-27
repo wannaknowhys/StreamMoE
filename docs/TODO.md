@@ -38,6 +38,17 @@
 - [ ] **短程测试统一 `-c 8192`**（小模型 gemma/Qwen），见 `docs/SMOKE_TESTING.md`。
 - [ ] **KV 集合（multi-replica）**：`--kv-placement RAM,VRAM0,VRAM1` 语法已支持，但**只走第一个元素**（多元素 warning）。多副本镜像需 Phase B（多后端并行 attention）才合理——写放大 N×、读单份，纯镜像无收益；推荐实现路径为**按层分片/分层**（hot 层 VRAM，冷层 RAM，每层一份）。参数落地见 common.cpp `common_context_params_to_llama`。
 
+## 阶段 6：用户体验项（2026-08-27，用户想试，优先）
+
+- [ ] **草稿推理（B11）**：`llama-cli/server --model-draft N:\AI_LLM\DeepSeek-V4-Flash-0731\dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf`（上游原生支持；验证 deepseek MTP 加速）。
+- [ ] **GPU 加速**：`GGML_VULKAN=ON` 构建（build.bat 环境变量透传已就绪；RX 590 8GB Vulkan-only）；`--device Vulkan0`/`-ngl` 验证 dense 加速；Phase B 专家池 GPU（`--moe-vram-pool`）。
+- [ ] **自造 4K 对齐 GGUF（`stream_moe_convert`）**：dense/expert 分区 + 4K 对齐 → dense 段/专家段整块 DIO（无 staging）。设计见 `docs/LLAMA_MMAP_CALLS.md` §6、`docs/LLAMA_EXE_ROADMAP.md` Phase 9。
+- [ ] **数值等价回归**：gemma/deepseek std vs `--expert-backend` 输出逐 token 一致（--temp 0）。
+- [ ] **长程命中率曲线**：`run_long_horizon` 采长历史 + `simulate_cache.js`（LRU/LFU/EST1/OPT）。
+- [ ] **导出功能重新适配上游**：prefill/KV/expert_history 导出（patch A 在 llama-context 通用；patch B 需新 server/cli 侧全 token logits）。
+- [ ] **M4 收尾**：删自研 `src/main.cpp`/`server_main.cpp`/`server/http_server.*`/`engine/llama_engine.*`（被上游替代）。
+- [ ] **`--moe-preload` / `--moe-eviction`** 参数（common_params member + arg.cpp）。
+
 ---
 
 ## 阶段 4：建议的深入基准测试矩阵（待办）
