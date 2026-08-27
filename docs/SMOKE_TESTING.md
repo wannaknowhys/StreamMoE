@@ -30,3 +30,25 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 ## 何时切回 DeepSeek-V4-Flash
 
 **专家池子系统（M3 route B 注入）跑通之后**，才用 `N:\AI_LLM\DeepSeek-V4-Flash-0731\...UD-Q8_K_XL` 做短程测试（届时专家池接管 N: 冷盘专家装载，冒烟不至于几分钟）。
+
+## 大 MoE 测试约定（2026-08-27 起）
+
+- **DeepSeek-V4-Flash 等大 MoE 用 `--moe-ram-pool 71680`（70GB 池）**，不用小池。
+  - 教训：8GB 小池 + 162GB 模型触发 llama.cpp `fit_params` 失败并卡死/死机（`--fit off` 无法完全规避，模型 mmap 虽不驻留但 fit 计算模型字节超系统内存）。大池 + `--fit off` 才稳。
+  - deepseek 启动参数：`--expert-backend --moe-ram-pool 71680 --fit off`。
+- 池预算乘法已修（double 计算，避免 uint64 溢出）。
+
+## Qwen3-VL 视觉测试（mmproj + 图片）
+
+仅 Qwen3-VL（本机已备 mmproj），作为 dense 模型的完整链路测试：
+
+- 模型：`F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf`
+- mmproj：`F:\Dev\computer-use\mmproj-F16.gguf`
+- 图片：`F:\Dev\computer-use\node\_game_full.png`
+- Prompt（英文）：问图片里都有啥（"What is in this image?" 之类），作为验证的一部分。
+
+```bat
+build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf ^
+    --mmproj F:\Dev\computer-use\mmproj-F16.gguf --host 127.0.0.1 --port 8997 -c 2048 -t 16 --no-webui
+rem chat body: content = [{type:text,text:"What is in this image?"},{type:image_url,image_url:{url:"data:image/png;base64,<b64>"}}]
+```
