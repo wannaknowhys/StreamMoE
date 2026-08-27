@@ -92,7 +92,6 @@ enum ggml_status moe_exec_mul_mat_id(
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 
     const moe_model_topology_t& topo = sched.topology();
-    const int32_t n_slots = static_cast<int32_t>(sched.num_slots());
 
     // ---- phase 1: parse + pin (non-down) / wait (down) ----
     std::vector<keyed_expert_t> pin_keys, down_keys;
@@ -106,12 +105,7 @@ enum ggml_status moe_exec_mul_mat_id(
 
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
-        if (nd->op != GGML_OP_MUL_MAT_ID) {
-            LOG_ERROR("stream_moe: unsupported op " << ggml_op_name(nd->op)
-                     << " node=" << (nd->name[0] ? nd->name : "?")
-                     << " w=" << (nd->src[0] && nd->src[0]->name[0] ? nd->src[0]->name : "?"));
-            return GGML_STATUS_FAILED;
-        }
+        if (nd->op != GGML_OP_MUL_MAT_ID) continue; // view/layout ops handled in phase 2
         parsed_node_t pn = parse_weight_name(nd->src[0]->name);
         if (!pn.ok) {
             LOG_ERROR("stream_moe: cannot parse weight name " << nd->src[0]->name);
@@ -148,6 +142,25 @@ enum ggml_status moe_exec_mul_mat_id(
     bool ok = true;
     for (int i = 0; i < n_nodes && ok; ++i) {
         const ggml_tensor* nd = nodes[i];
+
+        // View / layout ops on our host compute buffer: pure views, no weight
+        // read. Point the dst at the source slice (VIEW) or keep the data
+        // pointer (RESHAPE/TRANSPOSE/PERMUTE - nb already fixed by the graph).
+        if (nd->op != GGML_OP_MUL_MAT_ID) {
+            if (!nd->src[0] || !nd->src[0]->data) {
+                LOG_ERROR("stream_moe: view op without source data " << ggml_op_name(nd->op));
+                ok = false;
+                break;
+            }
+            ggml_tensor* mut = const_cast<ggml_tensor*>(nd);
+            if (nd->op == GGML_OP_VIEW) {
+                mut->data = (char*)nd->src[0]->data + nd->view_offs;
+            } else {
+                mut->data = nd->src[0]->data;
+            }
+            continue;
+        }
+
         const ggml_tensor* w   = nd->src[0];
         const ggml_tensor* cur = nd->src[1];
         const ggml_tensor* ids = nd->src[2];
@@ -161,12 +174,20 @@ enum ggml_status moe_exec_mul_mat_id(
             ok = false; break;
         }
 
-        // w3d leaf: [ne00, ne01, num_slots], data = pool + branch offset, nb[2] = slot stride
+        // w3d leaf: [ne00, ne01, group_slots], data = group base + branch offset,
+        // nb[2] = group slot stride (per-expert-group sub-pools)
+        uint32_t gidx = sched.group_of(pn.layer);
+        if (gidx == static_cast<uint32_t>(-1)) {
+            LOG_ERROR("stream_moe: no subpool group for layer " << pn.layer);
+            ok = false; break;
+        }
+        const auto& sp = sched.subpool(gidx);
+        const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
         ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
-        w3d->ne[2] = n_slots;
-        w3d->nb[2] = sched.slot_size();
-        w3d->nb[3] = w3d->nb[2] * n_slots;
-        w3d->data  = sched.pool_base() + off;
+        w3d->ne[2] = g_n_slots;
+        w3d->nb[2] = sp.expert_size;
+        w3d->nb[3] = sp.expert_size * g_n_slots;
+        w3d->data  = sp.base + off;
 
         // ids_slot: translate expert ids -> slot indices (private, main graph untouched)
         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
@@ -181,8 +202,8 @@ enum ggml_status moe_exec_mul_mat_id(
                     expert_handle_t h = pin_state_find(pin_state(), pn.layer, static_cast<uint32_t>(e));
                     if (h.pinned) slot = h.slot;
                 }
-                if (slot < 0 || slot >= n_slots) { ok = false; break; }
-                ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
+                if (slot < 0 || slot >= static_cast<int32_t>(sp.slot_begin + sp.n_slots)) { ok = false; break; }
+                ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k] = slot - static_cast<int32_t>(sp.slot_begin);
             }
         if (!ok) break;
 

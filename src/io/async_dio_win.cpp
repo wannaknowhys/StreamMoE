@@ -202,7 +202,9 @@ public:
                     req.is_completed = true;
                     submitted++;
                 } else {
-                    LOG_ERROR("ReadFile failed immediately, err: " << err);
+                    LOG_ERROR("ReadFile failed immediately, err: " << err
+                              << " buf=" << req.aligned_buf << " len=" << req.aligned_len
+                              << " off=" << req.file_offset);
                     req.error_code   = static_cast<int32_t>(err);
                     req.is_completed = true;
                 }

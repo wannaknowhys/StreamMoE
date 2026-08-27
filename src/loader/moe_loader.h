@@ -49,10 +49,21 @@ struct moe_model_topology_t {
 
     std::vector<std::string> shard_paths; // All discovered GGUF shard paths
     
-    // Homogeneous layout metadata
+    // Homogeneous layout metadata (group 0 unless heterogeneous)
     size_t      expert_slot_size = 0;
     size_t      expert_dio_staging_size = 0;
     uint32_t    num_sub_tensors_per_expert = 0;
+
+    // Per-expert layout groups (docs/MULTI_SUBPOOL.md). Experts are grouped by
+    // equal per-expert byte size; each group gets its own sub-pool whose slot
+    // size equals the group's expert size. Homogeneous models have one group.
+    struct expert_group_t {
+        uint32_t              idx = 0;
+        std::vector<uint32_t> layers;         // layers covered by this group
+        size_t                expert_size = 0;  // bytes per expert (uniform within group)
+        uint64_t              total_bytes  = 0; // layers.size()*n_expert*expert_size
+    };
+    std::vector<expert_group_t> groups;
 
     // Layer mapping
     std::vector<uint32_t> moe_layers;

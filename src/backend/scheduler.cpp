@@ -20,31 +20,78 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     dio_  = &dio;
     files_ = files;
 
-    slot_size_ = topo.expert_slot_size > 0 ? topo.expert_slot_size : (4096 * 4);
-    // Cap slot count to the model's total expert count.
-    uint32_t n_experts_total = static_cast<uint32_t>(topo.n_layer) * topo.n_expert;
-    size_t max_slots = pool_bytes / slot_size_;
-    num_slots_ = static_cast<uint32_t>(std::min<size_t>(max_slots, n_experts_total));
-    if (num_slots_ == 0) num_slots_ = 1;
-    pool_bytes_ = static_cast<size_t>(num_slots_) * slot_size_;
+    // Carve per-expert-group sub-pools by byte fraction (docs/MULTI_SUBPOOL.md).
+    // Slot count = group budget / group expert size, so both the slot ratio and
+    // the byte ratio match the source model's expert composition.
+    uint64_t total_bytes = 0;
+    for (const auto& g : topo.groups) total_bytes += g.total_bytes;
+    if (total_bytes == 0) {
+        LOG_ERROR("expert_scheduler: no expert groups in topology");
+        return false;
+    }
+
+    num_slots_ = 0;
+    for (const auto& g : topo.groups) {
+        // byte-fraction budget; use double to avoid 64-bit overflow for big pools
+        size_t budget = static_cast<size_t>(
+            static_cast<double>(pool_bytes) * (static_cast<double>(g.total_bytes) / static_cast<double>(total_bytes)));
+        uint32_t ns = static_cast<uint32_t>(std::max<size_t>(1, budget / g.expert_size));
+        uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * topo.n_expert;
+        if (ns > g_experts_total) ns = g_experts_total;
+        subpools_.push_back({ num_slots_, ns, g.expert_size, nullptr });
+        num_slots_ += ns;
+    }
+
+    size_t total_commit = 0;
+    for (const auto& sp : subpools_) total_commit += static_cast<size_t>(sp.n_slots) * sp.expert_size;
+    pool_bytes_ = total_commit;
 
     pool_base_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(pool_bytes_));
     if (!pool_base_) {
         LOG_ERROR("expert_scheduler: pool alloc failed for " << (pool_bytes_ / (1024 * 1024)) << " MB");
         return false;
     }
+    uint8_t* b = pool_base_;
+    for (auto& sp : subpools_) { sp.base = b; b += static_cast<size_t>(sp.n_slots) * sp.expert_size; }
 
     slots_ = std::make_unique<slot_meta[]>(num_slots_);
     owner_.resize(num_slots_, {0, 0});
     dir_owned_ = std::make_unique<expert_directory>(topo.n_layer, topo.n_expert, num_slots_);
     dir_ = dir_owned_.get();
 
-    staging_ = make_aligned_buffer(topo.expert_dio_staging_size > 0 ? topo.expert_dio_staging_size : (1024 * 1024));
+    // One staging buffer per expert group, sized to the group's MAX expert
+    // layout (per-expert staging needs differ due to file-offset alignment).
+    staging_per_group_.clear();
+    staging_per_group_.reserve(topo.groups.size());
+    for (const auto& g : topo.groups) {
+        size_t max_sz = 0;
+        for (uint32_t l : g.layers) {
+            for (uint32_t e = 0; e < topo.n_expert; ++e) {
+                size_t sz = topo.get_expert(l, e).read_plan.total_staging_size;
+                if (sz > max_sz) max_sz = sz;
+            }
+        }
+        staging_per_group_.push_back(make_aligned_buffer(max_sz > 0 ? max_sz : (1024 * 1024)));
+    }
     stats_.init("", topo.n_layer, topo.n_expert, 8192);
 
-    LOG_INFO("Expert pool: " << num_slots_ << " slots x " << (slot_size_ / 1024)
-             << " KB = " << (pool_bytes_ / (1024 * 1024)) << " MB committed (hard cap on expert residency)");
+    LOG_INFO("Expert pool: " << num_slots_ << " slots across " << subpools_.size()
+             << " groups = " << (pool_bytes_ / (1024 * 1024)) << " MB committed (hard cap on expert residency)");
+    for (const auto& sp : subpools_) {
+        LOG_INFO("  subpool: slots [" << sp.slot_begin << ", " << (sp.slot_begin + sp.n_slots)
+                 << ") x " << (sp.expert_size / 1024) << "KB");
+    }
     return true;
+}
+
+uint32_t expert_scheduler::group_of(uint32_t layer) const {
+    if (!topo_ || layer >= topo_->n_layer) return static_cast<uint32_t>(-1);
+    for (size_t i = 0; i < topo_->groups.size(); ++i) {
+        for (uint32_t l : topo_->groups[i].layers) {
+            if (l == layer) return static_cast<uint32_t>(i);
+        }
+    }
+    return static_cast<uint32_t>(-1);
 }
 
 void expert_scheduler::start() {
@@ -64,8 +111,13 @@ void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
 }
 
 int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
-    // 1. free slot
-    for (uint32_t i = 0; i < num_slots_; ++i) {
+    uint32_t gidx = group_of(layer);
+    if (gidx == static_cast<uint32_t>(-1)) return -1;
+    const subpool_t& sp = subpools_[gidx];
+    const uint32_t lo = sp.slot_begin, hi = sp.slot_begin + sp.n_slots;
+
+    // 1. free slot (within this group's sub-pool)
+    for (uint32_t i = lo; i < hi; ++i) {
         if (slot_word_state(slots_[i].load()) == SLOT_EMPTY) {
             slots_[i].begin_reload();
             owner_[i] = {layer, expert};
@@ -77,7 +129,7 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     int32_t victim = -1;
     double  best_score = std::numeric_limits<double>::infinity();
     uint64_t best_seq = 0;
-    for (uint32_t i = 0; i < num_slots_; ++i) {
+    for (uint32_t i = lo; i < hi; ++i) {
         uint64_t w = slots_[i].load();
         if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
         double freq = stats_.get_adaptive_frequency(owner_[i].first, owner_[i].second);
@@ -104,8 +156,9 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
 
 void expert_scheduler::load_slot(int32_t slot, uint32_t layer, uint32_t expert) {
     const expert_info_t& info = topo_->get_expert(layer, expert);
-    bool ok = read_expert_sync(dio_, files_, info.read_plan, staging_.get(),
-                               pool_base_ + static_cast<size_t>(slot) * slot_size_);
+    uint32_t gidx = group_of(layer);
+    if (gidx == static_cast<uint32_t>(-1) || !staging_per_group_[gidx]) return;
+    bool ok = read_expert_sync(dio_, files_, info.read_plan, staging_per_group_[gidx].get(), slot_mem(slot));
     if (ok) {
         slots_[slot].mark_ready();
         dir_->set(layer, expert, static_cast<uint32_t>(slot));

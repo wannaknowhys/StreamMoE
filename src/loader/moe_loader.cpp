@@ -3,6 +3,7 @@
 
 #include "gguf.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <sstream>
 #include <iostream>
@@ -325,13 +326,26 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
                 topo.expert_dio_staging_size = exp_info.read_plan.total_staging_size;
                 topo.num_sub_tensors_per_expert = expected_num_sub_tensors;
                 baseline_established = true;
-            } else {
-                if (exp_info.total_expert_bytes != expected_expert_size ||
-                    exp_info.sub_tensors.size() != expected_num_sub_tensors) {
-                    std::ostringstream err;
-                    err << "Heterogeneous MoE model detected! Layer " << l << " Expert " << e 
-                        << " has size " << exp_info.total_expert_bytes << " bytes, expected " << expected_expert_size;
-                    throw std::runtime_error(err.str());
+            }
+
+            // Per-expert group assignment (docs/MULTI_SUBPOOL.md): experts with
+            // the same per-expert byte size share a sub-pool. Heterogeneous
+            // layers simply land in their own group instead of being excluded.
+            {
+                auto fit = std::find_if(topo.groups.begin(), topo.groups.end(),
+                                        [&](const auto& g) { return g.expert_size == exp_info.total_expert_bytes; });
+                uint32_t gidx;
+                if (fit != topo.groups.end()) {
+                    gidx = fit->idx;
+                } else {
+                    gidx = static_cast<uint32_t>(topo.groups.size());
+                    moe_model_topology_t::expert_group_t g;
+                    g.idx = gidx;
+                    g.expert_size = exp_info.total_expert_bytes;
+                    topo.groups.push_back(g);
+                }
+                if (topo.groups[gidx].layers.empty() || topo.groups[gidx].layers.back() != static_cast<uint32_t>(l)) {
+                    topo.groups[gidx].layers.push_back(static_cast<uint32_t>(l));
                 }
             }
         }
@@ -339,9 +353,19 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
 
     topo.moe_layers = detected_moe_layers;
 
-    LOG_INFO("Homogeneous MoE Validation PASSED! " << topo.moe_layers.size() << " MoE layers, "
-             << topo.n_expert << " experts/layer, slot_size=" << (topo.expert_slot_size / 1024) << " KB, "
-             << "staging_size=" << (topo.expert_dio_staging_size / 1024) << " KB");
+    // Finalize group byte accounting.
+    for (auto& g : topo.groups) {
+        g.total_bytes = static_cast<uint64_t>(g.layers.size()) * topo.n_expert * g.expert_size;
+    }
+
+    LOG_INFO("Expert groups: " << topo.groups.size() << " ("
+             << topo.moe_layers.size() << " MoE layers, " << topo.n_expert
+             << " experts/layer, baseline slot_size=" << (topo.expert_slot_size / 1024) << " KB, "
+             << "staging_size=" << (topo.expert_dio_staging_size / 1024) << " KB)");
+    for (const auto& g : topo.groups) {
+        LOG_INFO("  group " << g.idx << ": layers=" << g.layers.size()
+                 << " expert_size=" << (g.expert_size / 1024) << "KB total=" << (g.total_bytes / (1024ull*1024ull)) << "MB");
+    }
 
     return topo;
 }

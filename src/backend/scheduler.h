@@ -64,12 +64,28 @@ public:
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
 
+    // Sub-pool layout (docs/MULTI_SUBPOOL.md): one contiguous pool carved into
+    // per-expert-group regions. Slot indices are global (across all groups).
+    struct subpool_t {
+        uint32_t slot_begin = 0;
+        uint32_t n_slots    = 0;
+        size_t   expert_size = 0;
+        uint8_t* base       = nullptr;
+    };
+    // Group index owning `layer`, or (uint32_t)-1.
+    uint32_t group_of(uint32_t layer) const;
+    const subpool_t& subpool(uint32_t gidx) const { return subpools_[gidx]; }
+
     // Raw slot memory for a pinned/resident slot (compute side).
     uint8_t* slot_mem(int32_t slot) const {
-        return (slot >= 0 && slot < static_cast<int32_t>(num_slots_))
-            ? pool_base_ + static_cast<size_t>(slot) * slot_size_ : nullptr;
+        if (slot < 0 || slot >= static_cast<int32_t>(num_slots_)) return nullptr;
+        for (const auto& sp : subpools_) {
+            if (slot >= static_cast<int32_t>(sp.slot_begin) && slot < static_cast<int32_t>(sp.slot_begin + sp.n_slots)) {
+                return sp.base + static_cast<size_t>(slot - sp.slot_begin) * sp.expert_size;
+            }
+        }
+        return nullptr;
     }
-    uint8_t* pool_base() const { return pool_base_; }
     // Current slot index for (layer, expert), or -1 if not resident.
     int32_t slot_of(uint32_t layer, uint32_t expert) const {
         uint32_t s = dir_->find(layer, expert);
@@ -97,7 +113,6 @@ public:
     uint64_t disk_misses()   const { return n_misses_.load(std::memory_order_relaxed); }
 
     size_t   pool_bytes() const { return pool_bytes_; }
-    size_t   slot_size() const { return slot_size_; }
     uint32_t num_slots() const { return num_slots_; }
 
 private:
@@ -111,11 +126,13 @@ private:
     std::vector<dio_file_t*>    files_;
 
     size_t   pool_bytes_ = 0;
-    size_t   slot_size_  = 0;
     uint32_t num_slots_  = 0;
     uint8_t* pool_base_  = nullptr;
+    std::vector<subpool_t> subpools_;
 
-    std::unique_ptr<uint8_t, aligned_buffer_deleter> staging_;
+    // One staging buffer per expert group (each group's experts share the same
+    // layout, so one buffer of that size suffices for the whole group).
+    std::vector<std::unique_ptr<uint8_t, aligned_buffer_deleter>> staging_per_group_;
     std::unique_ptr<slot_meta[]>    slots_;              // std::atomic makes slot_meta non-copyable
     std::vector<std::pair<uint32_t, uint32_t>> owner_;   // scheduler-private
     expert_directory*               dir_ = nullptr;
