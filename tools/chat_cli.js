@@ -1,10 +1,11 @@
 // chat_cli.js - interactive multi-turn chat client for the StreamMoE server.
 // Usage: node tools/chat_cli.js [--host 127.0.0.1] [--port 8992]
 // Commands:
-//   /quit | /exit | /bye   quit
+//   /quit | /exit | /bye   quit (after any in-flight request completes)
 //   /reset                 clear conversation history
 //   /stats                 show server stats
-// Any other line is sent as a user message (streamed reply).
+// Any other line is a user message (streamed reply). Input lines are processed
+// strictly in order (a serial queue), so a /quit cannot cut off a live request.
 const http = require('http');
 const readline = require('readline');
 
@@ -16,7 +17,12 @@ for (let i = 0; i < args.length; ++i) {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+rl.setPrompt('> ');
 let messages = [];
+let wantExit = false;
+let rlClosed = false;
+const queue = [];
+let pumping = false;
 
 function post(payload) {
     return new Promise((resolve, reject) => {
@@ -56,28 +62,41 @@ function stats() {
     });
 }
 
-async function send(text) {
-    messages.push({ role: 'user', content: text });
+async function handle(t) {
+    if (/^\/(quit|exit|bye)$/i.test(t)) { wantExit = true; console.log('bye'); rl.close(); return; }
+    if (t === '/reset') { messages = []; console.log('[reset] history cleared'); return; }
+    if (t === '/stats') {
+        const s = await stats();
+        console.log(`[stats] model=${s.model} pool=${s.pool_total_mb}MB slots=${s.slots_total} state=${s.runtime_state}`);
+        return;
+    }
+    if (!t) return;
+    messages.push({ role: 'user', content: t });
     const t0 = Date.now();
     process.stdout.write('[thinking...] ');
-    const resp = await post({ model: 'deepseek4', messages, stream: true });
-    const reply = extractStream(resp);
-    messages.push({ role: 'assistant', content: reply });
-    console.log(`\n[assistant] ${reply}\n[${Date.now() - t0} ms]`);
+    try {
+        const resp = await post({ model: 'deepseek4', messages, stream: true });
+        const reply = extractStream(resp);
+        messages.push({ role: 'assistant', content: reply });
+        console.log(`\n[assistant] ${reply}\n[${Date.now() - t0} ms]`);
+    } catch (e) {
+        console.error(`\n[error] ${e.message}`);
+    }
 }
 
-function loop() {
-    rl.question('> ', async (line) => {
-        const t = line.trim();
-        if (/^\/(quit|exit|bye)$/i.test(t)) { console.log('bye'); process.exit(0); }
-        else if (t === '/reset') { messages = []; console.log('[reset] history cleared'); }
-        else if (t === '/stats') {
-            const s = await stats();
-            console.log(`[stats] model=${s.model} pool=${s.pool_total_mb}MB slots=${s.slots_total} state=${s.runtime_state}`);
-        }
-        else if (t) { try { await send(t); } catch (e) { console.error('[error]', e.message); } }
-        loop();
-    });
+async function pump() {
+    if (pumping) return;
+    pumping = true;
+    while (queue.length && !wantExit) {
+        const t = queue.shift();
+        await handle(t);
+    }
+    pumping = false;
+    if (wantExit || rlClosed) process.exit(0);
 }
+
+rl.on('line', (line) => { queue.push(line.trim()); pump(); });
+rl.on('close', () => { rlClosed = true; if (!pumping) process.exit(0); });
+
 console.log(`StreamMoE chat @ http://${host}:${port}  (commands: /quit /reset /stats)`);
-loop();
+rl.prompt();
