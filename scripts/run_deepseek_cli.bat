@@ -33,7 +33,7 @@ if not exist "%MODEL%" (
 echo Loading DeepSeek-V4-Flash (expert pool 70GB, q8_0 KV, no-warmup) ...
 "%BIN%" -m "%MODEL%" --expert-backend --moe-ram-pool 71680 ^
     --cache-type-k q8_0 --cache-type-v q8_0 ^
-    --fit off --no-warmup -c 8192 -t 16 --temp 1.0 --top-p 0.95 -cnv
+    --fit off --no-warmup -c 8192 -t 16 --temp 1.0 --top-p 0.95
 
 echo.
 echo (exited)
