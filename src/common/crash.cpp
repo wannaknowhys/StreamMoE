@@ -51,6 +51,17 @@ void fatal_write(const char* what, uintptr_t code) {
 
 void on_fatal(const char* what, uintptr_t code) {
     fatal_write(what, code);
+#if defined(_WIN32)
+    if (g_fatal) {
+        // best-effort call stack so a repeat crash can be located
+        void* frames[32];
+        USHORT n = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+        std::fprintf(g_fatal, "  stack(%u):", (unsigned) n);
+        for (USHORT i = 0; i < n; ++i) std::fprintf(g_fatal, " %p", frames[i]);
+        std::fprintf(g_fatal, "\n");
+        std::fflush(g_fatal);
+    }
+#endif
     if (g_fatal) {
         std::fclose(g_fatal);
         g_fatal = nullptr;

@@ -11,8 +11,9 @@ echo ===================================================================
 echo  Starting StreamMoE server on http://127.0.0.1:%PORT%
 echo  - Ctrl+C to stop cleanly
 echo  - prompts appended to temp\server_prompts.log
-echo  - default sampling temp=1.0 top_p=0.95 max_tokens=384
+echo  - sampling temp=1.0 top_p=0.95 max_tokens=1024 (-n adjustable; a request
+echo    "max_tokens" may only lower it)
 echo ===================================================================
 mkdir temp 2>nul
-build\main\bin\stream_moe_server.exe -m "%MODEL%" --host 127.0.0.1 --port %PORT% --moe-ram-pool 71680 --kv-placement ram -t 16 --temp 1.0 --top-p 0.95 -n 384 --prompt-log temp\server_prompts.log %*
+build\main\bin\stream_moe_server.exe -m "%MODEL%" --host 127.0.0.1 --port %PORT% --moe-ram-pool 71680 --kv-placement ram -t 16 --temp 1.0 --top-p 0.95 -n 1024 --prompt-log temp\server_prompts.log %*
 endlocal

@@ -171,7 +171,23 @@ void http_server::listener_loop() {
             if (!running_) break;
             continue;
         }
-        handle_client(static_cast<uintptr_t>(client_sock));
+        try {
+            handle_client(static_cast<uintptr_t>(client_sock));
+        } catch (const std::exception& e) {
+            // record the exception reason (e.g. bad_alloc) before it becomes a
+            // hard crash; stack trace is appended by the global crash handler
+            LOG_ERROR("client handler exception: " << e.what());
+            FILE* pf = std::fopen("temp/stream_moe_fatal.log", "ab");
+            if (pf) {
+                char ts[32];
+                const std::time_t now = std::time(nullptr);
+                std::tm tmv;
+                localtime_s(&tmv, &now);
+                std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+                std::fprintf(pf, "[%s] HANDLER EXCEPTION: %s\n", ts, e.what());
+                std::fclose(pf);
+            }
+        }
     }
 }
 
