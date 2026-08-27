@@ -25,7 +25,7 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 
 - Llama-3.3-8B-Instruct-128K Q4_K_M：✅ 3s 加载，chat 正常返回。
 - Qwen3-VL-2B-Instruct Q4_K_M（dense）：✅ 6s 加载，chat 返回 "Hi!"。
-- gemma-4-26B-A4B-it-UD-Q4_K_M（MoE）：❌ **文件 0 字节**（`N:\AI_LLM\` 下为空占位，`gguf_init` 读 magic 失败）——需重新下载后才能冒烟。
+- gemma-4-26B-A4B-it-UD-Q4_K_M（MoE）：✅ **已重新下载**（15.78 GB，GGUF magic 有效，之前是 0 字节占位）。用于 M3 之后 route B 专家池验证（`--expert-backend`）。
 
 ## 何时切回 DeepSeek-V4-Flash
 
