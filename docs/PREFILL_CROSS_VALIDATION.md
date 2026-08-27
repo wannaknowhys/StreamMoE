@@ -5,15 +5,24 @@
 
 ## 形态
 
-- **patch A** `patches/prefill-export-llama.patch`：改造 vendored llama.cpp，在 `llama_context` 累积每步的 LM head 输入（`result_norm` / `t_embd`）+ hidden state（`t_h_nextn`），析构时一次性导出到文件（含最终 KV cache 全部子缓存逐层张量）。受环境变量 `LLM_EXPORT_DIR` 控制，不设则零开销。
-- **patch B（StreamMoE 侧）**：无需独立代码——StreamMoE 复用同一 `llama_context`，设 `LLM_EXPORT_DIR` 即同样导出。运行差异仅 `--expert-backend` 与否。
-- **独立验证程序** `tools/verify_prefill.js`：读两个导出文件，按 token 位置对齐，算 cosine/MAD/MSE，定位首个差异 + KV 逐层字节 diff。
+- **patch A** `patches/prefill-export-llama.patch`：改造 vendored llama.cpp——
+  - `llama_context` 累积每步的 LM head 输入（`result_norm` / `t_embd`）+ hidden state（`t_h_nextn`），析构时一次性导出到文件（含最终 KV cache 全部子缓存逐层张量）；
+  - `llama_new_context_with_model` 在设置 `LLM_EXPORT_DIR` 时**强制 `cparams.embeddings_nextn=true`**，使 `t_h_nextn` 被计算并导出（见"已知限制"）。
+- **patch B** `patches/prefill-export-streammoe.patch`：改造 StreamMoE `src/engine/llama_engine.cpp` 的 `decode_tokens`——在设置 `LLM_EXPORT_DIR` 时给 batch **全部 token 标记 `logits=true`**，使 prefill 的 LM head 输入（result_norm）覆盖全部 token。
+- **独立验证程序** `tools/verify_prefill.js`：读两个导出文件，按 token 位置对齐，**cosine 与 maxAbs 双门槛**判定（方向 + 幅度都一致才算一致），定位首个差异 + KV 逐层字节 diff。
+
+## 判定条件（verify_prefill.js）
+
+- 余弦相似度只衡量**方向**，对整体缩放不敏感——所以**同时要求 `|1-cos| <= 1e-6` 且 `maxAbs <= 1e-4`**，两者都过才算一致，任一超限即报 DIFF。
+- **两个全零向量**时 cos 公式会算出 0（而非 1），导致误报——先判 `normA < 1e-30 && normB < 1e-30` 视为一致。
+- 报告每 token 的 cos / MAD / MSE / maxAbs@pos 及命中的门槛（cos/abs）。
 
 ## 用法
 
 ```bat
-rem 1) 应用 patch A 并重建（build.bat llamalibs main）
+rem 1) 应用两个 patch 并重建（build.bat llamalibs main）
 git -C third_party/llama.cpp apply patches\prefill-export-llama.patch
+git apply patches\prefill-export-streammoe.patch
 build.bat llamalibs main && build.bat build main
 
 rem 2) 标准 run（无 --expert-backend）
@@ -46,49 +55,20 @@ deepseek4 的 KV 由 `llama_kv_cache_dsv4` 承载（raw_base/raw_swa/csa/hca/lid
 
 ## 2026-08-26 实测（prompt "Say hi.", -n 2）
 
-- embd（LM head 输入，2 行：prefill 末 token + decode 首 token）与 KV 全部子缓存逐层：**IDENTICAL（0 差异）**。
+- **LM head 输入（embd）**：6 行 = prefill 全部 5 token + decode 首 token（patch B 使 prefill 全 token 为 output）；**hidden（t_h_nextn）**：8 行（patch A 强制 embeddings_nextn 后导出）。std vs moe 均 **IDENTICAL（cos+maxAbs 双门槛 0 差异）**。
+- **KV**：全部子缓存（raw_swa 43 层 / csa 21 / hca 20 / lid 21）逐层字节 0 差异。
 - 与 `tools/compare_trace.js`（逐层 ffn/attn/gate/up/down + #ids/#cur 逐位一致）互相印证。
 
 ## 已知限制
 
-### 限制 1：`t_h_nextn`（hidden state）当前为 0 行
+### 限制 1：`t_h_nextn`（hidden state）——已由 patch A 解除
 
-**代码原因**（`src/models/deepseek4.cpp:1327-1331`）：
+原因为 `src/models/deepseek4.cpp:1327-1331` 仅在 `cparams.embeddings_nextn` 开启时设置 `res->t_h_nextn`。patch A 在 `llama_new_context_with_model` 检测到 `LLM_EXPORT_DIR` 时强制开启，故导出 run 能拿到全 token hidden state。注意这会多算 `h_nextn` 节点（仅在导出 run 生效，正确性不变）。
 
-```cpp
-if (cparams.embeddings_nextn) {
-    ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
-    cb(h_nextn, "h_nextn", -1);
-    res->t_h_nextn = h_nextn;
-}
-```
+### 限制 2：LM head 输入只含 output tokens——已由 patch B 解除
 
-`res->t_h_nextn` **只在 `cparams.embeddings_nextn` 为 true 时才会被设置**（该开关供 next-token embeddings 功能使用，llama_engine 默认关闭）。未开启时 `get_h_nextn()` 返回 `nullptr` → 累积代码直接跳过 → 导出 hidden=0 行。
-
-**要启用**：调用 `llama_set_embeddings_nextn(ctx, true)`（引擎侧需暴露参数）后，`t_h_nextn` 才会被计算并导出。
-
-### 限制 2：LM head 输入（result_norm）只含 output tokens
-
-**代码原因**（`src/models/deepseek4.cpp:1324-1342`）：
-
-```cpp
-ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
-ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
-...
-if (inp_out_ids) {
-    inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);   // 只保留 output tokens
-}
-cur = build_hc_head(inpL, ...);        // 只对 n_outputs 计算
-cur = build_norm(cur, model.output_norm, ...);   // result_norm = [n_embd, n_outputs]
-res->t_embd = cur;
-```
-
-当 `inp_out_ids` 非空（图里存在"只需 output token 参与后续计算"的需求）时，`inpL` 被 `get_rows` 提取成**只有 output tokens** 的 `[n_embd, hc, n_outputs]`，随后 hc_head + output_norm（= LM head 输入 `result_norm`）**只对 output tokens 计算** → `t_embd = [n_embd, n_outputs]`。
-
-而 llama_engine 的 prefill 只给最后 1 个 token 设 `logits=true`（`src/engine/llama_engine.cpp:240` `need_logits_last && (k == end-1)`），所以 prefill 的 `n_outputs=1` → 导出的 embd 只有 1 行（末 token）；decode 每 token 都是 output → 每次 1 行。
-
-**要 prefill 全 token 的 LM head 输入**：让 batch 全部 token 的 `logits=true`（`n_outputs = n_tokens`），`inp_out_ids` 为空/全取，`result_norm` 即为 `[n_embd, n_tokens]`——这需要专用 prefill 测试（如 `llama_batch` 全 logits 的 prefill run），非引擎默认行为。
+原因为 `src/models/deepseek4.cpp:1333-1342` 在 `inp_out_ids` 非空时只保留 output tokens 计算 hc_head/output_norm，而引擎 prefill 只给末 token 设 `logits=true`。patch B 使导出 run 的 prefill 全部 token `logits=true`（`n_outputs = n_tokens`），`result_norm` 即覆盖全部 token。
 
 ### 其他
 
-- 导出 patch 是一次性补丁（`patches/`）；还原 `git -C third_party/llama.cpp checkout .` 后需重建。
+- 导出 patch 是一次性补丁（`patches/`）；还原：`git -C third_party/llama.cpp apply -R patches\prefill-export-llama.patch && git apply -R patches\prefill-export-streammoe.patch` 后重建。

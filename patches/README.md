@@ -5,20 +5,21 @@
 
 ## prefill-export（Prefill 交叉验证导出）
 
-任务二（`docs/PREFILL_CROSS_VALIDATION.md`）：在 `llama_context` 累积每步 LM head 输入（`result_norm`）+ hidden state（`t_h_nextn`），析构时一次性导出到 `LLM_EXPORT_DIR/prefill_export.bin`（含最终 KV 全部子缓存逐层张量）。配合 `tools/verify_prefill.js` 对比标准 vs `--expert-backend`。
+任务二（`docs/PREFILL_CROSS_VALIDATION.md`）：在 `llama_context` 累积每步 LM head 输入（`result_norm`）+ hidden state（`t_h_nextn`），析构时一次性导出到 `LLM_EXPORT_DIR/prefill_export.bin`（含最终 KV 全部子缓存逐层张量）。配合 `tools/verify_prefill.js`（cos+maxAbs 双门槛）对比标准 vs `--expert-backend`。
 
 | 文件 | 内容 |
 |---|---|
-| `prefill-export-llama.patch` | vendored llama.cpp：`llama-kv-cache.h/.cpp` 加 `get_v_storage`；`llama-context.h/.cpp` 加累积成员 + 析构导出 `export_prefill_final()` + decode 循环内累积 |
-
-StreamMoE 侧无需 patch（复用同一 `llama_context`，设 `LLM_EXPORT_DIR` 即导出）。
+| `prefill-export-llama.patch` | vendored llama.cpp：`llama-kv-cache.h/.cpp` 加 `get_v_storage`；`llama-context.h/.cpp` 加累积成员 + 析构导出 `export_prefill_final()` + decode 循环内累积；`LLM_EXPORT_DIR` 时强制 `embeddings_nextn`（导出 `t_h_nextn`）|
+| `prefill-export-streammoe.patch` | StreamMoE `llama_engine.cpp`：`LLM_EXPORT_DIR` 时 prefill 全部 token `logits=true`（LM head 输入覆盖全部 token）|
 
 **应用/还原**：
 ```bat
 git -C third_party/llama.cpp apply patches\prefill-export-llama.patch
+git apply patches\prefill-export-streammoe.patch
 build.bat llamalibs main && build.bat build main
 rem 用完还原
 git -C third_party/llama.cpp apply -R patches\prefill-export-llama.patch
+git apply -R patches\prefill-export-streammoe.patch
 ```
 注意：cmd 设 env 必须 `set "LLM_EXPORT_DIR=path"`（引号），否则尾随空格导致 fopen 失败。
 

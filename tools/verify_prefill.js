@@ -68,24 +68,34 @@ console.log(`rows: std embd=${A.embd.length} hidden=${A.hidden.length} | moe emb
 const cos = (a, b) => {
     let dot = 0, na = 0, nb = 0;
     for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-    return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-30);
+    return { c: dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-30), na, nb };
 };
+// Agree only when BOTH pass: cosine near 1 (direction) AND maxAbs small (magnitude).
+// Cosine alone is scale-insensitive; a large uniform scale would still give cos=1.
+const COS_TH = 1e-6;  // |1 - cos| gate
+const ABS_TH = 1e-4;  // maxAbs gate (absolute)
 function cmpRows(tag, ra, rb) {
     let first = null;
     for (let i = 0; i < Math.min(ra.length, rb.length); i++) {
         const a = ra[i], b = rb[i];
         if (a.pos !== b.pos) { console.log(`  ${tag} pos mismatch @${i}: std=${a.pos} moe=${b.pos}`); if (!first) first = { tag, idx: i }; continue; }
         let mad = 0, mse = 0, maxAbs = 0, maxIdx = -1;
+        let dot = 0, na = 0, nb = 0;
         for (let j = 0; j < a.data.length; j++) {
             const d = Math.abs(a.data[j] - b.data[j]);
             mad += d; mse += d * d;
             if (d > maxAbs) { maxAbs = d; maxIdx = j; }
+            dot += a.data[j] * b.data[j]; na += a.data[j] * a.data[j]; nb += b.data[j] * b.data[j];
         }
         mad /= a.data.length; mse /= a.data.length;
-        const c = cos(a.data, b.data);
-        if (Math.abs(1 - c) > 1e-9) {
-            console.log(`  DIFF ${tag} @token#${a.pos} pos=${maxIdx} cos=${c.toFixed(10)} MAD=${mad.toExponential(3)} MSE=${mse.toExponential(3)} maxAbs=${maxAbs.toExponential(3)}`);
-            if (!first) first = { tag, token: a.pos, cos: c, mad, mse, maxAbs, maxIdx };
+        const normA = Math.sqrt(na), normB = Math.sqrt(nb);
+        // both all-zero vectors: cosine formula gives 0 (not 1), which would false-alarm
+        let c = (normA < 1e-30 && normB < 1e-30) ? 1 : dot / (normA * normB + 1e-30);
+        const cosBad = Math.abs(1 - c) > COS_TH;
+        const absBad = maxAbs > ABS_TH;
+        if (cosBad || absBad) {
+            console.log(`  DIFF ${tag} @token#${a.pos} cos=${c.toFixed(10)} MAD=${mad.toExponential(3)} MSE=${mse.toExponential(3)} maxAbs=${maxAbs.toExponential(3)}@${maxIdx} (${cosBad ? 'cos' : ''}${cosBad && absBad ? '+' : ''}${absBad ? 'abs' : ''})`);
+            if (!first) first = { tag, token: a.pos, cos: c, mad, mse, maxAbs, maxIdx, cosBad, absBad };
         }
     }
     return first;
