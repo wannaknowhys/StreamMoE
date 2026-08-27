@@ -1,4 +1,5 @@
 @echo off
+pushd "%~dp0\.."
 setlocal
 rem =====================================================================
 rem  DeepSeek-V4-Flash via the UPSTREAM llama-cli + StreamMoE expert pool.
@@ -38,3 +39,4 @@ echo.
 echo (exited)
 pause
 endlocal
+popd
