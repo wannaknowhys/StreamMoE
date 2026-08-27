@@ -36,6 +36,7 @@ StreamMoE/
 | `CODEBASE_AUDIT.md` | 代码库四类划分（mock/可用/废弃/变了但函数没问题）|
 | `TEST_FLOW.md` | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）|
 | `PROJECT_STRUCTURE.md` | 本文件 |
+| `DEPENDENCY_MAP.md` | vendored llama.cpp 使用情况（编译/冗余/未用）+ 自研文件功能表 |
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md` | 待办 / 可执行程序路线图 |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
