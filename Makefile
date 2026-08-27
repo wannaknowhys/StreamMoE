@@ -1,73 +1,48 @@
-# StreamMoE Linux build (mirrors build.bat layout)
-#   make llamalibs TAG=main   - build vendored libllama into build/$(TAG)/llama-build
-#   make                       - build stream_moe + stream_moe_server
-#   make test                  - build + run unit tests
-#   make clean                 - remove build/
+# StreamMoE build dispatcher (POSIX). Build rules live in CMakeLists.txt;
+# this Makefile only forwards to cmake + make/ninja.
+# Targets mirror build.bat: llamalibs | build | test | clean
+#   llamalibs: build vendored libllama static libs into build/<tag>/llama-build
+#   build    : configure + build stream_moe / stream_moe_server into build/<tag>/bin
+#   test     : build + run unit tests
+#   clean    : remove build/
+# Usage: make llamalibs TAG=main  |  make build TAG=main  |  make test TAG=main
+TAG ?= main
+BUILD := build/$(TAG)
+LLAMA_BUILD := $(BUILD)/llama-build
+CMAKE ?= cmake
+NINJA ?= ninja
+UNAME_S := $(shell uname -s)
+GENERATOR := $(if $(filter Linux%,$(UNAME_S)),Unix Makefiles,Ninja)
+NPROC := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 
-TAG      ?= main
-OUT      := build/$(TAG)
-LLAMA_BUILD := $(OUT)/llama-build
-BIN      := $(OUT)/bin
-OBJ      := $(OUT)/obj
-CXX      ?= clang++
-CXXFLAGS ?= -std=c++17 -O3 -fopenmp -D_CRT_SECURE_NO_WARNINGS \
-            -I src -I third_party/llama.cpp/ggml/include -I third_party/llama.cpp/ggml/src \
-            -I third_party/llama.cpp/include -I third_party/llama.cpp/vendor \
-            -Wall -Wextra -Wno-unused-parameter
-LLAMA_LIBS := $(LLAMA_BUILD)/src/libllama.a $(LLAMA_BUILD)/ggml/src/libggml.a \
-              $(LLAMA_BUILD)/ggml/src/libggml-base.a $(LLAMA_BUILD)/ggml/src/libggml-cpu.a
+.PHONY: llamalibs build test clean help
 
-.PHONY: all llamalibs test clean
-
-all: $(BIN)/stream_moe $(BIN)/stream_moe_server
-
-$(LLAMA_BUILD)/src/libllama.a:
+llamalibs:
 	@mkdir -p $(LLAMA_BUILD)
-	cmake -S third_party/llama.cpp -B $(LLAMA_BUILD) -G Ninja \
-	    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-	    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
-	    -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON
-	cmake --build $(LLAMA_BUILD) --target llama llama-common-base -j
+	$(CMAKE) -S third_party/llama.cpp -B $(LLAMA_BUILD) -G $(GENERATOR) \
+		-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+		-DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON
+	$(CMAKE) --build $(LLAMA_BUILD) -j $(NPROC) --target llama llama-common-base
+	@echo [+] llamalibs done for tag $(TAG)
 
-llamalibs: $(LLAMA_BUILD)/src/libllama.a
+build:
+	@test -f $(LLAMA_BUILD)/src/libllama.a || { echo "[-] run: make llamalibs TAG=$(TAG) first"; exit 1; }
+	$(CMAKE) -S . -B $(BUILD)/cmake -G $(GENERATOR) -DCMAKE_BUILD_TYPE=Release \
+		-DLLAMA_BUILD_DIR=$(abspath $(LLAMA_BUILD))
+	$(CMAKE) --build $(BUILD)/cmake -j $(NPROC) --target stream_moe stream_moe_server
+	@echo [+] Build SUCCESS: $(BUILD)/bin/stream_moe, $(BUILD)/bin/stream_moe_server
 
-$(BIN)/stream_moe: $(LLAMA_BUILD)/src/libllama.a src/main.cpp src/engine/llama_engine.cpp src/profile/profiler.cpp src/backend/moe_backend.cpp src/backend/scheduler.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/pool/expert_stats.cpp
-	@mkdir -p $(BIN)
-	$(CXX) $(CXXFLAGS) src/backend/moe_backend.cpp src/backend/scheduler.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/pool/expert_stats.cpp src/engine/llama_engine.cpp src/main.cpp src/profile/profiler.cpp \
-	    $(LLAMA_LIBS) -lopenmp -o $@
-
-$(BIN)/stream_moe_server: $(LLAMA_BUILD)/src/libllama.a src/server_main.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp src/io/staging_reader.cpp src/profile/profiler.cpp src/backend/moe_backend.cpp src/backend/scheduler.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/pool/expert_stats.cpp
-	@mkdir -p $(BIN)
-	$(CXX) $(CXXFLAGS) src/backend/moe_backend.cpp src/backend/scheduler.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/pool/expert_stats.cpp src/engine/llama_engine.cpp src/server/http_server.cpp src/loader/moe_loader.cpp \
-	    src/io/staging_reader.cpp src/profile/profiler.cpp src/server_main.cpp \
-	    $(LLAMA_LIBS) -lopenmp -lpthread -o $@
-
-test: $(OBJ)/test_async_dio $(OBJ)/test_moe_loader $(OBJ)/test_profiler $(OBJ)/test_scheduler $(OBJ)/test_slot
-	./$(OBJ)/test_async_dio
-	./$(OBJ)/test_moe_loader
-	./$(OBJ)/test_profiler
-	./$(OBJ)/test_scheduler
-	./$(OBJ)/test_slot
-
-$(OBJ)/test_async_dio: tests/test_async_dio.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp
-	@mkdir -p $(OBJ)
-	$(CXX) $(CXXFLAGS) -D_FILE_OFFSET_BITS=64 $^ -o $@
-
-$(OBJ)/test_moe_loader: $(LLAMA_BUILD)/src/libllama.a tests/test_moe_loader.cpp src/io/staging_reader.cpp src/loader/moe_loader.cpp
-	@mkdir -p $(OBJ)
-	$(CXX) $(CXXFLAGS) $(LLAMA_LIBS) -lopenmp $^ -o $@
-
-$(OBJ)/test_profiler: tests/test_profiler.cpp src/profile/profiler.cpp
-	@mkdir -p $(OBJ)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(OBJ)/test_scheduler: tests/test_scheduler.cpp src/backend/scheduler.cpp src/io/staging_reader.cpp src/io/async_dio_win.cpp src/io/async_dio_posix.cpp src/pool/expert_stats.cpp
-	@mkdir -p $(OBJ)
-	$(CXX) $(CXXFLAGS) -lpthread $^ -o $@
-
-$(OBJ)/test_slot: tests/test_slot.cpp
-	@mkdir -p $(OBJ)
-	$(CXX) $(CXXFLAGS) -lpthread $^ -o $@
+test:
+	@test -f $(LLAMA_BUILD)/src/libllama.a || { echo "[-] run: make llamalibs TAG=$(TAG) first"; exit 1; }
+	$(CMAKE) -S . -B $(BUILD)/cmake -G $(GENERATOR) -DCMAKE_BUILD_TYPE=Release \
+		-DLLAMA_BUILD_DIR=$(abspath $(LLAMA_BUILD))
+	$(CMAKE) --build $(BUILD)/cmake -j $(NPROC) --target test
+	@echo [+] All unit tests passed for tag $(TAG)
 
 clean:
-	rm -rf build
+	@rm -rf build
+	@echo [+] Clean complete.
+
+help:
+	@echo "make llamalibs TAG=main | build | test | clean   (rules in CMakeLists.txt)"
