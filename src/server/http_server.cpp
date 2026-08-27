@@ -174,8 +174,8 @@ void http_server::listener_loop() {
         try {
             handle_client(static_cast<uintptr_t>(client_sock));
         } catch (const std::exception& e) {
-            // record the exception reason (e.g. bad_alloc) before it becomes a
-            // hard crash; stack trace is appended by the global crash handler
+            // record the exception reason (e.g. bad_alloc / malformed UTF-8) before
+            // it becomes a hard crash; stack trace is appended by the crash handler
             LOG_ERROR("client handler exception: " << e.what());
             FILE* pf = std::fopen("temp/stream_moe_fatal.log", "ab");
             if (pf) {
@@ -187,6 +187,13 @@ void http_server::listener_loop() {
                 std::fprintf(pf, "[%s] HANDLER EXCEPTION: %s\n", ts, e.what());
                 std::fclose(pf);
             }
+            // reply 400 so the client sees an error instead of an abrupt ECONNRESET
+            try {
+                json err;
+                err["error"] = e.what();
+                send_response(client_sock, 400, "Bad Request", "application/json", err.dump());
+            } catch (...) {}
+            closesocket(client_sock);
         }
     }
 }

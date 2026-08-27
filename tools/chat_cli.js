@@ -24,33 +24,43 @@ let rlClosed = false;
 const queue = [];
 let pumping = false;
 
-function post(payload) {
+function postStream(payload, onDelta) {
     return new Promise((resolve, reject) => {
         const body = JSON.stringify(payload);
         const req = http.request({
             hostname: host, port, path: '/v1/chat/completions', method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
         }, (res) => {
-            let data = '';
-            res.on('data', (c) => (data += c));
-            res.on('end', () => resolve(data));
+            if (res.statusCode !== 200) {
+                let err = '';
+                res.on('data', (c) => (err += c));
+                res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${err.slice(0, 200)}`)));
+                return;
+            }
+            let buf = '';
+            res.on('data', (chunk) => {
+                buf += chunk;
+                let idx;
+                while ((idx = buf.indexOf('\n')) >= 0) {
+                    const line = buf.slice(0, idx);
+                    buf = buf.slice(idx + 1);
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data.includes('[DONE]')) continue;
+                        try {
+                            const j = JSON.parse(data);
+                            const d = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+                            if (d) onDelta(d);
+                        } catch (e) {}
+                    }
+                }
+            });
+            res.on('end', () => { if (buf.trim()) { try { const j = JSON.parse(buf.replace(/^data: /, '')); const d = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (d) onDelta(d); } catch (e) {} } resolve(); });
         });
         req.on('error', reject);
         req.write(body);
         req.end();
     });
-}
-function extractStream(sse) {
-    let out = '';
-    for (const line of sse.split('\n')) {
-        if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-            try {
-                const c = JSON.parse(line.substring(6));
-                if (c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content) out += c.choices[0].delta.content;
-            } catch (e) {}
-        }
-    }
-    return out.trim();
 }
 function stats() {
     return new Promise((resolve, reject) => {
@@ -75,10 +85,10 @@ async function handle(t) {
     const t0 = Date.now();
     process.stdout.write('[thinking...] ');
     try {
-        const resp = await post({ model: 'deepseek4', messages, stream: true });
-        const reply = extractStream(resp);
+        let reply = '';
+        await postStream({ model: 'deepseek4', messages, stream: true }, (piece) => { reply += piece; process.stdout.write(piece); });
         messages.push({ role: 'assistant', content: reply });
-        console.log(`\n[assistant] ${reply}\n[${Date.now() - t0} ms]`);
+        console.log(`\n[${Date.now() - t0} ms]`);
     } catch (e) {
         console.error(`\n[error] ${e.message}`);
     }
