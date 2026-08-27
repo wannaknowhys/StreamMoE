@@ -30,6 +30,15 @@
 
 ---
 
+## 阶段 5：route B 完善与启动体验（2026-08-27 增补）
+
+- [ ] **彻底杜绝 mmap 的边界确认**：dense 权重 162GB > 128GB RAM，物理装载不可行——mmap 是 dense 唯一现实路径（专家已 100% 走池）。记录设计边界到 RESEARCH/README（澄清"杜绝 mmap"= 专家杜绝，dense 保持 mmap + OS 页缓存）。
+- [ ] **不预加载参数**：`--moe-preload` 是 mock 时代参数（真实引擎无）。route B 专家按需 DIO 已实现"不预加载"；如需预热选项（`--moe-warmup <topk热专家>`）再议。
+- [ ] **deepseek 快速启动优化**：N: USB-NVMe 冷盘是首启瓶颈（5-10 分钟）。候选：专家热度预热（复用 simulate_cache 结果）、DIO 并行装载、`--mlock`（dense 部分，RAM 不够则免）、或提示权重放快盘。
+- [ ] **短程测试统一 `-c 8192`**（小模型 gemma/Qwen），见 `docs/SMOKE_TESTING.md`。
+
+---
+
 ## 阶段 4：建议的深入基准测试矩阵（待办）
 
 - [ ] **4.1 专家池容量扩展与命中率饱和曲线 (Cache Sizing & Hit Saturation)**
