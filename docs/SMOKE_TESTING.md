@@ -38,6 +38,25 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
   - deepseek 启动参数：`--expert-backend --moe-ram-pool 71680 --fit off`。
 - 池预算乘法已修（double 计算，避免 uint64 溢出）。
 
+## Context 与 KV 观察约定（2026-08-27 起）
+
+- **短程测试一律 `-c 8192`**（gemma / Qwen 等小模型）。
+- **长程 jsonl 用更大的 `-c`**。
+- **DeepSeek KV cache 实测流程**（q8_0 + windowed SWA 下，最大应约 3GB）：
+  1. `-c 8192` 启动，看 "KV Cache Memory (llama.cpp actual)" 行（server-context 注入打印，基于 `llama_get_memory_breakdown`）。
+  2. `-c 100000` 观察。
+  3. `-c 1048576` 开到最大观察。
+  - 实测值已追加在下方记录表。
+- KV 实际尺寸显示代码：`llama_get_memory_breakdown(ctx).context` 求和（自研 `llama_engine::kv_memory_bytes` 同款，llama_engine.cpp:220；原版 server 由 server-context.cpp 注入打印）。
+
+### DeepSeek-V4-Flash KV 实测记录（q8_0 + windowed，--expert-backend --moe-ram-pool 71680）
+
+| ctx | KV 内存 |
+| :--- | :--- |
+| 8192 | （待测）|
+| 100000 | （待测）|
+| 1048576 | （待测；预期 ~3GB）|
+
 ## Qwen3-VL 视觉测试（mmproj + 图片）
 
 仅 Qwen3-VL（本机已备 mmproj），作为 dense 模型的完整链路测试：
