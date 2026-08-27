@@ -15,8 +15,8 @@ rem cmake/ninja/clang paths use FORWARD slashes - backslash \D etc. is an
 rem invalid escape in CMake string parsing (vendored llamalibs already did this).
 set CMAKE=F:/Dev/cmake/bin/cmake.exe
 set NINJA=F:/Dev/cmake/bin/ninja.exe
-set CLANG=F:/Dev/LLVM/bin/clang.exe
-set CLANGXX=F:/Dev/LLVM/bin/clang++.exe
+set CLANG=F:/Dev/LLVM/bin/clang-cl.exe
+set CLANGXX=F:/Dev/LLVM/bin/clang-cl.exe
 set RC=F:/Dev/LLVM/bin/llvm-rc.exe
 set LIBOMP=F:/Dev/LLVM/lib/libomp.lib
 
@@ -37,6 +37,17 @@ goto help
 :llamalibs
 echo [StreamMoE] Building vendored libllama static libs into %LLAMA_BUILD% ...
 if not exist "%LLAMA_BUILD%" mkdir "%LLAMA_BUILD%"
+rem Device-backend switches are forwarded from the environment (empty = OFF).
+rem Set them to ON to enable: GGML_CUDA GGML_HIP GGML_METAL GGML_SYCL GGML_VULKAN
+rem (multiple can be ON at once - llama.cpp schedules layers across registered
+rem backends via --split-mode/--tensor-split). LLAMA_BUILD_TOOLS controls the
+rem upstream llama-cli/llama-server build (default ON).
+if "%LLAMA_BUILD_TOOLS%"=="" set LLAMA_BUILD_TOOLS=ON
+if "%GGML_VULKAN%"=="" set GGML_VULKAN=OFF
+if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
+if "%GGML_HIP%"==""   set GGML_HIP=OFF
+if "%GGML_METAL%"=="" set GGML_METAL=OFF
+if "%GGML_SYCL%"==""  set GGML_SYCL=OFF
 "%CMAKE%" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^
     -DCMAKE_C_COMPILER=%CLANG% ^
@@ -44,15 +55,19 @@ if not exist "%LLAMA_BUILD%" mkdir "%LLAMA_BUILD%"
     -DCMAKE_RC_COMPILER=%RC% ^
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ^
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
-    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF ^
+    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=%LLAMA_BUILD_TOOLS% ^
+    -DLLAMA_ALL_WARNINGS=OFF ^
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
-    -DOpenMP_C_FLAGS=-fopenmp -DOpenMP_CXX_FLAGS=-fopenmp ^
+    -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
+    -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc" ^
+    -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=%LIBOMP%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-"%NINJA%" -C "%LLAMA_BUILD%" llama llama-common-base
+"%NINJA%" -C "%LLAMA_BUILD%" llama llama-cli llama-server
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-echo [+] llamalibs done for tag %TAG%
+echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
 :build
