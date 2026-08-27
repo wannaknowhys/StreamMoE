@@ -1,4 +1,5 @@
 #include "engine/llama_engine.h"
+#include "llama-ext.h"
 #include "common/types.h"
 #include "common/logger.h"
 #include "backend/moe_backend.h"
@@ -43,6 +44,19 @@ static float parse_float_or(const std::string& s, float fallback) {
     } catch (...) {
         return fallback;
     }
+}
+
+static ggml_type parse_cache_type(const std::string& s) {
+    if (s == "f32")  return GGML_TYPE_F32;
+    if (s == "f16")  return GGML_TYPE_F16;
+    if (s == "bf16") return GGML_TYPE_BF16;
+    if (s == "q8_0") return GGML_TYPE_Q8_0;
+    if (s == "q4_0") return GGML_TYPE_Q4_0;
+    if (s == "q4_1") return GGML_TYPE_Q4_1;
+    if (s == "q5_0") return GGML_TYPE_Q5_0;
+    if (s == "q5_1") return GGML_TYPE_Q5_1;
+    if (s == "q6_k") return GGML_TYPE_Q6_K;
+    return GGML_TYPE_F16;
 }
 
 bool llama_engine::init(const llama_engine_params& p) {
@@ -138,6 +152,9 @@ bool llama_engine::init(const llama_engine_params& p) {
     cparams.n_threads       = static_cast<int32_t>(p.threads);
     cparams.n_threads_batch = static_cast<int32_t>(p.threads);
     cparams.offload_kqv     = p.kv_on_gpu;
+    cparams.type_k          = parse_cache_type(p.cache_type);
+    cparams.type_v          = cparams.type_k; // deepseek4/MLA requires type_k == type_v
+    cparams.swa_full        = p.swa_full;
 
 #ifdef STREAM_MOE_TEMP
     {
@@ -198,6 +215,16 @@ bool llama_engine::init(const llama_engine_params& p) {
 void llama_engine::reset() {
     llama_memory_clear(llama_get_memory(ctx_), 0);
     cache_tokens_.clear();
+}
+
+size_t llama_engine::kv_memory_bytes() const {
+    if (!ctx_) return 0;
+    size_t total = 0;
+    for (const auto& [buft, mb] : llama_get_memory_breakdown(ctx_)) {
+        (void) buft;
+        total += mb.context;
+    }
+    return total;
 }
 
 std::vector<llama_token> llama_engine::tokenize_prompt(const std::string& text) {

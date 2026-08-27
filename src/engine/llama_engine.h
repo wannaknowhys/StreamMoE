@@ -33,6 +33,10 @@ struct llama_engine_params {
     bool     kv_on_gpu       = false;// offload KQV ops + KV cache to GPU
     uint32_t threads         = 16;
 
+    // Native llama.cpp KV cache options (deepseek4/MLA requires type_k == type_v)
+    std::string cache_type   = "f16"; // f16 | bf16 | f32 | q8_0 | q4_0 | q5_0 (applies to both K and V)
+    bool        swa_full     = true;  // full-size SWA cache (llama.cpp default)
+
     // Sampling; negative values resolve from GGUF metadata defaults
     float    temp            = -1.0f;
     float    top_p           = -1.0f;
@@ -84,6 +88,9 @@ public:
     float       resolved_temp() const { return temp_; }
     float       resolved_top_p() const { return top_p_; }
     bool        kv_on_gpu() const { return kv_on_gpu_; }
+
+    // Actual KV cache (+ state) bytes as reported by llama.cpp (llama_get_memory_breakdown, context part)
+    size_t      kv_memory_bytes() const;
 
 private:
     std::vector<llama_token> tokenize_prompt(const std::string& text);

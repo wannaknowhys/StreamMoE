@@ -32,6 +32,8 @@ struct server_cmd_params_t {
     uint32_t    n_ctx = 4096;
     uint32_t    n_predict = 512;
     uint32_t    threads = 16;
+    std::string cache_type = "f16";
+    bool        swa_full = true;
     float       temp = -1.0f;
     float       top_p = -1.0f;
     int32_t     top_k = -1;
@@ -59,6 +61,8 @@ void print_server_usage(const char* prog) {
               << "  --top-k <N>                    Top-K override (<=0 disables)\n"
               << "  --profile-log <path>           Per-turn telemetry JSONL log\n"
               << "  --prompt-log <path>             Append every /v1/chat/completions request body here\n"
+              << "  --cache-type <TYPE>             KV cache data type for K and V (f16|bf16|f32|q8_0|q4_0|q5_0, default: f16)\n"
+              << "  --no-swa-full                   Disable full-size SWA cache (deepseek4: raw KV ~ window only)\n"
               << "  -t, --threads <N>              CPU threads (default: physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
@@ -110,6 +114,10 @@ server_cmd_params_t parse_server_args(int argc, char** argv) {
             params.profile_log_path = argv[++i];
         } else if (arg == "--prompt-log" && i + 1 < argc) {
             params.prompt_log_path = argv[++i];
+        } else if (arg == "--cache-type" && i + 1 < argc) {
+            params.cache_type = argv[++i];
+        } else if (arg == "--no-swa-full") {
+            params.swa_full = false;
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             params.threads = std::stoul(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -156,12 +164,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto kv_info = topo.compute_kv_cache_info(params.n_ctx, 2);
-    double kv_mb = static_cast<double>(kv_info.actual_kv_bytes) / (1024.0 * 1024.0);
-    double kv_gb = kv_mb / 1024.0;
-
-    uint32_t slots_total = topo.expert_slot_size > 0
-        ? static_cast<uint32_t>((ram_pool_mb * 1024ULL * 1024ULL) / topo.expert_slot_size)
+    uint32_t slots_total = topo.expert_slot_size > 0        ? static_cast<uint32_t>((ram_pool_mb * 1024ULL * 1024ULL) / topo.expert_slot_size)
         : 0;
 
     std::cout << "\n-------------------------------------------------------------------\n"
@@ -173,9 +176,8 @@ int main(int argc, char** argv) {
               << (total_ram / (1024.0*1024.0*1024.0)) << " GB (Available: "
               << (avail_ram / (1024.0*1024.0*1024.0)) << " GB)\n"
               << "  - Context Window:   " << params.n_ctx << " tokens\n"
-              << "  - KV Cache Memory:  " << std::fixed << std::setprecision(2)
-              << (kv_gb >= 1.0 ? kv_gb : kv_mb) << (kv_gb >= 1.0 ? " GB" : " MB")
-              << " -> placement: " << (params.kv_on_gpu ? "VRAM" : "Host RAM") << "\n"
+              << "  - KV Cache Type:    " << params.cache_type << " (K and V)\n"
+              << "  - SWA Cache:        " << (params.swa_full ? "full-size" : "windowed") << "\n"
               << "  - MoE RAM Pool:     " << ram_pool_mb << " MB (weights pinned via mmap+mlock)\n"
               << "  - Expert Slots:     ~" << slots_total << "\n"
               << "  - GPU Layers:       " << params.n_gpu_layers << "\n"
@@ -195,11 +197,23 @@ int main(int argc, char** argv) {
     eparams.temp           = params.temp;
     eparams.top_p          = params.top_p;
     eparams.top_k          = params.top_k;
+    eparams.cache_type     = params.cache_type;
+    eparams.swa_full       = params.swa_full;
 
     llama_engine engine;
     if (!engine.init(eparams)) {
         LOG_ERROR("Engine init failed");
         return 1;
+    }
+
+    {
+        const size_t kv_bytes = engine.kv_memory_bytes();
+        std::cout << " [Engine] KV Cache Memory (llama.cpp actual): "
+                  << std::fixed << std::setprecision(2)
+                  << ((kv_bytes >= (1024ULL*1024ULL*1024ULL))
+                      ? (kv_bytes / (1024.0*1024.0*1024.0)) : (kv_bytes / (1024.0*1024.0)))
+                  << ((kv_bytes >= (1024ULL*1024ULL*1024ULL)) ? " GB" : " MB")
+                  << " -> placement: " << (params.kv_on_gpu ? "VRAM" : "Host RAM") << "\n\n";
     }
 
     server_config_t s_cfg;

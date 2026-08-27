@@ -17,6 +17,8 @@ struct cmd_params_t {
     uint32_t    n_ctx = 4096;
     uint32_t    n_tokens = 512;
     uint32_t    threads = 16;
+    std::string cache_type = "f16";
+    bool        swa_full = true;
     float       temp = -1.0f;
     float       top_p = -1.0f;
     int32_t     top_k = -1;
@@ -42,6 +44,8 @@ void print_usage(const char* prog) {
               << "  --temp <F>                     Sampling temperature override\n"
               << "  --top-p <F>                    Nucleus sampling override\n"
               << "  --top-k <N>                    Top-K override (<=0 disables)\n"
+              << "  --cache-type <TYPE>             KV cache data type for K and V (f16|bf16|f32|q8_0|q4_0|q5_0, default: f16)\n"
+              << "  --no-swa-full                   Disable full-size SWA cache (deepseek4: raw KV ~ window only)\n"
               << "  -t, --threads <N>              CPU threads (default: physical cores)\n"
               << "  -h, --help                     Show this help message\n";
 }
@@ -87,6 +91,10 @@ cmd_params_t parse_args(int argc, char** argv) {
             params.top_p = std::stof(argv[++i]);
         } else if (arg == "--top-k" && i + 1 < argc) {
             params.top_k = std::stoi(argv[++i]);
+        } else if (arg == "--cache-type" && i + 1 < argc) {
+            params.cache_type = argv[++i];
+        } else if (arg == "--no-swa-full") {
+            params.swa_full = false;
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             params.threads = std::stoul(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -151,9 +159,11 @@ int main(int argc, char** argv) {
     eparams.use_expert_backend = params.use_expert_backend;
     eparams.kv_on_gpu    = params.kv_on_gpu;
     eparams.threads      = params.threads;
-    eparams.temp         = params.temp;
-    eparams.top_p        = params.top_p;
-    eparams.top_k        = params.top_k;
+    eparams.temp           = params.temp;
+    eparams.top_p          = params.top_p;
+    eparams.top_k          = params.top_k;
+    eparams.cache_type     = params.cache_type;
+    eparams.swa_full       = params.swa_full;
 
     llama_engine engine;
     if (!engine.init(eparams)) {
