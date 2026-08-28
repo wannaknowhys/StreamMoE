@@ -22,6 +22,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -120,6 +121,7 @@ static void cmd_open(const std::string & path, std::string & out) {
 
 // ---------- v1 convert (gguf API + streamed tensor data) ----------
 static const size_t ALIGN = 4096;
+static size_t align_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
 
 static void set_kv_from_src(gguf_context * dst, const gguf_context * src, int64_t kid) {
     const char * key = gguf_get_key(src, kid);
@@ -158,12 +160,192 @@ static int tensor_ndims(const int64_t * ne) {
     return nd;
 }
 
+// ---------- v2 (expert-blocks-v2): dense normal; each expert one compact block ----------
+// Per-expert block = concatenation of that expert's branch slices, branch order
+// gate_up, gate, up, down, scale. expert_sections (u64[] flattened [off,size,nsub]
+// per block, offsets relative to data start). Not upstream-readable.
+static void cmd_convert_v2(const std::string & json, std::string & out) {
+    try {
+        const std::string in = find_str(json, "in");
+        const std::string outp = find_str(json, "out");
+        std::vector<std::string> shards = split(in, ';');
+        if (shards.empty() || outp.empty()) { out = "{\"ok\":false,\"error\":\"need in;out\"}"; return; }
+
+        std::vector<gguf_context *> srcs;
+        for (auto & p : shards) {
+            gguf_init_params prm = { true, nullptr };
+            gguf_context * c = gguf_init_from_file(p.c_str(), prm);
+            if (!c) { for (auto * x : srcs) gguf_free(x); out = "{\"ok\":false,\"error\":\"cannot open " + p + "\"}"; return; }
+            srcs.push_back(c);
+        }
+
+        struct st { std::string name; std::vector<int64_t> ne; ggml_type type; size_t shard; int idx; };
+        std::vector<st> dense, expert;
+        for (size_t si = 0; si < srcs.size(); si++) {
+            const int nt = gguf_get_n_tensors(srcs[si]);
+            for (int i = 0; i < nt; i++) {
+                st t;
+                t.name = gguf_get_tensor_name(srcs[si], i);
+                const int64_t * ne = gguf_get_tensor_ne(srcs[si], i);
+                for (int d = 0; d < 4; d++) t.ne.push_back(ne[d]);
+                t.type  = gguf_get_tensor_type(srcs[si], i);
+                t.shard = si;
+                t.idx   = i;
+                (t.name.find("_exps") != std::string::npos ? expert : dense).push_back(t);
+            }
+        }
+
+        // n_expert from KV (<arch>.expert_count)
+        int64_t n_expert = 0;
+        for (auto * s : srcs) {
+            for (int i = 0; i < gguf_get_n_kv(s); i++) {
+                const std::string k = gguf_get_key(s, i);
+                if (k.find("expert_count") != std::string::npos) {
+                    if (gguf_get_kv_type(s, i) == GGUF_TYPE_INT32) { n_expert = gguf_get_val_i32(s, i); break; }
+                    if (gguf_get_kv_type(s, i) == GGUF_TYPE_UINT32) { n_expert = (int64_t) gguf_get_val_u32(s, i); break; }
+                }
+            }
+            if (n_expert) break;
+        }
+        if (!n_expert) { out = "{\"ok\":false,\"error\":\"cannot find expert_count KV\"}"; return; }
+
+        // target gguf
+        gguf_context * dst = gguf_init_empty();
+        gguf_set_alignment(dst, ALIGN);
+        for (int i = 0; i < gguf_get_n_kv(srcs[0]); i++) {
+            const std::string k = gguf_get_key(srcs[0], i);
+            if (k.rfind("split.", 0) == 0) continue;
+            if (k == "general.alignment") continue;
+            set_kv_from_src(dst, srcs[0], i);
+        }
+        gguf_set_val_u32(dst, "general.alignment", (uint32_t) ALIGN);
+        gguf_set_val_str(dst, "stream_moe.layout", "expert-blocks-v2");
+
+        // add dense tensors (offsets 4K-aligned via gguf_set_alignment)
+        ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
+        ggml_context * gctx = ggml_init(gprm);
+        if (!gctx) throw std::runtime_error("ggml_init failed");
+        for (auto & t : dense) {
+            ggml_tensor * gt = ggml_new_tensor(gctx, t.type, tensor_ndims(t.ne.data()), t.ne.data());
+            ggml_set_name(gt, t.name.c_str());
+            gguf_add_tensor(dst, gt);
+        }
+        ggml_free(gctx);
+
+        // dense section end (data-relative)
+        size_t denseEnd = 0;
+        for (size_t i = 0; i < dense.size(); i++) {
+            const size_t e = gguf_get_tensor_offset(dst, i) + gguf_get_tensor_size(dst, i);
+            if (e > denseEnd) denseEnd = e;
+        }
+        denseEnd = align_up(denseEnd, ALIGN);
+
+        // group expert tensors by layer + branch tag; per-expert slice size
+        struct branch_t { std::string tag; st t; size_t per_expert; };
+        std::map<int, std::vector<branch_t>> byLayer;
+        for (auto & t : expert) {
+            int layer = -1;
+            const size_t p = t.name.find("blk.");
+            if (p != std::string::npos) layer = std::atoi(t.name.c_str() + p + 4);
+            std::string tag;
+            if (t.name.find("gate_up") != std::string::npos) tag = "gate_up";
+            else if (t.name.find("ffn_gate_exps") != std::string::npos) tag = "gate";
+            else if (t.name.find("ffn_up_exps") != std::string::npos) tag = "up";
+            else if (t.name.find("down_exps") != std::string::npos) tag = t.name.find(".scale") != std::string::npos ? "scale" : "down";
+            else tag = t.name;
+            branch_t b;
+            b.tag = tag;
+            b.t = t;
+            b.per_expert = gguf_get_tensor_size(srcs[t.shard], t.idx) / (size_t) n_expert;
+            byLayer[layer].push_back(b);
+        }
+        const std::vector<std::string> order = { "gate_up", "gate", "up", "down", "scale" };
+
+        // per-expert blocks (4K-aligned), offsets relative to data start
+        struct block_t { size_t off; size_t size; };
+        std::vector<block_t> blocks;
+        size_t cur = denseEnd;
+        for (auto & [layer, branches] : byLayer) {
+            size_t raw = 0;
+            for (auto & ob : order)
+                for (auto & b : branches) if (b.tag == ob) { raw += b.per_expert; break; }
+            for (int64_t e = 0; e < n_expert; e++) {
+                blocks.push_back({ cur, align_up(raw, ALIGN) });
+                cur = align_up(cur + raw, ALIGN);
+            }
+        }
+        const size_t nBlocks = blocks.size();
+        std::vector<uint64_t> sec(nBlocks * 3);
+        for (size_t i = 0; i < nBlocks; i++) { sec[i * 3] = blocks[i].off; sec[i * 3 + 1] = blocks[i].size; sec[i * 3 + 2] = 3; }
+        gguf_set_arr_data(dst, "stream_moe.expert_sections", GGUF_TYPE_UINT64, sec.data(), sec.size());
+        uint64_t dsec[2] = { 0, denseEnd };
+        gguf_set_arr_data(dst, "stream_moe.dense_section", GGUF_TYPE_UINT64, dsec, 2);
+
+        if (!gguf_write_to_file(dst, outp.c_str(), /*only_meta=*/ true)) throw std::runtime_error("write meta failed");
+        FILE * outF = std::fopen(outp.c_str(), "r+b");
+        if (!outF) throw std::runtime_error("reopen output");
+        _fseeki64(outF, 0, SEEK_END);
+        const size_t dataStart = align_up((size_t) _ftelli64(outF), ALIGN);
+
+        std::vector<FILE *> srcF;
+        for (auto & p : shards) { FILE * f = std::fopen(p.c_str(), "rb"); if (!f) throw std::runtime_error("open " + p); srcF.push_back(f); }
+        std::vector<char> buf(64 * 1024 * 1024);
+        auto copy_from = [&](size_t shard, size_t pos, size_t size, size_t dstPos) {
+            FILE * sf = srcF[shard];
+            _fseeki64(sf, pos, SEEK_SET);
+            _fseeki64(outF, dstPos, SEEK_SET);
+            size_t left = size;
+            while (left) {
+                const size_t n = left < buf.size() ? left : buf.size();
+                if (std::fread(buf.data(), 1, n, sf) != n) throw std::runtime_error("read");
+                if (std::fwrite(buf.data(), 1, n, outF) != n) throw std::runtime_error("write");
+                left -= n;
+            }
+        };
+
+        // dense data
+        for (size_t i = 0; i < dense.size(); i++) {
+            auto & t = dense[i];
+            const size_t srcPos = gguf_get_data_offset(srcs[t.shard]) + gguf_get_tensor_offset(srcs[t.shard], t.idx);
+            const size_t size   = gguf_get_tensor_size(srcs[t.shard], t.idx);
+            copy_from(t.shard, srcPos, size, dataStart + gguf_get_tensor_offset(dst, i));
+        }
+        // expert blocks
+        size_t bi = 0;
+        for (auto & [layer, branches] : byLayer) {
+            for (int64_t e = 0; e < n_expert; e++, bi++) {
+                size_t dstPos = dataStart + blocks[bi].off;
+                size_t written = 0;
+                for (auto & ob : order) {
+                    for (auto & b : branches) if (b.tag == ob) {
+                        const size_t srcPos = gguf_get_data_offset(srcs[b.t.shard]) + gguf_get_tensor_offset(srcs[b.t.shard], b.t.idx) + (size_t) e * b.per_expert;
+                        copy_from(b.t.shard, srcPos, b.per_expert, dstPos + written);
+                        written += b.per_expert;
+                        break;
+                    }
+                }
+            }
+        }
+        std::fclose(outF);
+        for (auto * f : srcF) std::fclose(f);
+        for (auto * c : srcs) gguf_free(c);
+        gguf_free(dst);
+
+        out = "{\"ok\":true,\"dense\":" + std::to_string(dense.size()) +
+              ",\"expert_blocks\":" + std::to_string(nBlocks) +
+              ",\"n_expert\":" + std::to_string(n_expert) + "}";
+    } catch (const std::exception & e) {
+        out = "{\"ok\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+}
+
 static void cmd_convert(const std::string & json, std::string & out) {
     try {
         const std::string format = find_str(json, "format");
         const std::string in     = find_str(json, "in");
         const std::string outp   = find_str(json, "out");
-        if (format != "v1") { out = "{\"ok\":false,\"error\":\"only --format v1 (v2 TODO)\"}"; return; }
+        if (format == "v2") { cmd_convert_v2(json, out); return; }
+        if (format != "v1") { out = "{\"ok\":false,\"error\":\"only --format v1/v2\"}"; return; }
         std::vector<std::string> shards = split(in, ';');
         if (shards.empty() || outp.empty()) { out = "{\"ok\":false,\"error\":\"need in;out\"}"; return; }
 
