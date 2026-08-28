@@ -117,3 +117,47 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 | 专家 DIO | 3 次/专家（分支分散）| **1 次/专家**（紧凑块）|
 | 异构支持 | ✅（分支张量独立）| ✅（块大小独立）|
 | 生态 | GGUF 兼容 | 自研 |
+
+---
+
+## 6. 多文件：v1 合分片/分片，v2 RAID0 切分
+
+### 6.1 v1：合分片与张量级分片
+- **合分片**（`-00001-of-00005` → 单文件）：读全部 `splits` 张量，重写为单文件（张量连续）。流式（`gguf_init_from_callback` 读 + 边写边拷，162GB 不全量进内存）。**无本质困难**。
+- **分片**（单文件 → 文件系列）：**张量级**分片（文件1 含张量 0..k，文件2 含 k+1..m）——每个文件是完整可读 GGUF（类似原版 split），原版 `splits` 机制可合并。
+
+### 6.2 v2：专家块 RAID0 切分（跨盘）
+- **切分规则（固定）**：专家块**字节级**跨文件切（不考虑专家内三张量结构），按 4K 块均分——
+  - N 个文件，前 N-1 个各 `K` 个 4K，**最后一个文件小**（余数）。例：专家块 3329 个 4K，3 切 = 1110 / 1110 / 1109。
+  - 专家块的第 i 段 = 文件 `floor(i / K)`（或固定规则），段内偏移 = `(i mod K) * 4K`。
+- **bookkeeping 最小**：每专家只需知道"块总数"；每文件块数 K 固定（最后文件余数）→ 偏移由固定规则算出。
+- **装载**：专家 e = **N 次并发 DIO 直读**各文件片段（4K 对齐 start + 4K 对齐 len）→ 合并到槽。比非对齐 + staging 更简单。
+- **文件结构**：**每个文件都是完整 GGUF**（header/KV/tensor_info），但含：
+  - `stream_moe.format = "expert-blocks-v2"`
+  - `stream_moe.chunk = <no>/<total>`（自编号）
+  - `stream_moe.incomplete = 1`（**注明无法被原版单独读取**——张量被切分、文件内不完整，原版读会错）
+  - metadata（KV）主要在第 1 个文件；后续文件含最小 header + 编号 KV + 数据段。
+- **loader（common 侧）**：接受多文件输入（`--model` 主文件 + 按 `stream_moe.chunk`/`split.*` 自动发现兄弟文件），v2 下按固定切分规则合并装载专家。
+
+---
+
+## 7. 转换器架构（node 指挥 + C/C++ wrapper）
+
+- **Node 无可靠 GGUF 读写库**（`@huggingface/gguf` 等只读 metadata、写/重排/大张量不可靠）→ 用 **ggml 的 gguf C 库**（`ggml/include/gguf.h`：`gguf_init_from_callback` 流式读 + `gguf_set_val_*`/`gguf_add_tensor`/`gguf_write_to_file` 写）。
+- **wrapper（C/C++，`stream_moe_convertd`）**：**JSON 行管道**（stdin/stdout，每次转换跑一次）：
+  - `open {path}` → 输出 metadata JSON（header/alignment/KV/tensor_info 摘要）。
+  - `convert {format v1|v2, out, plan}` → 按 plan 读源张量、写目标（进度/完成/错误事件）。
+  - `chunk {n_chunks, out_base}` → v2 RAID0 切分（或 v1 张量级分片）。
+- **node（`tools/stream_moe_convert.js`）**：spawn wrapper → `open` 拿 metadata → 规划（分类/重排/切分/合分片）→ 发 `convert`/`chunk` → 汇总。
+- 复用：vendored `ggml/src/gguf.cpp`（llama.cpp 已编译进 ggml 库，wrapper 链接 ggml.lib）。
+
+---
+
+## 8. 转换器功能清单（v1/v2）
+
+- [ ] v1 合分片（`-00001-of-00005` → 单文件，流式）。
+- [ ] v1 张量级分片（单文件 → 文件系列，原版可合并）。
+- [ ] v1 sections（alignment=4096 + dense/expert 分区，原版可读）。
+- [ ] v2 expert-blocks（专家紧凑块，自有 loader）。
+- [ ] v2 RAID0 切分（专家块跨文件，固定规则 + 并发 DIO）。
+- [ ] 数值等价验证（转换前 vs 后，v1 原版读，v2 自 loader）。
