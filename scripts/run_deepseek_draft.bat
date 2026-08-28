@@ -28,7 +28,7 @@ if not exist "%MODEL%" ( echo [-] Model not found: %MODEL% & pause & exit /b 1 )
 if not exist "%DRAFT%" ( echo [-] Draft model not found: %DRAFT% & pause & exit /b 1 )
 
 echo Loading DeepSeek-V4-Flash + draft (expert pool 70GB, q8 KV, no-warmup, metrics) ...
-"%BIN%" -m "%MODEL%" --model-draft "%DRAFT%" --draft-max 5 --draft-min 3 --draft-p-min 0.9 ^
+"%BIN%" -m "%MODEL%" --model-draft "%DRAFT%" --spec-draft-n-max 5 --spec-draft-n-min 3 --spec-draft-p-min 0.9 ^
     --expert-backend --moe-ram-pool 71680 ^
     --cache-type-k q8_0 --cache-type-v q8_0 ^
     --fit off --no-warmup -c 8192 -t 16 --temp 1.0 --top-p 0.95 --metrics ^
