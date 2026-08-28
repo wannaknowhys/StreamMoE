@@ -2,6 +2,7 @@
 #include "common/logger.h"
 #include "ggml-impl.h"
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -92,6 +93,10 @@ enum ggml_status moe_exec_mul_mat_id(
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 
     const moe_model_topology_t& topo = sched.topology();
+#ifdef STREAM_MOE_TEMP
+    std::fprintf(stderr, "[TEMP] moe_exec: nodes=%d topo arch=%s n_layer=%u n_expert=%u pool_bytes=%zu\n",
+                 n_nodes, topo.arch_name.c_str(), topo.n_layer, topo.n_expert, sched.pool_bytes());
+#endif
 
     // ---- phase 1: parse + pin (non-down) / wait (down) ----
     std::vector<keyed_expert_t> pin_keys, down_keys;
@@ -138,6 +143,10 @@ enum ggml_status moe_exec_mul_mat_id(
             }
         }
     }
+#ifdef STREAM_MOE_TEMP
+    std::fprintf(stderr, "[TEMP] moe_exec: pin_keys=%zu down_keys=%zu has_down=%d\n",
+                 pin_keys.size(), down_keys.size(), (int) has_down);
+#endif
     // ---- phase 2: one official mul_mat_id per node, in a leaf-only mini-graph ----
     bool ok = true;
     for (int i = 0; i < n_nodes && ok; ++i) {

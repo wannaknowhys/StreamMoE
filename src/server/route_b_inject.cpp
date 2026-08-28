@@ -35,6 +35,10 @@ std::vector<std::unique_ptr<model_pool_t>> g_pools;
 
 llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t ram_pool_mb, int threads, bool pool_full_when_zero) {
     sm_tmr::timer _t("route_b_setup");
+#ifdef STREAM_MOE_TEMP
+    std::fprintf(stderr, "[TEMP] route_b_setup: model=%s ram_pool_mb=%zu full=%d\n",
+                 model_path, ram_pool_mb, (int)pool_full_when_zero);
+#endif
     for (const auto& p : g_pools) {
         if (p->model_path == model_path) {
             return p->overrides; // already initialized
@@ -72,10 +76,14 @@ llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t r
         if (ram_pool_mb > 0) {
             pool_bytes = ram_pool_mb * 1024ull * 1024ull;
         } else if (pool_full_when_zero) {
-            pool_bytes = pool->topo->expert_total_bytes; // full residency, no eviction
+            pool_bytes = pool->topo->expert_total_bytes;
         } else {
             pool_bytes = get_available_ram_bytes() * 3 / 4;
         }
+#ifdef STREAM_MOE_TEMP
+        std::fprintf(stderr, "[TEMP] route_b_setup: expert_total_bytes=%zu pool_bytes=%zu (%.1f GB)\n",
+                     (size_t)pool->topo->expert_total_bytes, pool_bytes, pool_bytes / (1024.0 * 1024.0 * 1024.0));
+#endif
 
         pool->sched = std::make_unique<expert_scheduler>();
         if (!pool->sched->init(*pool->topo, *pool->dio, pool->shards, pool_bytes)) {
