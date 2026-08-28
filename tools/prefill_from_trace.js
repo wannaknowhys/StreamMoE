@@ -1,29 +1,35 @@
-// prefill_from_trace.js - extract a ~N-token real conversation record from the
-// captured opencode sequences (temp/sequences, the fake capture server) and send
-// it as a prefill to a running llama-server (--expert-backend).
+// prefill_from_trace.js - extract a real conversation record from the captured
+// opencode sequences (temp/sequences) and send it as a prefill to a running
+// llama-server (--expert-backend).
 //
-// The server must be started with LLM_EXPORT_DIR=<--out> so its export lands in
-// the persistent trace/stats directory (expert_history_main.bin + prefill_export_main.bin),
-// which is the input for tools/simulate_cache.js policy/capacity tests.
+// Fidelity-first: messages are kept AS-IS (system / user / assistant with
+// tool_calls / tool with tool_call_id - nothing dropped or re-rolled), taken
+// FROM THE FIRST message, truncated at ~N tokens ending on a complete assistant
+// answer, so the prefill KV cache matches what deepseek official would build
+// for the same input. Sampling is forced deterministic (temperature 0, top_k 1)
+// -> lowest perplexity, near-top outputs.
+//
+// The server must run with LLM_EXPORT_DIR=<--out> so its export lands in the
+// persistent trace/stats dir (expert_history_main.bin etc.) - the input for
+// tools/simulate_cache.js policy/capacity tests.
 //
 // usage:
 //   node tools/prefill_from_trace.js [--tokens 10000] [--url http://127.0.0.1:8993]
 //                                    [--src temp/sequences] [--out benchmark/trace]
-//                                    [--max-tokens 16] [--include-system]
+//                                    [--max-tokens 16]
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 
 function parseArgs() {
     const a = process.argv.slice(2);
-    const p = { tokens: 10000, url: 'http://127.0.0.1:8993', src: 'temp/sequences', out: 'benchmark/trace', maxTokens: 16, includeSystem: false };
+    const p = { tokens: 10000, url: 'http://127.0.0.1:8993', src: 'temp/sequences', out: 'benchmark/trace', maxTokens: 16 };
     for (let i = 0; i < a.length; i++) {
         if (a[i] === '--tokens') p.tokens = parseInt(a[++i]);
         else if (a[i] === '--url') p.url = a[++i];
         else if (a[i] === '--src') p.src = a[++i];
         else if (a[i] === '--out') p.out = a[++i];
         else if (a[i] === '--max-tokens') p.maxTokens = parseInt(a[++i]);
-        else if (a[i] === '--include-system') p.includeSystem = true;
     }
     return p;
 }
@@ -41,6 +47,11 @@ function textOf(content) {
     return JSON.stringify(content);
 }
 
+function isCompleteAnswer(m) {
+    // a complete assistant answer = assistant with non-empty text content
+    return m.role === 'assistant' && textOf(m.content).trim().length > 0;
+}
+
 // latest captured POST request (each one carries the full conversation history)
 function latestCapture(src) {
     const files = fs.readdirSync(src).filter((f) => f.includes('POST')).sort((a, b) => fs.statSync(path.join(src, a)).mtimeMs - fs.statSync(path.join(src, b)).mtimeMs);
@@ -53,32 +64,24 @@ function main() {
     const rec = latestCapture(p.src);
     const all = rec.body.messages || [];
 
-    // flatten to {role, content} text-only; drop system (unless asked) and
-    // tool_calls-only messages (empty content). tool results fold into user role
-    // (llama-server chat API rejects tool messages without a matching tool_call).
-    const conv = [];
-    for (const m of all) {
-        const c = textOf(m.content);
-        if (m.role === 'system' && !p.includeSystem) continue;
-        if (!c.trim()) continue;
-        conv.push({ role: m.role === 'tool' ? 'user' : m.role, content: c });
+    // from the FIRST message, keep messages as-is; stop at ~target tokens,
+    // truncating on the last complete assistant answer.
+    let total = 0, lastGoodEnd = -1, stop = -1;
+    for (let i = 0; i < all.length; i++) {
+        total += estTokens(textOf(all[i].content)) + 4; // +4 per message overhead (roles)
+        if (isCompleteAnswer(all[i])) lastGoodEnd = i;
+        if (total >= p.tokens) { stop = i; break; }
     }
+    let end = stop >= 0 ? lastGoodEnd : all.length - 1;
+    if (lastGoodEnd >= 0) end = lastGoodEnd; // end on a complete answer when we can
+    const selected = all.slice(0, end + 1);
+    const est = selected.reduce((s, m) => s + estTokens(textOf(m.content)), 0);
+    const roles = {};
+    for (const m of selected) roles[m.role] = (roles[m.role] || 0) + 1;
 
-    // end at the last complete assistant answer (scan from the end)
-    let end = conv.length - 1;
-    while (end >= 0 && conv[end].role !== 'assistant') end--;
-    if (end < 0) end = conv.length - 1;
-
-    // grow [start..end] from the end toward the target token count
-    let total = 0, start = end;
-    for (let i = end; i >= 0 && total < p.tokens; i--) {
-        total += estTokens(conv[i].content);
-        start = i;
-    }
-    const selected = conv.slice(start, end + 1);
-    const est = selected.reduce((s, m) => s + estTokens(m.content), 0);
-    console.log(`[trace] src=${p.src} messages=${all.length} -> conv=${conv.length}`);
-    console.log(`[trace] selected [${start}..${end}] = ${selected.length} msgs, ~${est} tokens (target ${p.tokens})`);
+    console.log(`[trace] src=${p.src} messages=${all.length}`);
+    console.log(`[trace] selected [0..${end}] = ${selected.length} msgs, ~${est} tokens (target ${p.tokens})`);
+    console.log(`[trace] roles: ${JSON.stringify(roles)}`);
 
     // snapshot the prompt (persistent, not temp)
     fs.mkdirSync(p.out, { recursive: true });
@@ -87,8 +90,16 @@ function main() {
     fs.writeFileSync(promptFile, JSON.stringify(selected, null, 2));
     console.log(`[trace] prompt snapshot: ${promptFile}`);
 
-    // POST to the running server (prefill + a few generated tokens)
-    const body = JSON.stringify({ model: 'deepseek', messages: selected, max_tokens: p.maxTokens, stream: false });
+    // POST as-is + deterministic sampling (fidelity: KV == official for this input)
+    const body = JSON.stringify({
+        model: 'deepseek',
+        messages: selected,
+        max_tokens: p.maxTokens,
+        temperature: 0,
+        top_k: 1,
+        top_p: 1,
+        stream: false,
+    });
     const u = new URL(p.url);
     const req = http.request({
         hostname: u.hostname, port: u.port, path: '/v1/chat/completions', method: 'POST',
@@ -116,7 +127,6 @@ function main() {
     req.write(body);
     req.end();
     console.log(`[trace] NOTE: server must run with LLM_EXPORT_DIR=${p.out} so expert_history_main.bin lands there.`);
-    console.log(`[trace] done.`);
 }
 
 main();
