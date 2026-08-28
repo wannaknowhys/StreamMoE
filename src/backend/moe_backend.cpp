@@ -8,8 +8,10 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace stream_moe {
@@ -22,13 +24,16 @@ namespace {
 
 struct expert_buft_ctx {
     ggml_backend_dev_t dev = nullptr;
+    char name[32] = {};
 };
 
 struct expert_buf_ctx {
     size_t size = 0;
 };
 
-const char* expert_buft_get_name(ggml_backend_buffer_type_t) { return "STREAMMOE_EXPERT"; }
+const char* expert_buft_get_name(ggml_backend_buffer_type_t buft) {
+    return static_cast<expert_buft_ctx*>(buft->context)->name;
+}
 
 ggml_backend_buffer_t expert_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto* ctx = static_cast<expert_buf_ctx*>(std::calloc(1, sizeof(expert_buf_ctx)));
@@ -49,21 +54,20 @@ ggml_backend_buffer_t expert_buft_alloc_buffer(ggml_backend_buffer_type_t buft, 
 
 size_t expert_buft_get_alignment(ggml_backend_buffer_type_t) { return 64; }
 
-ggml_backend_buffer_type_t make_expert_buft(ggml_backend_dev_t dev) {
-    static ggml_backend_buffer_type buft = {};
-    static bool inited = false;
-    if (!inited) {
-        static expert_buft_ctx ctx;
-        ctx.dev = dev;
-        buft.iface.get_name       = expert_buft_get_name;
-        buft.iface.alloc_buffer   = expert_buft_alloc_buffer;
-        buft.iface.get_alignment  = expert_buft_get_alignment;
-        buft.iface.is_host        = [](ggml_backend_buffer_type_t) { return true; };
-        buft.device               = dev;
-        buft.context              = &ctx;
-        inited = true;
-    }
-    return &buft;
+// One expert weight buft per model pool (multi-model support). Never static:
+// each call allocates a fresh buft so buft identity == model identity.
+ggml_backend_buffer_type_t make_expert_buft(ggml_backend_dev_t dev, int ordinal) {
+    auto* buft = static_cast<ggml_backend_buffer_type*>(std::calloc(1, sizeof(ggml_backend_buffer_type)));
+    auto* ctx  = new expert_buft_ctx();
+    ctx->dev = dev;
+    std::snprintf(ctx->name, sizeof(ctx->name), "STREAMMOE_EXPERT%s", ordinal > 0 ? std::to_string(ordinal).c_str() : "");
+    buft->iface.get_name       = expert_buft_get_name;
+    buft->iface.alloc_buffer   = expert_buft_alloc_buffer;
+    buft->iface.get_alignment  = expert_buft_get_alignment;
+    buft->iface.is_host        = [](ggml_backend_buffer_type_t) { return true; };
+    buft->device               = dev;
+    buft->context              = ctx;
+    return buft;
 }
 
 // Compute (host) buft: plain malloc-backed buffer for node outputs ---------
@@ -120,8 +124,8 @@ ggml_backend_buffer_type_t make_host_buft(ggml_backend_dev_t dev) {
 // ---- backend / device ----------------------------------------------------
 
 struct moe_dev_ctx {
-    ggml_backend_buffer_type_t expert_buft = nullptr;
-    ggml_backend_buffer_type_t host_buft   = nullptr;
+    std::vector<ggml_backend_buffer_type_t> expert_bufts; // one per model pool
+    ggml_backend_buffer_type_t host_buft = nullptr;
 };
 
 struct moe_backend_ctx {
@@ -129,11 +133,14 @@ struct moe_backend_ctx {
     ggml_backend_t cpu = nullptr; // stock CPU backend for mini-graph delegation
 };
 
-// Single scheduler for the (single) expert backend, set by the engine before
-// model load so the device-init path can reach it. One instance per process is
-// the model-agnostic contract for route B.
-expert_scheduler* g_scheduler = nullptr;
-int               g_threads   = 1;
+// Model pools bind their expert buft to a scheduler; graph_compute resolves
+// the owning scheduler by the weight buft of the graph's MoE nodes.
+struct buft_sched_binding {
+    ggml_backend_buffer_type_t buft  = nullptr;
+    expert_scheduler*          sched = nullptr;
+};
+std::vector<buft_sched_binding> g_bindings;
+int g_threads = 1;
 
 static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
     size_t need = 16 * 1024 * 1024; // base + graph/overhead margin
@@ -193,7 +200,18 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     backend->iface.synchronize = [](ggml_backend_t) {};
     backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
         auto* bctx = static_cast<moe_backend_ctx*>(b->context);
-        if (!g_scheduler) {
+        // resolve the owning scheduler by the weight buft of this graph's nodes
+        // (each model pool has its own expert buft - see MULTI_MODEL_POOL.md)
+        expert_scheduler* sched = nullptr;
+        for (int i = 0; i < cgraph->n_nodes && !sched; ++i) {
+            const ggml_tensor* nd = cgraph->nodes[i];
+            if (!nd->src[0] || !nd->src[0]->buffer || !nd->src[0]->buffer->buft) continue;
+            ggml_backend_buffer_type_t buft = nd->src[0]->buffer->buft;
+            for (const auto& bnd : g_bindings) {
+                if (bnd.buft == buft) { sched = bnd.sched; break; }
+            }
+        }
+        if (!sched) {
             LOG_ERROR("stream_moe: graph_compute without a scheduler (expert backend not wired)");
             return GGML_STATUS_FAILED;
         }
@@ -208,7 +226,7 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
         }
         if (!bctx->arena.reset()) return GGML_STATUS_FAILED;
 
-        return moe_exec_mul_mat_id(bctx->arena.ctx(), bctx->cpu, *g_scheduler,
+        return moe_exec_mul_mat_id(bctx->arena.ctx(), bctx->cpu, *sched,
                                    nodes.data(), static_cast<int>(nodes.size()), g_threads);
     };
     return backend;
@@ -220,7 +238,11 @@ ggml_backend_buffer_type_t moe_dev_get_buffer_type(ggml_backend_dev_t dev) {
 
 bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
-    return buft == ctx->expert_buft || buft == ctx->host_buft;
+    if (buft == ctx->host_buft) return true;
+    for (const auto& eb : ctx->expert_bufts) {
+        if (buft == eb) return true;
+    }
+    return false;
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
@@ -264,11 +286,6 @@ ggml_backend_dev_t moe_reg_get_device(ggml_backend_reg_t reg, size_t index) {
 
 } // namespace
 
-ggml_backend_buffer_type_t stream_moe_expert_buft() {
-    // Requires registration first; fetch from the registered device.
-    return stream_moe_register_backend_helper_expert_buft();
-}
-
 ggml_backend_buffer_type_t stream_moe_compute_buft() {
     return stream_moe_register_backend_helper_compute_buft();
 }
@@ -295,8 +312,8 @@ void stream_moe_register_backend() {
     ctx.device.iface.supports_op       = moe_dev_supports_op;
     ctx.device.iface.offload_op        = moe_dev_offload_op;
 
-    ctx.dev_ctx.expert_buft = make_expert_buft(&ctx.device);
     ctx.dev_ctx.host_buft   = make_host_buft(&ctx.device);
+    // expert bufts are created lazily per model pool (stream_moe_create_expert_buft)
 
     // reg
     ctx.reg.api_version = GGML_BACKEND_API_VERSION;
@@ -313,13 +330,17 @@ void stream_moe_register_backend() {
     }
 }
 
-// Expose bufts after registration (declared in moe_backend.h).
-ggml_backend_buffer_type_t stream_moe_register_backend_helper_expert_buft() {
+// Create a NEW expert weight buft for one model pool (multi-model support).
+ggml_backend_buffer_type_t stream_moe_create_expert_buft() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("stream_moe");
     if (!reg) { stream_moe_register_backend(); reg = ggml_backend_reg_by_name("stream_moe"); }
     if (!reg) return nullptr;
     ggml_backend_dev_t dev = reg->iface.get_device(reg, 0);
-    return dev ? static_cast<moe_dev_ctx*>(dev->context)->expert_buft : nullptr;
+    if (!dev) return nullptr;
+    auto* dctx = static_cast<moe_dev_ctx*>(dev->context);
+    ggml_backend_buffer_type_t buft = make_expert_buft(dev, static_cast<int>(dctx->expert_bufts.size()));
+    dctx->expert_bufts.push_back(buft);
+    return buft;
 }
 
 ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft() {
@@ -329,7 +350,12 @@ ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft() {
     return dev ? static_cast<moe_dev_ctx*>(dev->context)->host_buft : nullptr;
 }
 
-void stream_moe_backend_set_scheduler(expert_scheduler* sched) { g_scheduler = sched; }
+void stream_moe_backend_bind_scheduler(ggml_backend_buffer_type_t buft, expert_scheduler* sched) {
+    for (auto& bnd : g_bindings) {
+        if (bnd.buft == buft) { bnd.sched = sched; return; }
+    }
+    g_bindings.push_back({ buft, sched });
+}
 void stream_moe_backend_set_threads(int threads) { g_threads = threads > 0 ? threads : 1; }
 
 } // namespace stream_moe

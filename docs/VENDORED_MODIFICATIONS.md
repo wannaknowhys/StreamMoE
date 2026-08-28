@@ -4,15 +4,16 @@
 > 用途：升级/还原/审阅时对照。所有改动都围绕"route B 专家池注入 + dense/moe 分流 + KV 实测显示"。
 > 基线：f280b2698。
 
-## 修改文件总览（5 个）
+## 修改文件总览（6 个）
 
 | 文件 | 改动 | 用途 |
 |---|---|---|
-| `common/common.h` | `common_params` 加 4 字段 | route B 参数载体 |
-| `common/arg.cpp` | 注册 4 个 CLI 参数 | `--expert-backend/--moe-ram-pool/--moe-vram-pool/--prompt-log` |
-| `common/common.cpp` | `common_init_from_params` 注入 route_b_setup | 加载前初始化专家池 + 挂 tensor_buft_overrides |
+| `common/common.h` | `common_params` 加 6 字段 | route B 参数载体（主池 2 + 草稿池 2 + flag + prompt-log）|
+| `common/arg.cpp` | 注册 6 个 CLI 参数 | `--expert-backend/--moe-ram-pool/--moe-vram-pool/--moe-draft-ram-pool/--moe-draft-vram-pool/--prompt-log` |
+| `common/common.cpp` | `common_init_from_params` 注入 route_b_setup | 主模型加载前初始化专家池 + 挂 tensor_buft_overrides |
+| `common/speculative.cpp` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型）|
 | `common/CMakeLists.txt` | `llama-common` 加父仓库 route B 源 + include + Windows 库 | 把 src/server/route_b_inject + backend/io/loader/pool 编译进 llama-server/cli |
-| `tools/server/server-context.cpp` | `llama-ext.h` include + 加载后打印 KV 内存 | 实际 KV cache 尺寸显示（llama_get_memory_breakdown）|
+| `tools/server/server-context.cpp` | `llama-ext.h` include + 加载后打印 KV 内存 + 析构打印 spec 统计 | 实际 KV 尺寸 + draft 统计 |
 
 ## 逐文件明细
 
@@ -20,16 +21,18 @@
 `common_params` 结构体 `n_predict` 后新增：
 ```cpp
 bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
-size_t  moe_ram_pool_mb  = 0;     // expert residency budget in MB (0 = 75% free RAM)
-size_t  moe_vram_pool_mb = 0;     // VRAM budget (GPU pool phase)
+size_t  moe_ram_pool_mb  = 0;     // MAIN expert residency budget in MB (0 = 75% free RAM)
+size_t  moe_vram_pool_mb = 0;     // MAIN VRAM budget (GPU pool phase)
+size_t  moe_draft_ram_pool_mb  = 0; // DRAFT expert RAM budget (0 = full resident)
+size_t  moe_draft_vram_pool_mb = 0; // DRAFT VRAM budget (GPU pool phase)
 std::string prompt_log_path;      // append /v1/chat/completions bodies
 ```
 
 ### common/arg.cpp
-`--swa-full` 后新增 4 个 `add_opt(common_arg(...))`：
+`--swa-full` 后新增 6 个 `add_opt(common_arg(...))`：
 - `--expert-backend`（flag）
-- `--moe-ram-pool <MB>`
-- `--moe-vram-pool <MB>`
+- `--moe-ram-pool <MB>` / `--moe-vram-pool <MB>`（主池）
+- `--moe-draft-ram-pool <MB>` / `--moe-draft-vram-pool <MB>`（草稿池，`0 = full resident`）
 - `--prompt-log <PATH>`（lambda 用 `const std::string &`）
 
 ### common/common.cpp
@@ -37,14 +40,27 @@ std::string prompt_log_path;      // append /v1/chat/completions bodies
 ```cpp
 if (params.expert_backend) {
     auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(),
-                    params.moe_ram_pool_mb, params.cpuparams.n_threads);
+                    params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
     if (ovr) {
         for (auto * p = ovr; p->pattern != nullptr; ++p) params.tensor_buft_overrides.push_back(*p);
         params.tensor_buft_overrides.push_back({nullptr, nullptr}); // terminator
     }
 }
 ```
-（`route_b_setup` 幂等：draft/MTP 二次上下文复用。）
+（`route_b_setup` 幂等：按模型路径去重，draft/MTP 二次上下文不复用主池。）
+
+### common/speculative.cpp
+`common_speculative_init_result` ctor 加载 draft 模型前注入（多模型池）：
+```cpp
+// draft gets its own pool + buft; NEVER reuse the main-model overrides.
+if (params.expert_backend) {
+    auto * ovr = stream_moe::route_b_setup(model_path.c_str(),
+                    params.moe_draft_ram_pool_mb, params.cpuparams.n_threads, true);
+    if (ovr) {
+        mparams.tensor_buft_overrides = ovr; // draft pool's own (terminated) array
+    }
+}
+```
 
 ### common/CMakeLists.txt
 `llama-common` 目标末尾追加：

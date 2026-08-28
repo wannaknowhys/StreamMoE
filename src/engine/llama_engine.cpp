@@ -79,9 +79,10 @@ bool llama_engine::init(const llama_engine_params& p) {
         // later milestone once the backend supports it.
         {nullptr, nullptr},
     };
+    ggml_backend_buffer_type_t eb = nullptr;
     if (p.use_expert_backend) {
         stream_moe_register_backend();
-        ggml_backend_buffer_type_t eb = stream_moe_register_backend_helper_expert_buft();
+        eb = stream_moe_create_expert_buft();
         if (eb) {
             moe_overrides[0].buft = eb;
             mparams.tensor_buft_overrides = moe_overrides;
@@ -118,7 +119,7 @@ bool llama_engine::init(const llama_engine_params& p) {
         scheduler_ = std::make_unique<expert_scheduler>();
         if (!scheduler_->init(*topo_, *dio_, shard_files_, pool_bytes)) return false;
         scheduler_->start();
-        stream_moe_backend_set_scheduler(scheduler_.get());
+        stream_moe_backend_bind_scheduler(eb, scheduler_.get());
         stream_moe_backend_set_threads(static_cast<int>(p.threads));
         LOG_INFO("Expert pool active: " << (pool_bytes / (1024ull * 1024ull * 1024ull))
                  << " GB cap, " << scheduler_->num_slots() << " slots");

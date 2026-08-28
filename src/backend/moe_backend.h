@@ -20,7 +20,12 @@ namespace stream_moe {
 // The weight buft that `tensor_buft_overrides` points MoE expert tensors to.
 // alloc_buffer returns a lightweight accounting handle (size = declared bytes,
 // dummy non-null base, no-op set/get/memset) - no physical allocation.
-ggml_backend_buffer_type_t stream_moe_expert_buft();
+//
+// Multi-model (docs/MULTI_MODEL_POOL.md): each model pool gets its OWN expert
+// buft via stream_moe_create_expert_buft(), so the backend can tell pools apart
+// by buft identity (main model buft vs draft model buft). No single shared
+// expert buft anymore.
+ggml_backend_buffer_type_t stream_moe_create_expert_buft();
 
 // Default (compute) buffer type for this backend: plain host memory for the
 // node outputs (cur/ids/dst) that other backends consume across splits.
@@ -31,12 +36,12 @@ ggml_backend_buffer_type_t stream_moe_compute_buft();
 // model.devices and the scheduler picks it up for MoE ops.
 void stream_moe_register_backend();
 
-// Buffer type accessors (valid after stream_moe_register_backend).
-ggml_backend_buffer_type_t stream_moe_register_backend_helper_expert_buft();
+// Buffer type accessor (valid after stream_moe_register_backend).
 ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft();
 
-// Give the backend its scheduler + compute threads (engine calls before load).
-void stream_moe_backend_set_scheduler(class expert_scheduler* sched);
+// Bind one model's expert pool scheduler to its expert buft. graph_compute
+// looks up the scheduler by the weight buft of the graph's MoE nodes.
+void stream_moe_backend_bind_scheduler(ggml_backend_buffer_type_t buft, class expert_scheduler* sched);
 void stream_moe_backend_set_threads(int threads);
 
 } // namespace stream_moe

@@ -23,10 +23,10 @@ index 36f1e0cd5..0ff91794e 100644
 +    target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
 +endif()
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 86f8610a5..58077ea8f 100644
+index 86f8610a5..bbdd583ce 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1683,6 +1683,51 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1683,6 +1683,65 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.swa_full = true;
          }
      ).set_env("LLAMA_ARG_SWA_FULL"));
@@ -49,6 +49,20 @@ index 86f8610a5..58077ea8f 100644
 +        "StreamMoE: VRAM budget for the expert pool (GPU pool phase)",
 +        [](common_params & params, int value) {
 +            params.moe_vram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-draft-ram-pool"}, "MB",
++        "StreamMoE: DRAFT model expert residency budget in MB (0 = full resident, no eviction)",
++        [](common_params & params, int value) {
++            params.moe_draft_ram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-draft-vram-pool"}, "MB",
++        "StreamMoE: VRAM budget for the DRAFT expert pool (GPU pool phase)",
++        [](common_params & params, int value) {
++            params.moe_draft_vram_pool_mb = value;
 +        }
 +    ));
 +    add_opt(common_arg(
@@ -79,7 +93,7 @@ index 86f8610a5..58077ea8f 100644
          {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
          string_format("max number of context checkpoints to create per slot (default: %d)"
 diff --git a/common/common.cpp b/common/common.cpp
-index 3d54bd600..e1b10db95 100644
+index 3d54bd600..f447cbcf3 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -9,6 +9,9 @@
@@ -147,7 +161,7 @@ index 3d54bd600..e1b10db95 100644
 +        // loader reads from index 0 and stops at the first null pattern. Clear
 +        // the padding first (no CLI sets these directly).
 +        params.tensor_buft_overrides.clear();
-+        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.moe_ram_pool_mb, params.cpuparams.n_threads);
++        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
 +        if (ovr) {
 +            for (auto * p = ovr; p->pattern != nullptr; ++p) {
 +                params.tensor_buft_overrides.push_back(*p);
@@ -183,18 +197,20 @@ index 3d54bd600..e1b10db95 100644
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
 diff --git a/common/common.h b/common/common.h
-index de49dac9f..80aed69a9 100644
+index de49dac9f..ee761553e 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -439,6 +439,17 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
+@@ -439,6 +439,19 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
  
  struct common_params {
      int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
 +
 +    // StreamMoE route B (expert pool) opt-in
 +    bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
-+    size_t  moe_ram_pool_mb  = 0;     // expert residency budget in MB (0 = 75% free RAM)
-+    size_t  moe_vram_pool_mb = 0;     // VRAM budget for the expert pool (GPU pool phase)
++    size_t  moe_ram_pool_mb  = 0;     // MAIN model expert residency budget in MB (0 = 75% free RAM)
++    size_t  moe_vram_pool_mb = 0;     // VRAM budget for the MAIN expert pool (GPU pool phase)
++    size_t  moe_draft_ram_pool_mb  = 0; // DRAFT model expert RAM budget in MB (0 = full resident, no eviction)
++    size_t  moe_draft_vram_pool_mb = 0; // VRAM budget for the DRAFT expert pool (GPU pool phase)
 +    std::string prompt_log_path;      // append every /v1/chat/completions request body here
 +
 +    // KV placement as a collection, e.g. "RAM,VRAM0,VRAM1" (multi-replica
@@ -205,10 +221,19 @@ index de49dac9f..80aed69a9 100644
      int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
      int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4eef2212e..cc58c46fe 100644
+index 4eef2212e..8d1af276e 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2140,6 +2140,54 @@ struct common_speculative {
+@@ -12,6 +12,8 @@
+ 
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
++#include "server/route_b_inject.h" // StreamMoE multi-model expert pools
++
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
+@@ -2140,6 +2142,54 @@ struct common_speculative {
      std::vector<common_speculative_impl *> impl_last;
  };
  
@@ -263,6 +288,25 @@ index 4eef2212e..cc58c46fe 100644
  static common_ngram_map get_common_ngram_map(
          common_speculative_type type,
          const common_params_speculative_ngram_map & config) {
+@@ -2401,6 +2451,18 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
++        // StreamMoE multi-model pools (docs/MULTI_MODEL_POOL.md): the draft
++        // model gets its own expert pool + buft. Point the draft load at the
++        // draft pool's overrides - never reuse the main-model overrides (the
++        // same _exps pattern must not route the draft's experts to the main
++        // pool). ram_pool_mb==0 -> full residency (no eviction).
++        if (params.expert_backend) {
++            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), params.moe_draft_ram_pool_mb, params.cpuparams.n_threads, true);
++            if (ovr) {
++                mparams.tensor_buft_overrides = ovr; // draft pool's own (terminated) array
++            }
++        }
++
+         llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
 diff --git a/common/speculative.h b/common/speculative.h
 index 12ae31b7d..1d6df4f42 100644
 --- a/common/speculative.h
