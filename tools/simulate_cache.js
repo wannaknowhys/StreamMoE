@@ -6,6 +6,10 @@
 // Format (EXPHIST1): u32 n_recs, then per rec: u32 layer, u32 token, u32 expert.
 // Cache key = layer*256 + expert (per-layer expert identity).
 //
+// Dedup: the same expert is recorded once per MUL_MAT_ID for one token
+// (gate/up/down), so (layer, token, expert) is deduplicated before replay -
+// otherwise hit rates are inflated by intra-token repeats.
+//
 // Policies: LRU, LFU, EST1 (recency-weighted decaying counter, simplified).
 // Usage: node tools/simulate_cache.js <expert_history.bin> [maxSlots]
 const fs = require('fs');
@@ -15,27 +19,37 @@ if (b.toString('ascii', 0, 8) !== 'EXPHIST1') throw new Error('bad magic');
 const n = b.readUInt32LE(8);
 const recs = new Uint32Array(n * 3);
 for (let i = 0; i < n * 3; i++) recs[i] = b.readUInt32LE(12 + i * 4);
-console.log(`records: ${n}  layers:${[...new Set(Array.from({length:n},(_,i)=>recs[i*3]))].length} uniqueExperts:${new Set(Array.from({length:n},(_,i)=>recs[i*3]*256+recs[i*3+2])).size}`);
+
+// dedupe (layer, token, expert)
+const seen = new Set();
+const keys = [];
+for (let i = 0; i < n; i++) {
+    const k = recs[i * 3] + '_' + recs[i * 3 + 1] + '_' + recs[i * 3 + 2];
+    if (!seen.has(k)) { seen.add(k); keys.push(recs[i * 3] * 256 + recs[i * 3 + 2]); }
+}
+const m = keys.length;
+const layers = new Set();
+for (let i = 0; i < m; i++) layers.add((keys[i] / 256) | 0);
+console.log(`records: ${m} (dedup of ${n})  layers:${layers.size} uniqueExperts:${new Set(keys).size}`);
 
 const maxSlots = process.argv[3] ? parseInt(process.argv[3]) : 4096;
 const steps = [32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
 for (let s = 4096 + 256; s <= 11008; s += 256) steps.push(s);
 const sizes = [...new Set([...steps, maxSlots].filter(s => s <= 11008 && s >= 1))].sort((a, b) => a - b);
 
-// OPT (Belady): offline - evict the key whose NEXT access is furthest in the
-// future (or never). Needs the whole sequence, so it is a theoretical upper bound.
-const optNext = new Int32Array(n);
+// OPT (Belady): offline - evict the key whose NEXT access is furthest in the future
+const optNext = new Int32Array(m);
 const optLast = new Map();
-for (let i = n - 1; i >= 0; i--) {
-    const key = recs[i * 3] * 256 + recs[i * 3 + 2];
+for (let i = m - 1; i >= 0; i--) {
+    const key = keys[i];
     optNext[i] = optLast.has(key) ? optLast.get(key) : 2147483647;
     optLast.set(key, i);
 }
 function replayOpt(slots) {
     let hit = 0;
-    const cache = new Map(); // key -> next access position
-    for (let i = 0; i < n; i++) {
-        const key = recs[i * 3] * 256 + recs[i * 3 + 2];
+    const cache = new Map();
+    for (let i = 0; i < m; i++) {
+        const key = keys[i];
         if (cache.has(key)) { hit++; cache.set(key, optNext[i]); }
         else if (cache.size < slots) { cache.set(key, optNext[i]); }
         else {
@@ -45,44 +59,42 @@ function replayOpt(slots) {
             cache.set(key, optNext[i]);
         }
     }
-    return hit / n;
+    return hit / m;
 }
 
 function replay(policy, slots) {
     let hit = 0;
-    // LRU/EST1: Map key->lastAccess (insertion order = recency). LFU: Map key->count.
-    const m = new Map();
+    const mm = new Map(); // key -> lastAccess (insertion order = recency) or count (LFU)
     const freq = new Map();
-    for (let i = 0; i < n; i++) {
-        const key = recs[i * 3] * 256 + recs[i * 3 + 2];
-        const has = m.has(key);
+    for (let i = 0; i < m; i++) {
+        const key = keys[i];
+        const has = mm.has(key);
         if (has) hit++;
         if (policy === 'lru') {
-            if (has) { m.delete(key); m.set(key, i); }
-            else if (m.size < slots) { m.set(key, i); }
-            else { const oldest = m.keys().next().value; m.delete(oldest); m.set(key, i); }
+            if (has) { mm.delete(key); mm.set(key, i); }
+            else if (mm.size < slots) { mm.set(key, i); }
+            else { const oldest = mm.keys().next().value; mm.delete(oldest); mm.set(key, i); }
         } else if (policy === 'lfu') {
-            if (!has && m.size >= slots) {
+            if (!has && mm.size >= slots) {
                 let minK = null, minC = Infinity;
-                for (const [k, v] of m) if (v < minC) { minC = v; minK = k; }
-                m.delete(minK); freq.delete(minK);
+                for (const [k, v] of mm) if (v < minC) { minC = v; minK = k; }
+                mm.delete(minK); freq.delete(minK);
             }
-            if (m.size < slots) { m.set(key, (freq.get(key) || 0) + 1); }
+            if (mm.size < slots) { mm.set(key, (freq.get(key) || 0) + 1); }
         } else { // est1: recency-weighted decaying counter (score = count, halves every 64 accesses)
-            if (has) { freq.set(key, (freq.get(key) || 0) + 1); m.delete(key); m.set(key, i); }
-            else if (m.size < slots) { m.set(key, i); freq.set(key, 1); }
+            if (has) { freq.set(key, (freq.get(key) || 0) + 1); mm.delete(key); mm.set(key, i); }
+            else if (mm.size < slots) { mm.set(key, i); freq.set(key, 1); }
             else {
-                const t = i / 64;
                 let minK = null, minS = Infinity;
-                for (const [k, v] of m) {
+                for (const [k, v] of mm) {
                     const c = (freq.get(k) || 0) / (Math.pow(2, (i - v) / 64) + 1e-30);
                     if (c < minS) { minS = c; minK = k; }
                 }
-                m.delete(minK); freq.delete(minK); m.set(key, i); freq.set(key, 1);
+                mm.delete(minK); freq.delete(minK); mm.set(key, i); freq.set(key, 1);
             }
         }
     }
-    return hit / n;
+    return hit / m;
 }
 
 console.log('\npool_slots  LRU       LFU       EST1      OPT');

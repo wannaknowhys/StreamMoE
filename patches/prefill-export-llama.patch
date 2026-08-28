@@ -1,9 +1,10 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..322a98d7c 100644
+index 0402044da..af3b6b015 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
- #include "llama-context.h"
+-#include "llama-context.h"
++﻿#include "llama-context.h"
 +#include "llama-kv-cache-dsv4.h"
 +#include "llama-kv-cache-iswa.h"
 +#include "../ggml/src/ggml-impl.h"
@@ -134,7 +135,7 @@ index 0402044da..322a98d7c 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2040,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2040,59 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -174,6 +175,10 @@ index 0402044da..322a98d7c 100644
 +                    if (!w0->name || !ids->data) continue;
 +                    const char * nm = w0->name;
 +                    if (std::strncmp(nm, "blk.", 4) != 0) continue;
++                    // only routed-expert MUL_MAT_ID (ffn_*_exps) carry the expert
++                    // routing ids; MLA/hyper-connection mul_mat_id nodes are not
++                    // experts and would inflate the history with fake 'experts'.
++                    if (std::strstr(nm, "_exps") == nullptr) continue;
 +                    const int layer = std::atoi(nm + 4);
 +                    for (int t = 0; t < ids->ne[1]; ++t)
 +                        for (int k = 0; k < ids->ne[0]; ++k) {
