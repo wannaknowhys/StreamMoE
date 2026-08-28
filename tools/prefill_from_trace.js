@@ -90,14 +90,14 @@ function main() {
     fs.writeFileSync(promptFile, JSON.stringify(selected, null, 2));
     console.log(`[trace] prompt snapshot: ${promptFile}`);
 
-    // POST as-is + deterministic sampling (fidelity: KV == official for this input)
+    // POST as-is + agentic sampling (docs/SAMPLING.md: temp 1.0, top_p 0.95) -
+    // fidelity: prefill KV == official for this input; output not forced to top.
     const body = JSON.stringify({
         model: 'deepseek',
         messages: selected,
         max_tokens: p.maxTokens,
-        temperature: 0,
-        top_k: 1,
-        top_p: 1,
+        temperature: 1.0,
+        top_p: 0.95,
         stream: false,
     });
     const u = new URL(p.url);
