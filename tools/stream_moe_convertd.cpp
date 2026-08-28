@@ -191,7 +191,11 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
                 t.type  = gguf_get_tensor_type(srcs[si], i);
                 t.shard = si;
                 t.idx   = i;
-                (t.name.find("_exps") != std::string::npos ? expert : dense).push_back(t);
+                // expert blocks pack the routed GEMM weights only; per-expert
+                // scale tensors (*_exps.scale) stay contiguous so the graph reads
+                // real data (they are not MUL_MAT_ID weights).
+                const bool is_expert_tensor = t.name.find("_exps") != std::string::npos && t.name.find(".scale") == std::string::npos;
+                (is_expert_tensor ? expert : dense).push_back(t);
             }
         }
 
@@ -221,20 +225,26 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
         gguf_set_val_u32(dst, "general.alignment", (uint32_t) ALIGN);
         gguf_set_val_str(dst, "stream_moe.layout", "expert-blocks-v2");
 
-        // add dense tensors (offsets 4K-aligned via gguf_set_alignment)
+        // add dense tensors + expert tensor metadata (expert data lives in the
+        // compact blocks below; tensor_info exists so llama.cpp graph builds,
+        // route B never reads tensor data). Offsets for expert tensors occupy a
+        // gap that the block section reuses conceptually.
         ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
         ggml_context * gctx = ggml_init(gprm);
         if (!gctx) throw std::runtime_error("ggml_init failed");
-        for (auto & t : dense) {
+        auto add_one = [&](const st & t) {
             ggml_tensor * gt = ggml_new_tensor(gctx, t.type, tensor_ndims(t.ne.data()), t.ne.data());
             ggml_set_name(gt, t.name.c_str());
             gguf_add_tensor(dst, gt);
-        }
+        };
+        for (auto & t : dense)  add_one(t);
+        for (auto & t : expert) add_one(t);
         ggml_free(gctx);
 
-        // dense section end (data-relative)
+        // dense section end (data-relative) over ALL tensors (dense + expert metadata gap)
         size_t denseEnd = 0;
-        for (size_t i = 0; i < dense.size(); i++) {
+        const size_t nAdd = dense.size() + expert.size();
+        for (size_t i = 0; i < nAdd; i++) {
             const size_t e = gguf_get_tensor_offset(dst, i) + gguf_get_tensor_size(dst, i);
             if (e > denseEnd) denseEnd = e;
         }
@@ -262,24 +272,42 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
         const std::vector<std::string> order = { "gate_up", "gate", "up", "down", "scale" };
 
         // per-expert blocks (4K-aligned), offsets relative to data start
-        struct block_t { size_t off; size_t size; };
+        struct block_t { size_t off; size_t size; size_t nsub; };
         std::vector<block_t> blocks;
         size_t cur = denseEnd;
         for (auto & [layer, branches] : byLayer) {
-            size_t raw = 0;
+            size_t raw = 0, nsub = 0;
             for (auto & ob : order)
-                for (auto & b : branches) if (b.tag == ob) { raw += b.per_expert; break; }
+                for (auto & b : branches) if (b.tag == ob) { raw += b.per_expert; nsub++; break; }
             for (int64_t e = 0; e < n_expert; e++) {
-                blocks.push_back({ cur, align_up(raw, ALIGN) });
+                blocks.push_back({ cur, align_up(raw, ALIGN), nsub });
                 cur = align_up(cur + raw, ALIGN);
             }
         }
         const size_t nBlocks = blocks.size();
         std::vector<uint64_t> sec(nBlocks * 3);
-        for (size_t i = 0; i < nBlocks; i++) { sec[i * 3] = blocks[i].off; sec[i * 3 + 1] = blocks[i].size; sec[i * 3 + 2] = 3; }
+        for (size_t i = 0; i < nBlocks; i++) { sec[i * 3] = blocks[i].off; sec[i * 3 + 1] = blocks[i].size; sec[i * 3 + 2] = blocks[i].nsub; }
         gguf_set_arr_data(dst, "stream_moe.expert_sections", GGUF_TYPE_UINT64, sec.data(), sec.size());
         uint64_t dsec[2] = { 0, denseEnd };
         gguf_set_arr_data(dst, "stream_moe.dense_section", GGUF_TYPE_UINT64, dsec, 2);
+
+        // per-layer per-branch expert sizes + FULL tensor names (block-internal
+        // layout + delegate branch_layout matching against the graph weight name)
+        std::vector<std::string> bnames;
+        std::vector<uint64_t> bsizes;
+        for (auto & [layer, branches] : byLayer) {
+            for (auto & ob : order) {
+                for (auto & b : branches) if (b.tag == ob) {
+                    bnames.push_back(b.t.name); // e.g. "blk.0.ffn_gate_up_exps.weight"
+                    bsizes.push_back((uint64_t) b.per_expert);
+                    break;
+                }
+            }
+        }
+        std::vector<const char *> bnames_c;
+        for (auto & n : bnames) bnames_c.push_back(n.c_str());
+        gguf_set_arr_str(dst, "stream_moe.expert_branch_names", bnames_c.data(), bnames_c.size());
+        gguf_set_arr_data(dst, "stream_moe.expert_branch_sizes", GGUF_TYPE_UINT64, bsizes.data(), bsizes.size());
 
         if (!gguf_write_to_file(dst, outp.c_str(), /*only_meta=*/ true)) throw std::runtime_error("write meta failed");
         FILE * outF = std::fopen(outp.c_str(), "r+b");

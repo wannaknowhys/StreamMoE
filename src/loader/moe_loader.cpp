@@ -108,6 +108,110 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
     return shards;
 }
 
+// v2 (expert-blocks-v2): experts are compact blocks described by stream_moe.* KV
+// (expert_sections [off,size,nsub] per block, branch_names + per-layer
+// branch_sizes for the block-internal layout). Builds the same
+// expert_info_t / read_plan shape as v1 so scheduler + delegate are untouched.
+static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& topo) {
+    auto get_arr_u64 = [&](const char* key, std::vector<uint64_t>& out) {
+        int64_t id = gguf_find_key(ctx0, key);
+        if (id < 0 || gguf_get_kv_type(ctx0, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx0, id) != GGUF_TYPE_UINT64) {
+            throw std::runtime_error(std::string("v2: missing/invalid ") + key);
+        }
+        const uint64_t* d = static_cast<const uint64_t*>(gguf_get_arr_data(ctx0, id));
+        out.assign(d, d + gguf_get_arr_n(ctx0, id));
+    };
+    std::vector<uint64_t> sections, bsizes;
+    get_arr_u64("stream_moe.expert_sections", sections);
+    get_arr_u64("stream_moe.expert_branch_sizes", bsizes);
+    const int64_t bnid = gguf_find_key(ctx0, "stream_moe.expert_branch_names");
+    if (bnid < 0) throw std::runtime_error("v2: missing expert_branch_names");
+    // branch_names are flattened per-layer full tensor names: total / n_layer = per-layer count
+    const size_t n_branch_total = gguf_get_arr_n(ctx0, bnid);
+    const size_t n_branch = n_branch_total / topo.n_layer;
+    std::vector<std::string> bnames;
+    bnames.reserve(n_branch_total);
+    for (size_t i = 0; i < n_branch_total; ++i) bnames.push_back(gguf_get_arr_str(ctx0, bnid, i));
+
+    const size_t n_blocks = sections.size() / 3;
+    if (n_blocks != static_cast<size_t>(topo.n_layer) * topo.n_expert) {
+        throw std::runtime_error("v2: expert_sections count mismatch");
+    }
+    const uint64_t data_start = gguf_get_data_offset(ctx0);
+
+    topo.experts.resize(static_cast<size_t>(topo.n_layer) * topo.n_expert);
+
+    for (uint32_t l = 0; l < topo.n_layer; ++l) {
+        const size_t layer_bsize = sections[(static_cast<size_t>(l) * topo.n_expert) * 3 + 1];
+        for (uint32_t e = 0; e < topo.n_expert; ++e) {
+            const size_t flat = static_cast<size_t>(l) * topo.n_expert + e;
+            const uint64_t boff  = sections[flat * 3];
+            const uint64_t bsize = sections[flat * 3 + 1];
+            expert_info_t& exp = topo.experts[flat];
+            exp.layer_idx = static_cast<int32_t>(l);
+            exp.expert_idx = static_cast<int32_t>(e);
+            exp.total_expert_bytes = 0;
+            exp.sub_tensors.clear();
+            std::vector<sub_tensor_req_t> reqs;
+            uint64_t cur = 0;
+            for (size_t j = 0; j < n_branch; ++j) {
+                const uint64_t bsz = bsizes[static_cast<size_t>(l) * n_branch + j];
+                sub_tensor_info_t st;
+                st.name = bnames[static_cast<size_t>(l) * n_branch + j]; // full tensor name
+                st.shard_idx = 0; // v2 is a single file
+                st.abs_file_offset = data_start + boff + cur;
+                st.byte_size = bsz;
+                st.slot_offset = cur;
+                st.ggml_type = 0; // F32 placeholder; staging is keyed on byte size
+                st.ne[0] = 0;
+                exp.sub_tensors.push_back(st);
+                sub_tensor_req_t req;
+                req.shard_idx = 0;
+                req.file_offset = data_start + boff + cur;
+                req.byte_size = bsz;
+                req.slot_offset = cur;
+                reqs.push_back(req);
+                cur += bsz;
+                exp.total_expert_bytes += bsz;
+            }
+            exp.read_plan = build_expert_read_plan(reqs.data(), static_cast<uint32_t>(reqs.size()));
+        }
+        // sub-pool group by layer block size
+        auto fit = std::find_if(topo.groups.begin(), topo.groups.end(),
+                                [&](const auto& g) { return g.expert_size == layer_bsize; });
+        uint32_t gidx;
+        if (fit != topo.groups.end()) {
+            gidx = fit->idx;
+        } else {
+            gidx = static_cast<uint32_t>(topo.groups.size());
+            moe_model_topology_t::expert_group_t g;
+            g.idx = gidx;
+            g.expert_size = layer_bsize;
+            topo.groups.push_back(g);
+        }
+        if (topo.groups[gidx].layers.empty() || topo.groups[gidx].layers.back() != l) {
+            topo.groups[gidx].layers.push_back(l);
+        }
+    }
+    topo.moe_layers.clear();
+    for (uint32_t l = 0; l < topo.n_layer; ++l) topo.moe_layers.push_back(l);
+    for (auto& g : topo.groups) {
+        g.total_bytes = static_cast<uint64_t>(g.layers.size()) * topo.n_expert * g.expert_size;
+    }
+    if (!topo.experts.empty()) {
+        topo.expert_slot_size = topo.experts[0].read_plan.total_slot_size;
+        topo.expert_dio_staging_size = topo.experts[0].read_plan.total_staging_size;
+        topo.num_sub_tensors_per_expert = static_cast<uint32_t>(topo.experts[0].sub_tensors.size());
+    }
+    LOG_INFO("v2 expert-blocks: layers=" << topo.n_layer << " experts/layer=" << topo.n_expert
+             << " groups=" << topo.groups.size());
+    for (const auto& g : topo.groups) {
+        LOG_INFO("  group " << g.idx << ": layers=" << g.layers.size()
+                 << " block_size=" << (g.expert_size / 1024) << "KB total=" << (g.total_bytes / (1024ull * 1024ull)) << "MB");
+    }
+}
+
 } // namespace
 
 moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_gguf_path) {
@@ -161,8 +265,17 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
         if (topo.kv_lora_rank == 0) {
             topo.kv_lora_rank = (key_len > 0) ? key_len : 512;
         }
-    }if (topo.n_layer == 0) topo.n_layer = static_cast<uint32_t>(get_kv_int(ctx0, "block_count", 0));
+    }    if (topo.n_layer == 0) topo.n_layer = static_cast<uint32_t>(get_kv_int(ctx0, "block_count", 0));
     if (topo.n_expert == 0) topo.n_expert = static_cast<uint32_t>(get_kv_int(ctx0, "expert_count", 0));topo.shard_paths = discover_shards(main_gguf_path, ctx0);
+
+    // v2 (expert-blocks-v2): experts are compact blocks described by stream_moe.* KV.
+    // Build the topology from KV and bypass the v1 per-tensor-slice path.
+    if (get_kv_str(ctx0, "stream_moe.layout", "") == "expert-blocks-v2") {
+        build_v2_experts(ctx0, topo);
+        gguf_free(ctx0);
+        return topo;
+    }
+
     gguf_free(ctx0);
 
     LOG_INFO("Parsed GGUF Topology: arch=" << topo.arch_name 
