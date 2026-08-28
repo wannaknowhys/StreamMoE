@@ -153,6 +153,23 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 - **node（`tools/stream_moe_convert.js`）**：spawn wrapper → `open` 拿 metadata → 规划（分类/重排/切分/合分片）→ 发 `convert`/`chunk` → 汇总。
 - 复用：vendored `ggml/src/gguf.cpp`（llama.cpp 已编译进 ggml 库，wrapper 链接 ggml.lib）。
 
+### wrapper 编译（Windows，clang-cl + vendored ggml）
+```bat
+rem tools/stream_moe_convertd.cpp：JSON-lines 管道（stdin 命令 / stdout 响应）
+F:\Dev\LLVM\bin\clang-cl.exe /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT ^
+    "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/include" ^
+    "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/src" ^
+    F:/Dev/StreamMoE/build/main/llama-build/ggml/src/ggml-base.lib ^
+    F:/Dev/LLVM/lib/libomp.lib /Fe:temp/stream_moe_convertd.exe
+rem 测试 open（读 GGUF metadata -> JSON）：
+echo {"cmd":"open","path":"N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"} | temp\stream_moe_convertd.exe
+```
+
+### wrapper 命令
+- `open {path}` → metadata JSON（header/alignment/KV/tensor_info）——✅ 已实现（gemma 验证）。
+- `convert {format v1|v2, in, out, plan}` → 读源张量写目标——TODO。
+- `chunk {n_chunks, out_base}` → v2 RAID0 切分——TODO。
+
 ---
 
 ## 8. 转换器功能清单（v1/v2）
