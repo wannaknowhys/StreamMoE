@@ -1,5 +1,5 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..7f06bca63 100644
+index 0402044da..322a98d7c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -29,7 +29,7 @@ index 0402044da..7f06bca63 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1632,6 +1638,99 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1638,104 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -40,7 +40,10 @@ index 0402044da..7f06bca63 100644
 +void llama_context::export_expert_history_final() {
 +    const char * dir = std::getenv("LLM_EXPORT_DIR");
 +    if (!dir || export_expert_id.empty()) return;
-+    std::string path = std::string(dir) + "/expert_history.bin";
++    // dual-MoE: main model and draft (MTP) each have their own context - write
++    // to per-context files so they do not overwrite each other.
++    const bool is_draft = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) || (model.arch_name() == "dflash");
++    std::string path = std::string(dir) + "/expert_history" + (is_draft ? "_draft" : "_main") + ".bin";
 +    FILE * f = std::fopen(path.c_str(), "wb");
 +    if (!f) return;
 +    const uint32_t n = (uint32_t) export_expert_id.size();
@@ -61,7 +64,9 @@ index 0402044da..7f06bca63 100644
 +void llama_context::export_prefill_final() {
 +    const char * dir = std::getenv("LLM_EXPORT_DIR");
 +    if (!dir) return;
-+    std::string path = std::string(dir) + "/prefill_export.bin";
++    // dual-MoE: separate main / draft prefill exports
++    const bool is_draft = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) || (model.arch_name() == "dflash");
++    std::string path = std::string(dir) + "/prefill_export" + (is_draft ? "_draft" : "_main") + ".bin";
 +    FILE * f = std::fopen(path.c_str(), "wb");
 +    if (!f) return;
 +
@@ -129,7 +134,7 @@ index 0402044da..7f06bca63 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2035,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2040,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
