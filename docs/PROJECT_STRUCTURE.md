@@ -123,6 +123,25 @@ build\<tag>\
 3. 临时文件/产物进 `build\<tag>\` 或系统 %TEMP%，严禁散落根目录。
 4. 删除文件用 `git rm`（保留历史），不要直接 `Remove-Item` 后失联。
 
+### vendored 改动的 "commit" 语义（约定）
+
+> 改动涉及 `third_party/llama.cpp`（子仓库）时，说"commit"的实际动作是 **父仓库提交 patch 文件**；
+> 子仓库本身**永不 commit**（改动只留工作区，靠 patch 记录，升级/换机时 apply 恢复）。
+
+当只应用 route-b patch（或任何 vendored 改动）时，commit 的标准流程：
+
+1. **更新 patch**（cmd 重定向，PS `>` 会写 UTF-16 导致 `git apply` 失败）：
+   ```bat
+   rem 各 patch 各管各的文件，用文件列表限定，绝不 `git diff >` 全量抄（会把其他 patch 混进来）
+   cmd /c "git -C third_party/llama.cpp diff -- <文件列表> > patches\<patch名>.patch"
+   ```
+2. **验证可还原**：`git -C third_party/llama.cpp apply --check -R patches\<patch名>.patch`
+3. **提交**：`git add patches/<patch名>.patch` + `git commit` + `git push`（父仓库）
+
+例子：
+- 只应用 route-b：commit = 更新 `route-b-inject.patch`（含 `[TMR]` 计时行）+ commit 该文件。
+- route-b + prefill 同时应用：两个 patch 各自更新 + 各自 commit（叠加纪律见 `patches/README.md`）。
+
 ## 10. 临时代码规范（已修复 bug 的打桩/诊断代码）
 
 - **优先：独立文件夹 + 独立 .cpp**——短期诊断代码放 `diagnostics/` 下自成一文件（如 `trace_dump.cpp`），单独编译、不进入主构建、不污染 `src/`。该文件夹的代码可直接进 git 跟踪。
