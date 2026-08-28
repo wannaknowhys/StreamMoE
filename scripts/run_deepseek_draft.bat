@@ -28,7 +28,9 @@ if not exist "%MODEL%" ( echo [-] Model not found: %MODEL% & pause & exit /b 1 )
 if not exist "%DRAFT%" ( echo [-] Draft model not found: %DRAFT% & pause & exit /b 1 )
 
 echo Loading DeepSeek-V4-Flash + draft (expert pool 70GB, q8 KV, no-warmup, metrics) ...
-"%BIN%" -m "%MODEL%" --model-draft "%DRAFT%" --spec-draft-n-max 5 --spec-draft-n-min 3 --spec-draft-p-min 0.9 ^
+rem Draft params tuned for dspark MTP: its confidence decays fast (t1~0.99, t2~0.95, t3~0.6-0.8),
+rem so n_min=3 + p_min=0.9 cleared every draft (<3 tokens) - n_min=1 p_min=0.6 lets it through.
+"%BIN%" -m "%MODEL%" --model-draft "%DRAFT%" --spec-draft-n-max 5 --spec-draft-n-min 1 --spec-draft-p-min 0.6 ^
     --expert-backend --moe-ram-pool 71680 ^
     --cache-type-k q8_0 --cache-type-v q8_0 ^
     --fit off --no-warmup -c 8192 -t 16 --temp 1.0 --top-p 0.95 --metrics ^
