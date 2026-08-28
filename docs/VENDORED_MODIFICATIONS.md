@@ -76,7 +76,13 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
 
 ## 生命周期 / 还原
 
-- patch 备份：`patches/route-b-inject.patch`（`git -C third_party/llama.cpp diff > ...`）。
+- patch 备份：`patches/route-b-inject.patch`（**必须用 cmd 重定向生成**，PS 5.1 的 `>` 会写 UTF-16，导致 `git apply` 报 "No valid patches"）：
+  ```bat
+  rem 在父仓库根目录执行（cmd 重定向字节透传，产出纯文本 patch）
+  cmd /c "git -C third_party/llama.cpp diff > patches\route-b-inject.patch"
+  rem 校验 patch 有效（在已应用的工作区应通过 reverse-check）
+  git -C third_party/llama.cpp apply --check -R patches\route-b-inject.patch
+  ```
 - 应用：`git -C third_party/llama.cpp apply patches/route-b-inject.patch`（在当前干净基线时）。
 - 还原：`git -C third_party/llama.cpp apply -R patches/route-b-inject.patch`。
 - 升级子模块前必须：还原 patch → 升级 → 重新 apply 并适配新版本（改动点收敛在 5 个文件）。
