@@ -43,7 +43,7 @@
 9. **规范与防污染**
    - vendored `third_party/llama.cpp` **永不 commit**，改动只留工作区、靠 `patches/*.patch` 记录；主仓库文件正常 git add/commit。
    - 多 commit、每步成功就 commit；临时调试代码用完清理；临时文件进 temp/（gitignored）。
-   - **`muliti_test.bat`（跑 deepseek 导出测试的入口）随 commit 一并提交**——它是测试入口，保持跟踪，不要忽略/删除。
+   - **commit 顺便 push**——本地提交后立即 `git push origin main`，保持远程同步（用户会看 GitHub 确认进度）。
 
 10. **文档双语文档 + 落地**
     - 设计文档写英文 + 简体中文两版（`[English](x.md) | [简体中文](x.zh-CN.md)`）；讨论定的方案要落地成 md 并提交。
