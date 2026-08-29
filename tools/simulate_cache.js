@@ -37,10 +37,10 @@ const layers = new Set();
 for (let i = 0; i < m; i++) layers.add((keys[i] / 256) | 0);
 console.log(`records: ${m} (dedup of ${n})  layers:${layers.size} uniqueExperts:${new Set(keys).size}`);
 
-const maxSlots = process.argv[3] ? parseInt(process.argv[3]) : 4096;
-const steps = [32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
-for (let s = 4096 + 256; s <= 11008; s += 256) steps.push(s);
-const sizes = [...new Set([...steps, maxSlots].filter(s => s <= 11008 && s >= 1))].sort((a, b) => a - b);
+const uniqueExperts = new Set(keys).size;
+const step = Math.max(1, Math.floor(uniqueExperts / 16));
+const sizes = [];
+for (let i = 1; i <= 16; i++) sizes.push(step * i);
 
 // OPT (Belady): offline - evict the key whose NEXT access is furthest in the future
 const optNext = new Int32Array(m);
@@ -102,8 +102,12 @@ function replay(policy, slots) {
     return hit / m;
 }
 
-console.log('\npool_slots  LRU       LFU       EST1      OPT');
+const { performance } = require('perf_hooks');
+console.log('\npool_slots  pool%    LRU       LFU       EST1      OPT       ms');
 for (const s of sizes) {
+    const pct = (100 * s / uniqueExperts).toFixed(1) + '%';
+    const t0 = performance.now();
     const r = [replay('lru', s), replay('lfu', s), replay('est1', s), replayOpt(s)].map(v => v.toFixed(4));
-    console.log(`${String(s).padStart(10)}  ${r.join('   ')}`);
+    const ms = (performance.now() - t0).toFixed(0);
+    console.log(`${String(s).padStart(8)} ${pct.padStart(7)}  ${r.join('   ')}  ${String(ms).padStart(4)}`);
 }
