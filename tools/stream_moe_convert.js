@@ -54,7 +54,7 @@ async function main() {
     console.log(`[convert] shards=${shards.length}`);
     const res = await call({ cmd: 'convert', format: p.format, in: shards.join(';'), out: p.out });
     if (!res.ok) { console.error('[convert] FAILED: ' + res.error); process.exit(1); }
-    console.log(`[convert] done: ${res.tensors} tensors (dense ${res.dense}, expert ${res.expert}) -> ${p.out}`);
+    console.log(`[convert] done: ${res.tensors ?? (res.dense + (res.expert_blocks ?? 0))} tensors (dense ${res.dense}, expert ${res.expert ?? res.expert_blocks}) -> ${p.out}`);
 }
 
 main().catch((e) => { console.error('[convert] ' + e.message); process.exit(1); });
