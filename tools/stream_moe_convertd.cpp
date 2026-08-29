@@ -241,10 +241,12 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
         for (auto & t : expert) add_one(t);
         ggml_free(gctx);
 
-        // dense section end (data-relative) over ALL tensors (dense + expert metadata gap)
+        // dense section end (data-relative) over DENSE tensors only. _exps
+        // tensor_info offsets are graph-build placeholders - expert data lives
+        // in the compact blocks below, which reuse the placeholder gap, so the
+        // file has no hole.
         size_t denseEnd = 0;
-        const size_t nAdd = dense.size() + expert.size();
-        for (size_t i = 0; i < nAdd; i++) {
+        for (size_t i = 0; i < dense.size(); i++) {
             const size_t e = gguf_get_tensor_offset(dst, i) + gguf_get_tensor_size(dst, i);
             if (e > denseEnd) denseEnd = e;
         }
@@ -295,19 +297,24 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
         // layout + delegate branch_layout matching against the graph weight name)
         std::vector<std::string> bnames;
         std::vector<uint64_t> bsizes;
+        std::vector<uint64_t> bcounts; // per-layer branch count (non-uniform layers)
         for (auto & [layer, branches] : byLayer) {
+            uint64_t cnt = 0;
             for (auto & ob : order) {
                 for (auto & b : branches) if (b.tag == ob) {
                     bnames.push_back(b.t.name); // e.g. "blk.0.ffn_gate_up_exps.weight"
                     bsizes.push_back((uint64_t) b.per_expert);
+                    cnt++;
                     break;
                 }
             }
+            bcounts.push_back(cnt);
         }
         std::vector<const char *> bnames_c;
         for (auto & n : bnames) bnames_c.push_back(n.c_str());
         gguf_set_arr_str(dst, "stream_moe.expert_branch_names", bnames_c.data(), bnames_c.size());
         gguf_set_arr_data(dst, "stream_moe.expert_branch_sizes", GGUF_TYPE_UINT64, bsizes.data(), bsizes.size());
+        gguf_set_arr_data(dst, "stream_moe.expert_branch_counts", GGUF_TYPE_UINT64, bcounts.data(), bcounts.size());
 
         if (!gguf_write_to_file(dst, outp.c_str(), /*only_meta=*/ true)) throw std::runtime_error("write meta failed");
         FILE * outF = std::fopen(outp.c_str(), "r+b");

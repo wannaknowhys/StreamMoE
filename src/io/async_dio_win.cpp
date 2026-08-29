@@ -97,7 +97,10 @@ public:
 
         if (hFile == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
-            LOG_ERROR("CreateFileW failed for " << wstring_to_utf8(path_w) << ", err: " << err);
+            LOG_ERROR("CreateFileW(NO_BUFFERING) failed for '" << wstring_to_utf8(path_w)
+                     << "' err=" << err
+                     << " (check the volume supports unbuffered I/O - network/virtual disks often do not;"
+                     << " StreamMoE expert loading requires FILE_FLAG_NO_BUFFERING)");
             return nullptr;
         }
 

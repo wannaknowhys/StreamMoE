@@ -127,9 +127,14 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
     get_arr_u64("stream_moe.expert_branch_sizes", bsizes);
     const int64_t bnid = gguf_find_key(ctx0, "stream_moe.expert_branch_names");
     if (bnid < 0) throw std::runtime_error("v2: missing expert_branch_names");
-    // branch_names are flattened per-layer full tensor names: total / n_layer = per-layer count
+    // branch_names are flattened per-layer full tensor names, sliced by the
+    // per-layer branch counts (non-uniform MoE layers supported).
     const size_t n_branch_total = gguf_get_arr_n(ctx0, bnid);
-    const size_t n_branch = n_branch_total / topo.n_layer;
+    std::vector<uint64_t> bcounts;
+    get_arr_u64("stream_moe.expert_branch_counts", bcounts);
+    if (bcounts.size() != static_cast<size_t>(topo.n_layer)) {
+        throw std::runtime_error("v2: expert_branch_counts length mismatch");
+    }
     std::vector<std::string> bnames;
     bnames.reserve(n_branch_total);
     for (size_t i = 0; i < n_branch_total; ++i) bnames.push_back(gguf_get_arr_str(ctx0, bnid, i));
@@ -142,7 +147,9 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
 
     topo.experts.resize(static_cast<size_t>(topo.n_layer) * topo.n_expert);
 
+    size_t branch_off = 0;
     for (uint32_t l = 0; l < topo.n_layer; ++l) {
+        const size_t n_branch = static_cast<size_t>(bcounts[l]);
         const size_t layer_bsize = sections[(static_cast<size_t>(l) * topo.n_expert) * 3 + 1];
         for (uint32_t e = 0; e < topo.n_expert; ++e) {
             const size_t flat = static_cast<size_t>(l) * topo.n_expert + e;
@@ -156,9 +163,9 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
             std::vector<sub_tensor_req_t> reqs;
             uint64_t cur = 0;
             for (size_t j = 0; j < n_branch; ++j) {
-                const uint64_t bsz = bsizes[static_cast<size_t>(l) * n_branch + j];
+                const uint64_t bsz = bsizes[branch_off + j];
                 sub_tensor_info_t st;
-                st.name = bnames[static_cast<size_t>(l) * n_branch + j]; // full tensor name
+                st.name = bnames[branch_off + j]; // full tensor name
                 st.shard_idx = 0; // v2 is a single file
                 st.abs_file_offset = data_start + boff + cur;
                 st.byte_size = bsz;
@@ -177,6 +184,7 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
             }
             exp.read_plan = build_expert_read_plan(reqs.data(), static_cast<uint32_t>(reqs.size()));
         }
+        branch_off += n_branch;
         // sub-pool group by layer block size
         auto fit = std::find_if(topo.groups.begin(), topo.groups.end(),
                                 [&](const auto& g) { return g.expert_size == layer_bsize; });
