@@ -757,6 +757,119 @@ static void cmd_chunk(const std::string & json, std::string & out) {
     }
 }
 
+// ---- merge: v2-chunk strips back into a single v2 file ----------------------
+// in = N chunk files (`;`-separated, from cmd_chunk); out = merged v2. Each
+// chunk records its strip layout in stream_moe.chunk_slices ([dense_blocks,
+// per-expert blocks]); this concatenates strips from all files back into the
+// full dense section and every expert block (defensive sums checked).
+static void cmd_merge(const std::string & json, std::string & out) {
+    try {
+        std::vector<std::string> files = split(find_str(json, "in"), ';');
+        const std::string outp = find_str(json, "out");
+        if (files.size() < 2 || outp.empty()) { out = "{\"ok\":false,\"error\":\"merge: need in=c1;c2;... + out\"}"; return; }
+        const int N = (int) files.size();
+
+        std::vector<gguf_context *> srcs;
+        for (auto & p : files) {
+            gguf_init_params prm = { true, nullptr };
+            gguf_context * c = gguf_init_from_file(p.c_str(), prm);
+            if (!c) { for (auto * x : srcs) gguf_free(x); out = "{\"ok\":false,\"error\":\"merge: cannot open " + p + "\"}"; return; }
+            srcs.push_back(c);
+        }
+        auto get_arr_u64 = [&](gguf_context * c, const char * key, std::vector<uint64_t> & v) {
+            const int id = gguf_find_key(c, key);
+            if (id < 0) throw std::runtime_error(std::string("merge: missing ") + key);
+            const uint64_t * d = static_cast<const uint64_t *>(gguf_get_arr_data(c, id));
+            v.assign(d, d + gguf_get_arr_n(c, id));
+        };
+        std::vector<uint64_t> dsec, esec;
+        get_arr_u64(srcs[0], "stream_moe.dense_section", dsec);
+        get_arr_u64(srcs[0], "stream_moe.expert_sections", esec);
+        const uint64_t denseOff = dsec[0], denseSize = dsec[1];
+        const size_t nBlocks = esec.size() / 3;
+        std::vector<std::vector<uint64_t>> chunkSlices(N);
+        for (int i = 0; i < N; i++) get_arr_u64(srcs[i], "stream_moe.chunk_slices", chunkSlices[i]);
+        for (int i = 0; i < N; i++)
+            if (chunkSlices[i].size() != 1 + nBlocks) throw std::runtime_error("merge: chunk_slices layout mismatch");
+
+        gguf_context * dst = gguf_init_empty();
+        gguf_set_alignment(dst, ALIGN);
+        for (int k = 0; k < gguf_get_n_kv(srcs[0]); k++) {
+            const std::string key = gguf_get_key(srcs[0], k);
+            if (key.rfind("split.", 0) == 0 || key == "general.alignment" ||
+                key.rfind("stream_moe.chunk_", 0) == 0 || key == "stream_moe.incomplete") continue;
+            set_kv_from_src(dst, srcs[0], k);
+        }
+        gguf_set_val_u32(dst, "general.alignment", (uint32_t) ALIGN);
+        gguf_set_val_str(dst, "stream_moe.layout", "expert-blocks-v2");
+        ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
+        ggml_context * gctx = ggml_init(gprm);
+        for (int k = 0; k < gguf_get_n_tensors(srcs[0]); k++) {
+            const int64_t * ne = gguf_get_tensor_ne(srcs[0], k);
+            ggml_tensor * gt = ggml_new_tensor(gctx, gguf_get_tensor_type(srcs[0], k), tensor_ndims(ne), ne);
+            ggml_set_name(gt, gguf_get_tensor_name(srcs[0], k));
+            gguf_add_tensor(dst, gt);
+        }
+        ggml_free(gctx);
+        if (!gguf_write_to_file(dst, outp.c_str(), true)) throw std::runtime_error("merge: write meta failed");
+
+        FILE * outF = std::fopen(outp.c_str(), "r+b");
+        if (!outF) throw std::runtime_error("merge: reopen output");
+        _fseeki64(outF, 0, SEEK_END);
+        const size_t dataStart = align_up((size_t) _ftelli64(outF), ALIGN);
+
+        std::vector<FILE *> fds;
+        std::vector<size_t> ds(N);
+        for (int i = 0; i < N; i++) {
+            FILE * f = std::fopen(files[i].c_str(), "rb");
+            if (!f) throw std::runtime_error("merge: reopen " + files[i]);
+            fds.push_back(f);
+            _fseeki64(f, 0, SEEK_END);
+            ds[i] = align_up((size_t) _ftelli64(f), ALIGN);
+        }
+        std::vector<char> buf(16 * 1024 * 1024);
+        auto copy = [&](FILE * sf, uint64_t sp, FILE * of, uint64_t dp, size_t sz) {
+            _fseeki64(sf, sp, SEEK_SET);
+            _fseeki64(of, dp, SEEK_SET);
+            size_t left = sz;
+            while (left) {
+                const size_t n = left < buf.size() ? left : buf.size();
+                if (std::fread(buf.data(), 1, n, sf) != n) throw std::runtime_error("merge: read");
+                if (std::fwrite(buf.data(), 1, n, of) != n) throw std::runtime_error("merge: write");
+                left -= n;
+            }
+        };
+        uint64_t denseCum = 0;
+        for (int i = 0; i < N; i++) {
+            const uint64_t db = chunkSlices[i][0];
+            copy(fds[i], ds[i], outF, dataStart + denseOff + denseCum * ALIGN, (size_t) db * ALIGN);
+            denseCum += db;
+        }
+        if (denseCum * ALIGN != denseSize) throw std::runtime_error("merge: dense sum mismatch");
+        std::vector<uint64_t> blkCum(nBlocks, 0);
+        for (int i = 0; i < N; i++) {
+            uint64_t filePos = ds[i] + chunkSlices[i][0] * ALIGN;
+            for (size_t b = 0; b < nBlocks; b++) {
+                const uint64_t nb = chunkSlices[i][1 + b];
+                copy(fds[i], filePos, outF, dataStart + esec[b * 3] + blkCum[b] * ALIGN, (size_t) nb * ALIGN);
+                blkCum[b] += nb;
+                filePos += nb * ALIGN;
+            }
+        }
+        for (size_t b = 0; b < nBlocks; b++)
+            if (blkCum[b] * ALIGN != esec[b * 3 + 1]) throw std::runtime_error("merge: expert block sum mismatch");
+
+        std::fclose(outF);
+        for (auto * f : fds) std::fclose(f);
+        for (auto * c : srcs) gguf_free(c);
+        gguf_free(dst);
+
+        out = "{\"ok\":true,\"chunks\":" + std::to_string(N) + ",\"expert_blocks\":" + std::to_string(nBlocks) + "}";
+    } catch (const std::exception & e) {
+        out = "{\"ok\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+}
+
 int main() {
     std::string line, buf;
     while (true) {
@@ -769,6 +882,7 @@ int main() {
         if (cmd == "open") cmd_open(find_str(buf, "path"), out);
         else if (cmd == "convert") cmd_convert(buf, out);
         else if (cmd == "chunk") cmd_chunk(buf, out);
+        else if (cmd == "merge") cmd_merge(buf, out);
         else out = "{\"ok\":false,\"error\":\"unknown cmd\"}";
         std::fprintf(stdout, "%s\n", out.c_str());
         std::fflush(stdout);
