@@ -100,7 +100,7 @@ function postShutdown() {
 
 function postChat(messages) {
     return new Promise((resolve, reject) => {
-        const body = JSON.stringify({ model: 'm', messages, max_tokens: 256, stream: false });
+        const body = JSON.stringify({ model: 'm', messages, max_tokens: 1024, stream: false });
         const req = http.request({ hostname: '127.0.0.1', port: PORT, path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
             let d = '';
             res.on('data', (c) => (d += c));
@@ -108,7 +108,13 @@ function postChat(messages) {
                 try {
                     const j = JSON.parse(d);
                     if (j.error) resolve({ error: String(j.error.message || j.error) });
-                    else resolve({ content: j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content || '' : '', prompt_tokens: j.usage ? j.usage.prompt_tokens : 0 });
+                    else {
+                        // reasoning models (gemma4): content may be empty until
+                        // [End thinking]; keep reasoning_content so chat.json has the reply.
+                        const msg = j.choices && j.choices[0] && j.choices[0].message;
+                        const content = msg ? (msg.content || msg.reasoning_content || '') : '';
+                        resolve({ content, prompt_tokens: j.usage ? j.usage.prompt_tokens : 0 });
+                    }
                 } catch (e) { reject(new Error('bad chat JSON: ' + d.slice(0, 200))); }
             });
         });
