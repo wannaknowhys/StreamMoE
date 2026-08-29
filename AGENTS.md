@@ -53,3 +53,35 @@
 - 做技术选型/方案取舍时：按上述偏好给推荐（改函数优先、通用性优先、性能底线、可回放），并说明取舍。
 - **拿不定主意 / 有重大分叉（改动面大、影响架构、删除保留等）→ 用 question 工具问用户**，不要自作主张。
 - 用户会纠正——纠正意见记进本文件（追加"修订"段，保持本文件与用户当前想法同步）。
+
+## 四、docs 文档地图（按需读取）
+
+### 重要必读（会话开始 / 大改动前）
+| 文档 | 内容 |
+| :--- | :--- |
+| `docs/CHECKPOINT.md` | 当前状态、下一步、验证命令（会话恢复先读）|
+| `docs/PROJECT_STRUCTURE.md` | 目录/产物/规范、vendored patch 纪律 |
+| `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` | route B 核心设计（第三路径：官方内核 + 均匀 stride 槽池）|
+| `docs/Backend.md` | 自定义 backend / expert pool 调度设计 |
+| `docs/VENDORED_MODIFICATIONS.md` | vendored 改动汇总 + patch 记录 |
+
+### 按场景读取
+| 场景 | 文档 |
+| :--- | :--- |
+| 调度/池（dir 二维、异步装载、全局线程、驱逐打分）| `docs/EXPERT_SCHEDULER_DESIGN.md` |
+| GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）| `docs/ROUTE_B_GPU_PHASE.md` |
+| 多模型池 / 异构子池 | `docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md` |
+| GGUF 格式 v1/v2 / RAID0 分片 | `docs/STREAMMOE_GGUF_FORMAT.md` |
+| prefill 交叉验证 / 专家历史模拟 / repack 排查 | `docs/PREFILL_CROSS_VALIDATION.md`、`docs/EXPERT_TRACE_SIMULATION.md`、`docs/REPACK_DIVERGENCE_DEBUG.md` |
+| delegate 排查方法论 / bug 清单 | `docs/DEBUG_DELEGATION.md`、`docs/BUG_TRACKER.md` |
+| patch 拆分/更新踩坑 | `docs/PATCH_SPLITTING_PITFALLS.md` |
+| 迁移上游工具 / 可执行程序路线 | `docs/UPSTREAM_TOOLS_MIGRATION.md`、`docs/LLAMA_EXE_ROADMAP.md` |
+| 冒烟/测试/采样 | `docs/SMOKE_TESTING.md`、`docs/TEST_FLOW.md`、`docs/SAMPLING.md` |
+| ASan 构建 | `docs/ASAN_BUILD.md` |
+| v2 架构修正 | `docs/V2_ARCHITECTURE_REVISION.md` |
+
+### 可以不读（参考/历史）
+| 文档 | 内容 |
+| :--- | :--- |
+| `docs/REVIEW_2026_08_28.md` | 早期审查对照（结论已并入代码）|
+| `docs/LLAMA_MMAP_CALLS.md` | mmap 调用点调试地图（低优先级）|
