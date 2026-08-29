@@ -119,10 +119,29 @@ public:
     uint32_t num_slots() const { return num_slots_; }
 
 private:
+    // One in-flight expert load. The ringbuffer element is a contiguous 4K-aligned
+    // block [async_load_t header][staging data area]; `staging` points into that
+    // data area (0-sized for v2 which DIOs straight into the slot). `reqs` holds
+    // one async DIO request per sector-aligned slice; `pending` counts down to
+    // zero (IOCP has no batch-completion - we aggregate ourselves). One pool per
+    // model (draft/main sizes differ; even one may be v2 and the other original).
+    struct async_load_t {
+        uint32_t layer = 0, expert = 0, pool = 0, slot = 0;
+        expert_read_plan_t plan;
+        int pending = 0;
+        bool failed = false;
+        bool direct = false;      // v2: reqs read straight into the slot
+        uint8_t* staging = nullptr;
+        aio_req_t reqs[MAX_SUB_TENSORS_PER_EXPERT];
+    };
+
     void scheduler_loop();
     int32_t alloc_or_evict(uint32_t layer, uint32_t expert);
-    void load_slot(int32_t slot, uint32_t layer, uint32_t expert);
+    async_load_t* start_async_load(int32_t slot, uint32_t layer, uint32_t expert);
     void clear_directory(uint32_t layer, uint32_t expert);
+    async_load_t* load_task(uint32_t idx) {
+        return reinterpret_cast<async_load_t*>(load_pool_ + static_cast<size_t>(idx) * load_stride_);
+    }
 
     const moe_model_topology_t* topo_   = nullptr;
     async_dio_engine*           dio_    = nullptr;
@@ -134,6 +153,19 @@ private:
     uint8_t* pool_base_  = nullptr;
     std::vector<subpool_t> subpools_;
 
+    // Async-load ringbuffer pool: preallocated contiguous aligned block, element
+    // stride = 4K-aligned header + 4K-aligned staging size. max_in_flight = pool
+    // size = the actual concurrency limit (open it up for large prefill, e.g. 64).
+    // When the pool is full the scheduler must keep draining completions to free
+    // elements (it never blocks on submission); a full pool with no completions
+    // is genuine backpressure (IO saturated) - surfaced by the sat report macro.
+    uint32_t max_in_flight_ = 64;
+    size_t   load_stride_ = 0;
+    size_t   load_staging_size_ = 0;   // 0 when layout == V2
+    uint8_t* load_pool_ = nullptr;
+    std::vector<uint32_t> load_free_;   // free element indices (LIFO)
+    std::vector<uint8_t>  load_in_use_;
+
     // Eviction scoring state (scheduler thread owns):
     //   recency = max(0, cur_token - last_used_token)   (dir_ holds last_used)
     //   score   = alpha * 1/(1+recency) + (1-alpha) * freq
@@ -143,9 +175,6 @@ private:
     double hit_rate_ema_ = 0.0;
     uint64_t hit_rate_init_denom_ = 1;      // initial hit rate = pool bytes / total expert bytes
 
-    // One staging buffer per expert group (each group's experts share the same
-    // layout, so one buffer of that size suffices for the whole group).
-    std::vector<std::unique_ptr<uint8_t, aligned_buffer_deleter>> staging_per_group_;
     std::unique_ptr<slot_meta[]>    slots_;              // std::atomic makes slot_meta non-copyable
     std::vector<std::pair<uint32_t, uint32_t>> owner_;   // scheduler-private
     expert_directory*               dir_ = nullptr;

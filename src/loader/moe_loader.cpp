@@ -278,10 +278,15 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
 
     // v2 (expert-blocks-v2): experts are compact blocks described by stream_moe.* KV.
     // Build the topology from KV and bypass the v1 per-tensor-slice path.
-    if (get_kv_str(ctx0, "stream_moe.layout", "") == "expert-blocks-v2") {
-        build_v2_experts(ctx0, topo);
-        gguf_free(ctx0);
-        return topo;
+    {
+        const std::string layout = get_kv_str(ctx0, "stream_moe.layout", "");
+        if (layout == "expert-blocks-v2") {
+            topo.layout = gguf_layout_t::V2_EXPERT_BLOCKS;
+            build_v2_experts(ctx0, topo);
+            gguf_free(ctx0);
+            return topo;
+        }
+        if (layout == "sections-v1") topo.layout = gguf_layout_t::V1_SECTIONS;
     }
 
     gguf_free(ctx0);

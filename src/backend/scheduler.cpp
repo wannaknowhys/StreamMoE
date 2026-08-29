@@ -1,5 +1,6 @@
 #include "backend/scheduler.h"
 #include "common/logger.h"
+#include "common/types.h"
 
 #include <cstring>
 #include <chrono>
@@ -11,6 +12,10 @@ expert_scheduler::~expert_scheduler() {
     if (pool_base_) {
         async_dio_engine::free_aligned(pool_base_);
         pool_base_ = nullptr;
+    }
+    if (load_pool_) {
+        async_dio_engine::free_aligned(load_pool_);
+        load_pool_ = nullptr;
     }
 }
 
@@ -65,20 +70,33 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     if (hit_rate_ema_ > 0.95) hit_rate_ema_ = 0.95;
     alpha_.store(1.0 - hit_rate_ema_, std::memory_order_relaxed);
 
-    // One staging buffer per expert group, sized to the group's MAX expert
-    // layout (per-expert staging needs differ due to file-offset alignment).
-    staging_per_group_.clear();
-    staging_per_group_.reserve(topo.groups.size());
-    for (const auto& g : topo.groups) {
-        size_t max_sz = 0;
-        for (uint32_t l : g.layers) {
-            for (uint32_t e = 0; e < topo.n_expert; ++e) {
-                size_t sz = topo.get_expert(l, e).read_plan.total_staging_size;
-                if (sz > max_sz) max_sz = sz;
+    // Async-load ringbuffer pool (one per model). staging size = max over all
+    // groups (0 for v2, which DIOs straight into the slot). Element stride is
+    // 4K-aligned; the pool size = max_in_flight_ = the real concurrency limit.
+    load_staging_size_ = 0;
+    if (topo.needs_staging()) {
+        for (const auto& g : topo.groups) {
+            size_t gmax = 0;
+            for (uint32_t l : g.layers) {
+                for (uint32_t e = 0; e < topo.n_expert; ++e) {
+                    size_t sz = topo.get_expert(l, e).read_plan.total_staging_size;
+                    if (sz > gmax) gmax = sz;
+                }
             }
+            if (gmax > load_staging_size_) load_staging_size_ = gmax;
         }
-        staging_per_group_.push_back(make_aligned_buffer(max_sz > 0 ? max_sz : (1024 * 1024)));
+        if (load_staging_size_ == 0) load_staging_size_ = 1024 * 1024;
     }
+    const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
+    load_stride_ = header_sz + align_ceil(load_staging_size_, DIO_SECTOR_SIZE);
+    load_pool_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(load_stride_ * max_in_flight_));
+    if (!load_pool_) {
+        LOG_ERROR("expert_scheduler: async load pool alloc failed");
+        return false;
+    }
+    load_free_.resize(max_in_flight_);
+    for (uint32_t i = 0; i < max_in_flight_; ++i) load_free_[i] = i;
+    load_in_use_.assign(max_in_flight_, 0);
     stats_.init("", topo.n_layer, topo.n_expert, 8192);
 
     LOG_INFO("Expert pool: " << num_slots_ << " slots across " << subpools_.size()
@@ -165,42 +183,98 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     return victim;
 }
 
-void expert_scheduler::load_slot(int32_t slot, uint32_t layer, uint32_t expert) {
+expert_scheduler::async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, uint32_t expert) {
+    if (load_free_.empty()) return nullptr;   // pool full: keep draining completions
+    const uint32_t idx = load_free_.back();
+    load_free_.pop_back();
+    load_in_use_[idx] = 1;
+    async_load_t* t = load_task(idx);
+    t->layer = layer;
+    t->expert = expert;
+    t->slot = static_cast<uint32_t>(slot);
+    t->pool = 0;   // CPU RAM in Phase A
     const expert_info_t& info = topo_->get_expert(layer, expert);
-    uint32_t gidx = group_of(layer);
-    if (gidx == static_cast<uint32_t>(-1) || !staging_per_group_[gidx]) return;
-    bool ok = read_expert_sync(dio_, files_, info.read_plan, staging_per_group_[gidx].get(), slot_mem(slot));
-    if (ok) {
-        slots_[slot].mark_ready();
-        dir_->set(layer, expert, 0 /* pool: CPU RAM in Phase A */, static_cast<uint32_t>(slot));
-        n_misses_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        slots_[slot].mark_failed();
-        LOG_ERROR("expert_scheduler: DIO load failed for L" << layer << " E" << expert);
+    t->plan = info.read_plan;
+    t->failed = false;
+    t->direct = !topo_->needs_staging();
+    const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
+    t->staging = t->direct ? nullptr
+                           : (load_pool_ + static_cast<size_t>(idx) * load_stride_ + header_sz);
+    t->pending = 0;
+    for (uint32_t s = 0; s < t->plan.num_tensors; ++s) {
+        const auto& sl = t->plan.slices[s];
+        aio_req_t& r = t->reqs[s];
+        r = aio_req_t{};
+        r.file = files_[sl.shard_idx];
+        r.file_offset = sl.file_read_start;
+        r.aligned_buf = t->direct
+            ? (static_cast<uint8_t*>(slot_mem(slot)) + sl.copy_dst_offset)  // v2: straight into slot
+            : (t->staging + sl.staging_offset);                              // original/v1: staging
+        r.aligned_len = sl.file_read_len;
+        r.user_data = t;
+        if (dio_->submit_batch(&r, 1) > 0) {
+            ++t->pending;
+        } else {
+            t->failed = true;
+            break;
+        }
     }
+    if (t->pending == 0) {
+        load_free_.push_back(idx);
+        load_in_use_[idx] = 0;
+        return nullptr;
+    }
+    return t;
 }
 
 void expert_scheduler::scheduler_loop() {
     slot_request_t req;
     uint64_t last_lookups = 0, last_hits = 0;
     while (running_) {
-        if (requests_.pop(req)) {
-            // Skip if already resident in any pool (duplicate request raced us).
+        // 1. drain IO completions (non-blocking poll). IOCP has no batch
+        //    completion - we aggregate per async_load_t via `pending`.
+        aio_req_t* done[64];
+        const uint32_t ndone = dio_->wait_events(done, 64, 0, 0);
+        for (uint32_t i = 0; i < ndone; ++i) {
+            async_load_t* t = static_cast<async_load_t*>(done[i]->user_data);
+            const int slice = static_cast<int>(done[i] - t->reqs);
+            if (done[i]->error_code != 0) {
+                t->failed = true;
+            } else if (!t->failed && !t->direct) {
+                const auto& sl = t->plan.slices[slice];
+                std::memcpy(slot_mem(static_cast<int32_t>(t->slot)) + sl.copy_dst_offset,
+                            t->staging + sl.copy_src_offset, sl.copy_byte_len);
+            }
+            --t->pending;
+            if (t->pending == 0) {
+                if (!t->failed) {
+                    slots_[t->slot].mark_ready();
+                    dir_->set(t->layer, t->expert, t->pool, t->slot);
+                    n_misses_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    slots_[t->slot].mark_failed();
+                    LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
+                }
+                const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
+                const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
+                load_free_.push_back(idx);
+                load_in_use_[idx] = 0;
+            }
+        }
+        // 2. accept new requests (only when a task element is free)
+        bool popped = false;
+        while (requests_.pop(req)) {
+            popped = true;
             uint32_t pool = 0;
             if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
+            if (load_free_.empty()) { requests_.push(req); break; }
             int32_t slot = alloc_or_evict(req.layer, req.expert);
-            if (slot < 0) {
-                // pool fully pinned right now; retry shortly
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                requests_.push(req);
-                continue;
-            }
-            load_slot(slot, req.layer, req.expert);
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (slot < 0) { requests_.push(req); break; }
+            async_load_t* t = start_async_load(slot, req.layer, req.expert);
+            if (!t) { requests_.push(req); break; }
         }
-        // Adapt alpha from overall hit rate EMA (scheduler-thread owned):
-        //   alpha = clamp(1 - hit_rate_ema, 0.1, 0.9)
+        // 3. adapt alpha from overall hit rate EMA (scheduler-thread owned):
+        //    alpha = clamp(1 - hit_rate_ema, 0.1, 0.9)
         const uint64_t lookups = n_lookups_.load(std::memory_order_relaxed);
         const uint64_t hits = n_hits_.load(std::memory_order_relaxed);
         if (lookups != last_lookups && lookups > 0) {
@@ -212,6 +286,9 @@ void expert_scheduler::scheduler_loop() {
             if (a < 0.1) a = 0.1;
             if (a > 0.9) a = 0.9;
             alpha_.store(a, std::memory_order_relaxed);
+        }
+        if (ndone == 0 && !popped) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 }
