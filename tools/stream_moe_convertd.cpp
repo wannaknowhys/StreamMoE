@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cmath>
+#include <algorithm>
 
 // ---------- minimal JSON (read: flat object of string/num; write: we build manually) ----------
 static std::string jstr(const std::string & s) {
@@ -504,9 +506,136 @@ static void cmd_convert(const std::string & json, std::string & out) {
     }
 }
 
+// ---- chunk: v2 expert-blocks RAID0 across N files ---------------------------
+// in = a v2 (expert-blocks-v2) single file; out = comma-separated N target
+// paths (arbitrary names/locations, N decides the strip count). Both the dense
+// section and each expert block are cut into N 4K-aligned strips: uniform
+// (base=B/N, rem=B%N, first rem +1) or --ratio a:b:c (largest remainder /
+// Hamilton - stable-sorted fractional quotas). Every output is a complete GGUF
+// (full KV + tensor_info) plus its strip data, marked stream_moe.incomplete=1.
 static void cmd_chunk(const std::string & json, std::string & out) {
-    out = "{\"ok\":false,\"error\":\"chunk not implemented yet\"}";
-    (void) json;
+    try {
+        const std::string in = find_str(json, "in");
+        std::vector<std::string> outs = split(find_str(json, "out"), ',');
+        if (in.empty() || outs.size() < 2) { out = "{\"ok\":false,\"error\":\"chunk: need in + out1,out2,...\"}"; return; }
+        const int N = (int) outs.size();
+
+        std::vector<int> ratio;
+        const std::string rat = find_str(json, "ratio");
+        if (!rat.empty()) for (auto & s : split(rat, ':')) ratio.push_back(std::atoi(s.c_str()));
+        if (!ratio.empty() && (int) ratio.size() != N) { out = "{\"ok\":false,\"error\":\"chunk: ratio count != out count\"}"; return; }
+
+        gguf_init_params prm = { true, nullptr };
+        gguf_context * src = gguf_init_from_file(in.c_str(), prm);
+        if (!src) { out = "{\"ok\":false,\"error\":\"chunk: cannot open " + in + "\"}"; return; }
+
+        auto get_u64_arr = [&](const char * k, std::vector<uint64_t> & v) {
+            const int id = gguf_find_key(src, k);
+            if (id < 0) throw std::runtime_error(std::string("chunk: missing ") + k);
+            const uint64_t * d = static_cast<const uint64_t *>(gguf_get_arr_data(src, id));
+            v.assign(d, d + gguf_get_arr_n(src, id));
+        };
+        std::vector<uint64_t> dsec, esec;
+        get_u64_arr("stream_moe.dense_section", dsec);
+        get_u64_arr("stream_moe.expert_sections", esec);
+        const uint64_t denseOff = dsec[0], denseSize = dsec[1];
+        const size_t nBlocks = esec.size() / 3;
+        std::vector<uint64_t> blockOffs(nBlocks), blockSizes(nBlocks);
+        for (size_t b = 0; b < nBlocks; b++) { blockOffs[b] = esec[b * 3]; blockSizes[b] = esec[b * 3 + 1]; }
+        const size_t srcData = gguf_get_data_offset(src);
+
+        // split B 4K blocks into N strips (uniform or largest-remainder ratio).
+        auto splitBlocks = [&](uint64_t B) -> std::vector<uint64_t> {
+            std::vector<uint64_t> nslice(N, 0);
+            if (ratio.empty()) {
+                const uint64_t base = B / N, rem = B % N;
+                for (int i = 0; i < N; i++) nslice[i] = base + (i < (int) rem ? 1 : 0);
+            } else {
+                int sum = 0; for (int r : ratio) sum += r;
+                std::vector<double> quota(N);
+                uint64_t total = 0;
+                for (int i = 0; i < N; i++) { quota[i] = (double) B * ratio[i] / sum; nslice[i] = (uint64_t) std::floor(quota[i]); total += nslice[i]; }
+                uint64_t diff = B - total;
+                std::vector<int> order(N);
+                for (int i = 0; i < N; i++) order[i] = i;
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return (quota[a] - (double) nslice[a]) > (quota[b] - (double) nslice[b]); });
+                for (uint64_t k = 0; k < diff; k++) nslice[order[k]]++;
+            }
+            // defensive: strips must sum back to the block count (non-hot path)
+            uint64_t chk = 0; for (int i = 0; i < N; i++) chk += nslice[i];
+            if (chk != B) throw std::runtime_error("chunk: strip sum != block count");
+            return nslice;
+        };
+        auto stripStart = [](const std::vector<uint64_t> & s, int i) { uint64_t acc = 0; for (int k = 0; k < i; k++) acc += s[k]; return acc; };
+
+        const std::vector<uint64_t> denseSlices = splitBlocks(denseSize / ALIGN);
+        std::vector<std::vector<uint64_t>> expSlices(nBlocks);
+        for (size_t b = 0; b < nBlocks; b++) expSlices[b] = splitBlocks(blockSizes[b] / ALIGN);
+
+        FILE * srcF = std::fopen(in.c_str(), "rb");
+        if (!srcF) throw std::runtime_error("chunk: reopen source");
+        std::vector<char> buf(16 * 1024 * 1024);
+        for (int i = 0; i < N; i++) {
+            gguf_context * dst = gguf_init_empty();
+            gguf_set_alignment(dst, ALIGN);
+            for (int k = 0; k < gguf_get_n_kv(src); k++) {
+                const std::string key = gguf_get_key(src, k);
+                if (key.rfind("split.", 0) == 0 || key == "general.alignment") continue;
+                set_kv_from_src(dst, src, k);
+            }
+            gguf_set_val_u32(dst, "general.alignment", (uint32_t) ALIGN);
+            gguf_set_val_str(dst, "stream_moe.layout", "expert-blocks-v2");
+            gguf_set_val_u32(dst, "stream_moe.chunk_no", (uint32_t) i);
+            gguf_set_val_u32(dst, "stream_moe.chunk_total", (uint32_t) N);
+            gguf_set_val_u32(dst, "stream_moe.incomplete", 1);
+            ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
+            ggml_context * gctx = ggml_init(gprm);
+            for (int k = 0; k < gguf_get_n_tensors(src); k++) {
+                const int64_t * ne = gguf_get_tensor_ne(src, k);
+                ggml_tensor * gt = ggml_new_tensor(gctx, gguf_get_tensor_type(src, k), tensor_ndims(ne), ne);
+                ggml_set_name(gt, gguf_get_tensor_name(src, k));
+                gguf_add_tensor(dst, gt);
+            }
+            ggml_free(gctx);
+            if (!gguf_write_to_file(dst, outs[i].c_str(), /*only_meta=*/ true)) throw std::runtime_error("chunk: write meta " + outs[i]);
+            FILE * outF = std::fopen(outs[i].c_str(), "r+b");
+            if (!outF) throw std::runtime_error("chunk: reopen " + outs[i]);
+            _fseeki64(outF, 0, SEEK_END);
+            const size_t dataStart = align_up((size_t) _ftelli64(outF), ALIGN);
+            auto copy_from = [&](uint64_t srcPos, size_t size, size_t dstPos) {
+                _fseeki64(srcF, srcPos, SEEK_SET);
+                _fseeki64(outF, dstPos, SEEK_SET);
+                size_t left = size;
+                while (left) {
+                    const size_t n = left < buf.size() ? left : buf.size();
+                    if (std::fread(buf.data(), 1, n, srcF) != n) throw std::runtime_error("chunk: read");
+                    if (std::fwrite(buf.data(), 1, n, outF) != n) throw std::runtime_error("chunk: write");
+                    left -= n;
+                }
+            };
+            size_t pos = dataStart;
+            // dense strip
+            const uint64_t dStart = stripStart(denseSlices, i);
+            copy_from(srcData + denseOff + dStart * ALIGN, (size_t) denseSlices[i] * ALIGN, pos);
+            pos += (size_t) denseSlices[i] * ALIGN;
+            // per-expert strips (block order)
+            for (size_t b = 0; b < nBlocks; b++) {
+                const uint64_t bStart = stripStart(expSlices[b], i);
+                copy_from(srcData + blockOffs[b] + bStart * ALIGN, (size_t) expSlices[b][i] * ALIGN, pos);
+                pos += (size_t) expSlices[b][i] * ALIGN;
+            }
+            std::fclose(outF);
+            gguf_free(dst);
+        }
+        std::fclose(srcF);
+        gguf_free(src);
+
+        out = "{\"ok\":true,\"chunks\":" + std::to_string(N) +
+              ",\"expert_blocks\":" + std::to_string(nBlocks) +
+              ",\"dense_blocks\":" + std::to_string(denseSize / ALIGN) + "}";
+    } catch (const std::exception & e) {
+        out = "{\"ok\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
 }
 
 int main() {
