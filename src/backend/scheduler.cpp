@@ -3,6 +3,7 @@
 #include "common/types.h"
 
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 
 namespace stream_moe {
@@ -120,12 +121,12 @@ uint32_t expert_scheduler::group_of(uint32_t layer) const {
 
 void expert_scheduler::start() {
     if (running_.exchange(true)) return;
-    worker_ = std::thread(&expert_scheduler::scheduler_loop, this);
+    global_expert_scheduler::instance().register_scheduler(this);
 }
 
 void expert_scheduler::stop() {
     if (!running_.exchange(false)) return;
-    if (worker_.joinable()) worker_.join();
+    global_expert_scheduler::instance().unregister_scheduler(this);
 }
 
 void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
@@ -183,7 +184,7 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     return victim;
 }
 
-expert_scheduler::async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, uint32_t expert) {
+async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, uint32_t expert) {
     if (load_free_.empty()) return nullptr;   // pool full: keep draining completions
     const uint32_t idx = load_free_.back();
     load_free_.pop_back();
@@ -193,6 +194,7 @@ expert_scheduler::async_load_t* expert_scheduler::start_async_load(int32_t slot,
     t->expert = expert;
     t->slot = static_cast<uint32_t>(slot);
     t->pool = 0;   // CPU RAM in Phase A
+    t->sched = this;   // shared-dio completions are dispatched by owner
     const expert_info_t& info = topo_->get_expert(layer, expert);
     t->plan = info.read_plan;
     t->failed = false;
@@ -227,69 +229,66 @@ expert_scheduler::async_load_t* expert_scheduler::start_async_load(int32_t slot,
     return t;
 }
 
-void expert_scheduler::scheduler_loop() {
+void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
+    // IOCP has no batch completion - we aggregate per async_load_t via `pending`.
+    for (uint32_t i = 0; i < n; ++i) {
+        async_load_t* t = static_cast<async_load_t*>(done[i]->user_data);
+        const int slice = static_cast<int>(done[i] - t->reqs);
+        if (done[i]->error_code != 0) {
+            t->failed = true;
+        } else if (!t->failed && !t->direct) {
+            const auto& sl = t->plan.slices[slice];
+            std::memcpy(slot_mem(static_cast<int32_t>(t->slot)) + sl.copy_dst_offset,
+                        t->staging + sl.copy_src_offset, sl.copy_byte_len);
+        }
+        --t->pending;
+        if (t->pending == 0) {
+            if (!t->failed) {
+                slots_[t->slot].mark_ready();
+                dir_->set(t->layer, t->expert, t->pool, t->slot);
+                n_misses_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                slots_[t->slot].mark_failed();
+                LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
+            }
+            const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
+            const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
+            load_free_.push_back(idx);
+            load_in_use_[idx] = 0;
+        }
+    }
+}
+
+bool expert_scheduler::accept_requests() {
+    bool any = false;
     slot_request_t req;
-    uint64_t last_lookups = 0, last_hits = 0;
-    while (running_) {
-        // 1. drain IO completions (non-blocking poll). IOCP has no batch
-        //    completion - we aggregate per async_load_t via `pending`.
-        aio_req_t* done[64];
-        const uint32_t ndone = dio_->wait_events(done, 64, 0, 0);
-        for (uint32_t i = 0; i < ndone; ++i) {
-            async_load_t* t = static_cast<async_load_t*>(done[i]->user_data);
-            const int slice = static_cast<int>(done[i] - t->reqs);
-            if (done[i]->error_code != 0) {
-                t->failed = true;
-            } else if (!t->failed && !t->direct) {
-                const auto& sl = t->plan.slices[slice];
-                std::memcpy(slot_mem(static_cast<int32_t>(t->slot)) + sl.copy_dst_offset,
-                            t->staging + sl.copy_src_offset, sl.copy_byte_len);
-            }
-            --t->pending;
-            if (t->pending == 0) {
-                if (!t->failed) {
-                    slots_[t->slot].mark_ready();
-                    dir_->set(t->layer, t->expert, t->pool, t->slot);
-                    n_misses_.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    slots_[t->slot].mark_failed();
-                    LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
-                }
-                const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
-                const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
-                load_free_.push_back(idx);
-                load_in_use_[idx] = 0;
-            }
-        }
-        // 2. accept new requests (only when a task element is free)
-        bool popped = false;
-        while (requests_.pop(req)) {
-            popped = true;
-            uint32_t pool = 0;
-            if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
-            if (load_free_.empty()) { requests_.push(req); break; }
-            int32_t slot = alloc_or_evict(req.layer, req.expert);
-            if (slot < 0) { requests_.push(req); break; }
-            async_load_t* t = start_async_load(slot, req.layer, req.expert);
-            if (!t) { requests_.push(req); break; }
-        }
-        // 3. adapt alpha from overall hit rate EMA (scheduler-thread owned):
-        //    alpha = clamp(1 - hit_rate_ema, 0.1, 0.9)
-        const uint64_t lookups = n_lookups_.load(std::memory_order_relaxed);
-        const uint64_t hits = n_hits_.load(std::memory_order_relaxed);
-        if (lookups != last_lookups && lookups > 0) {
-            last_lookups = lookups;
-            last_hits = hits;
-            const double hr = static_cast<double>(hits) / static_cast<double>(lookups);
-            hit_rate_ema_ = hit_rate_ema_ * 0.9 + hr * 0.1;
-            double a = 1.0 - hit_rate_ema_;
-            if (a < 0.1) a = 0.1;
-            if (a > 0.9) a = 0.9;
-            alpha_.store(a, std::memory_order_relaxed);
-        }
-        if (ndone == 0 && !popped) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+    while (requests_.pop(req)) {
+        any = true;
+        uint32_t pool = 0;
+        if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
+        if (load_free_.empty()) { requests_.push(req); break; }
+        int32_t slot = alloc_or_evict(req.layer, req.expert);
+        if (slot < 0) { requests_.push(req); break; }
+        async_load_t* t = start_async_load(slot, req.layer, req.expert);
+        if (!t) { requests_.push(req); break; }
+    }
+    return any;
+}
+
+void expert_scheduler::update_alpha() {
+    // alpha = clamp(1 - hit_rate_ema, 0.1, 0.9) from overall hit rate EMA.
+    static thread_local uint64_t last_lookups = 0, last_hits = 0;
+    const uint64_t lookups = n_lookups_.load(std::memory_order_relaxed);
+    const uint64_t hits = n_hits_.load(std::memory_order_relaxed);
+    if (lookups != last_lookups && lookups > 0) {
+        last_lookups = lookups;
+        last_hits = hits;
+        const double hr = static_cast<double>(hits) / static_cast<double>(lookups);
+        hit_rate_ema_ = hit_rate_ema_ * 0.9 + hr * 0.1;
+        double a = 1.0 - hit_rate_ema_;
+        if (a < 0.1) a = 0.1;
+        if (a > 0.9) a = 0.9;
+        alpha_.store(a, std::memory_order_relaxed);
     }
 }
 
@@ -344,6 +343,75 @@ void expert_scheduler::wait_ready(uint32_t layer, uint32_t expert) {
 void expert_scheduler::unpin(const expert_handle_t& h) {
     if (h.slot >= 0 && h.slot < static_cast<int32_t>(num_slots_)) {
         slots_[h.slot].unpin();
+    }
+}
+
+// ---- global scheduler thread (multi-level cache controller) ----------------
+
+global_expert_scheduler& global_expert_scheduler::instance() {
+    static global_expert_scheduler g;
+    return g;
+}
+
+global_expert_scheduler::~global_expert_scheduler() {
+    { std::lock_guard<std::mutex> lk(mtx_); running_ = false; }
+    if (worker_.joinable()) worker_.join();
+}
+
+void global_expert_scheduler::register_scheduler(expert_scheduler* s) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    schedulers_.push_back(s);
+    // One worker for the process lifetime: started on first registration and
+    // never torn down per-pool (a pool unregistering while others remain, or
+    // re-registering later, must not restart/race the thread).
+    if (!worker_.joinable()) {
+        running_ = true;
+        worker_ = std::thread(&global_expert_scheduler::worker_loop, this);
+    }
+}
+
+void global_expert_scheduler::unregister_scheduler(expert_scheduler* s) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    schedulers_.erase(std::remove(schedulers_.begin(), schedulers_.end(), s), schedulers_.end());
+    // worker keeps running (idle when no pools are registered) until process exit.
+}
+
+void global_expert_scheduler::worker_loop() {
+    for (;;) {
+        std::vector<expert_scheduler*> snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!running_) break;
+            snap = schedulers_;
+        }
+        bool any = false;
+        // 1. drain each pool's DIO completions (shared engine in production -
+        //    a completion may belong to another pool; dispatch by owner).
+        for (auto* s : snap) {
+            if (!s->is_running()) continue;
+            async_dio_engine* dio = s->dio_engine();
+            if (!dio) continue;
+            aio_req_t* done[64];
+            const uint32_t n = dio->wait_events(done, 64, 0, 0);
+            if (n) any = true;
+            for (uint32_t i = 0; i < n; ++i) {
+                async_load_t* t = static_cast<async_load_t*>(done[i]->user_data);
+                if (t->sched && t->sched->is_running()) {
+                    t->sched->drain_completions(&done[i], 1);
+                }
+            }
+        }
+        // 2. accept alloc requests from every registered pool.
+        for (auto* s : snap) {
+            if (s->is_running() && s->accept_requests()) any = true;
+        }
+        // 3. adapt eviction alpha (overall hit-rate EMA, scheduler-thread owned).
+        for (auto* s : snap) {
+            if (s->is_running()) s->update_alpha();
+        }
+        if (!any) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
 

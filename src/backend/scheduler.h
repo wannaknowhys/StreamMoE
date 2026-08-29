@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -38,6 +39,24 @@ struct expert_handle_t {
     bool     pinned     = false;
 };
 
+// One in-flight expert load. The ringbuffer element is a contiguous 4K-aligned
+// block [async_load_t header][staging data area]; `staging` points into that
+// data area (0-sized for v2 which DIOs straight into the slot). `reqs` holds
+// one async DIO request per sector-aligned slice; `pending` counts down to
+// zero (IOCP has no batch-completion - we aggregate ourselves). One pool per
+// model (draft/main sizes differ; even one may be v2 and the other original).
+// `sched` names the owning pool so shared-dio completions are dispatched to it.
+struct async_load_t {
+    uint32_t layer = 0, expert = 0, pool = 0, slot = 0;
+    expert_read_plan_t plan;
+    int pending = 0;
+    bool failed = false;
+    bool direct = false;      // v2: reqs read straight into the slot
+    uint8_t* staging = nullptr;
+    class expert_scheduler* sched = nullptr;
+    aio_req_t reqs[MAX_SUB_TENSORS_PER_EXPERT];
+};
+
 class expert_scheduler {
 public:
     expert_scheduler() = default;
@@ -51,8 +70,24 @@ public:
     bool init(const moe_model_topology_t& topo, async_dio_engine& dio,
               const std::vector<dio_file_t*>& files, size_t pool_bytes);
 
+    // A single process-wide scheduler thread drives all pools (multi-model:
+    // main + draft). start() registers this pool with it; stop() unregisters.
     void start();
     void stop();
+
+    // Worker-driven execution hooks (called by the global scheduler thread):
+    //  - drain_completions: finish IO completions dispatched to this pool by
+    //    their owner (shared-dio completions carry the owning pool in the task)
+    //  - accept_requests: pop the MPSC alloc queue and submit async loads
+    //  - update_alpha: adapt eviction blend from hit-rate EMA
+    void drain_completions(aio_req_t** done, uint32_t n);
+    bool accept_requests();
+    void update_alpha();
+    bool is_running() const { return running_.load(std::memory_order_relaxed); }
+    // The DIO engine this pool submits loads to. Pools share one engine in
+    // production (route_b_inject); tests use their own. The global worker polls
+    // each pool's engine and dispatches completions by owner (async_load_t::sched).
+    async_dio_engine* dio_engine() const { return dio_; }
 
     // Compute-side API (called from graph_compute).
     // Block until (layer, expert) is resident, then pin it (refcount++).
@@ -119,23 +154,6 @@ public:
     uint32_t num_slots() const { return num_slots_; }
 
 private:
-    // One in-flight expert load. The ringbuffer element is a contiguous 4K-aligned
-    // block [async_load_t header][staging data area]; `staging` points into that
-    // data area (0-sized for v2 which DIOs straight into the slot). `reqs` holds
-    // one async DIO request per sector-aligned slice; `pending` counts down to
-    // zero (IOCP has no batch-completion - we aggregate ourselves). One pool per
-    // model (draft/main sizes differ; even one may be v2 and the other original).
-    struct async_load_t {
-        uint32_t layer = 0, expert = 0, pool = 0, slot = 0;
-        expert_read_plan_t plan;
-        int pending = 0;
-        bool failed = false;
-        bool direct = false;      // v2: reqs read straight into the slot
-        uint8_t* staging = nullptr;
-        aio_req_t reqs[MAX_SUB_TENSORS_PER_EXPERT];
-    };
-
-    void scheduler_loop();
     int32_t alloc_or_evict(uint32_t layer, uint32_t expert);
     async_load_t* start_async_load(int32_t slot, uint32_t layer, uint32_t expert);
     void clear_directory(uint32_t layer, uint32_t expert);
@@ -182,7 +200,6 @@ private:
 
     mpsc_alloc_queue        requests_{4096};
     std::atomic<bool>       running_{false};
-    std::thread             worker_;
     std::atomic<uint64_t>   seq_{0};
 
     std::atomic<uint64_t>   n_lookups_{0};
@@ -190,6 +207,30 @@ private:
     std::atomic<uint64_t>   n_misses_{0};
 
     expert_stats_tracker    stats_;
+};
+
+// ---- global scheduler thread (multi-level cache controller) ----------------
+// One process-wide worker drives every registered pool: drains shared-dio
+// completions (dispatched to the owning pool via async_load_t::sched), accepts
+// alloc requests, and adapts eviction alpha. Pools register on start() and
+// unregister on stop(); the worker runs while any pool is registered. Future
+// GPU pools and CPU<->GPU migration ride the same controller.
+class global_expert_scheduler {
+public:
+    static global_expert_scheduler& instance();
+    ~global_expert_scheduler();
+
+    void register_scheduler(expert_scheduler* s);
+    void unregister_scheduler(expert_scheduler* s);
+
+private:
+    global_expert_scheduler() = default;
+    void worker_loop();
+
+    std::mutex mtx_;
+    std::vector<expert_scheduler*> schedulers_;
+    std::thread worker_;
+    bool running_ = false;
 };
 
 } // namespace stream_moe

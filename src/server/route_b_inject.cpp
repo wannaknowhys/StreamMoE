@@ -17,12 +17,13 @@ namespace stream_moe {
 namespace {
 
 // One bounded expert pool per model (multi-model: main model + draft/MTP model
-// each get their own pool, scheduler, DIO files and expert buft). Overrides are
-// per-pool and point at that pool's own buft - never shared across models.
+// each get their own pool, scheduler and expert buft, but SHARE a single DIO
+// engine and the process-wide global scheduler thread). Overrides are per-pool
+// and point at that pool's own buft - never shared across models.
 struct model_pool_t {
     std::string model_path;
     std::unique_ptr<moe_model_topology_t> topo;
-    std::unique_ptr<async_dio_engine>     dio;
+    std::shared_ptr<async_dio_engine>     dio;   // shared across all pools
     std::vector<dio_file_t*>              shards;
     std::unique_ptr<expert_scheduler>     sched;
     ggml_backend_buffer_type_t            buft = nullptr;
@@ -30,6 +31,7 @@ struct model_pool_t {
 };
 
 std::vector<std::unique_ptr<model_pool_t>> g_pools;
+std::shared_ptr<async_dio_engine> g_shared_dio;   // one IOCP engine for all pools
 
 } // namespace
 
@@ -58,9 +60,12 @@ llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t r
             std::fprintf(stderr, "route B: dense model - expert backend is a no-op\n");
             return nullptr;
         }
-        pool->dio = async_dio_engine::create(1024);
+        if (!g_shared_dio) {
+            g_shared_dio = async_dio_engine::create(1024);
+        }
+        pool->dio = g_shared_dio;
         for (const auto& shard : pool->topo->shard_paths) {
-            dio_file_t* f = pool->dio->open_file(shard);
+            dio_file_t* f = g_shared_dio->open_file(shard);
             if (!f) {
                 std::fprintf(stderr, "route B: cannot DIO-open shard %s\n", shard.c_str());
                 return nullptr;
