@@ -83,6 +83,10 @@ static void emit_meta(const gguf_context * ctx, std::string & out) {
         const int t = gguf_get_kv_type(ctx, i);
         out += ",\"t\":" + std::to_string(t);
         switch (t) {
+            case GGUF_TYPE_UINT8:  out += ",\"v\":" + std::to_string(gguf_get_val_u8 (ctx, i)); break;
+            case GGUF_TYPE_INT8:   out += ",\"v\":" + std::to_string(gguf_get_val_i8 (ctx, i)); break;
+            case GGUF_TYPE_UINT16: out += ",\"v\":" + std::to_string(gguf_get_val_u16(ctx, i)); break;
+            case GGUF_TYPE_INT16:  out += ",\"v\":" + std::to_string(gguf_get_val_i16(ctx, i)); break;
             case GGUF_TYPE_UINT32: out += ",\"v\":" + std::to_string(gguf_get_val_u32(ctx, i)); break;
             case GGUF_TYPE_INT32:  out += ",\"v\":" + std::to_string(gguf_get_val_i32(ctx, i)); break;
             case GGUF_TYPE_UINT64: out += ",\"v\":" + std::to_string(gguf_get_val_u64(ctx, i)); break;
