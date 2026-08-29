@@ -109,13 +109,15 @@ function postChat(messages) {
                     const j = JSON.parse(d);
                     if (j.error) resolve({ error: String(j.error.message || j.error) });
                     else {
-                        // Keep EVERYTHING the model emitted: reasoning (thinking)
-                        // + final content, even when truncated / ctx-exhausted.
                         const msg = j.choices && j.choices[0] && j.choices[0].message;
-                        const parts = [];
-                        if (msg && msg.reasoning_content) parts.push(msg.reasoning_content);
-                        if (msg && msg.content) parts.push(msg.content);
-                        resolve({ content: parts.join('\n\n'), prompt_tokens: j.usage ? j.usage.prompt_tokens : 0 });
+                        // keep the full message object (reasoning_content + content +
+                        // tool_calls etc.) so chat.json can replay exactly what the
+                        // model emitted, even when truncated / ctx-exhausted.
+                        resolve({
+                            msg: msg || null,
+                            content: msg ? (msg.content || '') : '',
+                            prompt_tokens: j.usage ? j.usage.prompt_tokens : 0,
+                        });
                     }
                 } catch (e) { reject(new Error('bad chat JSON: ' + d.slice(0, 200))); }
             });
@@ -137,19 +139,23 @@ async function feedTask(run, dir) {
     } else if (f.type === 'jsonl') {
         const lines = fs.readFileSync(f.path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
         const maxTurns = f.maxTurns || lines.length;
-        const messages = [];
+        const messages = [];   // request body (final content only)
+        const chatLog = [];    // full message objects incl. reasoning_content
         for (let i = 0; i < maxTurns; i++) {
             const { system, prompt } = lines[i];
-            if (system && String(system).trim()) messages.push({ role: 'system', content: system });
+            if (system && String(system).trim()) { messages.push({ role: 'system', content: system }); chatLog.push({ role: 'system', content: system }); }
             messages.push({ role: 'user', content: prompt });
+            chatLog.push({ role: 'user', content: prompt });
             const res = await postChat(messages);
             if (res.error) { console.log('  turn ' + (i + 1) + '/' + maxTurns + ': ERROR ' + res.error); break; }
             messages.push({ role: 'assistant', content: res.content });
+            chatLog.push(res.msg || { role: 'assistant', content: res.content });
             console.log('  turn ' + (i + 1) + '/' + maxTurns + ' done (prompt_tokens=' + res.prompt_tokens + ')');
         }
-        // full conversation incl. model replies, next to the exported bins
-        fs.writeFileSync(path.join(dir, 'chat.json'), JSON.stringify(messages, null, 2));
-        console.log('  chat saved: ' + path.join(dir, 'chat.json') + ' (' + messages.length + ' msgs)');
+        // full conversation incl. complete model messages (thinking + content),
+        // next to the exported bins
+        fs.writeFileSync(path.join(dir, 'chat.json'), JSON.stringify(chatLog, null, 2));
+        console.log('  chat saved: ' + path.join(dir, 'chat.json') + ' (' + chatLog.length + ' msgs)');
     } else throw new Error('[run_export] unknown feed type ' + f.type);
 }
 
