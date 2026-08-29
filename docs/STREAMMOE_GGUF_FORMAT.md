@@ -185,8 +185,61 @@ echo {"cmd":"open","path":"N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"} | tem
 - [x] **v1 sections**（`alignment=4096` + dense/expert 分区，原版可读）——`convert --format v1`。
 - [x] **v2 expert-blocks**（专家紧凑块，自有 loader）——`convert --format v2`；已产出 gemma-4-26B-A4B `-v2.gguf` / `-v2-NOHOLE.gguf` 并做 bit 级验证。
 - [x] **v1 合分片**（`-00001-of-00005` → 单文件，`in` 支持 `p1;p2` 多分片输入）。
-- [ ] **v2 RAID0 切分**（专家块跨文件，固定规则 + 并发 DIO）——`chunk` 命令 **TODO**（`"chunk not implemented yet"`）。
+- [x] **v2 RAID0 切分**（dense 段 + 每专家块按 4K 块切 N 份，均匀 base/rem 或 `--ratio` largest-remainder）——`chunk` 命令（`out1,out2,...` 逗号分隔 N 路径，完整 GGUF + `incomplete=1`）。
 - [ ] **v1 张量级分片**（单文件 → 文件系列，原版可合并）——未实现。
+- [ ] **v2 反重排还原**（v2 → v1/原版，经中间格式拆块）——未实现，见 §9。
 - [x] **数值等价验证**（gemma v2 vs 原版逐位一致已做；v1 原版可读自证）。
 
-**结论**：转换（v1/v2 单文件）已可用；**chunk（跨盘 RAID0）是下一步**——它是 v2 多盘并发 DIO 直读的装载前提（见 `docs/EXPERT_SCHEDULER_DESIGN.md` §11）。
+**结论**：原版 → v1/v2 单文件 + v1 → v2 + v2 → chunk 已可用；**中间格式（§9）统一 parse/write 后矩阵全通**（含 v2 → v1/原版 反重排还原）。
+
+---
+
+## 9. 转换器中间格式（统一模型抽象）
+
+> 目标：让**所有格式**（原版 / v1 / v2 / v2 切）都能解析到同一个内存中的模型抽象，再从该抽象写出任意目标（v1 / v2 / v2 切）——矩阵全通、单向可逆（v2 只是"打乱"而非"丢失"，可拆回）。这样**任意多方向转换可互相验证转换器无 bug**。
+
+### 9.1 中间格式（JS 内存中的模型抽象，不是文件）
+
+```js
+{
+  arch, n_layer, n_expert, n_expert_used,
+  layout,                       // 'original' | 'v1' | 'v2'
+  dense:  [ { name, ne:[], type, size, src:{file, off, size} } ],  // dense 张量 + 数据源
+  expert: [ { name, ne:[], type, perExpert, src:{file, off, size}, branch } ],
+                                // 每分支张量（按层），src 可跨文件/块
+}
+```
+
+- `src` 是**统一的字节区间定位**（文件 + 偏移 + 大小）——写入任何目标格式时按它读数据。
+- 只描述结构 + 数据定位，不持有数据本身（大模型不进内存）。
+
+### 9.2 解析器（各格式 → 中间）
+
+| 源格式 | 解析 |
+| :--- | :--- |
+| 原版 | open 张量列表 → dense/expert（name 含 `_exps` 且非 `.scale`）→ `src` = shard+off+size |
+| v1 | 同原版（张量连续可读）+ `dense_section` 标记 |
+| v2 | `expert_sections`（块 off/size）+ `expert_branch_names/sizes/counts`（块内布局）→ 每专家块拆出各分支区间 → 专家张量 `src` = 块内分支区间（**可逆关键**）|
+| v2 切 | chunk 规则（base/rem 或 ratio）→ 专家张量 `src` = "文件 i 的段区间" |
+
+### 9.3 写入器（中间 → 各格式）
+
+| 目标 | 写入 |
+| :--- | :--- |
+| v1 | 张量重排（dense 段 + expert 段，4K 对齐）|
+| v2 | dense 段 + 每专家块（从分支 `src` 拼）|
+| v2 切 | dense/专家块按规则切 N 份（每份完整 GGUF + chunk KV）|
+
+转换 = `parse(源) → 中间 → write(目标)`；执行层（convertd）只做"按 `src` 读区间 + 按布局写"。
+
+### 9.4 矩阵（经中间格式全通）
+
+| 源 \ 目标 | v1 | v2 | v2 切 |
+| :--- | :--- | :--- | :--- |
+| 原版 | ✓ | ✓ | ✓ |
+| v1 | — | ✓ | ✓ |
+| v2 | ✓（拆块还原）| — | ✓ |
+| v2 切 | ✓（合并还原）| ✓ | 重切 |
+
+- **可逆性**：v2 的专家数据是"打乱"（重排成块），张量 name/ne/type + branch 布局都在 KV/tensor_info——可拆回；真正丢失的只有多分片结构（`split.*`）与对齐 padding（有原始大小可去）。
+- **验证方法**：`A→中间→B` 与 `A→B` 直转对比逐字节；`A→中间→v2→中间→v1` 回环与 `A→v1` 对比——多方向转换互相校验转换器。
