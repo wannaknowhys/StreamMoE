@@ -109,11 +109,13 @@ function postChat(messages) {
                     const j = JSON.parse(d);
                     if (j.error) resolve({ error: String(j.error.message || j.error) });
                     else {
-                        // reasoning models (gemma4): content may be empty until
-                        // [End thinking]; keep reasoning_content so chat.json has the reply.
+                        // Keep EVERYTHING the model emitted: reasoning (thinking)
+                        // + final content, even when truncated / ctx-exhausted.
                         const msg = j.choices && j.choices[0] && j.choices[0].message;
-                        const content = msg ? (msg.content || msg.reasoning_content || '') : '';
-                        resolve({ content, prompt_tokens: j.usage ? j.usage.prompt_tokens : 0 });
+                        const parts = [];
+                        if (msg && msg.reasoning_content) parts.push(msg.reasoning_content);
+                        if (msg && msg.content) parts.push(msg.content);
+                        resolve({ content: parts.join('\n\n'), prompt_tokens: j.usage ? j.usage.prompt_tokens : 0 });
                     }
                 } catch (e) { reject(new Error('bad chat JSON: ' + d.slice(0, 200))); }
             });
