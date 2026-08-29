@@ -55,3 +55,27 @@ git -C temp/llama_verify apply F:\Dev\StreamMoE\temp\patches_split\route-b-injec
 rem ... 按顺序 apply 其余 ...
 git -C temp/llama_verify diff --stat ffe029953   rem 应为空
 ```
+
+## Patch 更新：把"B 应用后的后续修改"并进 B.patch（实测 2026-08-29，好用）
+
+问题：应用 A.patch、B.patch 后又在工作区改了代码，想把后续修改并入 B.patch。
+
+方法（A/B 分开 commit -> 修复 amend 进 B -> 重新导出）：
+1. 先确保当前工作区状态已提交（含 A+B+后续修改）；未提交则先 commit 或 stash。
+2. 临时分支从干净基线重建 A 和 B：
+   ```
+   git -C temp/llama_verify checkout f280b2698
+   git -C temp/llama_verify checkout -b patch-export
+   git -C temp/llama_verify apply A.patch ... && git commit -m "A"     rem commit A
+   git -C temp/llama_verify apply B.patch ... && git commit -m "B"     rem commit B
+   ```
+3. 生成后续修改的增量 diff（相对"B 应用后的状态"）：
+   ```
+   cmd /c "git -C third_party/llama.cpp diff <A+B状态commit> <修复后commit> -- <改动文件> > temp\fix.diff"
+   ```
+   在临时分支 apply 该 diff -> `git add -A && git commit --amend`（并入 B commit）。
+4. 导出新 B.patch：
+   - format-patch（含 email 头）：`git format-patch -1 --stdout > B.patch`
+   - 纯 diff（patches/ 风格，推荐）：`git -C temp/llama_verify diff <A commit> <B commit> > B.patch`
+5. 验证：temp 从基线依次 apply A + 新 B -> `git diff <目标状态>` 应只差非 patch 文件
+   （如 tsc_timer.h 这类独立提交的文件），其余一致。
