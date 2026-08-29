@@ -392,6 +392,19 @@ static void cmd_convert_v2(const std::string & json, std::string & out) {
                         break;
                     }
                 }
+                // 0-fill the block tail up to its aligned size so the block's
+                // 4K-aligned span is fully present in the file (DIO / chunk /
+                // loader read the full blockSize without running past EOF).
+                const size_t blockSize = blocks[bi].size;
+                if (written < blockSize) {
+                    static const char zeros[ALIGN] = { 0 };
+                    size_t pad = blockSize - written;
+                    while (pad) {
+                        const size_t n = pad < sizeof(zeros) ? pad : sizeof(zeros);
+                        if (std::fwrite(zeros, 1, n, outF) != n) throw std::runtime_error("write pad");
+                        pad -= n;
+                    }
+                }
             }
         }
         std::fclose(outF);
