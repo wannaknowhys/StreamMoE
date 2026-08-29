@@ -160,7 +160,6 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
             exp.expert_idx = static_cast<int32_t>(e);
             exp.total_expert_bytes = 0;
             exp.sub_tensors.clear();
-            std::vector<sub_tensor_req_t> reqs;
             uint64_t cur = 0;
             for (size_t j = 0; j < n_branch; ++j) {
                 const uint64_t bsz = bsizes[branch_off + j];
@@ -173,16 +172,20 @@ static void build_v2_experts(struct gguf_context* ctx0, moe_model_topology_t& to
                 st.ggml_type = 0; // F32 placeholder; staging is keyed on byte size
                 st.ne[0] = 0;
                 exp.sub_tensors.push_back(st);
-                sub_tensor_req_t req;
-                req.shard_idx = 0;
-                req.file_offset = data_start + boff + cur;
-                req.byte_size = bsz;
-                req.slot_offset = cur;
-                reqs.push_back(req);
                 cur += bsz;
                 exp.total_expert_bytes += bsz;
             }
-            exp.read_plan = build_expert_read_plan(reqs.data(), static_cast<uint32_t>(reqs.size()));
+            // Read plan = ONE whole-block 4K-aligned slice read straight into the
+            // slot base (the block's internal branch layout IS the slot layout,
+            // so no staging / memcpy is needed). Per-branch slices would need
+            // 4K-aligned branch offsets inside the block, which the converter
+            // does not pad - so a single whole-block read is the correct v2 form.
+            sub_tensor_req_t blk;
+            blk.shard_idx = 0;
+            blk.file_offset = data_start + boff;
+            blk.byte_size = bsize;
+            blk.slot_offset = 0;
+            exp.read_plan = build_expert_read_plan(&blk, 1);
         }
         branch_off += n_branch;
         // sub-pool group by layer block size
