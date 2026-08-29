@@ -31,6 +31,14 @@ static moe_model_topology_t build_topo() {
     topo.expert_slot_size = SLOT_SIZE;
     topo.experts.resize(static_cast<size_t>(N_LAYERS) * N_EXPERTS);
 
+    // One homogeneous expert group covering both layers (uniform stride slots).
+    moe_model_topology_t::expert_group_t g;
+    g.idx = 0;
+    g.layers = {0, 1};
+    g.expert_size = SLOT_SIZE;
+    g.total_bytes = static_cast<uint64_t>(g.layers.size()) * N_EXPERTS * g.expert_size;
+    topo.groups.push_back(g);
+
     for (uint32_t l = 0; l < N_LAYERS; ++l) {
         for (uint32_t e = 0; e < N_EXPERTS; ++e) {
             auto& info = topo.experts[static_cast<size_t>(l) * N_EXPERTS + e];

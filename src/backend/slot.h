@@ -168,28 +168,53 @@ struct slot_meta {
 };
 
 // ---- expert directory -----------------------------------------------------
-// Maps (layer, expert) -> slot index or UNASSIGNED. Compute threads read-only;
-// scheduler thread writes. version[e] bumps on every mapping change so waiters
-// can wake and re-scan without a lock.
+// Maps (layer, expert) -> slot index (per pool) or UNASSIGNED. Two-dimensional:
+// outer (layer, expert), inner pool (CPU RAM / GPU VRAM ...). The whole expert
+// store is viewed as a read-only multi-level cache: a directory is kept per
+// (layer, expert) per pool, plus one cross-pool last_used_token (recency for
+// eviction scoring). Compute threads read-only; scheduler thread writes.
+// version[e] bumps on every mapping change (any pool) so waiters can wake and
+// re-scan without a lock.
 static constexpr uint32_t SLOT_UNASSIGNED = 0xFFFFFFFFu;
 
 class expert_directory {
 public:
-    expert_directory(uint32_t n_layers, uint32_t n_experts, uint32_t n_slots)
-        : n_layers_(n_layers), n_experts_(n_experts), n_slots_(n_slots),
-          entries_(static_cast<size_t>(n_layers) * n_experts),
-          versions_(static_cast<size_t>(n_layers) * n_experts) {
+    expert_directory(uint32_t n_layers, uint32_t n_experts, uint32_t n_pools, uint32_t n_slots)
+        : n_layers_(n_layers), n_experts_(n_experts), n_pools_(n_pools), n_slots_(n_slots),
+          entries_(static_cast<size_t>(n_layers) * n_experts * n_pools),
+          versions_(static_cast<size_t>(n_layers) * n_experts),
+          last_used_(static_cast<size_t>(n_layers) * n_experts) {
         for (auto& e : entries_) e.store(SLOT_UNASSIGNED, std::memory_order_relaxed);
     }
 
-    uint32_t find(uint32_t layer, uint32_t expert) const {
-        return entries_[idx(layer, expert)].load(std::memory_order_acquire);
+    uint32_t n_pools() const { return n_pools_; }
+
+    // (layer, expert) -> slot in a specific pool, or SLOT_UNASSIGNED.
+    uint32_t find(uint32_t layer, uint32_t expert, uint32_t pool) const {
+        return entries_[idx(layer, expert, pool)].load(std::memory_order_acquire);
     }
 
-    void set(uint32_t layer, uint32_t expert, uint32_t slot) {
-        entries_[idx(layer, expert)].store(slot, std::memory_order_release);
+    // Scan all pools for (layer, expert). Returns slot (global) and writes the
+    // owning pool to *out_pool, or SLOT_UNASSIGNED if resident nowhere.
+    uint32_t scan(uint32_t layer, uint32_t expert, uint32_t* out_pool) const {
+        for (uint32_t p = 0; p < n_pools_; ++p) {
+            uint32_t s = entries_[idx(layer, expert, p)].load(std::memory_order_acquire);
+            if (s != SLOT_UNASSIGNED) {
+                if (out_pool) *out_pool = p;
+                return s;
+            }
+        }
+        return SLOT_UNASSIGNED;
+    }
+
+    void set(uint32_t layer, uint32_t expert, uint32_t pool, uint32_t slot) {
+        entries_[idx(layer, expert, pool)].store(slot, std::memory_order_release);
         versions_[idx(layer, expert)].fetch_add(1, std::memory_order_acq_rel);
         slot_wake_all(&versions_[idx(layer, expert)]);
+    }
+
+    void clear(uint32_t layer, uint32_t expert, uint32_t pool) {
+        set(layer, expert, pool, SLOT_UNASSIGNED);
     }
 
     uint32_t version(uint32_t layer, uint32_t expert) const {
@@ -205,13 +230,26 @@ public:
         }
     }
 
+    // Cross-pool recency: bumped with the global token counter on every
+    // successful pin; eviction scoring reads it (max(0, cur - last_used)).
+    void touch_last_used(uint32_t layer, uint32_t expert, uint64_t token) {
+        last_used_[idx(layer, expert)].store(token, std::memory_order_relaxed);
+    }
+    uint64_t last_used(uint32_t layer, uint32_t expert) const {
+        return last_used_[idx(layer, expert)].load(std::memory_order_relaxed);
+    }
+
 private:
     size_t idx(uint32_t layer, uint32_t expert) const {
         return static_cast<size_t>(layer) * n_experts_ + expert;
     }
-    uint32_t n_layers_, n_experts_, n_slots_;
+    size_t idx(uint32_t layer, uint32_t expert, uint32_t pool) const {
+        return (static_cast<size_t>(layer) * n_experts_ + expert) * n_pools_ + pool;
+    }
+    uint32_t n_layers_, n_experts_, n_pools_, n_slots_;
     std::vector<std::atomic<uint32_t>> entries_;
     std::vector<std::atomic<uint32_t>> versions_;
+    std::vector<std::atomic<uint64_t>> last_used_;
 };
 
 // ---- bounded MPSC alloc-request queue -------------------------------------

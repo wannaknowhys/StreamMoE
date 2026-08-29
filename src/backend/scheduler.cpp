@@ -56,8 +56,14 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
 
     slots_ = std::make_unique<slot_meta[]>(num_slots_);
     owner_.resize(num_slots_, {0, 0});
-    dir_owned_ = std::make_unique<expert_directory>(topo.n_layer, topo.n_expert, num_slots_);
+    dir_owned_ = std::make_unique<expert_directory>(topo.n_layer, topo.n_expert, n_pools_, num_slots_);
     dir_ = dir_owned_.get();
+
+    // Initial hit rate prior = pool bytes / total expert bytes (recency-vs-freq
+    // blend prior before real traffic; alpha = clamp(1 - hit_rate_ema, 0.1, 0.9)).
+    hit_rate_ema_ = total_bytes > 0 ? (static_cast<double>(pool_bytes_) / static_cast<double>(total_bytes)) : 0.5;
+    if (hit_rate_ema_ > 0.95) hit_rate_ema_ = 0.95;
+    alpha_.store(1.0 - hit_rate_ema_, std::memory_order_relaxed);
 
     // One staging buffer per expert group, sized to the group's MAX expert
     // layout (per-expert staging needs differ due to file-offset alignment).
@@ -105,8 +111,10 @@ void expert_scheduler::stop() {
 }
 
 void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
-    if (dir_->find(layer, expert) != SLOT_UNASSIGNED) {
-        dir_->set(layer, expert, SLOT_UNASSIGNED);
+    uint32_t pool = 0;
+    uint32_t s = dir_->scan(layer, expert, &pool);
+    if (s != SLOT_UNASSIGNED) {
+        dir_->clear(layer, expert, pool);
     }
 }
 
@@ -125,19 +133,23 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
         }
     }
 
-    // 2. evict victim: READY && refcount==0, lowest hybrid score (EST1) then oldest
+    // 2. evict victim: READY && refcount==0, lowest hybrid score then oldest.
+    //    score = alpha * 1/(1+recency) + (1-alpha) * freq   (smaller = evict first)
+    //    recency = max(0, cur_token - last_used_token); alpha = clamp(1-hit_rate_ema, .1, .9)
     int32_t victim = -1;
     double  best_score = std::numeric_limits<double>::infinity();
-    uint64_t best_seq = 0;
+    const uint64_t cur = token_.load(std::memory_order_relaxed);
+    const double a = alpha_.load(std::memory_order_relaxed);
     for (uint32_t i = lo; i < hi; ++i) {
         uint64_t w = slots_[i].load();
         if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
-        double freq = stats_.get_adaptive_frequency(owner_[i].first, owner_[i].second);
-        double score = 0.5 * freq + 0.5 * (1.0 - (static_cast<double>(slot_word_generation(w)) / 1e9));
+        const uint64_t last = dir_->last_used(owner_[i].first, owner_[i].second);
+        const uint64_t recency = (cur > last) ? (cur - last) : 0;
+        const double freq = stats_.get_adaptive_frequency(owner_[i].first, owner_[i].second);
+        const double score = a * (1.0 / (1.0 + static_cast<double>(recency))) + (1.0 - a) * freq;
         if (score < best_score) {
             best_score = score;
             victim = static_cast<int32_t>(i);
-            best_seq = slot_word_generation(w);
         }
     }
     if (victim < 0) return -1; // all slots pinned/in-flight
@@ -150,7 +162,6 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     }
     slots_[victim].begin_reload();
     owner_[victim] = {layer, expert};
-    (void)best_seq;
     return victim;
 }
 
@@ -161,7 +172,7 @@ void expert_scheduler::load_slot(int32_t slot, uint32_t layer, uint32_t expert) 
     bool ok = read_expert_sync(dio_, files_, info.read_plan, staging_per_group_[gidx].get(), slot_mem(slot));
     if (ok) {
         slots_[slot].mark_ready();
-        dir_->set(layer, expert, static_cast<uint32_t>(slot));
+        dir_->set(layer, expert, 0 /* pool: CPU RAM in Phase A */, static_cast<uint32_t>(slot));
         n_misses_.fetch_add(1, std::memory_order_relaxed);
     } else {
         slots_[slot].mark_failed();
@@ -171,10 +182,12 @@ void expert_scheduler::load_slot(int32_t slot, uint32_t layer, uint32_t expert) 
 
 void expert_scheduler::scheduler_loop() {
     slot_request_t req;
+    uint64_t last_lookups = 0, last_hits = 0;
     while (running_) {
         if (requests_.pop(req)) {
-            // Skip if already resident (duplicate request raced us).
-            if (dir_->find(req.layer, req.expert) != SLOT_UNASSIGNED) continue;
+            // Skip if already resident in any pool (duplicate request raced us).
+            uint32_t pool = 0;
+            if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
             int32_t slot = alloc_or_evict(req.layer, req.expert);
             if (slot < 0) {
                 // pool fully pinned right now; retry shortly
@@ -186,6 +199,20 @@ void expert_scheduler::scheduler_loop() {
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        // Adapt alpha from overall hit rate EMA (scheduler-thread owned):
+        //   alpha = clamp(1 - hit_rate_ema, 0.1, 0.9)
+        const uint64_t lookups = n_lookups_.load(std::memory_order_relaxed);
+        const uint64_t hits = n_hits_.load(std::memory_order_relaxed);
+        if (lookups != last_lookups && lookups > 0) {
+            last_lookups = lookups;
+            last_hits = hits;
+            const double hr = static_cast<double>(hits) / static_cast<double>(lookups);
+            hit_rate_ema_ = hit_rate_ema_ * 0.9 + hr * 0.1;
+            double a = 1.0 - hit_rate_ema_;
+            if (a < 0.1) a = 0.1;
+            if (a > 0.9) a = 0.9;
+            alpha_.store(a, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -193,7 +220,8 @@ expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
     n_lookups_.fetch_add(1, std::memory_order_relaxed);
     bool waited_for_load = false;
     for (int retries = 0; retries < 100000; ++retries) {
-        uint32_t s = dir_->find(layer, expert);
+        uint32_t pool = 0;
+        uint32_t s = dir_->scan(layer, expert, &pool);
         if (s == SLOT_UNASSIGNED) {
             waited_for_load = true;
             uint32_t v = dir_->version(layer, expert);
@@ -204,24 +232,27 @@ expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
         uint32_t st = slot_word_state(slots_[s].load());
         if (st == SLOT_FAILED) {
             LOG_ERROR("expert_scheduler: pin_expert FAILED for L" << layer << " E" << expert);
-            return {-1, 0, layer, expert, false};
+            return {-1, 0, layer, expert, pool, false};
         }
         int64_t gen = slots_[s].try_pin();
         if (gen >= 0) {
             if (!waited_for_load) {
                 n_hits_.fetch_add(1, std::memory_order_relaxed);
             }
-            return {static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, expert, true};
+            const uint64_t t = token_.fetch_add(1, std::memory_order_relaxed) + 1;
+            dir_->touch_last_used(layer, expert, t);
+            return {static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, expert, pool, true};
         }
         std::this_thread::yield(); // transient (evicting); retry
     }
     LOG_ERROR("expert_scheduler: pin_expert retry limit hit for L" << layer << " E" << expert);
-    return {-1, 0, layer, expert, false};
+    return {-1, 0, layer, expert, 0, false};
 }
 
 void expert_scheduler::wait_ready(uint32_t layer, uint32_t expert) {
     for (;;) {
-        uint32_t s = dir_->find(layer, expert);
+        uint32_t pool = 0;
+        uint32_t s = dir_->scan(layer, expert, &pool);
         if (s == SLOT_UNASSIGNED) {
             uint32_t v = dir_->version(layer, expert);
             requests_.push({layer, expert, static_cast<uint32_t>(seq_.fetch_add(1, std::memory_order_relaxed))});

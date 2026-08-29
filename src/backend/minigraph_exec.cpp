@@ -63,7 +63,7 @@ bool pin_state_has(const pin_state_t& st, uint32_t layer, uint32_t expert) {
 expert_handle_t pin_state_find(const pin_state_t& st, uint32_t layer, uint32_t expert) {
     for (const auto& h : st.pins)
         if (h.layer == layer && h.expert == expert) return h;
-    return {-1, 0, layer, expert, false};
+    return {-1, 0, layer, expert, 0, false};
 }
 
 } // namespace

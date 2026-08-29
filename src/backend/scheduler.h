@@ -34,6 +34,7 @@ struct expert_handle_t {
     uint32_t generation = 0;
     uint32_t layer      = 0;
     uint32_t expert     = 0;
+    uint32_t pool       = 0;   // device pool index (0 = CPU RAM)
     bool     pinned     = false;
 };
 
@@ -87,9 +88,10 @@ public:
         }
         return nullptr;
     }
-    // Current slot index for (layer, expert), or -1 if not resident.
+    // Current slot index for (layer, expert) in any pool, or -1 if not resident.
     int32_t slot_of(uint32_t layer, uint32_t expert) const {
-        uint32_t s = dir_->find(layer, expert);
+        uint32_t pool = 0;
+        uint32_t s = dir_->scan(layer, expert, &pool);
         return s == SLOT_UNASSIGNED ? -1 : static_cast<int32_t>(s);
     }
     void unpin_slot(int32_t slot) {
@@ -128,8 +130,18 @@ private:
 
     size_t   pool_bytes_ = 0;
     uint32_t num_slots_  = 0;
+    uint32_t n_pools_    = 1;   // device pools; multi-device (GPU) comes in Phase B
     uint8_t* pool_base_  = nullptr;
     std::vector<subpool_t> subpools_;
+
+    // Eviction scoring state (scheduler thread owns):
+    //   recency = max(0, cur_token - last_used_token)   (dir_ holds last_used)
+    //   score   = alpha * 1/(1+recency) + (1-alpha) * freq
+    //   alpha   = clamp(1 - hit_rate_ema, 0.1, 0.9)
+    std::atomic<uint64_t> token_{0};        // global pin counter (recency source)
+    std::atomic<double>   alpha_{0.5};
+    double hit_rate_ema_ = 0.0;
+    uint64_t hit_rate_init_denom_ = 1;      // initial hit rate = pool bytes / total expert bytes
 
     // One staging buffer per expert group (each group's experts share the same
     // layout, so one buffer of that size suffices for the whole group).

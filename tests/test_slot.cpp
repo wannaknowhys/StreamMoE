@@ -87,16 +87,28 @@ static bool test_slot_wake_thread() {
 }
 
 static bool test_expert_directory() {
-    expert_directory dir(4, 256, 1024);
-    TEST_ASSERT(dir.find(0, 0) == SLOT_UNASSIGNED, "unassigned initially");
+    expert_directory dir(4, 256, 2, 1024);   // n_pools = 2 (multi-pool layout)
+    TEST_ASSERT(dir.n_pools() == 2, "pool count");
+    TEST_ASSERT(dir.find(0, 0, 0) == SLOT_UNASSIGNED, "unassigned initially (pool 0)");
+    TEST_ASSERT(dir.scan(0, 0, nullptr) == SLOT_UNASSIGNED, "unassigned across pools");
 
-    dir.set(2, 17, 42);
-    TEST_ASSERT(dir.find(2, 17) == 42, "find after set");
-    TEST_ASSERT(dir.find(0, 0) == SLOT_UNASSIGNED, "other entry untouched");
+    dir.set(2, 17, 0, 42);
+    TEST_ASSERT(dir.find(2, 17, 0) == 42, "find after set (pool 0)");
+    TEST_ASSERT(dir.find(2, 17, 1) == SLOT_UNASSIGNED, "other pool untouched");
+    uint32_t scan_pool = 99;
+    TEST_ASSERT(dir.scan(2, 17, &scan_pool) == 42 && scan_pool == 0, "scan returns slot + pool");
+    TEST_ASSERT(dir.find(0, 0, 0) == SLOT_UNASSIGNED, "other entry untouched");
 
     uint32_t v0 = dir.version(2, 17);
-    dir.set(2, 17, 43);
-    TEST_ASSERT(dir.version(2, 17) == v0 + 1, "version bumped on remap");
+    dir.set(2, 17, 0, 43);
+    TEST_ASSERT(dir.version(2, 17) == v0 + 1, "version bumped on remap (pool 0)");
+    dir.set(2, 17, 1, 55);                    // second pool mapping
+    TEST_ASSERT(dir.version(2, 17) == v0 + 2, "version bumped on cross-pool remap");
+    TEST_ASSERT(dir.scan(2, 17, &scan_pool) == 43 && scan_pool == 0, "scan picks lowest pool first");
+
+    dir.touch_last_used(2, 17, 1000);
+    TEST_ASSERT(dir.last_used(2, 17) == 1000, "last_used stored");
+    TEST_ASSERT(dir.last_used(0, 0) == 0, "other entry last_used zero");
 
     std::printf("[+] test_expert_directory PASSED\n"); std::fflush(stdout);
     return true;
