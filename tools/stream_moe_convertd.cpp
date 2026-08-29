@@ -444,6 +444,56 @@ static void cmd_convert(const std::string & json, std::string & out) {
             }
         }
 
+        // v2 source: expert data lives in compact blocks (one per expert), so
+        // tensor offsets are placeholders. Branch layout comes from the
+        // expert_branch_* KV - unpack blocks back into per-tensor per-expert
+        // byte ranges (the intermediate-format equivalent; reversible).
+        bool src_v2 = false;
+        int64_t n_expert = 0;
+        for (int i = 0; i < gguf_get_n_kv(srcs[0]); i++) {
+            const std::string k = gguf_get_key(srcs[0], i);
+            if (k == "stream_moe.layout") src_v2 = std::string(gguf_get_val_str(srcs[0], i)) == "expert-blocks-v2";
+            if (k.find("expert_count") != std::string::npos) {
+                if (gguf_get_kv_type(srcs[0], i) == GGUF_TYPE_INT32) n_expert = gguf_get_val_i32(srcs[0], i);
+                else if (gguf_get_kv_type(srcs[0], i) == GGUF_TYPE_UINT32) n_expert = (int64_t) gguf_get_val_u32(srcs[0], i);
+            }
+        }
+        std::map<std::string, std::vector<std::pair<size_t, size_t>>> v2src;
+        if (src_v2) {
+            auto get_arr_u64 = [&](const char * key, std::vector<uint64_t> & v) {
+                const int id = gguf_find_key(srcs[0], key);
+                if (id < 0) throw std::runtime_error(std::string("v2 source: missing ") + key);
+                const uint64_t * d = static_cast<const uint64_t *>(gguf_get_arr_data(srcs[0], id));
+                v.assign(d, d + gguf_get_arr_n(srcs[0], id));
+            };
+            std::vector<uint64_t> sec, bsizes, bcounts;
+            get_arr_u64("stream_moe.expert_sections", sec);
+            get_arr_u64("stream_moe.expert_branch_sizes", bsizes);
+            get_arr_u64("stream_moe.expert_branch_counts", bcounts);
+            const int bnid = gguf_find_key(srcs[0], "stream_moe.expert_branch_names");
+            if (bnid < 0) throw std::runtime_error("v2 source: missing branch_names");
+            std::vector<std::string> bnames(gguf_get_arr_n(srcs[0], bnid));
+            for (size_t i = 0; i < bnames.size(); i++) bnames[i] = gguf_get_arr_str(srcs[0], bnid, i);
+            const size_t dataOff = gguf_get_data_offset(srcs[0]);
+            const int64_t nBlocks = (int64_t)(sec.size() / 3);
+            size_t ni = 0, si = 0;
+            for (size_t l = 0; l < bcounts.size(); l++) {
+                size_t branchOff = 0;
+                for (uint64_t j = 0; j < bcounts[l]; j++) {
+                    const std::string & nm = bnames[ni++];
+                    const size_t perExp = (size_t) bsizes[si++];
+                    std::vector<std::pair<size_t, size_t>> srcsL((size_t) n_expert);
+                    for (int64_t e = 0; e < n_expert; e++) {
+                        const int64_t blk = (int64_t) l * n_expert + e;
+                        if (blk >= nBlocks) throw std::runtime_error("v2 source: block index out of range");
+                        srcsL[e] = { dataOff + (size_t) sec[blk * 3] + branchOff, perExp };
+                    }
+                    v2src[nm] = std::move(srcsL);
+                    branchOff += perExp;
+                }
+            }
+        }
+
         // target gguf
         gguf_context * dst = gguf_init_empty();
         gguf_set_alignment(dst, ALIGN);
@@ -505,18 +555,41 @@ static void cmd_convert(const std::string & json, std::string & out) {
         std::vector<char> buf(64 * 1024 * 1024);
         int idx = 0;
         for (auto & t : ordered) {
-            const size_t srcPos = gguf_get_data_offset(srcs[t.shard]) + gguf_get_tensor_offset(srcs[t.shard], t.idx);
-            const size_t size   = gguf_get_tensor_size(srcs[t.shard], t.idx);
             const size_t dstPos = dataStart + gguf_get_tensor_offset(dst, idx);
-            FILE * sf = srcF[t.shard];
-            if (_fseeki64(sf, srcPos, SEEK_SET) != 0) throw std::runtime_error("seek src failed");
-            if (_fseeki64(outF, dstPos, SEEK_SET) != 0) throw std::runtime_error("seek dst failed");
-            size_t left = size;
-            while (left) {
-                const size_t n = left < buf.size() ? left : buf.size();
-                if (std::fread(buf.data(), 1, n, sf) != n) throw std::runtime_error("read tensor data failed");
-                if (std::fwrite(buf.data(), 1, n, outF) != n) throw std::runtime_error("write tensor data failed");
-                left -= n;
+            if (t.expert && src_v2) {
+                // unpack from the compact blocks: per-expert branch intervals
+                auto it = v2src.find(t.name);
+                if (it == v2src.end()) throw std::runtime_error("v2 source: no block src for " + t.name);
+                const auto & srcsL = it->second;
+                if ((int64_t) srcsL.size() != n_expert) throw std::runtime_error("v2 source: expert count mismatch");
+                const size_t perExp = (size_t) gguf_get_tensor_size(srcs[0], t.idx) / (size_t) n_expert;
+                FILE * sf = srcF[0]; // v2 is a single file
+                for (int64_t e = 0; e < n_expert; e++) {
+                    const auto & sp = srcsL[e];
+                    const size_t dstE = dstPos + (size_t) e * perExp;
+                    if (_fseeki64(sf, sp.first, SEEK_SET) != 0) throw std::runtime_error("v2 src seek");
+                    if (_fseeki64(outF, dstE, SEEK_SET) != 0) throw std::runtime_error("v2 dst seek");
+                    size_t left = sp.second;
+                    while (left) {
+                        const size_t n = left < buf.size() ? left : buf.size();
+                        if (std::fread(buf.data(), 1, n, sf) != n) throw std::runtime_error("v2 read expert");
+                        if (std::fwrite(buf.data(), 1, n, outF) != n) throw std::runtime_error("v2 write expert");
+                        left -= n;
+                    }
+                }
+            } else {
+                const size_t srcPos = gguf_get_data_offset(srcs[t.shard]) + gguf_get_tensor_offset(srcs[t.shard], t.idx);
+                const size_t size   = gguf_get_tensor_size(srcs[t.shard], t.idx);
+                FILE * sf = srcF[t.shard];
+                if (_fseeki64(sf, srcPos, SEEK_SET) != 0) throw std::runtime_error("seek src failed");
+                if (_fseeki64(outF, dstPos, SEEK_SET) != 0) throw std::runtime_error("seek dst failed");
+                size_t left = size;
+                while (left) {
+                    const size_t n = left < buf.size() ? left : buf.size();
+                    if (std::fread(buf.data(), 1, n, sf) != n) throw std::runtime_error("read tensor data failed");
+                    if (std::fwrite(buf.data(), 1, n, outF) != n) throw std::runtime_error("write tensor data failed");
+                    left -= n;
+                }
             }
             idx++;
         }
