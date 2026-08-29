@@ -77,6 +77,8 @@ static void emit_meta(const gguf_context * ctx, std::string & out) {
     out += std::to_string(gguf_get_alignment(ctx));
     out += ",\"n_tensors\":";
     out += std::to_string(gguf_get_n_tensors(ctx));
+    out += ",\"data_offset\":";
+    out += std::to_string(gguf_get_data_offset(ctx));
     out += ",\"kv\":[";
     for (int i = 0; i < gguf_get_n_kv(ctx); ++i) {
         if (i) out += ",";
@@ -107,6 +109,8 @@ static void emit_meta(const gguf_context * ctx, std::string & out) {
         out += ",\"offset\":" + std::to_string(gguf_get_tensor_offset(ctx, i));
         out += ",\"size\":" + std::to_string(gguf_get_tensor_size(ctx, i));
         out += ",\"type\":" + std::to_string(gguf_get_tensor_type(ctx, i));
+        const int64_t * tne = gguf_get_tensor_ne(ctx, i);
+        out += ",\"ne\":[" + std::to_string(tne[0]) + "," + std::to_string(tne[1]) + "," + std::to_string(tne[2]) + "," + std::to_string(tne[3]) + "]";
         out += "}";
     }
     out += "]";
