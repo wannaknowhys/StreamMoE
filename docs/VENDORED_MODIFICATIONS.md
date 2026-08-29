@@ -99,9 +99,9 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
   rem 校验 patch 有效（在已应用的工作区应通过 reverse-check）
   git -C third_party/llama.cpp apply --check -R patches\route-b-inject.patch
   ```
-- **未跟踪依赖**：`third_party/llama.cpp/src/tsc_timer.h`（`[TMR]` 启动计时，被 route-b-inject 的
-  `src/llama.cpp` / `src/llama-context.cpp` include）。它**不在 patch 内**（未跟踪文件），还原
-  route-b-inject 后必须重建——内容是一个 `sm_tmr::timer`（chrono，析构打印 `[TMR] name dur=xx ms`）。
+- **已跟踪依赖**：`third_party/llama.cpp/src/tsc_timer.h`（`[TMR]` 启动计时，被 route-b-inject 的
+  `src/llama.cpp` / `src/llama-context.cpp` include）。**已提交进 vendored 子模块**（2026-08-28，
+  route-b-inject 应用后无需重建）——内容是一个 `sm_tmr::timer`（chrono，析构打印 `[TMR] name dur=xx ms`）。
   缺失会导致编译 `'tsc_timer.h' file not found`。
 - 应用：`git -C third_party/llama.cpp apply patches/route-b-inject.patch`（在当前干净基线时）。
 - 还原：`git -C third_party/llama.cpp apply -R patches/route-b-inject.patch`。

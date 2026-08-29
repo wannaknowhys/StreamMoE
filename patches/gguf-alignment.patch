@@ -1,0 +1,31 @@
+diff --git a/ggml/include/gguf.h b/ggml/include/gguf.h
+index b3a1e1230..d1cf977b3 100644
+--- a/ggml/include/gguf.h
++++ b/ggml/include/gguf.h
+@@ -93,6 +93,7 @@
+ 
+     GGML_API uint32_t gguf_get_version    (const struct gguf_context * ctx);
+     GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
++    GGML_API void     gguf_set_alignment  (struct gguf_context * ctx, size_t alignment);
+     GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);  // padded to gguf_get_alignment if and only if the gguf_context contains at least one tensor
+ 
+     GGML_API int64_t      gguf_get_n_kv(const struct gguf_context * ctx);
+diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
+index 6c7b58178..e95112220 100644
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -1022,6 +1022,14 @@
+     return ctx->alignment;
+ }
+ 
++// allow callers (e.g. stream_moe_convertd) to emit GGUF with a non-default
++// alignment (e.g. 4096 for 4K-aligned tensor sections); used by both
++// gguf_add_tensor (offset layout) and gguf_write_to_file (data padding).
++void gguf_set_alignment(struct gguf_context * ctx, size_t alignment) {
++    GGML_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0 && "alignment must be a power of 2");
++    ctx->alignment = alignment;
++}
++
+ size_t gguf_get_data_offset(const struct gguf_context * ctx) {
+     return ctx->offset;
+ }
