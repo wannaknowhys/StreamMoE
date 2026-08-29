@@ -98,6 +98,29 @@ static void emit_meta(const gguf_context * ctx, std::string & out) {
             case GGUF_TYPE_FLOAT32:out += ",\"v\":" + std::to_string(gguf_get_val_f32(ctx, i)); break;
             case GGUF_TYPE_BOOL:   out += ",\"v\":" + std::to_string(gguf_get_val_bool(ctx, i)); break;
             case GGUF_TYPE_STRING: out += ",\"v\":" + jstr(gguf_get_val_str(ctx, i)); break;
+            case GGUF_TYPE_ARRAY: {
+                const int at = gguf_get_arr_type(ctx, i);
+                const uint64_t n = gguf_get_arr_n(ctx, i);
+                out += ",\"t\":" + std::to_string(t) + ",\"arr\":[";
+                for (uint64_t j = 0; j < n; j++) {
+                    if (j) out += ",";
+                    switch (at) {
+                        case GGUF_TYPE_UINT8:  out += std::to_string(((const uint8_t *) gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_INT8:   out += std::to_string(((const int8_t *)  gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_UINT16: out += std::to_string(((const uint16_t*)gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_INT16:  out += std::to_string(((const int16_t*) gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_UINT32: out += std::to_string(((const uint32_t*)gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_INT32:  out += std::to_string(((const int32_t*) gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_UINT64: out += std::to_string(((const uint64_t*)gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_INT64:  out += std::to_string(((const int64_t*) gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_FLOAT32:out += std::to_string(((const float*)    gguf_get_arr_data(ctx, i))[j]); break;
+                        case GGUF_TYPE_STRING: out += jstr(gguf_get_arr_str(ctx, i, j)); break;
+                        default: out += "0"; break;
+                    }
+                }
+                out += "]";
+                break;
+            }
             default: out += ",\"v\":null"; break;
         }
         out += "}";
