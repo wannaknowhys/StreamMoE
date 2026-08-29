@@ -253,3 +253,23 @@ index 6cb6dbd2f..bfbcd6a62 100644
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 5fe2729ba..596411797 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -244,6 +244,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
+     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
++    // StreamMoE: graceful shutdown endpoint - flushes prefill exports and
++    // destructs contexts (used by the std/moe export orchestration).
++    ctx_http.post("/shutdown", ex_wrapper([](const server_http_req &) -> server_http_res_ptr {
++        llama_server_terminate();
++        auto res = std::make_unique<server_http_res>();
++        res->status = 200;
++        res->data = "ok";
++        return res;
++    }));
+     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
