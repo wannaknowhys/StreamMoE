@@ -1,0 +1,1 @@
+{ "input": "en", "feed": { "type": "jsonl", "path": "${SM_JSONL_EN}", "maxTurns": 10 } }

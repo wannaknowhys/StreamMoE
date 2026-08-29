@@ -1,0 +1,1 @@
+{ "model": "deepseek", "modelPath": "${SM_DS_MAIN}", "draft": "${SM_DS_DRAFT}", "pool": 71680 }

@@ -1,0 +1,1 @@
+{ "model": "gemma-v2", "modelPath": "${SM_GEMMA_V2}", "draft": null, "pool": 16384 }
