@@ -117,17 +117,19 @@ function postChat(messages) {
     });
 }
 
-async function feedTask(run) {
+async function feedTask(run, dir) {
     const f = run.feed;
     if (!f || !f.type) throw new Error('[run_export] run.feed.type required (prefill|jsonl)');
     if (f.type === 'prefill') {
+        // prompt snapshot (the exact sent payload) lands in the run dir next to
+        // the exported bins (prefill_from_trace writes it to --out).
         const tokens = String(f.tokens || 10000);
-        const c = spawn(process.execPath, [path.join(__dirname, 'prefill_from_trace.js'), '--tokens', tokens], { stdio: 'inherit' });
+        const c = spawn(process.execPath, [path.join(__dirname, 'prefill_from_trace.js'), '--tokens', tokens, '--out', dir], { stdio: 'inherit' });
         await new Promise((res, rej) => { c.on('exit', (code) => (code === 0 ? res() : rej(new Error('prefill_from_trace exit ' + code)))); });
     } else if (f.type === 'jsonl') {
         const lines = fs.readFileSync(f.path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
         const maxTurns = f.maxTurns || lines.length;
-        let messages = [];
+        const messages = [];
         for (let i = 0; i < maxTurns; i++) {
             const { system, prompt } = lines[i];
             if (system && String(system).trim()) messages.push({ role: 'system', content: system });
@@ -137,6 +139,9 @@ async function feedTask(run) {
             messages.push({ role: 'assistant', content: res.content });
             console.log('  turn ' + (i + 1) + '/' + maxTurns + ' done (prompt_tokens=' + res.prompt_tokens + ')');
         }
+        // full conversation incl. model replies, next to the exported bins
+        fs.writeFileSync(path.join(dir, 'chat.json'), JSON.stringify(messages, null, 2));
+        console.log('  chat saved: ' + path.join(dir, 'chat.json') + ' (' + messages.length + ' msgs)');
     } else throw new Error('[run_export] unknown feed type ' + f.type);
 }
 
@@ -152,7 +157,7 @@ async function runOne(run) {
     const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, LLM_EXPORT_DIR: dir } });
     try {
         await waitHealth(600000);
-        await feedTask(run);
+        await feedTask(run, dir);
         await postShutdown();
         await new Promise((res, rej) => { child.on('exit', res); child.on('error', rej); });
         console.log('  ' + dir + ' done');
