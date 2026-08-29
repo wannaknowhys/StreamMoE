@@ -20,13 +20,18 @@ const n = b.readUInt32LE(8);
 const recs = new Uint32Array(n * 3);
 for (let i = 0; i < n * 3; i++) recs[i] = b.readUInt32LE(12 + i * 4);
 
-// dedupe (layer, token, expert)
+// dedupe (layer, token, expert), then replay in GLOBAL TOKEN order (one token
+// = one step through ALL layers). The raw file is ordered per-layer per-ubatch
+// (all tokens of layer 0, then layer 1, ...), so replaying it as-is inflates
+// hit rates: each layer fills the pool once and every later access hits.
 const seen = new Set();
-const keys = [];
+const entries = [];
 for (let i = 0; i < n; i++) {
     const k = recs[i * 3] + '_' + recs[i * 3 + 1] + '_' + recs[i * 3 + 2];
-    if (!seen.has(k)) { seen.add(k); keys.push(recs[i * 3] * 256 + recs[i * 3 + 2]); }
+    if (!seen.has(k)) { seen.add(k); entries.push({ t: recs[i * 3 + 1], k: recs[i * 3] * 256 + recs[i * 3 + 2] }); }
 }
+entries.sort((a, b) => a.t - b.t);
+const keys = entries.map((e) => e.k);
 const m = keys.length;
 const layers = new Set();
 for (let i = 0; i < m; i++) layers.add((keys[i] / 256) | 0);
