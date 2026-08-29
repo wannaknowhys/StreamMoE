@@ -102,7 +102,41 @@ freq  = stats_.get_adaptive_frequency(owner)   // EST1，读时按当前最大�
 
 ## 9. 文件对照
 
-- `src/backend/slot.h`：slot_meta / expert_directory / mpsc_alloc_queue / wait-wake。
+- `src/backend/slot.h`：slot_meta / expert_directory（二维：`(layer,expert)×(pool)` + last_used_token）/ mpsc_alloc_queue / wait-wake。
 - `src/backend/scheduler.h/.cpp`：expert_scheduler（init / pin / wait_ready / unpin / alloc_or_evict / scheduler_loop / load_slot / subpool 布局）。
 - `src/io/async_dio_win.cpp` / `async_dio_posix.cpp`：DIO（Win IOCP 真异步 / POSIX 同步 pread，io_uring 待办 B22）。
 - `src/pool/expert_stats.h/.cpp`：EST1 热度。
+
+## 10. 频率与放置（GPU Phase 扩展）
+
+专家存储整体视为**只读、可抛弃的多级缓存**（磁盘=源，CPU RAM=大慢层，GPU VRAM=快小层）——池里内容丢了不丢数据，只浪费一次重读。因此迁移可以"先拷贝后释放"保持全程合法，无需独占/双份。
+
+### 10.1 每专家 EMA 实时频率
+
+新增每 `(layer,expert)` 的 **EMA 实时频率**（pin 时更新，比 EST1 平滑、实时）：
+
+```
+freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1    // lambda ~ 0.95
+```
+
+放在 `expert_directory`（正向，跨池共享属性，与 last_used_token 并列）。
+
+### 10.2 放置决策（pin 时，全局调度线程做）
+
+新专家读入时按 `freq_ema` 决定进哪层：
+
+- `freq_ema` 高 → 放进 **GPU 池**（IOCP DirectIO 直读 HOST_VISIBLE VRAM——反正高频复用，值得占显存）
+- `freq_ema` 低 → 放进 **CPU RAM 池**
+
+### 10.3 迁移（全局调度线程驱动，Phase C）
+
+- 判据：GPU 最冷专家（freq_ema 最低） vs CPU 某专家（freq_ema 高出一个阈值）——满足则互换。
+- **滞回阈值 + 冷却期**：热度差要超过固定 margin 才触发；每专家迁移后冷却 N token，防来回搬（抖动耗 PCIe）。
+- **先拷贝后释放**：device→host 读（或 host→device 写）完成后再释放/覆盖槽——非独占 cache 语义，全程合法；用 slot_meta 的 generation 绑定读操作防脏读。
+- **紧急 pin 优先**：后台迁移的每步可中断；锁定"最冷"时若发现它正被真实请求 pin（refcount>0）→ 放弃这次迁移，让位给紧急 pin。
+- **攒批评估**：每 N decode step 或某侧命中率下滑时评估一次，非常驻高频轮询。
+
+### 10.4 与 EST1 的关系
+
+`get_adaptive_frequency`（EST1，读时归一化）用于驱逐打分；EMA 频率用于放置/迁移判据。两者并存：打分用 EST1 热度 + recency，放置用 EMA 实时频率。
+

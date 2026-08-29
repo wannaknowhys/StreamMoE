@@ -83,9 +83,39 @@ compute thread is never blocked on IO. scheduler runs IOCP (Win) / io_uring
 (Linux) / io_submit fallback with concurrent in-flight reads (QD sweep: 1/4/16/64).
 IO completion writes the slot READY (memory_order_release) + WakeByAddressAll /
 futex_wake; compute threads wait on `slot_meta[slot]` (state+refcount+generation
-64-bit word) with wait-on-address (acquire), never busy-wait. GPU slots add a
-host->device copy after IO (or direct write into HOST_VISIBLE VRAM, ReBAR in
-Phase C).
+64-bit word) with wait-on-address (acquire), never busy-wait.
+
+### 3.1 Zero-copy DIO into HOST_VISIBLE (GPU pool)
+
+Verified on this machine (Vulkan SDK 1.4.357 + RX 590): `memoryTypes[2]` is an
+8 GiB `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap (the modded 8 GiB BAR1 is
+real, not a 256 MB stub). So the GPU pool's Vulkan buffer can be allocated from
+that type and `vkMapMemory`'d.
+
+Primary path: **IOCP DirectIO reads the GGUF expert block straight into the
+mapped VRAM pointer** (`vkMapMemory + slot offset`). Alignment holds (Vulkan
+allocations are page-aligned; 4K-aligned v1/v2 expert blocks satisfy DIO
+offset/length alignment). This skips both the RAM staging buffer and the
+host->device copy.
+
+Fallback (if DirectIO-into-VRAM fails or no DirectStorage on target): IOCP
+DirectIO into a RAM staging buffer, then `vkCmdCopyBuffer` / memcpy into VRAM.
+
+### 3.2 Frequency-based placement: RAM vs VRAM
+
+Every `(layer, expert)` keeps an **EMA real-time frequency** (bumped on each
+successful pin, smoother than EST1):
+
+```
+freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1      // lambda ~ 0.95
+```
+
+Placement decision at pin time (global scheduler thread):
+- high `freq_ema` -> allocate in the GPU pool (DIO straight into VRAM - it will
+  be reused, worth the VRAM)
+- low `freq_ema` -> allocate in the CPU RAM pool
+- paired with migration: cold GPU experts demote to CPU, hot CPU experts promote
+  to GPU, judged by relative `freq_ema` with a hysteresis threshold + cooldown.
 
 ## 4. Multi-GPU
 
@@ -136,6 +166,12 @@ three distributions per `docs/Backend.md` go-live gate: all-CPU / all-GPU / mixe
 
 - Vulkan SDK (glslc shader compiler, vulkan.hpp, vulkan-1.lib) - required at build
   time; build.bat already forwards `GGML_VULKAN=ON` (default OFF). Runtime needs
-  only the GPU driver (vulkan-1.dll is present at 1.3.250.0).
-- RX 590 8GB is Vulkan-only; VRAM pool budget is therefore small - realistic
-  target is dense on Vulkan + small experts on GPU + most experts in RAM.
+  only the GPU driver (vulkan-1.dll present at 1.3.250.0).
+- **Verified (2026-08-29)**: `GGML_VULKAN=ON` + SDK 1.4.357 builds clean
+  (llamalibs tag `vulkan`); `llama-cli --list-devices` reports
+  `Vulkan0: Radeon RX 590 Series (8192 MiB)`. Requires copying `libomp.dll`
+  next to the exe. A vendored CMake patch forwards `CMAKE_MAKE_PROGRAM` +
+  compilers into the vulkan-shaders-gen ExternalProject.
+- RX 590 8GB is Vulkan-only; the 8 GiB BAR1 is HOST_VISIBLE|DEVICE_LOCAL
+  (verified) - the GPU pool can use zero-copy DIO. Realistic target: dense on
+  Vulkan + hot experts on GPU + most experts in RAM.
