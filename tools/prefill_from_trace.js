@@ -1,6 +1,6 @@
-// prefill_from_trace.js - extract a real conversation record from the captured
-// opencode sequences (temp/sequences) and send it as a prefill to a running
-// llama-server (--expert-backend).
+// prefill_from_trace.js - extract a real conversation record from the fixed
+// archived capture and send it as a prefill to a running llama-server
+// (--expert-backend).
 //
 // Fidelity-first: messages are kept AS-IS (system / user / assistant with
 // tool_calls / tool with tool_call_id - nothing dropped or re-rolled), taken
@@ -15,19 +15,17 @@
 //
 // usage:
 //   node tools/prefill_from_trace.js [--tokens 10000] [--url http://127.0.0.1:8993]
-//                                    [--src temp/sequences] [--out benchmark/trace]
-//                                    [--max-tokens 16]
+//                                    [--out benchmark/trace] [--max-tokens 16]
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 
 function parseArgs() {
     const a = process.argv.slice(2);
-    const p = { tokens: 10000, url: 'http://127.0.0.1:8993', src: 'temp/sequences', out: 'benchmark/trace', maxTokens: 16 };
+    const p = { tokens: 10000, url: 'http://127.0.0.1:8993', out: 'benchmark/trace', maxTokens: 16 };
     for (let i = 0; i < a.length; i++) {
         if (a[i] === '--tokens') p.tokens = parseInt(a[++i]);
         else if (a[i] === '--url') p.url = a[++i];
-        else if (a[i] === '--src') p.src = a[++i];
         else if (a[i] === '--out') p.out = a[++i];
         else if (a[i] === '--max-tokens') p.maxTokens = parseInt(a[++i]);
     }
@@ -52,9 +50,9 @@ function isCompleteAnswer(m) {
     return m.role === 'assistant' && textOf(m.content).trim().length > 0;
 }
 
-// deterministic source: the fixed archived capture (not "latest"), so the same
-// args always produce the identical prompt for std-vs-moe comparison.
-function latestCapture(src) {
+// deterministic source: the single fixed archived capture, so the same args
+// always produce the identical prompt for std-vs-moe comparison.
+function latestCapture() {
     const p = path.join(__dirname, '..', 'benchmark', 'trace', 'sequences', '1787884103582_POST__v1_chat_completions.json');
     if (!fs.existsSync(p)) throw new Error(`fixed capture not found: ${p}`);
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -62,7 +60,7 @@ function latestCapture(src) {
 
 function main() {
     const p = parseArgs();
-    const rec = latestCapture(p.src);
+    const rec = latestCapture();
     const all = rec.body.messages || [];
 
     // from the FIRST message, keep messages as-is; stop at ~target tokens,
@@ -80,7 +78,7 @@ function main() {
     const roles = {};
     for (const m of selected) roles[m.role] = (roles[m.role] || 0) + 1;
 
-    console.log(`[trace] src=${p.src} messages=${all.length}`);
+    console.log(`[trace] fixed capture: benchmark/trace/sequences/1787884103582_POST__v1_chat_completions.json (${all.length} msgs)`);
     console.log(`[trace] selected [0..${end}] = ${selected.length} msgs, ~${est} tokens (target ${p.tokens})`);
     console.log(`[trace] roles: ${JSON.stringify(roles)}`);
 
