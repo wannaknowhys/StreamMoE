@@ -25,11 +25,11 @@ the default `llama.cpp` behavior.
 4. **On-demand expert loading + adaptive eviction (EST1)**: hit experts compute
    immediately; miss experts are prefetched asynchronously; LRU/LFU/EST1 policy
    with bounded pool residency.
-5. **OpenAI-compatible API server (`stream_moe_server`)**: lightweight C++
-   HTTP server with `/v1/chat/completions` (SSE streaming), `/v1/models`,
-   `/health`, `/stats`.
-6. **Interactive REPL CLI (`stream_moe`)**: multi-turn streaming chat with
-   exact KV cache footprint reporting.
+5. **OpenAI-compatible API server**: upstream `llama-server` (with the route B
+   plugin injected via `--expert-backend`) - `/v1/chat/completions` (SSE
+   streaming), `/v1/completions`, `/v1/models`, `/health`, `/metrics`.
+6. **Interactive REPL CLI**: upstream `llama-cli` (with the route B plugin) -
+   multi-turn streaming chat with exact KV cache footprint reporting.
 7. **Speculative decoding (draft model)**: planned (see `docs/BUG_TRACKER.md`
    B11); the draft model file is used once implemented.
 
@@ -41,12 +41,14 @@ Architecture comparison with upstream `llama.cpp` tools: [`docs/LLAMA_EXE_ROADMA
 
 Project layout, build sub-path pattern, and test/result archiving conventions: [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md).
 
+Upstream tool migration plan (route B as a plugin): [`docs/UPSTREAM_TOOLS_MIGRATION.md`](docs/UPSTREAM_TOOLS_MIGRATION.md).
+
 | Binary | Description | Status |
 | :--- | :--- | :--- |
-| **`build/main/bin/stream_moe.exe`** | Interactive REPL CLI & Single-shot prompt runner | **Ready** |
-| **`build/main/bin/stream_moe_server.exe`** | OpenAI-compatible HTTP/SSE API server | **Ready** |
+| **`build/main/llama-build/bin/llama-cli.exe`** | Upstream CLI + route B plugin (interactive REPL / single-shot prompt) | **Ready** |
+| **`build/main/llama-build/bin/llama-server.exe`** | Upstream OpenAI-compatible HTTP/SSE server + route B plugin | **Ready** |
+| **`build/main/bin/stream_moe_convert.exe`** | 4KB sector-aligned zero-copy GGUF optimizer (`stream_moe_convert`) | Planned |
 | **`build/main/bin/stream_moe_bench.exe`** | Multi-dimensional MoE benchmark suite | Planned |
-| **`build/main/bin/stream_moe_convert.exe`** | 4KB sector-aligned zero-copy GGUF optimizer | Planned |
 
 ---
 
@@ -58,8 +60,9 @@ Project layout, build sub-path pattern, and test/result archiving conventions: [
 
 ### Windows Build
 ```powershell
-# Build all binaries into build\main\bin\
-.\build.bat build
+# Build vendored libllama + upstream llama-cli/llama-server (route B plugin linked in)
+.\build.bat llamalibs main
+.\build.bat build main
 
 # Run unit test suites
 .\build.bat test
@@ -77,33 +80,40 @@ make test
 
 ## Usage
 
+> Both binaries are the upstream `llama-cli` / `llama-server` with the route B
+> plugin injected. Enable the expert pool with `--expert-backend`; without it
+> the model runs in stock llama.cpp mode. MoE models should add `--fit off
+> --no-warmup` (skip the empty startup forward pass so boot does not cold-read
+> experts from disk).
+
 ### 1. Interactive Multi-Turn CLI Mode
 ```powershell
 # Launch interactive REPL with a 70 GB expert pool and 16 physical cores
-build\main\bin\stream_moe.exe `
+build\main\llama-build\bin\llama-cli.exe `
     -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
-    --moe-ram-pool 71680 `
-    -c 4096 `
-    -t 16 `
-    -i
+    --expert-backend --moe-ram-pool 71680 `
+    -c 8192 -t 16 `
+    --fit off --no-warmup `
+    -p "Hello" -i
 ```
 
 ### 2. OpenAI-Compatible API Server Mode
 ```powershell
 # Start HTTP/SSE API server on port 8080
-build\main\bin\stream_moe_server.exe `
+build\main\llama-build\bin\llama-server.exe `
     -m "N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf" `
-    --host 127.0.0.1 `
-    --port 8080 `
-    --moe-ram-pool 71680 `
-    -t 16
+    --expert-backend --moe-ram-pool 71680 `
+    --host 127.0.0.1 --port 8080 `
+    -c 8192 -t 16 `
+    --fit off --no-warmup --no-webui
 ```
 
-#### API Endpoints
+#### API Endpoints (upstream llama-server)
 - `POST /v1/chat/completions` (OpenAI format, supports `"stream": true`)
+- `POST /v1/completions`
 - `GET /v1/models`
 - `GET /health`
-- `GET /stats` (real-time pool usage, hit counters)
+- `GET /metrics` / `GET /slots` (upstream observability)
 
 ---
 
