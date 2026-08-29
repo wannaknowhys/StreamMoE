@@ -52,11 +52,12 @@ function isCompleteAnswer(m) {
     return m.role === 'assistant' && textOf(m.content).trim().length > 0;
 }
 
-// latest captured POST request (each one carries the full conversation history)
+// deterministic source: the fixed archived capture (not "latest"), so the same
+// args always produce the identical prompt for std-vs-moe comparison.
 function latestCapture(src) {
-    const files = fs.readdirSync(src).filter((f) => f.includes('POST')).sort((a, b) => fs.statSync(path.join(src, a)).mtimeMs - fs.statSync(path.join(src, b)).mtimeMs);
-    if (!files.length) throw new Error(`no POST captures in ${src}`);
-    return JSON.parse(fs.readFileSync(path.join(src, files[files.length - 1]), 'utf8'));
+    const p = path.join(__dirname, '..', 'benchmark', 'trace', 'sequences', '1787884103582_POST__v1_chat_completions.json');
+    if (!fs.existsSync(p)) throw new Error(`fixed capture not found: ${p}`);
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
 function main() {
