@@ -688,6 +688,12 @@ static void cmd_chunk(const std::string & json, std::string & out) {
             gguf_set_val_u32(dst, "stream_moe.chunk_no", (uint32_t) i);
             gguf_set_val_u32(dst, "stream_moe.chunk_total", (uint32_t) N);
             gguf_set_val_u32(dst, "stream_moe.incomplete", 1);
+            // record this file's strip layout so merge can locate slices:
+            // [dense_blocks, per-expert blocks in block order]
+            std::vector<uint64_t> slices;
+            slices.push_back(denseSlices[i]);
+            for (size_t b = 0; b < nBlocks; b++) slices.push_back(expSlices[b][i]);
+            gguf_set_arr_data(dst, "stream_moe.chunk_slices", GGUF_TYPE_UINT64, slices.data(), slices.size());
             ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
             ggml_context * gctx = ggml_init(gprm);
             for (int k = 0; k < gguf_get_n_tensors(src); k++) {
