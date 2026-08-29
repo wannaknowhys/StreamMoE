@@ -39,7 +39,7 @@ function readSpecList(csv) {
 // Resolve ${X}: run field wins, then env. Called AFTER merge so ${pool} (a
 // model spec field) resolves against the merged run.
 function expandRun(run) {
-    const expand = (s) => s.replace(/\$\{([A-Z0-9_]+)\}/g, (m, k) => {
+    const expand = (s) => s.replace(/\$\{([A-Za-z0-9_]+)\}/g, (m, k) => {
         if (run[k] !== undefined) return String(run[k]);
         if (process.env[k] !== undefined) return process.env[k];
         throw new Error('[run_export] unresolvable ${' + k + '}');
