@@ -80,7 +80,7 @@
 
 ## P3 保留资产
 
-GGUF 元数据/多分片发现、per-expert offset/read plan、4KB sector staging reader、Windows IOCP DIO、pin/unpin 生命周期语义、LRU/LFU/EST1 驱逐算法、RDTSCP profiler + JSONL、HTTP server、bench_agent.js 测评线。详见 `docs/CODEBASE_AUDIT.md`。
+GGUF 元数据/多分片发现、per-expert offset/read plan、4KB sector staging reader、Windows IOCP DIO、pin/unpin 生命周期语义、LRU/LFU/EST1 驱逐算法、RDTSCP profiler + JSONL、HTTP server、bench_agent.js 测评线（对应资产已在 route B 落地：`src/backend/`、`src/io/`、`src/loader/`、`src/pool/`）。
 
 ---
 

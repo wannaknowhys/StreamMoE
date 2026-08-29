@@ -30,15 +30,16 @@ StreamMoE/
 |---|---|
 | `Backend.md` | DeepSeek4 自定义 backend / expert pool 调度设计（用户原始架构文档）|
 | `LLAMA_MOE_NO_MMAP_RESEARCH.md` | MoE 去 mmap 可行性研究 + route B 实现要点（含 pin 生命周期 §4.8、shexp §4.9）|
-| `EXPERT_OFFLOAD_INTEGRATION.md` | llama.cpp 集成追踪早期分析 |
-| `DESIGN_REVIEW.md` | 各设计文档矛盾与待决策问题 |
 | `BUG_TRACKER.md` | bug 追踪清单（P0/P1/P2/P3 + INC 事故记录 + 修复批次）|
-| `CODEBASE_AUDIT.md` | 代码库四类划分（mock/可用/废弃/变了但函数没问题）|
 | `TEST_FLOW.md` | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）|
 | `PROJECT_STRUCTURE.md` | 本文件 |
-| `DEPENDENCY_MAP.md` | vendored llama.cpp 使用情况（编译/冗余/未用）+ 自研文件功能表 |
-| `MULTI_SUBPOOL.md` | 按专家种类分子池设计（异构层进池，替代排除方案）|
+| `MULTI_MODEL_POOL.md` / `MULTI_SUBPOOL.md` | 多模型池 / 按专家种类分子池设计 |
 | `UPSTREAM_TOOLS_MIGRATION.md` | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入）|
+| `VENDORED_MODIFICATIONS.md` | 对 vendored llama.cpp 的改动汇总（route-b-inject patch）|
+| `PREFILL_CROSS_VALIDATION.md` / `EXPERT_TRACE_SIMULATION.md` | prefill/专家历史交叉验证与命中率模拟 |
+| `SAMPLING.md` / `SAMPLING.zh-CN.md` | 采样参数推荐 |
+| `REVIEW_2026_08_28.md` / `DEBUG_DELEGATION.md` | 代码审查对照 / delegate 排查记录 |
+| `REPACK_DIVERGENCE_DEBUG.md` / `.zh-CN.md` | repack vs 普通内核路径差异的 bit 级排查 |
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md` | 待办 / 可执行程序路线图 |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
@@ -84,7 +85,7 @@ src/
 └── server/                http_server（OpenAI 兼容 + SSE）
 ```
 
-已删除 mock/废弃模块：`src/scheduler/`、`src/kv/`、`src/tokenizer/`、`engine/subgraph_executor`、`engine/speculative_engine`、`engine/state_machine`、`pool/expert_pool`。可救逻辑（驱逐算法、状态策略表、SMKV、槽重绑定概念）见 docs/CODEBASE_AUDIT.md §3。
+已删除 mock/废弃模块：`src/scheduler/`、`src/kv/`、`src/tokenizer/`、`engine/subgraph_executor`、`engine/speculative_engine`、`engine/state_machine`、`pool/expert_pool`。
 
 ## 7. tests/（UT）
 
