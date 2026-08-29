@@ -200,18 +200,21 @@ echo {"cmd":"open","path":"N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"} | tem
 
 ### 9.1 中间格式（JS 内存中的模型抽象，不是文件）
 
+以 **v2 为中心**的块抽象：头块 + [dense 张量块][专家原子块]。
+
 ```js
 {
-  arch, n_layer, n_expert, n_expert_used,
-  layout,                       // 'original' | 'v1' | 'v2'
-  dense:  [ { name, ne:[], type, size, src:{file, off, size} } ],  // dense 张量 + 数据源
-  expert: [ { name, ne:[], type, perExpert, src:{file, off, size}, branch } ],
-                                // 每分支张量（按层），src 可跨文件/块
+  headerKV,                                 // 源 KV（写回时保留）
+  dense:  [ { name, ne, type, src:{file,off,size} } ],  // dense 张量块（每张量一块）
+  experts:[ { layer, branch, name, ne, type, perExpert,
+              srcs: [每专家 {file, off, size}] } ],     // 专家原子块（每专家每分支）
 }
 ```
 
-- `src` 是**统一的字节区间定位**（文件 + 偏移 + 大小）——写入任何目标格式时按它读数据。
-- 只描述结构 + 数据定位，不持有数据本身（大模型不进内存）。
+- **原子块 = 每专家每分支的 `per_expert` 连续切片**——不携带源格式的对齐（切片语义）。
+- **专家块（v2）= 该专家各分支原子块连续拼接**——块内分支**不各自对齐**（与 v2 真实布局一致），仅块尾 `align_up` 到 4K → **紧凑**。因此从 v1 读（三分量张量各自 4K 对齐）也不会让 v2 块不紧凑——对齐被"读取"吸收。
+- **scale 走 dense 张量块**（不进专家块，v2 现状）。
+- 转换 = 源格式解析成原子块列表 → 按目标布局重排（v1 张量连续 / v2 专家块 / v2 切 段）。
 
 ### 9.2 解析器（各格式 → 中间）
 
