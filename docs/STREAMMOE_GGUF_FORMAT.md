@@ -172,11 +172,15 @@ echo {"cmd":"open","path":"N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"} | tem
 
 ---
 
-## 8. 转换器功能清单（v1/v2）
+## 8. 转换器功能清单（v1/v2）【2026-08-29 更新为实际状态】
 
-- [ ] v1 合分片（`-00001-of-00005` → 单文件，流式）。
-- [ ] v1 张量级分片（单文件 → 文件系列，原版可合并）。
-- [ ] v1 sections（alignment=4096 + dense/expert 分区，原版可读）。
-- [ ] v2 expert-blocks（专家紧凑块，自有 loader）。
-- [ ] v2 RAID0 切分（专家块跨文件，固定规则 + 并发 DIO）。
-- [ ] 数值等价验证（转换前 vs 后，v1 原版读，v2 自 loader）。
+`tools/stream_moe_convertd.cpp`（JSON 行管道 wrapper）+ `tools/stream_moe_convert.js`（CLI 前端，多分片发现）：
+
+- [x] **v1 sections**（`alignment=4096` + dense/expert 分区，原版可读）——`convert --format v1`。
+- [x] **v2 expert-blocks**（专家紧凑块，自有 loader）——`convert --format v2`；已产出 gemma-4-26B-A4B `-v2.gguf` / `-v2-NOHOLE.gguf` 并做 bit 级验证。
+- [x] **v1 合分片**（`-00001-of-00005` → 单文件，`in` 支持 `p1;p2` 多分片输入）。
+- [ ] **v2 RAID0 切分**（专家块跨文件，固定规则 + 并发 DIO）——`chunk` 命令 **TODO**（`"chunk not implemented yet"`）。
+- [ ] **v1 张量级分片**（单文件 → 文件系列，原版可合并）——未实现。
+- [x] **数值等价验证**（gemma v2 vs 原版逐位一致已做；v1 原版可读自证）。
+
+**结论**：转换（v1/v2 单文件）已可用；**chunk（跨盘 RAID0）是下一步**——它是 v2 多盘并发 DIO 直读的装载前提（见 `docs/EXPERT_SCHEDULER_DESIGN.md` §11）。

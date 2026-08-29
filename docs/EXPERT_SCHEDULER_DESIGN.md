@@ -140,3 +140,18 @@ freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1    // lambda ~ 0.95
 
 `get_adaptive_frequency`（EST1，读时归一化）用于驱逐打分；EMA 频率用于放置/迁移判据。两者并存：打分用 EST1 热度 + recency，放置用 EMA 实时频率。
 
+## 11. async_load_t：三种装载形态（一结构承载）
+
+`async_load_t`（头 4K 对齐 + 可选 staging 数据段合成一个连续结构，v2 只有头）+ `reqs[8]` + `pending` 计数统一承载所有装载形态：
+
+| 格式 | 装载方式 | reqs 数 | staging | memcpy |
+| :--- | :--- | :--- | :--- | :--- |
+| 原版 / v1 | 3 分支 slice（gate/up/down 对齐区间）→ staging → memcpy 槽 | 3 | 要 | 要 |
+| v2 单文件 | 1 个 4K 对齐专家块直读槽 | 1 | 免 | 免 |
+| v2 RAID0 分片 | N 个文件片段直读槽不同偏移（4K 对齐） | N | 免 | 免 |
+
+- **IOCP 无"逻辑任务全完成"聚合**：每个 `aio_req_t` 独立完成、乱序；聚合靠头里 `pending` 计数（每 req 完成递减，`pending==0` → `mark_ready` + dir set + wake）。调度线程单线程收割，`pending--` 非原子。
+- **per-model layout 标记**：loader 解析 `stream_moe.layout`（无 = 原版 / `sections-v1` / `expert-blocks-v2`）→ 决定 staging 有无。**草稿与主体独立判断**（可能一个原版一个 v2，甚至结构大小差一个 staging 段）。
+- **ringbuffer 池**：每模型一个，元素大小 = `sizeof(async_load_t)` + (v1/原版 ? 组内 max staging : 0)；元素数 = 事实并发数（大规模 prefill 开大，如 64~128）。ringbuffer 满时调度线程**继续轮询完成**腾槽（不阻塞），"无完成可收割 + 满"才真正背压（IO 满载信号）；饱和报告用宏包裹（`STREAM_MOE_LOAD_SAT`，限频日志 + 屏幕）。
+
+
