@@ -48,6 +48,11 @@ if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF
 if "%GGML_METAL%"=="" set GGML_METAL=OFF
 if "%GGML_SYCL%"==""  set GGML_SYCL=OFF
+rem vulkan-shaders-gen sub-cmake uses the injected VULKAN_SHADER_GEN_CMAKE_ARGS
+rem to pick our ninja/clang toolchain (upstream hook - no vendored edit needed).
+if "%GGML_VULKAN%"=="ON" (
+    set VULKAN_TOOLCHAIN_ARGS=-DVULKAN_SHADER_GEN_CMAKE_ARGS="-DCMAKE_MAKE_PROGRAM=%NINJA%;-DCMAKE_C_COMPILER=%CLANG%;-DCMAKE_CXX_COMPILER=%CLANGXX%"
+) else set VULKAN_TOOLCHAIN_ARGS=
 "%CMAKE%" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^
     -DCMAKE_C_COMPILER=%CLANG% ^
@@ -63,7 +68,7 @@ if "%GGML_SYCL%"==""  set GGML_SYCL=OFF
     -DCMAKE_C_FLAGS="-Wno-cast-qual" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
-    -DOpenMP_libomp_LIBRARY=%LIBOMP%
+    -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 "%NINJA%" -C "%LLAMA_BUILD%" llama llama-cli llama-server
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
