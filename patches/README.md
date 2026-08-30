@@ -23,12 +23,13 @@
      `src/llama-model-loader.cpp`、`src/llama-model.cpp`、`src/llama.cpp`、`src/tsc_timer.h`（[TMR] 计时，随包新增）。
    - `gguf-alignment.patch`（GGUF 转换器依赖）：`ggml gguf.h/cpp`（`gguf_set_alignment`）。
    - `prefill-export-llama.patch`：`src/llama-context.cpp/h`（prefill 导出 + 专家历史 + export_token_seq）、
-     `src/llama-kv-cache.h/cpp`、`tools/server/server-context.cpp`、`tools/server/server.cpp`（/shutdown 端点）、
-     `ggml/src/ggml-vulkan/CMakeLists.txt`（vulkan shaders-gen 修复，原 vulkan-shaders-gen-cmake.patch 已并入）。
+     `src/llama-kv-cache.h/cpp`、`tools/server/server-context.cpp`、`tools/server/server.cpp`（/shutdown 端点）。
+   - `vulkan-shaders-gen-cmake.patch`（vulkan 构建修复，独立）：`ggml/src/ggml-vulkan/CMakeLists.txt`
+     （shader-gen 子 cmake 传我们的 ninja/clang 工具链）。修改上游文件 → 不入 vendored 主线，走 patch。
 
 **route B 栈应用顺序**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
    ```
-   route-b-inject → gguf-alignment → prefill-export-llama
+   route-b-inject → gguf-alignment → prefill-export-llama → vulkan-shaders-gen-cmake
    ```
 
 **当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
