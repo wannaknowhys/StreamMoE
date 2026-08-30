@@ -16,28 +16,25 @@
    b. 快照 vendored 工作区：
       `git -C third_party/llama.cpp diff > temp/patch_backup_<date>/working-tree-full.patch`。
 2. **生成 patch 用 `git diff -- <文件列表>` 限定范围**，各 patch 各管各的文件，绝不 `git diff >` 全量抄
-   （那会把其他 patch 的改动混进来）。参考文件归属（route B 栈已按主题拆分）：
-   - `route-b-inject.patch`（route B 核心）：CMakeLists、arg.cpp（pool 参数）、common.cpp（route_b_setup +
-     KV 实测报告）、common.h、speculative.cpp（draft 池绑定）、llama-model-loader/model/llama.cpp、
-     llama-context.cpp（仅 [TMR] 计时行）、server-context.cpp（[TMR] timers）。
-   - `spec-stats.patch`（draft 统计）：speculative.h/cpp（`common_speculative_*` getter）+ server-context.cpp
-     （析构打印）。
-   - `gguf-alignment.patch`（GGUF 转换器依赖）：ggml gguf.h/cpp（`gguf_set_alignment`）。
-   - `export-args.patch`（export 工具链参数）：`--prompt-log` + `--kv-placement`（arg.cpp/common.h/common.cpp
-     对应 hunk）。
-   - `prefill-export-llama.patch`：llama-context.h/cpp（prefill 部分，含 `_main/_draft` 分文件）、
-     llama-kv-cache.h/cpp、server.cpp（/shutdown 端点）。
+   （那会把其他 patch 的改动混进来）。文件归属（2026-08-30 整理，route B 栈收敛为 3 个 patch）：
+   - `route-b-inject.patch`（route B 核心 + 附属）：`common/CMakeLists.txt`、`common/arg.cpp`（route-b 参数 +
+     `--prompt-log`/`--kv-placement`，原 export-args.patch 已并入）、`common/common.cpp`、`common/common.h`、
+     `common/speculative.cpp/h`（route B draft 池绑定 + draft 统计，原 spec-stats.patch 已并入）、
+     `src/llama-model-loader.cpp`、`src/llama-model.cpp`、`src/llama.cpp`、`src/tsc_timer.h`（[TMR] 计时，随包新增）。
+   - `gguf-alignment.patch`（GGUF 转换器依赖）：`ggml gguf.h/cpp`（`gguf_set_alignment`）。
+   - `prefill-export-llama.patch`：`src/llama-context.cpp/h`（prefill 导出 + 专家历史 + export_token_seq）、
+     `src/llama-kv-cache.h/cpp`、`tools/server/server-context.cpp`、`tools/server/server.cpp`（/shutdown 端点）、
+     `ggml/src/ggml-vulkan/CMakeLists.txt`（vulkan shaders-gen 修复，原 vulkan-shaders-gen-cmake.patch 已并入）。
 
-**route B 栈应用顺序**（拆分后可选择性打部分 patch；行号已按此顺序重算，`git apply --check` 已验证
-   复现 ffe029953 = route B + prefill 全量状态）：
+**route B 栈应用顺序**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
    ```
-   route-b-inject → spec-stats → gguf-alignment → export-args → prefill-export-llama
+   route-b-inject → gguf-alignment → prefill-export-llama
    ```
-   依赖：`tsc_timer.h`（route-b-inject 的 [TMR] 计时）已提交进 vendored 子模块（`src/tsc_timer.h`），
-   应用 route-b-inject 后无需重建。
+
+**当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
+StreamMoE 全部改动只存在于上述 patch（含 tsc_timer/spec-stats/export-args/vulkan 并入项），按顺序 apply 可完整复现。
 3. 应用前 `git apply --check`，应用后 `git apply --check -R`（验证可还原）。
-4. 涉及同一文件的两个 patch（如 llama-context.cpp 的 [TMR] 与 prefill）位置不重叠，靠 `git apply` 的
-   上下文 fuzz 叠加，应用顺序无关，但**还原顺序必须逆序**（先 -R 后应用的）。
+4. 涉及同一文件的两个 patch 位置不重叠，靠 `git apply` 的上下文 fuzz 叠加，应用顺序无关，但**还原顺序必须逆序**（先 -R 后应用的）。
 
 ## prefill-export（Prefill 交叉验证导出 + 专家访问历史）
 

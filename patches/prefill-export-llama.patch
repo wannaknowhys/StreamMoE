@@ -1,5 +1,5 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index cff2694ef..edf8da1be 100644
+index 0402044da..edf8da1be 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -11,7 +11,15 @@ index cff2694ef..edf8da1be 100644
  
  #include "ggml.h"
  #include "llama-arch.h"
-@@ -116,7 +119,7 @@ llama_context::llama_context(
+@@ -8,6 +11,7 @@
+ #include "llama-io.h"
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
++#include "tsc_timer.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+@@ -115,7 +119,7 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
@@ -20,7 +28,7 @@ index cff2694ef..edf8da1be 100644
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -483,6 +486,9 @@ llama_context::~llama_context() {
+@@ -482,6 +486,9 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
@@ -30,7 +38,7 @@ index cff2694ef..edf8da1be 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1633,6 +1639,104 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1639,104 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -135,7 +143,7 @@ index cff2694ef..edf8da1be 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1937,6 +2041,74 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2041,74 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -210,6 +218,14 @@ index cff2694ef..edf8da1be 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
+@@ -3553,6 +3726,7 @@ llama_context_params llama_context_default_params() {
+ llama_context * llama_init_from_model(
+                  llama_model * model,
+         llama_context_params   params) {
++    sm_tmr::timer _t("llama_init_from_model");
+     if (!model) {
+         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+         return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
 index bf91daa8b..4089ee72b 100644
 --- a/src/llama-context.h
@@ -269,6 +285,63 @@ index 6cb6dbd2f..bfbcd6a62 100644
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..51143f011 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,8 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#include "../src/llama-ext.h"
++#include "../src/tsc_timer.h"
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -809,6 +811,9 @@ public:
+     }
+ 
+     ~server_context_impl() {
++        if (spec) {
++            common_speculative_print_stats(spec.get(), stderr);
++        }
+         if (!sleeping) {
+             // destroy() is already called when entering sleeping state
+             // we don't call it again here to avoid double free
+@@ -956,6 +961,7 @@ private:
+     // load the model and initialize llama_context
+     // this may also be called to resume from sleeping state
+     bool load_model(common_params & params) {
++        sm_tmr::timer _t("server load_model");
+         load_progress_data load_progress_text  (this, "text_model");
+         load_progress_data load_progress_mmproj(this, "mmproj_model");
+         load_progress_data load_progress_spec  (this, "spec_model");
+@@ -1050,8 +1056,11 @@ private:
+ 
+         llama_init = common_init_from_params(params_base);
+ 
+-        model_tgt = llama_init->model();
+-        ctx_tgt   = llama_init->context();
++        {
++            sm_tmr::timer _t("init->model/context");
++            model_tgt = llama_init->model();
++            ctx_tgt   = llama_init->context();
++        }
+ 
+         if (model_tgt == nullptr) {
+             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+@@ -1063,7 +1072,10 @@ private:
+             return false;
+         }
+ 
+-        vocab = llama_model_get_vocab(model_tgt);
++        {
++            sm_tmr::timer _t("vocab get");
++            vocab = llama_model_get_vocab(model_tgt);
++        }
+ 
+         n_ctx = llama_n_ctx(ctx_tgt);
+ 
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
 index 5fe2729ba..596411797 100644
 --- a/tools/server/server.cpp
@@ -289,3 +362,17 @@ index 5fe2729ba..596411797 100644
      ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
+diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
+index e733ad5cc..720a1c1e1 100644
+--- a/ggml/src/ggml-vulkan/CMakeLists.txt
++++ b/ggml/src/ggml-vulkan/CMakeLists.txt
+@@ -180,6 +180,9 @@ if (Vulkan_FOUND)
+         CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
+                    -DCMAKE_INSTALL_BINDIR=.
+                    -DCMAKE_BUILD_TYPE=$<CONFIG>
++                   -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
++                   -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
++                   -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+                    ${VULKAN_SHADER_GEN_CMAKE_ARGS}
+ 
+         BUILD_COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>

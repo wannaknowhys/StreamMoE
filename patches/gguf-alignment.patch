@@ -2,7 +2,7 @@ diff --git a/ggml/include/gguf.h b/ggml/include/gguf.h
 index b3a1e1230..d1cf977b3 100644
 --- a/ggml/include/gguf.h
 +++ b/ggml/include/gguf.h
-@@ -93,6 +93,7 @@
+@@ -93,6 +93,7 @@ extern "C" {
  
      GGML_API uint32_t gguf_get_version    (const struct gguf_context * ctx);
      GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
@@ -14,7 +14,7 @@ diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
 index 6c7b58178..e95112220 100644
 --- a/ggml/src/gguf.cpp
 +++ b/ggml/src/gguf.cpp
-@@ -1022,6 +1022,14 @@
+@@ -1022,6 +1022,14 @@ size_t gguf_get_alignment(const struct gguf_context * ctx) {
      return ctx->alignment;
  }
  
