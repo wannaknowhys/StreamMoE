@@ -1,15 +1,16 @@
 @echo off
 rem ===========================================================================
-rem Converter matrix verification (v2-centric block abstraction, docs §9).
+rem Converter matrix verification (v2-centric block abstraction, docs sec 9).
 rem original -> v1/v2/v2chunk baseline, then each of v1/v2/v2chunk as source
 rem produces all three formats and is byte-compared to the baseline. Stops on
-rem the first mismatch, printing which two files differ.
+rem the first mismatch, printing which two files differ. Intermediate products
+rem are deleted right after each compare to keep the workdir small.
 rem
 rem usage: verify_convert_matrix.bat <workdir>   (workdir needs ~3x model free)
 rem   e.g. on a ramdisk: verify_convert_matrix.bat R:\conv
 rem
 rem Requires: temp\sm_env.bat (SM_GEMMA_ORIG), temp\stream_moe_convertd.exe
-rem (compile line in docs/STREAMMOE_GGUF_FORMAT.md §7).
+rem (compile line in docs/STREAMMOE_GGUF_FORMAT.md sec 7).
 rem ===========================================================================
 setlocal
 set DIR=%~1
@@ -32,8 +33,8 @@ echo [step 2/4] v1 source -^> v1/v2/v2chunk
 node tools\stream_moe_convert.js -m "%DIR%\v1_base.gguf" -o "%DIR%\t2_v1.gguf" --format v1 || goto fail
 call :cmp "%DIR%\v1_base.gguf" "%DIR%\t2_v1.gguf" "v1->v1" || goto fail
 node tools\stream_moe_convert.js -m "%DIR%\v1_base.gguf" -o "%DIR%\t2_v2.gguf" --format v2 || goto fail
-call :cmp "%DIR%\v2_base.gguf" "%DIR%\t2_v2.gguf" "v1->v2" || goto fail
 call :chunk "%DIR%\t2_v2.gguf" "%DIR%\t2_chunk" || goto fail
+call :cmp "%DIR%\v2_base.gguf" "%DIR%\t2_v2.gguf" "v1->v2" || goto fail
 call :cmpdir "%DIR%\chunk_base" "%DIR%\t2_chunk" "v1->v2chunk" || goto fail
 
 echo [step 3/4] v2 source -^> v1/v2/v2chunk
@@ -44,10 +45,10 @@ call :cmpdir "%DIR%\chunk_base" "%DIR%\t3_chunk" "v2->v2chunk" || goto fail
 
 echo [step 4/4] v2chunk source -^> v1/v2/v2chunk
 call :merge "%DIR%\chunk_base" "%DIR%\t4_v2.gguf" || goto fail
-call :cmp "%DIR%\v2_base.gguf" "%DIR%\t4_v2.gguf" "v2chunk->v2" || goto fail
 node tools\stream_moe_convert.js -m "%DIR%\t4_v2.gguf" -o "%DIR%\t4_v1.gguf" --format v1 || goto fail
 call :cmp "%DIR%\v1_base.gguf" "%DIR%\t4_v1.gguf" "v2chunk->v1" || goto fail
 call :chunk "%DIR%\t4_v2.gguf" "%DIR%\t4_chunk" || goto fail
+call :cmp "%DIR%\v2_base.gguf" "%DIR%\t4_v2.gguf" "v2chunk->v2" || goto fail
 call :cmpdir "%DIR%\chunk_base" "%DIR%\t4_chunk" "v2chunk->v2chunk" || goto fail
 
 echo.
@@ -68,15 +69,18 @@ if errorlevel 1 ( echo [verify] merge failed: %~1 & exit /b 1 )
 exit /b 0
 
 :cmp
-rem %1 %2 files, %3 label
+rem %1 = expected file, %2 = candidate file, %3 label; deletes candidate
 fc /b "%~1" "%~2" >nul 2>&1
 if errorlevel 1 ( echo [DIFF] %~3 : %~1  vs  %~2 & exit /b 1 )
 echo   [OK] %~3
+del /q "%~2" 2>nul
 exit /b 0
 
 :cmpdir
-rem %1 baseline dir, %2 candidate dir, %3 label
+rem %1 = baseline dir, %2 = candidate dir, %3 label; deletes candidate dir
 for %%f in ("%~2\*.gguf") do call :cmp "%~1\%%~nxf" "%%f" "%~3"
+if errorlevel 1 ( exit /b 1 )
+rd /s /q "%~2" 2>nul
 exit /b 0
 
 :fail
