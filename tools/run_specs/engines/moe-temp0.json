@@ -1,12 +1,14 @@
 {
-  "engine": "moe",
+  "engine": "moe-temp0",
   "bin": "rbexport",
   "extra": [
     "--expert-backend",
     "--moe-ram-pool",
     "${pool}",
     "--temp",
-    "1.0",
+    "0",
+    "--top-k",
+    "1",
     "--cache-type-k",
     "f32",
     "--cache-type-v",

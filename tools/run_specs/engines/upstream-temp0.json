@@ -1,9 +1,11 @@
 {
-  "engine": "upstream",
+  "engine": "upstream-temp0",
   "bin": "upstream",
   "extra": [
     "--temp",
-    "1.0",
+    "0",
+    "--top-k",
+    "1",
     "--cache-type-k",
     "f32",
     "--cache-type-v",
