@@ -6,10 +6,6 @@
     "--moe-ram-pool",
     "${pool}",
     "--temp",
-    "1.0",
-    "--cache-type-k",
-    "f32",
-    "--cache-type-v",
-    "f32"
+    "1.0"
   ]
 }

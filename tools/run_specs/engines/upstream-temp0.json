@@ -5,10 +5,6 @@
     "--temp",
     "0",
     "--top-k",
-    "1",
-    "--cache-type-k",
-    "f32",
-    "--cache-type-v",
-    "f32"
+    "1"
   ]
 }
