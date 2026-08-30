@@ -149,100 +149,103 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 
 ---
 
-## 7. 转换器架构（node 指挥 + C/C++ wrapper）
+## 7. 转换器架构（JS 逻辑单点 + convertd 哑物理服务，裸 TCP）
 
-- **Node 无可靠 GGUF 读写库**（`@huggingface/gguf` 等只读 metadata、写/重排/大张量不可靠）→ 用 **ggml 的 gguf C 库**（`ggml/include/gguf.h`：`gguf_init_from_callback` 流式读 + `gguf_set_val_*`/`gguf_add_tensor`/`gguf_write_to_file` 写）。
-- **wrapper（C/C++，`stream_moe_convertd`）**：**JSON 行管道**（stdin/stdout，每次转换跑一次）：
-  - `open {path}` → 输出 metadata JSON（header/alignment/KV/tensor_info 摘要）。
-  - `convert {format v1|v2, out, plan}` → 按 plan 读源张量、写目标（进度/完成/错误事件）。
-  - `chunk {n_chunks, out_base}` → v2 RAID0 切分（或 v1 张量级分片）。
-- **node（`tools/stream_moe_convert.js`）**：spawn wrapper → `open` 拿 metadata → 规划（分类/重排/切分/合分片）→ 发 `convert`/`chunk` → 汇总。
-- 复用：vendored `ggml/src/gguf.cpp`（llama.cpp 已编译进 ggml 库，wrapper 链接 ggml.lib）。
+- **JS（`tools/stream_moe_layout.js`）= 唯一逻辑实现**：
+  - `buildModel(files)`：任意源（官方分片 / 原版 / v1 / v2 / v2 切）→ 统一 Model 描述（`dense[]` srcs 多段 + `expert[]` perExpertSrcs 每专家段列表；v2 切源的块条带跨 N 文件 → 段拼接）。
+  - 写入器 `writeV1/writeV2/writeV2chunk`：Model + 落地参数 → `write_meta/copy/fill/close` 指令流。
+- **convertd（`tools/stream_moe_convertd.cpp`）= 哑物理服务**：裸 TCP（`127.0.0.1`，JSON-lines，每行一命令/一响应，单客户端，启动打印 `PORT n` 到 stderr），5 原语：
+  - `open {in:[...]}` → 每文件 metadata JSON。
+  - `write_meta {out, in, skip_kv, set_kv, tensors, alignment}` → 写头（KV 从源复制、按 `skip_kv` 前缀过滤、`set_kv` 覆盖；`tensors` 由 JS 定序）→ `dataOffset` + 张量 `offsets`。
+  - `copy {src, dst, ops}` / `fill {dst, ops}` → 流式搬字节 / 写零（dstOff 相对 dataOffset）。
+  - `close {dst}` → 关输出。
+- **数据不跨进程**：JS 从 `open` 元数据构建描述，发给 convertd 的是小的 copy 指令流（16GB 数据 = 几百条大区间指令）。
+- **`write_meta` 的 KV 消毒**：只复制模型信息 KV（跳过 `stream_moe.*`/`split.*`/`general.alignment`），目标格式的布局 KV 全部由 JS 经 `set_kv` 全新生成——v1 遗留 KV 永不泄漏进 v2/v2 切。
+- 复用：vendored `ggml/src/gguf.cpp`（llama.cpp 已编译进 ggml 库，wrapper 链接 ggml-base.lib）。
 
-### wrapper 编译（Windows，clang-cl + vendored ggml）
+### wrapper 编译（Windows，clang-cl + vendored ggml，含 ws2_32.lib）
 ```bat
-rem tools/stream_moe_convertd.cpp：JSON-lines 管道（stdin 命令 / stdout 响应）
+rem tools/stream_moe_convertd.cpp：裸 TCP server（JSON-lines）
 F:\Dev\LLVM\bin\clang-cl.exe /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT ^
     "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/include" ^
     "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/src" ^
     F:/Dev/StreamMoE/build/main/llama-build/ggml/src/ggml-base.lib ^
-    F:/Dev/LLVM/lib/libomp.lib /Fe:temp/stream_moe_convertd.exe
+    F:/Dev/LLVM/lib/libomp.lib ws2_32.lib /Fe:temp/stream_moe_convertd.exe
 rem 测试 open（读 GGUF metadata -> JSON）：
-echo {"cmd":"open","path":"N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"} | temp\stream_moe_convertd.exe
+node tools\convertd_call.js '{"cmd":"open","in":["N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"]}'
 ```
 
 ### wrapper 命令
-- `open {path}` → metadata JSON（header/alignment/KV/tensor_info）——✅ 已实现（gemma 验证）。
-- `convert {format v1|v2, in, out, plan}` → 读源张量写目标——TODO。
-- `chunk {n_chunks, out_base}` → v2 RAID0 切分——TODO。
+- `open` → metadata JSON —— ✅ 已实现。
+- `write_meta` / `copy` / `fill` / `close` —— ✅ 已实现（布局指令流由 JS 生成）。
 
 ---
 
-## 8. 转换器功能清单（v1/v2）【2026-08-29 更新为实际状态】
+## 8. 转换器功能清单【2026-08-30 更新为实际状态】
 
-`tools/stream_moe_convertd.cpp`（JSON 行管道 wrapper）+ `tools/stream_moe_convert.js`（CLI 前端，多分片发现）：
+`tools/stream_moe_convertd.cpp`（裸 TCP 哑物理服务）+ `tools/stream_moe_layout.js`（逻辑单点）+ `tools/stream_moe_convert.js`（CLI 前端）：
 
-- [x] **v1 sections**（`alignment=4096` + dense/expert 分区，原版可读）——`convert --format v1`。
-- [x] **v2 expert-blocks**（专家紧凑块，自有 loader）——`convert --format v2`；已产出 gemma-4-26B-A4B `-v2.gguf` / `-v2-NOHOLE.gguf` 并做 bit 级验证。
-- [x] **v1 合分片**（`-00001-of-00005` → 单文件，`in` 支持 `p1;p2` 多分片输入）。
-- [x] **v2 RAID0 切分**（dense 段 + 每专家块按 4K 块切 N 份，均匀 base/rem 或 `--ratio` largest-remainder）——`chunk` 命令（`out1,out2,...` 逗号分隔 N 路径，完整 GGUF + `incomplete=1`）。
+- [x] **v1 sections**（`alignment=4096` + dense/expert 分区，原版可读）——`--format v1`。
+- [x] **v2 expert-blocks**（专家紧凑块，每专家一块：分支拼接 + 块尾 0 填充，自有 loader）——`--format v2`。
+- [x] **v2 RAID0 切分**（dense 段 + 每专家块按 4K 块切 N 份，均匀 base/rem 或 `--ratio` largest-remainder）——`--format v2chunk --chunks N [--ratio a:b:c]`；每文件完整 header + `chunk_no/total/incomplete=1` + `chunk_slices`（各文件条带布局）。
+- [x] **任意源 → 统一 Model**（官方分片 / 原版 / v1 / v2 / v2 切），v2 切源 = 多段 src（块条带跨 N 文件）。
+- [x] **v2 → v1 拆块还原**、**v2 切 → v2/v1/v2 切 合并还原**。
+- [x] **scale 统一归 dense**（v1/v2 分类一致，消灭布局随源变）。
+- [x] **KV 消毒**（write_meta 只复制模型信息 KV，布局 KV 全新生成——v1 单数 `expert_section` 不再泄漏）。
+- [x] **5 源 × 3 目标矩阵逐字节一致**——`scripts/verify_convert_matrix.bat <workdir>`（N 盘原版源 → R 盘 ramdisk 工作区）全 PASS。
 - [ ] **v1 张量级分片**（单文件 → 文件系列，原版可合并）——未实现。
-- [ ] **v2 反重排还原**（v2 → v1/原版，经中间格式拆块）——未实现，见 §9。
-- [x] **数值等价验证**（gemma v2 vs 原版逐位一致已做；v1 原版可读自证）。
 
-**结论**：原版 → v1/v2 单文件 + v1 → v2 + v2 → chunk 已可用；**中间格式（§9）统一 parse/write 后矩阵全通**（含 v2 → v1/原版 反重排还原）。
+**结论**：转换器重构为「读 = 构建统一 Model 描述，写 = 描述 + 落地参数 → 文件」；原版/v1/v2/v2 切 任意源 → v1/v2/v2 切 任意目标全部字节可复现。
 
 ---
 
-## 9. 转换器中间格式（统一模型抽象）
+## 9. 转换器中间格式（统一模型抽象）【2026-08-30 已实现】
 
 > 目标：让**所有格式**（原版 / v1 / v2 / v2 切）都能解析到同一个内存中的模型抽象，再从该抽象写出任意目标（v1 / v2 / v2 切）——矩阵全通、单向可逆（v2 只是"打乱"而非"丢失"，可拆回）。这样**任意多方向转换可互相验证转换器无 bug**。
 
-### 9.1 中间格式（JS 内存中的模型抽象，不是文件）
-
-以 **v2 为中心**的块抽象：头块 + [dense 张量块][专家原子块]。
+### 9.1 中间格式（`tools/stream_moe_layout.js` 的 Model，内存抽象，不是文件）
 
 ```js
 {
-  headerKV,                                 // 源 KV（写回时保留）
-  dense:  [ { name, ne, type, src:{file,off,size} } ],  // dense 张量块（每张量一块）
-  experts:[ { layer, branch, name, ne, type, perExpert,
-              srcs: [每专家 {file, off, size}] } ],     // 专家原子块（每专家每分支）
+  arch, layout, nLayer, nExpert, nExpertUsed, incomplete, files,
+  dense:  [ { name, ne, type, size, srcs:[{fi,off,len,inOff}] } ],   // 源顺序
+  expert: [ { name, ne, type, size, perExpert, branch, layer,
+              perExpertSrcs:[ [{fi,off,len,inOff}] x nExpert ] } ],  // 按 (layer, ORDER) 排序
 }
 ```
 
-- **原子块 = 每专家每分支的 `per_expert` 连续切片**——不携带源格式的对齐（切片语义）。
-- **专家块（v2）= 该专家各分支原子块连续拼接**——块内分支**不各自对齐**（与 v2 真实布局一致），仅块尾 `align_up` 到 4K → **紧凑**。因此从 v1 读（三分量张量各自 4K 对齐）也不会让 v2 块不紧凑——对齐被"读取"吸收。
-- **scale 走 dense 张量块**（不进专家块，v2 现状）。
-- 转换 = 源格式解析成原子块列表 → 按目标布局重排（v1 张量连续 / v2 专家块 / v2 切 段）。
+- **srcs / perExpertSrcs 是段列表**：原版/v1/v2 = 单段；**v2 切源 = 多段**（块条带跨 N 文件，区间与各文件条带求交 → 段序列）。
+- `inOff` = 段在张量/专家切片内的偏移（多段拼接恢复原区间）。
+- **scale 归 dense**（`_exps && !.scale` → expert；`.scale` → dense），v1/v2 一致。
+- **dense 保持源顺序**；expert 按 (layer, `[gate_up,gate,up,down]`) 排序——写出的张量序与源无关。
 
-### 9.2 解析器（各格式 → 中间）
+### 9.2 解析器（各格式 → Model，`buildModel`）
 
 | 源格式 | 解析 |
 | :--- | :--- |
-| 原版 | open 张量列表 → dense/expert（name 含 `_exps` 且非 `.scale`）→ `src` = shard+off+size |
-| v1 | 同原版（张量连续可读）+ `dense_section` 标记 |
-| v2 | `expert_sections`（块 off/size）+ `expert_branch_names/sizes/counts`（块内布局）→ 每专家块拆出各分支区间 → 专家张量 `src` = 块内分支区间（**可逆关键**）|
-| v2 切 | chunk 规则（base/rem 或 ratio）→ 专家张量 `src` = "文件 i 的段区间" |
+| 官方分片 / 原版 | 张量列表 → dense/expert（`_exps` 且非 `.scale`）→ `src` = file+off+size；`split.count>1` 自动合并分片 |
+| v1 | 同原版 + `dense_section` 标记 |
+| v2 | `expert_sections`（块 off/size）+ `expert_branch_names/sizes/counts`（块内布局）→ 每专家块拆出各分支区间（**可逆关键**）|
+| v2 切 | `chunk_slices`（每文件条带布局）→ 区间 × 各文件条带求交 → 多段 `src`（全部 N 文件必须同时传入）|
 
-### 9.3 写入器（中间 → 各格式）
+### 9.3 写入器（Model → 各格式，`writeV1/writeV2/writeV2chunk`）
 
 | 目标 | 写入 |
 | :--- | :--- |
-| v1 | 张量重排（dense 段 + expert 段，4K 对齐）|
-| v2 | dense 段 + 每专家块（从分支 `src` 拼）|
-| v2 切 | dense/专家块按规则切 N 份（每份完整 GGUF + chunk KV）|
+| v1 | `write_meta`（dense 前 expert 后定序）→ `copy` 每段 → `close` |
+| v2 | `write_meta`（含 `dense_section`/`expert_sections`/`branch_*` 布局 KV）→ `copy` dense + 每专家块（分支拼接）→ `fill` 块尾零 → `close` |
+| v2 切 | 按 N 份切 4K 块（均匀或 ratio）→ 每文件 `write_meta`（含 chunk KV + `chunk_slices`）→ `copy` 各条带 + `fill` 条带尾 → `close` |
 
-转换 = `parse(源) → 中间 → write(目标)`；执行层（convertd）只做"按 `src` 读区间 + 按布局写"。
+转换 = `buildModel(源) → 布局计划 → write_meta/copy/fill/close 指令流`；convertd 只做"按指令读区间 + 写"。
 
-### 9.4 矩阵（经中间格式全通）
+### 9.4 矩阵（经中间格式全通，2026-08-30 验证 PASS）
 
 | 源 \ 目标 | v1 | v2 | v2 切 |
 | :--- | :--- | :--- | :--- |
 | 原版 | ✓ | ✓ | ✓ |
-| v1 | — | ✓ | ✓ |
-| v2 | ✓（拆块还原）| — | ✓ |
+| v1 | ✓ | ✓ | ✓ |
+| v2 | ✓（拆块还原）| ✓ | ✓ |
 | v2 切 | ✓（合并还原）| ✓ | 重切 |
 
-- **可逆性**：v2 的专家数据是"打乱"（重排成块），张量 name/ne/type + branch 布局都在 KV/tensor_info——可拆回；真正丢失的只有多分片结构（`split.*`）与对齐 padding（有原始大小可去）。
-- **验证方法**：`A→中间→B` 与 `A→B` 直转对比逐字节；`A→中间→v2→中间→v1` 回环与 `A→v1` 对比——多方向转换互相校验转换器。
+- 验证：`scripts/verify_convert_matrix.bat <workdir>`——N 盘原版源 → R 盘 ramdisk：基准（原版→v1/v2/v2chunk）+ 各源互转，`tools/cmp_gguf.js` 逐字节比较，**全部 identical**。
+- 可逆性：v2 专家数据是"重排"（块），张量 name/ne/type + branch 布局都在 KV/tensor_info——可拆回；真正丢失的只有多分片结构（`split.*`）与对齐 padding。

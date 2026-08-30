@@ -1,0 +1,1 @@
+{ "input": "hi", "feed": { "type": "jsonl", "path": "benchmark/prompts/hi.jsonl", "maxTurns": 1 } }
