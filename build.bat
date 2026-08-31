@@ -71,8 +71,12 @@ rem environment: make our ninja + clang visible via PATH. (The toolchain-file
 rem hook is cross-compile-only, and the raw VULKAN_SHADER_GEN_CMAKE_ARGS -D is
 rem cleared by ggml-vulkan's `set(VULKAN_SHADER_GEN_CMAKE_ARGS "")`.)
 if "%GGML_VULKAN%"=="ON" (
-    for %%I in ("%NINJA%") do set PATH=%%~dpI;%PATH%
-    for %%I in ("%CLANG%") do set PATH=%%~dpI;%PATH%
+    rem split dir-extraction from the PATH assignment: expanding %PATH% inside
+    rem `for ... in (...)` breaks when PATH contains "(x86)" (cmd treats the `)`
+    rem of (x86) as the end of the for list -> "此时不应有 \VMware\VMware").
+    for %%I in ("%NINJA%") do set NINJA_DIR=%%~dpI
+    for %%I in ("%CLANG%") do set CLANG_DIR=%%~dpI
+    set PATH=%NINJA_DIR%;%CLANG_DIR%;%PATH%
     set VULKAN_TOOLCHAIN_ARGS=
 ) else set VULKAN_TOOLCHAIN_ARGS=
 "%CMAKE%" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
