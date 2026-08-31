@@ -13,14 +13,19 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ## 2. 当前状态（✅ 已完成）
 
-### vendored patch 体系（2026-08-30 整理，纪律：vendored 永不 commit，改动全在 patch）
-- **vendored HEAD = 纯上游 `f280b2698`**，工作区完全干净。
-- **4 个 patch**（`patches/`，按序 apply，`git apply --check` 已验证叠加）：
-  1. `tsc_timer.patch`：`src/tsc_timer.h`（[TMR] 计时，route-b 和 prefill 共享）
-  2. `route-b-inject.patch`：route B 核心（common/arg/speculative/model-loader/model/llama.cpp）+ spec-stats + export-args（--prompt-log/--kv-placement）+ server-context.cpp（spec-stats 析构打印 + [TMR]）
-  3. `gguf-alignment.patch`：`gguf_set_alignment`（转换器依赖）
-  4. `prefill-export-llama.patch`：prefill 导出 + 专家历史 + cb_eval 图内抓取 + --export-dir/--prefill-from
-- **应用顺序**：`tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama`。
+### vendored patch 体系（2026-08-31 重构，phase 结构 + 宏隔离，vendored 永不 commit）
+- **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
+- **5 个 patch**（`patches/`，phase 结构，`git apply --check` 验证叠加）：
+  - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（共享文件 include 锚点）+ `tsc_timer.patch`（[TMR]）
+  - **Phase 2a（可选）**：`route-b-inject.patch`（route B：5 个 `stmoe_routeb_*.frag` + 专属文件）
+  - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 导出：6 个 `stmoe_prefill_*.frag` + llama 层）
+  - **`gguf-alignment.patch`**（转换器工具独立，不入推理构建）
+- **宏隔离**（编译时 -D 选功能，专属文件代码也包宏）：
+  - `main` → `-D STREAM_MOE_ROUTE_B`（route-b 完整推理）
+  - `upstream_dump` → `-D STREAM_MOE_PREFILL_EXPORT`（prefill 导出，标准上游基准）
+  - `StreamMoE_dump` → 两者（完整 StreamMoE 导出）
+  - **无宏 = 原版行为**（已编译 + llama-server help 验证无 StreamMoE 参数）
+- **应用顺序**：`streammoe-macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama`（temp 干净重建逐字节一致）。
 - vulkan 构建修复**无 patch**：`build.bat` 经上游 `VULKAN_SHADER_GEN_CMAKE_ARGS` hook 传工具链。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
@@ -62,24 +67,27 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 | 动作 | 命令 |
 |---|---|
-| 重建 vendored | 应用 4 patch（顺序见 §2）→ `build.bat llamalibs main` → `build.bat build main` |
+| route-b 完整推理 | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe` |
+| prefill 导出（上游基准）| `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe` |
+| 完整栈导出 | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe` |
+| 转换器服务 | `build.bat convertd` → `build\convertd\convertd.exe` |
 | 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（N 原版源 → R 盘）|
 | gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |
 | prefill 导出（--export-dir）| `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |
 | prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt|tokens.bin> --export-dir <dir> -c 1024 -t 8` |
-| 单测 | `build.bat test main` |
 
 ---
 
 ## 4. 下一步（TODO）
 
 **主线方向**
-1. **vulkan 作为 backend dll**（`GGML_BACKEND_DL` + `BUILD_SHARED_LIBS=ON`，官方一堆 cpu/vulkan dll）——**需与 moe 适配商议**（route B 专家池现走 CPU 内核）。
-2. **deepseek `--prefill-from` KV 预构建实测**（gemma 非 dsv4 无 KV；deepseek 才有，验证 KV 导出 + 预构建价值）。
+1. **deepseek `--prefill-from` KV 预构建实测**（gemma 非 dsv4 无 KV；deepseek 才有，验证 KV 导出 + 预构建价值）。
+2. **vulkan 作为 backend dll**（`GGML_BACKEND_DL` + `BUILD_SHARED_LIBS=ON`）——**需与 moe 适配商议**。
 3. **mini-graph / 主图就地池化**（route B 计算路径重构，待聊设计）。
 
 **顺手**
 4. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）。
+5. 3 个 direct_fill task spec（`tools/run_specs/tasks/direct_fill_cn_txt/en_txt/10000_txt.json`，引用同名 txt）。
 
 **明确不做**（用户决策）
 - deepseek prefill 追 bit 级（A1）。
@@ -92,6 +100,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ## 5. 环境与坑（记住）
 
 - **测试约定**：route B 池 `--moe-ram-pool 71680`（70GB）大 MoE / gemma 8192；`--fit off --no-warmup`。
+- **编译目录**：`build\<tag>\llama-build\bin\`（llama-server + libomp.dll 已自动 copy）；tag 决定宏（见 §2）。
+- **AVX flags**：build.bat llamalibs 显式 `-mavx2 -mfma`（5950X；clang-cl 的 ggml 指令集检测否则 Failed 落 SSE2）。
 - **R: 是 ramdisk，会掉**（多次消失）——矩阵基准/测试产物重启即丢。
 - **O: 盘慢**——source 避免 O；模型源用 N。`SM_OUT_ROOT` 默认 `O:\1`。
 - **prefill10000 产物勿清**（回归基准）：`O:\1\deepseek\*`。
