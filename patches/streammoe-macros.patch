@@ -16,18 +16,25 @@ index 86f8610a5..66dd9dd3e 100644
          {"-p", "--prompt"}, "PROMPT",
          "prompt to start generation with; for system message, use -sys",
 diff --git a/common/common.cpp b/common/common.cpp
-index 3d54bd600..05e606afd 100644
+index 3d54bd600..f5103121e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1742,6 +1742,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1692,6 +1692,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.check_tensors   = params.check_tensors;
+     mparams.use_extra_bufts = !params.no_extra_bufts;
+     mparams.no_host         = params.no_host;
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_ctx.frag"
++#endif
+ 
+     if (params.kv_overrides.empty()) {
+         mparams.kv_overrides = NULL;
+@@ -1742,6 +1745,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.flash_attn_type   = params.flash_attn_type;
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +#include "stmoe_prefill_ctx.frag"
-+#endif
-+#ifdef STREAM_MOE_ROUTE_B
-+#include "stmoe_routeb_ctx.frag"
 +#endif
      cparams.offload_kqv       = !params.no_kv_offload;
      cparams.no_perf           = params.no_perf;

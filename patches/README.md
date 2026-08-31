@@ -32,11 +32,16 @@
 **vulkan 构建修复（无 patch）**：`GGML_VULKAN=ON` 时由 `build.bat` 通过上游注入点
 `-DVULKAN_SHADER_GEN_CMAKE_ARGS` 把 ninja/clang 工具链传给 shader-gen 子 cmake——不改 vendored。
 
-**route B 栈应用顺序**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
+**route B 栈应用顺序（phase 结构）**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
    ```
-   streammoe-macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama
+   Phase 1（必选，互不依赖，顺序可互换）：streammoe-macros → tsc_timer
+   Phase 2a（可选）：route-b-inject
+   Phase 2b（可选，互相独立）：gguf-alignment + prefill-export-llama
    ```
-   `streammoe-macros.patch` = 共享文件宏骨架（common.h/common.cpp/arg.cpp/llama.h 的 ROUTE_B/PREFILL 空块），先应用建稳定锚点；功能 patch 只注入自己的宏块（见下"共享文件宏隔离"）。
+- **Phase 1 = 占位 + tsc**：占位改共享文件（common.h/common.cpp/arg.cpp/llama.h 的宏 include 块），tsc 新增 `src/tsc_timer.h`（[TMR]）——不同文件，先谁后谁无所谓；但**必须在所有功能 patch 前**（占位 = include 锚点；tsc = route-b/prefill 都 include 的 [TMR] 头）。**Phase 1 单独 apply + 无宏编译 = 纯上游等价物**（include 行被预处理跳过）。
+- **Phase 2a = route-b**（可选）：只新增 route 的 `include/*.frag` + 专属文件，不碰共享文件。
+- **Phase 2b = gguf + prefill**（可选，互相独立）：gguf 改 ggml gguf.h/cpp；prefill 只新增 prefill 的 `include/*.frag` + llama 层（llama-context/kv-cache/server.cpp）。prefill 只依赖 tsc（phase 1 已含），不依赖 route-b。
+- **组合任意**：只 2a / 只 2b / 2a+2b / 都不——各功能 patch 只新增自己的文件 + 各自命名的 .frag（不同名），apply 层零交集；编译时 `-D` 宏选功能（`STREAM_MOE_ROUTE_B` / `STREAM_MOE_PREFILL_EXPORT`）。
 
 **当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
 StreamMoE 全部改动只存在于上述 patch（含 spec-stats/export-args 并入项，vulkan 走 build.bat），按顺序 apply 可完整复现。
