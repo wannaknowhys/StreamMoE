@@ -167,8 +167,9 @@ async function runOne(run) {
         '--temp', '1.0', '--top-p', '0.95', '--host', '127.0.0.1', '--port', String(PORT), '--no-webui'];
     if (run.draft) args.push('--model-draft', run.draft, '--spec-draft-n-max', '5', '--spec-draft-n-min', '1', '--spec-draft-p-min', '0.6');
     if (run.extra) args.push(...run.extra);
+    args.push('--export-dir', dir); // StreamMoE: export via arg (replaces LLM_EXPORT_DIR env)
     console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} -> ${dir} ===`);
-    const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, LLM_EXPORT_DIR: dir } });
+    const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'] });
     try {
         await waitHealth(600000);
         await feedTask(run, dir);
