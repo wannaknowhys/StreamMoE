@@ -151,3 +151,10 @@ build\<tag>\
 - 已修复 bug 的验证代码用完即删（`git rm`）。
 - 命名：`STREAM_MOE_TEMP` 为总开关；细化用 `STREAM_MOE_TEMP_<NAME>` 子宏，受总开关约束。
 - 诊断编译：`diagnostics/README.md` 说明各自的构建命令。
+
+### debug 构建分离纪律（2026-08-31）
+
+- **debug 永不覆盖正式 binary**：debug 编译到独立路径 `build\<tag>_debug`（如 `upstream_dump_debug`），spec 用 `_debug` 后缀（`upstream-temp0_debug.json` → `bin=upstream_dump_debug`）。
+- **debug 代码永不进正式源码/patch**：临时调试打印做成独立 debug patch（`temp/debug-*.patch`，gitignored）——apply → 编译 debug → 用后 `apply -R` 还原，工作区永远回正式态。
+- **三层隔离**：源码 = 正式态（patch apply 后可重放）、patch = 正式功能差异、binary = tag 隔离（正式 vs `_debug`）。
+- **可复现**：正式 binary 必须能由"干净 patch 序列 + 编译"精确复现；对比实验固定 binary 只变输入（否则无法归因）。
