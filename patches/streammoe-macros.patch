@@ -16,7 +16,7 @@ index 86f8610a5..66dd9dd3e 100644
          {"-p", "--prompt"}, "PROMPT",
          "prompt to start generation with; for system message, use -sys",
 diff --git a/common/common.cpp b/common/common.cpp
-index 3d54bd600..e21190db1 100644
+index 3d54bd600..ea312af49 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -9,7 +9,9 @@
@@ -40,12 +40,15 @@ index 3d54bd600..e21190db1 100644
  
      if (params.kv_overrides.empty()) {
          mparams.kv_overrides = NULL;
-@@ -1742,6 +1747,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1742,6 +1747,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.flash_attn_type   = params.flash_attn_type;
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +#include "stmoe_prefill_ctx.frag"
++#endif
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_ctx2.frag"
 +#endif
      cparams.offload_kqv       = !params.no_kv_offload;
      cparams.no_perf           = params.no_perf;
