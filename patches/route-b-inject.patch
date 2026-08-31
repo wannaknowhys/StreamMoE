@@ -22,208 +22,6 @@ index 36f1e0cd5..0ff91794e 100644
 +if (WIN32)
 +    target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
 +endif()
-diff --git a/common/arg.cpp b/common/arg.cpp
-index 86f8610a5..bbdd583ce 100644
---- a/common/arg.cpp
-+++ b/common/arg.cpp
-@@ -1683,6 +1683,65 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
-             params.swa_full = true;
-         }
-     ).set_env("LLAMA_ARG_SWA_FULL"));
-+    add_opt(common_arg(
-+        {"--expert-backend"},
-+        "StreamMoE route B: route MoE expert tensors (ffn_*_exps / ffn_*_shexp) to the stream_moe expert pool (bounded RAM)",
-+        [](common_params & params) {
-+            params.expert_backend = true;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-ram-pool"}, "MB",
-+        "StreamMoE: expert residency budget in MB (0 = auto 75%% free RAM)",
-+        [](common_params & params, int value) {
-+            params.moe_ram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-vram-pool"}, "MB",
-+        "StreamMoE: VRAM budget for the expert pool (GPU pool phase)",
-+        [](common_params & params, int value) {
-+            params.moe_vram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-draft-ram-pool"}, "MB",
-+        "StreamMoE: DRAFT model expert residency budget in MB (0 = full resident, no eviction)",
-+        [](common_params & params, int value) {
-+            params.moe_draft_ram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-draft-vram-pool"}, "MB",
-+        "StreamMoE: VRAM budget for the DRAFT expert pool (GPU pool phase)",
-+        [](common_params & params, int value) {
-+            params.moe_draft_vram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--prompt-log"}, "PATH",
-+        "StreamMoE: append every /v1/chat/completions request body to this file",
-+        [](common_params & params, const std::string & value) {
-+            params.prompt_log_path = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--kv-placement"}, "<RAM,VRAM0,...>",
-+        "StreamMoE: KV cache placement as a collection (comma-separated). "
-+        "Multi-replica mirrors are a future feature - today only the first "
-+        "element is honored, extra elements warn.",
-+        [](common_params & params, const std::string & value) {
-+            params.kv_placement.clear();
-+            size_t start = 0;
-+            while (start <= value.size()) {
-+                size_t comma = value.find(',', start);
-+                std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-+                if (!tok.empty()) params.kv_placement.push_back(tok);
-+                if (comma == std::string::npos) break;
-+                start = comma + 1;
-+            }
-+        }
-+    ));
-     add_opt(common_arg(
-         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
-         string_format("max number of context checkpoints to create per slot (default: %d)"
-diff --git a/common/common.cpp b/common/common.cpp
-index 3d54bd600..f255b1183 100644
---- a/common/common.cpp
-+++ b/common/common.cpp
-@@ -9,6 +9,9 @@
- #include "sampling.h"
- #include "speculative.h"
- #include "unicode.h"
-+#include "server/route_b_inject.h"
-+#include "../src/tsc_timer.h"
-+#include "../src/llama-ext.h"
- 
- #include <algorithm>
- #include <cinttypes>
-@@ -1289,6 +1292,7 @@ struct common_init_result::impl {
- 
- common_init_result::common_init_result(common_params & params, bool model_only) :
-     pimpl(new impl{}) {
-+    sm_tmr::timer _t("common_init_result ctor");
-     auto mparams = common_model_params_to_llama(params);
-     auto cparams = common_context_params_to_llama(params);
- 
-@@ -1330,7 +1334,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
-     if (model == NULL) {
-         return;
-     }
--
-     pimpl->model.reset(model);
- 
-     if (model_only) {
-@@ -1434,6 +1437,7 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
- }
- 
- common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-+    sm_tmr::timer _t("common_init_from_params");
-     common_init_result_ptr res(new common_init_result(params, model_only));
- 
-     llama_model * model = res->model();
-@@ -1452,6 +1456,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
-         return res;
-     }
- 
-+    // StreamMoE: report the actual KV cache footprint on EVERY tool that loads
-+    // a model (server + CLI both go through common_init_from_params).
-+    {
-+        size_t kv_bytes = 0;
-+        for (const auto & [buft, mb] : llama_get_memory_breakdown(lctx)) {
-+            (void) buft;
-+            kv_bytes += mb.context;
-+        }
-+        std::fprintf(stderr, "KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 1024.0);
-+    }
-+
-     const llama_vocab * vocab = llama_model_get_vocab(model);
- 
-     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-@@ -1693,6 +1708,28 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
-     mparams.use_extra_bufts = !params.no_extra_bufts;
-     mparams.no_host         = params.no_host;
- 
-+    // StreamMoE route B: when opted in, register the expert-pool backend and
-+    // route MoE expert tensors (ffn_*_exps) to its weight buft before load.
-+    // Shared experts stay on defaults until the backend supports them.
-+    // Note: skip when this common_params IS the draft model (speculative.cpp
-+    // reuses common_model_params_to_llama for the draft mparams) - the draft
-+    // gets its own pool bound in speculative.cpp, never the main-pool budget.
-+    if (params.expert_backend &&
-+            params.model.path != params.speculative.draft.mparams.path) {
-+        // common_params_parse pads tensor_buft_overrides with 4096 null entries
-+        // (llama_params_fit scratch). Our override must sit at the FRONT - the
-+        // loader reads from index 0 and stops at the first null pattern. Clear
-+        // the padding first (no CLI sets these directly).
-+        params.tensor_buft_overrides.clear();
-+        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
-+        if (ovr) {
-+            for (auto * p = ovr; p->pattern != nullptr; ++p) {
-+                params.tensor_buft_overrides.push_back(*p);
-+            }
-+            params.tensor_buft_overrides.push_back({ nullptr, nullptr }); // terminator
-+        }
-+    }
-+
-     if (params.kv_overrides.empty()) {
-         mparams.kv_overrides = NULL;
-     } else {
-@@ -1743,6 +1780,22 @@ struct llama_context_params common_context_params_to_llama(const common_params &
-     cparams.cb_eval           = params.cb_eval;
-     cparams.cb_eval_user_data = params.cb_eval_user_data;
-     cparams.offload_kqv       = !params.no_kv_offload;
-+
-+    // StreamMoE KV placement collection: multi-replica mirrors are not
-+    // implemented yet - honor only the first element, warn if more are given.
-+    if (!params.kv_placement.empty()) {
-+        if (params.kv_placement.size() > 1) {
-+            COM_WRN("multi-replica KV placement not implemented yet; using first element '%s'",
-+                    params.kv_placement.front().c_str());
-+        }
-+        const std::string & p = params.kv_placement.front();
-+        if (p == "RAM" || p == "ram") {
-+            cparams.offload_kqv = false;   // KV stays in host RAM
-+        } else if (p.rfind("VRAM", 0) == 0) {
-+            cparams.offload_kqv = true;    // KV offloaded to GPU (device idx after "VRAM")
-+        }
-+    }
-+
-     cparams.no_perf           = params.no_perf;
-     cparams.op_offload        = !params.no_op_offload;
-     cparams.swa_full          = params.swa_full;
-diff --git a/common/common.h b/common/common.h
-index de49dac9f..ee761553e 100644
---- a/common/common.h
-+++ b/common/common.h
-@@ -439,6 +439,19 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
- 
- struct common_params {
-     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
-+
-+    // StreamMoE route B (expert pool) opt-in
-+    bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
-+    size_t  moe_ram_pool_mb  = 0;     // MAIN model expert residency budget in MB (0 = 75% free RAM)
-+    size_t  moe_vram_pool_mb = 0;     // VRAM budget for the MAIN expert pool (GPU pool phase)
-+    size_t  moe_draft_ram_pool_mb  = 0; // DRAFT model expert RAM budget in MB (0 = full resident, no eviction)
-+    size_t  moe_draft_vram_pool_mb = 0; // VRAM budget for the DRAFT expert pool (GPU pool phase)
-+    std::string prompt_log_path;      // append every /v1/chat/completions request body here
-+
-+    // KV placement as a collection, e.g. "RAM,VRAM0,VRAM1" (multi-replica
-+    // mirrors are a future feature; today only the first element is honored
-+    // and multiple elements warn - see TODO.md)
-+    std::vector<std::string> kv_placement;
-     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
-     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
-     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
 diff --git a/common/speculative.cpp b/common/speculative.cpp
 index 4eef2212e..8d1af276e 100644
 --- a/common/speculative.cpp
@@ -336,6 +134,141 @@ index 12ae31b7d..1d6df4f42 100644
  // comma separated list the provided types
  std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
  
+diff --git a/common/stmoe_routeb_args.frag b/common/stmoe_routeb_args.frag
+new file mode 100644
+index 000000000..d7f38130b
+--- /dev/null
++++ b/common/stmoe_routeb_args.frag
+@@ -0,0 +1,59 @@
++    add_opt(common_arg(
++        {"--expert-backend"},
++        "StreamMoE route B: route MoE expert tensors (ffn_*_exps / ffn_*_shexp) to the stream_moe expert pool (bounded RAM)",
++        [](common_params & params) {
++            params.expert_backend = true;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-ram-pool"}, "MB",
++        "StreamMoE: expert residency budget in MB (0 = auto 75% free RAM)",
++        [](common_params & params, int value) {
++            params.moe_ram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-vram-pool"}, "MB",
++        "StreamMoE: VRAM budget for the expert pool (GPU pool phase)",
++        [](common_params & params, int value) {
++            params.moe_vram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-draft-ram-pool"}, "MB",
++        "StreamMoE: DRAFT model expert residency budget in MB (0 = full resident, no eviction)",
++        [](common_params & params, int value) {
++            params.moe_draft_ram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-draft-vram-pool"}, "MB",
++        "StreamMoE: VRAM budget for the DRAFT expert pool (GPU pool phase)",
++        [](common_params & params, int value) {
++            params.moe_draft_vram_pool_mb = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--prompt-log"}, "PATH",
++        "StreamMoE: append every /v1/chat/completions request body to this file",
++        [](common_params & params, const std::string & value) {
++            params.prompt_log_path = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--kv-placement"}, "<RAM,VRAM0,...>",
++        "StreamMoE: KV cache placement as a collection (comma-separated). "
++        "Multi-replica mirrors are a future feature - today only the first "
++        "element is honored, extra elements warn.",
++        [](common_params & params, const std::string & value) {
++            params.kv_placement.clear();
++            size_t start = 0;
++            while (start <= value.size()) {
++                size_t comma = value.find(',', start);
++                std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
++                if (!tok.empty()) params.kv_placement.push_back(tok);
++                if (comma == std::string::npos) break;
++                start = comma + 1;
++            }
++        }
++    ));
+diff --git a/common/stmoe_routeb_common_params.frag b/common/stmoe_routeb_common_params.frag
+new file mode 100644
+index 000000000..e7048dfd1
+--- /dev/null
++++ b/common/stmoe_routeb_common_params.frag
+@@ -0,0 +1,11 @@
++    // StreamMoE route B (expert pool) opt-in
++    bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
++    size_t  moe_ram_pool_mb  = 0;     // MAIN model expert residency budget in MB (0 = 75% free RAM)
++    size_t  moe_vram_pool_mb = 0;     // VRAM budget for the MAIN expert pool (GPU pool phase)
++    size_t  moe_draft_ram_pool_mb  = 0; // DRAFT model expert RAM budget in MB (0 = full resident, no eviction)
++    size_t  moe_draft_vram_pool_mb = 0; // VRAM budget for the DRAFT expert pool (GPU pool phase)
++    std::string prompt_log_path;      // append every /v1/chat/completions request body here
++
++    // KV placement as a collection, e.g. "RAM,VRAM0,VRAM1" (multi-replica
++    // mirrors are a future feature; today only the first element is honored)
++    std::vector<std::string> kv_placement;
+diff --git a/common/stmoe_routeb_ctx.frag b/common/stmoe_routeb_ctx.frag
+new file mode 100644
+index 000000000..30447de69
+--- /dev/null
++++ b/common/stmoe_routeb_ctx.frag
+@@ -0,0 +1,18 @@
++    // StreamMoE route B: when opted in, register the expert-pool backend and
++    // route MoE expert tensors (ffn_*_exps) to its weight buft before load.
++    // Skip when this common_params IS the draft model (speculative.cpp binds
++    // the draft to its own pool, never the main-pool budget).
++    if (params.expert_backend &&
++            params.model.path != params.speculative.draft.mparams.path) {
++        // common_params_parse pads tensor_buft_overrides with 4096 null entries
++        // (llama_params_fit scratch). Our override must sit at the FRONT - the
++        // loader reads from index 0 and stops at the first null pattern.
++        params.tensor_buft_overrides.clear();
++        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
++        if (ovr) {
++            for (auto * p = ovr; p->pattern != nullptr; ++p) {
++                params.tensor_buft_overrides.push_back(*p);
++            }
++            params.tensor_buft_overrides.push_back({ nullptr, nullptr }); // terminator
++        }
++    }
+diff --git a/common/stmoe_routeb_ctx2.frag b/common/stmoe_routeb_ctx2.frag
+new file mode 100644
+index 000000000..541cc11dd
+--- /dev/null
++++ b/common/stmoe_routeb_ctx2.frag
+@@ -0,0 +1,14 @@
++    // StreamMoE KV placement collection: multi-replica mirrors are not
++    // implemented yet - honor only the first element, warn if more are given.
++    if (!params.kv_placement.empty()) {
++        if (params.kv_placement.size() > 1) {
++            COM_WRN("multi-replica KV placement not implemented yet; using first element '%s'",
++                    params.kv_placement.front().c_str());
++        }
++        const std::string & p = params.kv_placement.front();
++        if (p == "RAM" || p == "ram") {
++            cparams.offload_kqv = false;   // KV stays in host RAM
++        } else if (p.rfind("VRAM", 0) == 0) {
++            cparams.offload_kqv = true;    // KV offloaded to GPU (device idx after "VRAM")
++        }
++    }
+diff --git a/common/stmoe_routeb_includes.frag b/common/stmoe_routeb_includes.frag
+new file mode 100644
+index 000000000..788a0d4f8
+--- /dev/null
++++ b/common/stmoe_routeb_includes.frag
+@@ -0,0 +1,3 @@
++#include "server/route_b_inject.h"
++#include "../src/tsc_timer.h"
++#include "../src/llama-ext.h"
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 9b22cb05f..40a220f6b 100644
 --- a/src/llama-model-loader.cpp
