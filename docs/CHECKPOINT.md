@@ -88,6 +88,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 **顺手**
 4. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）。
 5. 3 个 direct_fill task spec（`tools/run_specs/tasks/direct_fill_cn_txt/en_txt/10000_txt.json`，引用同名 txt）。
+6. **OpenSSL**（build 报 "OpenSSL not found, HTTPS support disabled"）——需要 `OPENSSL_ROOT_DIR` 提供 `libcrypto` 才能编入 HTTPS；不急但看着烦。
 
 **明确不做**（用户决策）
 - deepseek prefill 追 bit 级（A1）。

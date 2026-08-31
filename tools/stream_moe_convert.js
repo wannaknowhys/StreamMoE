@@ -35,7 +35,14 @@ function parseArgs() {
 function discoverShards(files, modelArg) {
     if (modelArg.includes(';')) return modelArg.split(';').filter(Boolean);
     const split = kv(files, 'split.count');
-    const n = split ? Number(split) : 1;
+    let n = split ? Number(split) : 1;
+    // Fall back to the -00001-of-NNNNN filename pattern when split.count is
+    // absent: some chunked sources carry no split KV (00001 is metadata-only,
+    // tensors live spread across the later shards) and must still be opened.
+    if (!split) {
+        const m = /-(\d{5})-of-(\d{5})\.gguf$/.exec(modelArg);
+        if (m) n = Number(m[2]);
+    }
     if (n <= 1) return [modelArg];
     const base = modelArg.replace(/-\d{5}-of-\d{5}\.gguf$/, '');
     const out = [];
@@ -46,10 +53,10 @@ function discoverShards(files, modelArg) {
 async function main() {
     const p = parseArgs();
     let srcs = p.model.includes(';') ? p.model.split(';').filter(Boolean) : [p.model];
-    const files = await openFiles(srcs);
+    let files = await openFiles(srcs);
     const shards = discoverShards(files, p.model);
     if (shards.length > files.length) {
-        const more = await openFiles(shards);
+        files = await openFiles(shards);
         srcs = shards;
     }
     const model = buildModel(files);
