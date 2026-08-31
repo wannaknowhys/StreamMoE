@@ -73,10 +73,21 @@ index de49dac9f..ede0718dd 100644
      int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
      int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
 diff --git a/include/llama.h b/include/llama.h
-index a04177f9f..6078848e8 100644
+index a04177f9f..82b5001aa 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -378,6 +378,10 @@ extern "C" {
+@@ -12,6 +12,10 @@
+ #include <stdio.h>
+ #include <stdbool.h>
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_llama_includes.frag"
++#endif
++
+ #ifdef LLAMA_SHARED
+ #    if defined(_WIN32) && !defined(__MINGW32__)
+ #        ifdef LLAMA_BUILD
+@@ -378,6 +382,10 @@ extern "C" {
          ggml_backend_sched_eval_callback cb_eval;
          void * cb_eval_user_data;
  
