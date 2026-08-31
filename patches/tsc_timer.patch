@@ -1,0 +1,26 @@
+diff --git a/src/tsc_timer.h b/src/tsc_timer.h
+new file mode 100644
+index 000000000..d19369cb8
+--- /dev/null
++++ b/src/tsc_timer.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++// [TMR] startup timing - diagnostic timers used by the route-b-inject [TMR]
++// instrumentation. Tracked in git so the patch stack is self-contained.
++#include <cstdio>
++#include <chrono>
++
++namespace sm_tmr {
++
++struct timer {
++    const char* name;
++    std::chrono::steady_clock::time_point t0;
++    timer(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
++    ~timer() {
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        std::fprintf(stderr, "[TMR] %s dur=%.2f ms\n", name, ms);
++    }
++};
++
++} // namespace sm_tmr

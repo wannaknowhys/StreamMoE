@@ -16,25 +16,29 @@
    b. 快照 vendored 工作区：
       `git -C third_party/llama.cpp diff > temp/patch_backup_<date>/working-tree-full.patch`。
 2. **生成 patch 用 `git diff -- <文件列表>` 限定范围**，各 patch 各管各的文件，绝不 `git diff >` 全量抄
-   （那会把其他 patch 的改动混进来）。文件归属（2026-08-30 整理，route B 栈收敛为 3 个 patch）：
+   （那会把其他 patch 的改动混进来）。文件归属（2026-08-30 整理，route B 栈收敛为 4 个 patch）：
+   - `tsc_timer.patch`（[TMR] 计时头，独立）：`src/tsc_timer.h`。被 route-b（common）和 prefill
+     （llama-context.cpp 的 sm_tmr）共享，独立成 patch。
    - `route-b-inject.patch`（route B 核心 + 附属）：`common/CMakeLists.txt`、`common/arg.cpp`（route-b 参数 +
      `--prompt-log`/`--kv-placement`，原 export-args.patch 已并入）、`common/common.cpp`、`common/common.h`、
      `common/speculative.cpp/h`（route B draft 池绑定 + draft 统计，原 spec-stats.patch 已并入）、
-     `src/llama-model-loader.cpp`、`src/llama-model.cpp`、`src/llama.cpp`、`src/tsc_timer.h`（[TMR] 计时，随包新增）。
+     `src/llama-model-loader.cpp`、`src/llama-model.cpp`、`src/llama.cpp`、
+     `tools/server/server-context.cpp`（spec-stats 析构打印 + [TMR]）。
    - `gguf-alignment.patch`（GGUF 转换器依赖）：`ggml gguf.h/cpp`（`gguf_set_alignment`）。
-   - `prefill-export-llama.patch`：`src/llama-context.cpp/h`（prefill 导出 + 专家历史 + export_token_seq）、
-     `src/llama-kv-cache.h/cpp`、`tools/server/server-context.cpp`、`tools/server/server.cpp`（/shutdown 端点）。
+   - `prefill-export-llama.patch`：`src/llama-context.cpp/h`（prefill 导出 + 专家历史 + export_token_seq +
+     cb_eval 图内抓取：top-4 logits + logsumexp + 采样 tokens）、`src/llama-kv-cache.h/cpp`、
+     `tools/server/server.cpp`（/shutdown 端点）。
 
 **vulkan 构建修复（无 patch）**：`GGML_VULKAN=ON` 时由 `build.bat` 通过上游注入点
 `-DVULKAN_SHADER_GEN_CMAKE_ARGS` 把 ninja/clang 工具链传给 shader-gen 子 cmake——不改 vendored。
 
 **route B 栈应用顺序**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
    ```
-   route-b-inject → gguf-alignment → prefill-export-llama
+   tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama
    ```
 
 **当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
-StreamMoE 全部改动只存在于上述 patch（含 tsc_timer/spec-stats/export-args/vulkan 并入项），按顺序 apply 可完整复现。
+StreamMoE 全部改动只存在于上述 patch（含 spec-stats/export-args 并入项，vulkan 走 build.bat），按顺序 apply 可完整复现。
 3. 应用前 `git apply --check`，应用后 `git apply --check -R`（验证可还原）。
 4. 涉及同一文件的两个 patch 位置不重叠，靠 `git apply` 的上下文 fuzz 叠加，应用顺序无关，但**还原顺序必须逆序**（先 -R 后应用的）。
 

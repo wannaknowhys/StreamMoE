@@ -459,29 +459,60 @@ index 1609fec88..e9035ebcb 100644
      std::vector<std::string> splits = {};
      return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
  }
-diff --git a/src/tsc_timer.h b/src/tsc_timer.h
-new file mode 100644
-index 000000000..d19369cb8
---- /dev/null
-+++ b/src/tsc_timer.h
-@@ -0,0 +1,20 @@
-+#pragma once
-+
-+// [TMR] startup timing - diagnostic timers used by the route-b-inject [TMR]
-+// instrumentation. Tracked in git so the patch stack is self-contained.
-+#include <cstdio>
-+#include <chrono>
-+
-+namespace sm_tmr {
-+
-+struct timer {
-+    const char* name;
-+    std::chrono::steady_clock::time_point t0;
-+    timer(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
-+    ~timer() {
-+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-+        std::fprintf(stderr, "[TMR] %s dur=%.2f ms\n", name, ms);
-+    }
-+};
-+
-+} // namespace sm_tmr
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..51143f011 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,8 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#include "../src/llama-ext.h"
++#include "../src/tsc_timer.h"
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -809,6 +811,9 @@ public:
+     }
+ 
+     ~server_context_impl() {
++        if (spec) {
++            common_speculative_print_stats(spec.get(), stderr);
++        }
+         if (!sleeping) {
+             // destroy() is already called when entering sleeping state
+             // we don't call it again here to avoid double free
+@@ -956,6 +961,7 @@ private:
+     // load the model and initialize llama_context
+     // this may also be called to resume from sleeping state
+     bool load_model(common_params & params) {
++        sm_tmr::timer _t("server load_model");
+         load_progress_data load_progress_text  (this, "text_model");
+         load_progress_data load_progress_mmproj(this, "mmproj_model");
+         load_progress_data load_progress_spec  (this, "spec_model");
+@@ -1050,8 +1056,11 @@ private:
+ 
+         llama_init = common_init_from_params(params_base);
+ 
+-        model_tgt = llama_init->model();
+-        ctx_tgt   = llama_init->context();
++        {
++            sm_tmr::timer _t("init->model/context");
++            model_tgt = llama_init->model();
++            ctx_tgt   = llama_init->context();
++        }
+ 
+         if (model_tgt == nullptr) {
+             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+@@ -1063,7 +1072,10 @@ private:
+             return false;
+         }
+ 
+-        vocab = llama_model_get_vocab(model_tgt);
++        {
++            sm_tmr::timer _t("vocab get");
++            vocab = llama_model_get_vocab(model_tgt);
++        }
+ 
+         n_ctx = llama_n_ctx(ctx_tgt);
+ 

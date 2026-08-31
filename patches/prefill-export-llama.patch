@@ -1,10 +1,9 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..edf8da1be 100644
+index 0402044da..def288ed1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
--#include "llama-context.h"
-+锘?include "llama-context.h"
+ #include "llama-context.h"
 +#include "llama-kv-cache-dsv4.h"
 +#include "llama-kv-cache-iswa.h"
 +#include "../ggml/src/ggml-impl.h"
@@ -19,7 +18,22 @@ index 0402044da..edf8da1be 100644
  #include "llama-model.h"
  #include "llama-ext.h"
  #include "llama-sampler.h"
-@@ -115,7 +119,7 @@ llama_context::llama_context(
+@@ -16,10 +20,14 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
++#include <cfloat>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
+ 
++// STREAM_MOE_TEMP: graph-eval-callback export (defined near the export section)
++static bool moe_export_eval_cb(ggml_tensor * t, bool ask, void * ud);
++
+ //
+ // llama_context
+ //
+@@ -115,7 +123,7 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
@@ -28,7 +42,25 @@ index 0402044da..edf8da1be 100644
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -482,6 +486,9 @@ llama_context::~llama_context() {
+@@ -139,6 +147,17 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++    // STREAM_MOE_TEMP: when exporting, replace cb_eval with the graph-eval
++    // capture callback (original kept and chained). Captures embd/hidden/top-4
++    // logits/routing ids right after each node computes.
++    if (std::getenv("LLM_EXPORT_DIR")) {
++        export_active            = true;
++        export_prev_cb_eval      = params.cb_eval;
++        export_prev_cb_eval_ud   = params.cb_eval_user_data;
++        cparams.cb_eval          = moe_export_eval_cb;
++        cparams.cb_eval_user_data = this;
++    }
++
+     cparams.ctx_other = nullptr;
+ 
+     // TODO: more generic
+@@ -482,6 +501,9 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
@@ -38,7 +70,7 @@ index 0402044da..edf8da1be 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1632,6 +1639,104 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1654,218 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -46,6 +78,97 @@ index 0402044da..edf8da1be 100644
 +// routed expert, in decode order. Written once at destruction to
 +// <LLM_EXPORT_DIR>/expert_history.bin ("EXPHIST1"). Read by tools/simulate_cache.js
 +// to evaluate cache policies / pool sizes without re-running the model.
++// STREAM_MOE_TEMP: graph-eval-callback export capture (LLM_EXPORT_DIR).
++static bool moe_export_eval_cb(ggml_tensor * t, bool ask, void * ud) {
++    llama_context * ctx = (llama_context *) ud;
++    if (ctx->export_prev_cb_eval) {
++        if (!ctx->export_prev_cb_eval(t, ask, ctx->export_prev_cb_eval_ud)) return false;
++    }
++    if (ask) return true;
++    if (t == ctx->export_t_embd)   { ctx->export_capture_embd(t);   return true; }
++    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
++    if (t == ctx->export_t_logits) { ctx->export_capture_logits(t); return true; }
++    if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->src[0]->name
++            && t->src[0]->name[0] == 'b' && std::strstr(t->src[0]->name, "_exps")) {
++        ctx->export_capture_experts(t);
++    }
++    return true;
++}
++
++void llama_context::export_capture_embd(ggml_tensor * t) {
++    if (!t || !t->data || t->ne[1] <= 0) return;
++    const uint32_t n = (uint32_t) t->ne[1], d = (uint32_t) t->ne[0];
++    const float * p = (const float *) t->data;
++    const size_t base = export_embd.size();
++    export_embd.resize(base + (size_t) n * d);
++    std::memcpy(export_embd.data() + base, p, (size_t) n * d * sizeof(float));
++    for (uint32_t i = 0; i < n; ++i) export_embd_pos.push_back(export_token_seq + i);
++}
++
++void llama_context::export_capture_hidden(ggml_tensor * t) {
++    if (!t || !t->data || t->ne[1] <= 0) return;
++    const uint32_t n = (uint32_t) t->ne[1], d = (uint32_t) t->ne[0];
++    const float * p = (const float *) t->data;
++    const size_t base = export_hidden.size();
++    export_hidden.resize(base + (size_t) n * d);
++    std::memcpy(export_hidden.data() + base, p, (size_t) n * d * sizeof(float));
++    for (uint32_t i = 0; i < n; ++i) export_hidden_pos.push_back(export_token_seq + i);
++}
++
++void llama_context::export_capture_logits(ggml_tensor * t) {
++    if (!t || !t->data || t->ne[1] <= 0) return;
++    const uint32_t n = (uint32_t) t->ne[1], v = (uint32_t) t->ne[0];
++    const float * p = (const float *) t->data;
++    for (uint32_t i = 0; i < n; ++i) {
++        const float * row = p + (size_t) i * v;
++        int32_t top4[4] = { -1, -1, -1, -1 };
++        float   topv[4] = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
++        float   maxv = -FLT_MAX;
++        double  sum = 0.0;
++        for (uint32_t j = 0; j < v; ++j) {
++            if (row[j] > maxv) maxv = row[j];
++            if (row[j] > topv[0]) {
++                topv[3] = topv[2]; top4[3] = top4[2];
++                topv[2] = topv[1]; top4[2] = top4[1];
++                topv[1] = topv[0]; top4[1] = top4[0];
++                topv[0] = row[j];  top4[0] = (int32_t) j;
++            } else if (row[j] > topv[1]) {
++                topv[3] = topv[2]; top4[3] = top4[2];
++                topv[2] = topv[1]; top4[2] = top4[1];
++                topv[1] = row[j];  top4[1] = (int32_t) j;
++            } else if (row[j] > topv[2]) {
++                topv[3] = topv[2]; top4[3] = top4[2];
++                topv[2] = row[j];  top4[2] = (int32_t) j;
++            } else if (row[j] > topv[3]) {
++                topv[3] = row[j];  top4[3] = (int32_t) j;
++            }
++        }
++        for (uint32_t j = 0; j < v; ++j) sum += std::exp((double) row[j] - maxv);
++        const float lse = maxv + (float) std::log(sum);
++        for (int k = 0; k < 4; ++k) {
++            export_top4_id.push_back((uint32_t) top4[k]);
++            export_top4_logit.push_back(topv[k]);
++        }
++        export_lse.push_back(lse);
++        export_lse_pos.push_back(export_token_seq + i);
++    }
++}
++
++void llama_context::export_capture_experts(ggml_tensor * t) {
++    ggml_tensor * w0 = t->src[0], * ids = t->src[2];
++    if (!ids->data || !w0->name || std::strncmp(w0->name, "blk.", 4) != 0) return;
++    const int layer = std::atoi(w0->name + 4);
++    const int32_t * base = (const int32_t *) ids->data;
++    for (int tt = 0; tt < ids->ne[1]; ++tt) {
++        for (int k = 0; k < ids->ne[0]; ++k) {
++            const int32_t e = base[(size_t) tt * ids->nb[1] / 4 + (size_t) k * ids->nb[0] / 4];
++            export_expert_layer.push_back((uint32_t) layer);
++            export_expert_token.push_back(export_token_seq + (uint32_t) tt);
++            export_expert_id.push_back((uint32_t) e);
++        }
++    }
++}
++
 +void llama_context::export_expert_history_final() {
 +    const char * dir = std::getenv("LLM_EXPORT_DIR");
 +    if (!dir || export_expert_id.empty()) return;
@@ -137,88 +260,68 @@ index 0402044da..edf8da1be 100644
 +            }
 +        }
 +    }
++    // STREAM_MOE_TEMP: top-4 logits + logsumexp per output row, then sampled
++    // token ids (decode). Appended after KV so PREFEXP1 readers stay compatible.
++    {
++        const uint32_t n_top4 = (uint32_t) export_lse_pos.size();
++        const uint32_t k_top4 = 4;
++        fwrite(&n_top4, 4, 1, f);
++        fwrite(&k_top4, 4, 1, f);
++        for (uint32_t i = 0; i < n_top4; ++i) {
++            fwrite(&export_lse_pos[i], 4, 1, f);
++            for (int k = 0; k < 4; ++k) {
++                fwrite(&export_top4_id[i * 4 + k], 4, 1, f);
++            }
++            for (int k = 0; k < 4; ++k) {
++                fwrite(&export_top4_logit[i * 4 + k], 4, 1, f);
++            }
++            fwrite(&export_lse[i], 4, 1, f);
++        }
++        const uint32_t n_tok = (uint32_t) export_tokens.size();
++        fwrite(&n_tok, 4, 1, f);
++        for (uint32_t i = 0; i < n_tok; ++i) {
++            fwrite(&export_tokens[i], 4, 1, f);
++        }
++    }
 +    std::fclose(f);
 +}
 +
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2041,74 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2170,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
-+        // accumulate LM head input (result_norm, output tokens) + hidden state
-+        // (t_h_nextn, all tokens) for the prefill cross-validation export
++        // LM head input (result_norm), hidden state (t_h_nextn) and routing ids
++        // are captured inside the graph via moe_export_eval_cb (set in ctor when
++        // LLM_EXPORT_DIR); here we only publish the target tensor pointers for
++        // the current batch and advance the global token sequence.
 +        if (std::getenv("LLM_EXPORT_DIR")) {
-+            ggml_tensor * te = res->get_embd();
-+            ggml_tensor * th = res->get_h_nextn();
-+            if (te && te->ne[1] > 0) {
-+                const uint32_t n = (uint32_t) te->ne[1], d = (uint32_t) te->ne[0];
-+                const size_t base = export_embd.size();
-+                export_embd.resize(base + (size_t) n * d);
-+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), te);
-+                ggml_backend_tensor_get_async(b, te, export_embd.data() + base, 0, (size_t) n * d * sizeof(float));
-+                ggml_backend_synchronize(b);
-+                for (uint32_t i = 0; i < n; ++i) export_embd_pos.push_back(export_token_seq + i);
-+            }
-+            if (th && th->ne[1] > 0) {
-+                const uint32_t n = (uint32_t) th->ne[1], d = (uint32_t) th->ne[0];
-+                const size_t base = export_hidden.size();
-+                export_hidden.resize(base + (size_t) n * d);
-+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), th);
-+                ggml_backend_tensor_get_async(b, th, export_hidden.data() + base, 0, (size_t) n * d * sizeof(float));
-+                ggml_backend_synchronize(b);
-+                for (uint32_t i = 0; i < n; ++i) export_hidden_pos.push_back(export_token_seq + i);
-+            }
-+            // expert access history (task 1): walk the executed graph's MUL_MAT_ID
-+            // nodes, read the routing ids (honoring nb[1] stride), append ordered
-+            // (layer, global_token, expert) records on this single decode thread.
-+            ggml_cgraph * gf = res->get_gf();
-+            if (gf) {
-+                for (int i = 0; i < gf->n_nodes; ++i) {
-+                    ggml_tensor * nd = gf->nodes[i];
-+                    if (!nd || nd->op != GGML_OP_MUL_MAT_ID || !nd->src[2] || !nd->src[0]) continue;
-+                    ggml_tensor * w0  = nd->src[0];
-+                    ggml_tensor * ids = nd->src[2];
-+                    if (!w0->name) continue;
-+                    const char * nm = w0->name;
-+                    if (std::strncmp(nm, "blk.", 4) != 0) continue;
-+                    // only routed-expert MUL_MAT_ID (ffn_*_exps) carry the expert
-+                    // routing ids; MLA/hyper-connection mul_mat_id nodes are not
-+                    // experts and would inflate the history with fake 'experts'.
-+                    if (std::strstr(nm, "_exps") == nullptr) continue;
-+                    const int layer = std::atoi(nm + 4);
-+                    // stream_moe (route B) keeps ids in a host buft valid after
-+                    // compute -> direct read; plain mmap builds may reclaim the
-+                    // sched ids buffer, so fall back to a backend copy.
-+                    const int32_t * base = (const int32_t *) ids->data;
-+                    std::vector<int32_t> idata;
-+                    if (!base) {
-+                        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), ids);
-+                        if (b) {
-+                            idata.resize((size_t) ids->ne[0] * ids->ne[1]);
-+                            ggml_backend_tensor_get_async(b, ids, idata.data(), 0, idata.size() * sizeof(int32_t));
-+                            ggml_backend_synchronize(b);
-+                            base = idata.data();
-+                        }
-+                    }
-+                    if (!base) continue;
-+                    for (int t = 0; t < ids->ne[1]; ++t)
-+                        for (int k = 0; k < ids->ne[0]; ++k) {
-+                            const int32_t e = base[(size_t) t * ids->nb[1] / 4 + (size_t) k * ids->nb[0] / 4];
-+                            export_expert_layer.push_back((uint32_t) layer);
-+                            export_expert_token.push_back(export_token_seq + (uint32_t) t);
-+                            export_expert_id.push_back((uint32_t) e);
-+                        }
-+                }
-+            }
++            export_t_embd   = res->get_embd();
++            export_t_hidden = res->get_h_nextn();
++            export_t_logits = res->get_logits();
 +            export_token_seq += ubatch.n_tokens;
 +        }
 +
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -3553,6 +3726,7 @@ llama_context_params llama_context_default_params() {
+@@ -1963,6 +2208,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++
++            // STREAM_MOE_TEMP: record the actually sampled token ids (decode only)
++            if (export_active && sampling.sampled.data) {
++                for (int64_t i = 0; i < n_outputs; ++i) {
++                    export_tokens.push_back(sampling.sampled.data[n_outputs_prev + i]);
++                }
++            }
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -3553,6 +3805,7 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
@@ -227,10 +330,10 @@ index 0402044da..edf8da1be 100644
          LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
          return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..4089ee72b 100644
+index bf91daa8b..22eb29e97 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -367,6 +367,25 @@ private:
+@@ -367,6 +367,46 @@ private:
      llm_graph_result_ptr gf_res_prev;
      llm_graph_result_ptr gf_res_reserve;
  
@@ -252,6 +355,27 @@ index bf91daa8b..4089ee72b 100644
 +    std::vector<uint32_t>   export_expert_id;
 +    uint32_t                export_token_seq = 0; // global token seq across decode calls (all computed tokens, incl. speculative candidates)
 +    void export_expert_history_final();
++
++    // STREAM_MOE_TEMP: graph-eval-callback export. When LLM_EXPORT_DIR is set,
++    // cparams.cb_eval is replaced by moe_export_eval_cb (original kept) which
++    // captures per-token top-4 logits + logsumexp, embd/hidden, and routing ids
++    // at the moment each node finishes computing (no post-decode pull).
++    bool                             export_active = false;
++    ggml_backend_sched_eval_callback export_prev_cb_eval = nullptr;
++    void *                           export_prev_cb_eval_ud = nullptr;
++    struct ggml_tensor *             export_t_embd   = nullptr; // result_norm
++    struct ggml_tensor *             export_t_hidden = nullptr; // t_h_nextn
++    struct ggml_tensor *             export_t_logits = nullptr; // t_logits
++    std::vector<uint32_t>            export_top4_id;            // n_rows x 4
++    std::vector<float>               export_top4_logit;         // n_rows x 4
++    std::vector<float>               export_lse;                // logsumexp per row
++    std::vector<uint32_t>            export_lse_pos;            // per-row pos
++    std::vector<llama_token>         export_tokens;             // sampled token ids (decode only)
++    void export_capture_embd(struct ggml_tensor * t);
++    void export_capture_hidden(struct ggml_tensor * t);
++    void export_capture_logits(struct ggml_tensor * t);
++    void export_capture_experts(struct ggml_tensor * t);
++    friend bool moe_export_eval_cb(struct ggml_tensor * t, bool ask, void * ud);
 +
      // host buffer for the model output (logits and embeddings)
      ggml_backend_buffer_ptr buf_output;
@@ -284,63 +408,6 @@ index 6cb6dbd2f..bfbcd6a62 100644
 +    ggml_tensor * get_v_storage(int32_t il) const;
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
- 
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..51143f011 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -11,6 +11,8 @@
- #include "common.h"
- #include "fit.h"
- #include "llama.h"
-+#include "../src/llama-ext.h"
-+#include "../src/tsc_timer.h"
- #include "log.h"
- #include "sampling.h"
- #include "speculative.h"
-@@ -809,6 +811,9 @@ public:
-     }
- 
-     ~server_context_impl() {
-+        if (spec) {
-+            common_speculative_print_stats(spec.get(), stderr);
-+        }
-         if (!sleeping) {
-             // destroy() is already called when entering sleeping state
-             // we don't call it again here to avoid double free
-@@ -956,6 +961,7 @@ private:
-     // load the model and initialize llama_context
-     // this may also be called to resume from sleeping state
-     bool load_model(common_params & params) {
-+        sm_tmr::timer _t("server load_model");
-         load_progress_data load_progress_text  (this, "text_model");
-         load_progress_data load_progress_mmproj(this, "mmproj_model");
-         load_progress_data load_progress_spec  (this, "spec_model");
-@@ -1050,8 +1056,11 @@ private:
- 
-         llama_init = common_init_from_params(params_base);
- 
--        model_tgt = llama_init->model();
--        ctx_tgt   = llama_init->context();
-+        {
-+            sm_tmr::timer _t("init->model/context");
-+            model_tgt = llama_init->model();
-+            ctx_tgt   = llama_init->context();
-+        }
- 
-         if (model_tgt == nullptr) {
-             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
-@@ -1063,7 +1072,10 @@ private:
-             return false;
-         }
- 
--        vocab = llama_model_get_vocab(model_tgt);
-+        {
-+            sm_tmr::timer _t("vocab get");
-+            vocab = llama_model_get_vocab(model_tgt);
-+        }
- 
-         n_ctx = llama_n_ctx(ctx_tgt);
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
 index 5fe2729ba..596411797 100644
