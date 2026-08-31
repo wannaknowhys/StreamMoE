@@ -57,7 +57,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..cc644b2e0 100644
+index 0402044da..a59c574e8 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -157,7 +157,7 @@ index 0402044da..cc644b2e0 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,6 +1677,255 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1677,312 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -176,7 +176,7 @@ index 0402044da..cc644b2e0 100644
 +    if (std::getenv("STREAM_MOE_DBG")) {
 +        if (t == ctx->export_t_embd || t == ctx->export_t_hidden || t == ctx->export_t_logits
 +            || (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[0]->name && std::strstr(t->src[0]->name, "_exps")))
-+            fprintf(stderr, "[dbg] cb hit op=%d name=%s\n", (int) t->op, t->name ? t->name : "?");
++            fprintf(stderr, "[dbg] cb hit op=%d name=%s type=%d ne0=%d ne1=%d\n", (int) t->op, t->name ? t->name : "?", (int) t->type, (int) t->ne[0], (int) t->ne[1]);
 +    }
 +    if (t == ctx->export_t_embd)   { ctx->export_capture_embd(t);   return true; }
 +    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
@@ -191,29 +191,55 @@ index 0402044da..cc644b2e0 100644
 +void llama_context::export_capture_embd(ggml_tensor * t) {
 +    if (!t || !t->data || t->ne[1] <= 0) return;
 +    const uint32_t n = (uint32_t) t->ne[1], d = (uint32_t) t->ne[0];
-+    const float * p = (const float *) t->data;
++    const size_t esz = ggml_element_size(t);
++    const size_t need  = (size_t) n * d * esz;
 +    const size_t base = export_embd.size();
-+    export_embd.resize(base + (size_t) n * d);
-+    std::memcpy(export_embd.data() + base, p, (size_t) n * d * sizeof(float));
++    export_embd.resize(base + need);
++    // read through the sched backend (t->data may not be host-readable mid-graph)
++    std::vector<uint8_t> buf(need);
++    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(get_sched(), t);
++    ggml_backend_tensor_get_async(b, t, buf.data(), 0, need);
++    ggml_backend_synchronize(b);
++    std::memcpy(export_embd.data() + base, buf.data(), need);
++    export_embd_dim = d;
++    export_embd_type = t->type;
 +    for (uint32_t i = 0; i < n; ++i) export_embd_pos.push_back(export_token_seq + i);
 +}
 +
 +void llama_context::export_capture_hidden(ggml_tensor * t) {
 +    if (!t || !t->data || t->ne[1] <= 0) return;
 +    const uint32_t n = (uint32_t) t->ne[1], d = (uint32_t) t->ne[0];
-+    const float * p = (const float *) t->data;
++    const size_t esz = ggml_element_size(t);
++    const size_t need  = (size_t) n * d * esz;
 +    const size_t base = export_hidden.size();
-+    export_hidden.resize(base + (size_t) n * d);
-+    std::memcpy(export_hidden.data() + base, p, (size_t) n * d * sizeof(float));
++    export_hidden.resize(base + need);
++    // read through the sched backend (t->data may not be host-readable mid-graph)
++    std::vector<uint8_t> buf(need);
++    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(get_sched(), t);
++    ggml_backend_tensor_get_async(b, t, buf.data(), 0, need);
++    ggml_backend_synchronize(b);
++    std::memcpy(export_hidden.data() + base, buf.data(), need);
++    export_hidden_dim = d;
++    export_hidden_type = t->type;
 +    for (uint32_t i = 0; i < n; ++i) export_hidden_pos.push_back(export_token_seq + i);
 +}
 +
 +void llama_context::export_capture_logits(ggml_tensor * t) {
 +    if (!t || !t->data || t->ne[1] <= 0) return;
 +    const uint32_t n = (uint32_t) t->ne[1], v = (uint32_t) t->ne[0];
-+    const float * p = (const float *) t->data;
++    const bool f32 = (t->type == GGML_TYPE_F32);
++    if (!f32 && t->type != GGML_TYPE_F16) return; // top4 scan supports f32/f16 only
++    const float * p = f32 ? (const float *) t->data : nullptr;
++    std::vector<float> rowbuf(f32 ? 0 : v);
 +    for (uint32_t i = 0; i < n; ++i) {
-+        const float * row = p + (size_t) i * v;
++        const float * row;
++        if (f32) {
++            row = p + (size_t) i * v;
++        } else {
++            const ggml_fp16_t * p16 = ((const ggml_fp16_t *) t->data) + (size_t) i * v;
++            for (uint32_t j = 0; j < v; ++j) rowbuf[j] = ggml_fp16_to_fp32(p16[j]);
++            row = rowbuf.data();
++        }
 +        int32_t top4[4] = { -1, -1, -1, -1 };
 +        float   topv[4] = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
 +        float   maxv = -FLT_MAX;
@@ -251,10 +277,11 @@ index 0402044da..cc644b2e0 100644
 +    ggml_tensor * w0 = t->src[0], * ids = t->src[2];
 +    if (!ids->data || !w0->name || std::strncmp(w0->name, "blk.", 4) != 0) return;
 +    const int layer = std::atoi(w0->name + 4);
++    const size_t isz = ggml_element_size(ids);
 +    const int32_t * base = (const int32_t *) ids->data;
 +    for (int tt = 0; tt < ids->ne[1]; ++tt) {
 +        for (int k = 0; k < ids->ne[0]; ++k) {
-+            const int32_t e = base[(size_t) tt * ids->nb[1] / 4 + (size_t) k * ids->nb[0] / 4];
++            const int32_t e = base[(size_t) tt * (ids->nb[1] / isz) + (size_t) k * (ids->nb[0] / isz)];
 +            export_expert_layer.push_back((uint32_t) layer);
 +            export_expert_token.push_back(export_token_seq + (uint32_t) tt);
 +            export_expert_id.push_back((uint32_t) e);
@@ -305,24 +332,28 @@ index 0402044da..cc644b2e0 100644
 +    if (!f) return;
 +
 +    const uint32_t n_embd_rows = (uint32_t) export_embd_pos.size();
-+    const uint32_t n_embd_dim  = n_embd_rows ? (uint32_t) (export_embd.size() / n_embd_rows) : 0;
++    const uint32_t n_embd_dim  = export_embd_dim;
 +    const uint32_t n_hid_rows  = (uint32_t) export_hidden_pos.size();
-+    const uint32_t n_hid_dim   = n_hid_rows ? (uint32_t) (export_hidden.size() / n_hid_rows) : 0;
-+    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] exp embd=%zu hidden=%zu top4=%zu active=%d t_embd=%p t_hidden=%p t_logits=%p\n",
-+        export_embd_pos.size(), export_hidden_pos.size(), export_lse_pos.size(), (int) export_active, (void*) export_t_embd, (void*) export_t_hidden, (void*) export_t_logits);
++    const uint32_t n_hid_dim   = export_hidden_dim;
++    const size_t   esz_embd    = ggml_type_size(export_embd_type);
++    const size_t   esz_hidden  = ggml_type_size(export_hidden_type);
++    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] exp embd=%zu/%s hidden=%zu/%s top4=%zu active=%d\n",
++        export_embd_pos.size(), ggml_type_name(export_embd_type), export_hidden_pos.size(), ggml_type_name(export_hidden_type), export_lse_pos.size(), (int) export_active);
 +
-+    fwrite("PREFEXP1", 1, 8, f);
++    fwrite("PREFEXP2", 1, 8, f);
 +    fwrite(&n_embd_rows, 4, 1, f);
 +    fwrite(&n_embd_dim, 4, 1, f);
++    fwrite(&export_embd_type, 4, 1, f);
 +    for (uint32_t i = 0; i < n_embd_rows; ++i) {
 +        fwrite(&export_embd_pos[i], 4, 1, f);
-+        fwrite(export_embd.data() + (size_t) i * n_embd_dim, 4, n_embd_dim, f);
++        fwrite(export_embd.data() + (size_t) i * n_embd_dim * esz_embd, 1, (size_t) n_embd_dim * esz_embd, f);
 +    }
 +    fwrite(&n_hid_rows, 4, 1, f);
 +    fwrite(&n_hid_dim, 4, 1, f);
++    fwrite(&export_hidden_type, 4, 1, f);
 +    for (uint32_t i = 0; i < n_hid_rows; ++i) {
 +        fwrite(&export_hidden_pos[i], 4, 1, f);
-+        fwrite(export_hidden.data() + (size_t) i * n_hid_dim, 4, n_hid_dim, f);
++        fwrite(export_hidden.data() + (size_t) i * n_hid_dim * esz_hidden, 1, (size_t) n_hid_dim * esz_hidden, f);
 +    }
 +
 +    std::vector<std::pair<llama_kv_cache *, const char *>> caches;
@@ -406,6 +437,32 @@ index 0402044da..cc644b2e0 100644
 +            std::fclose(ttf);
 +        }
 +    }
++    // prefill_meta.json: describe the bins (dtype/layout) so readers (verify)
++    // never hardcode element sizes.
++    {
++        FILE * mf = std::fopen((std::string(dir) + "/prefill_meta.json").c_str(), "w");
++        if (mf) {
++            std::string m;
++            m += "{\n";
++            m += "  \"format\": \"PREFEXP2\",\n";
++            m += "  \"model\": \"" + std::string(model.arch_name()) + "\",\n";
++            m += "  \"files\": {\n";
++            m += "    \"prefill_export_main.bin\": {\n";
++            m += "      \"byte_order\": \"little\",\n";
++            m += "      \"sections\": [\n";
++            m += "        { \"id\": \"embd\", \"dtype\": \"" + std::string(ggml_type_name(export_embd_type)) + "\", \"n\": " + std::to_string(n_embd_rows) + ", \"dim\": " + std::to_string(n_embd_dim) + " },\n";
++            m += "        { \"id\": \"hidden\", \"dtype\": \"" + std::string(ggml_type_name(export_hidden_type)) + "\", \"n\": " + std::to_string(n_hid_rows) + ", \"dim\": " + std::to_string(n_hid_dim) + " },\n";
++            m += "        { \"id\": \"top4\", \"id_dtype\": \"u32\", \"logit_dtype\": \"f32\", \"lse_dtype\": \"f32\", \"n\": " + std::to_string((uint32_t) export_lse_pos.size()) + " }\n";
++            m += "      ]\n";
++            m += "    },\n";
++            m += "    \"expert_history_main.bin\": { \"record\": [\"layer u32\", \"token u32\", \"expert u32\"], \"n\": " + std::to_string((uint32_t) export_expert_id.size()) + " },\n";
++            m += "    \"tokens_id.bin\": { \"dtype\": \"u32\", \"n\": " + std::to_string((uint32_t) export_tokens.size()) + " }\n";
++            m += "  }\n";
++            m += "}\n";
++            fwrite(m.data(), 1, m.size(), mf);
++            std::fclose(mf);
++        }
++    }
 +    std::fclose(f);
 +}
 +#endif
@@ -413,7 +470,7 @@ index 0402044da..cc644b2e0 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2230,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2287,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -433,7 +490,7 @@ index 0402044da..cc644b2e0 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2270,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2327,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -450,7 +507,7 @@ index 0402044da..cc644b2e0 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3849,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3906,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -460,7 +517,7 @@ index 0402044da..cc644b2e0 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3873,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3930,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
@@ -471,7 +528,7 @@ index 0402044da..cc644b2e0 100644
          LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
          return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..c77eb3ecc 100644
+index bf91daa8b..8d639079e 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -253,6 +253,11 @@ public:
@@ -486,7 +543,7 @@ index bf91daa8b..c77eb3ecc 100644
  private:
      llm_graph_params graph_params(
                          llm_graph_result * res,
-@@ -367,6 +372,49 @@ private:
+@@ -367,6 +372,53 @@ private:
      llm_graph_result_ptr gf_res_prev;
      llm_graph_result_ptr gf_res_reserve;
  
@@ -494,10 +551,14 @@ index bf91daa8b..c77eb3ecc 100644
 +    // prefill cross-validation export (env LLM_EXPORT_DIR): accumulate per-token
 +    // LM head input (result_norm / t_embd) and hidden state (t_h_nextn), then
 +    // flush everything plus the final KV cache to a file on destruction.
-+    std::vector<float>      export_embd;
++    std::vector<uint8_t>    export_embd;         // raw element bytes (see export_embd_type)
 +    std::vector<uint32_t>   export_embd_pos;
-+    std::vector<float>      export_hidden;
++    uint32_t                export_embd_dim = 0; // per-token element count
++    enum ggml_type          export_embd_type = GGML_TYPE_F32;
++    std::vector<uint8_t>    export_hidden;
 +    std::vector<uint32_t>   export_hidden_pos;
++    uint32_t                export_hidden_dim = 0;
++    enum ggml_type          export_hidden_type = GGML_TYPE_F32;
 +    void export_prefill_final();
 +
 +    // expert access history (task 1, cache-policy simulation): one record per
@@ -569,11 +630,27 @@ index 6cb6dbd2f..3d1522068 100644
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..4293ffe28 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3744,6 +3744,11 @@ private:
+ 
+             common_sampler_accept(slot.smpl.get(), id, true);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++            // StreamMoE: record the actually sampled token for export (flush on destruction)
++            llama_export_add_token(slot.ctx_tgt, id);
++#endif
++
+             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+             const int64_t t_now = ggml_time_us();
+ 
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 5fe2729ba..061512bac 100644
+index 5fe2729ba..98f21a20b 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -112,6 +112,71 @@ int llama_server(int argc, char ** argv) {
+@@ -112,6 +112,73 @@ int llama_server(int argc, char ** argv) {
      return llama_server(params, argc, argv);
  }
  
@@ -623,9 +700,11 @@ index 5fe2729ba..061512bac 100644
 +    if (toks.empty()) { SRV_ERR("prefill-from: no tokens in %s\n", params.prefill_from.c_str()); llama_model_free(model); return 1; }
 +
 +    llama_context * ctx = llama_new_context_with_model(model, cparams);
-+    if (!ctx) { SRV_ERR("prefill-from: failed to create context\n"); llama_model_free(model); return 1; }
-+    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] prefill cparams n_ctx=%d n_batch=%d n_ubatch=%d n_seq_max=%d export='%s'\n",
-+        cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_seq_max, cparams.export_dir.c_str());
++    if (!ctx) {
++        fprintf(stderr, "prefill-from: failed to create context\n");
++        llama_model_free(model);
++        return 1;
++    }
 +
 +    std::vector<int8_t> lg(toks.size(), 0);
 +    lg.back() = 1; // output only the last token
@@ -645,7 +724,7 @@ index 5fe2729ba..061512bac 100644
  int llama_server(common_params & params, int argc, char ** argv) {
      bool is_run_by_cli = (argv == nullptr);
  
-@@ -163,6 +228,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -163,6 +230,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
          params.model_alias.insert(model_name);
      }
  
@@ -659,7 +738,7 @@ index 5fe2729ba..061512bac 100644
      // note: this is guaranteed to out-live ctx_http and tools
      server_mcp mcp_mgr;
  
-@@ -244,6 +316,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -244,6 +318,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
      ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
@@ -675,19 +754,3 @@ index 5fe2729ba..061512bac 100644
      ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..c9d2ced1d 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -3744,6 +3768,11 @@ private:
- 
-             common_sampler_accept(slot.smpl.get(), id, true);
- 
-+#ifdef STREAM_MOE_PREFILL_EXPORT
-+            // StreamMoE: record the actually sampled token for export (flush on destruction)
-+            llama_export_add_token(slot.ctx_tgt, id);
-+#endif
-+
-             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-             const int64_t t_now = ggml_time_us();
- 

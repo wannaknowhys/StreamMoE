@@ -13,34 +13,61 @@
 // Reports per-token cosine / MAD / MSE for embd and hidden, the first diverging
 // token+position, and per-(cache,layer) KV max byte diff.
 // Usage: node tools/verify_prefill.js <std.bin> <moe.bin>
+// PREFEXP2: dtype comes from prefill_meta.json (same dir) or the per-section
+// GGML_TYPE marker (0=F32 1=F16); f16 rows are converted to float for compare.
 const fs = require('fs');
+const path = require('path');
+
+function f16ToF32(h) {
+    const s = (h & 0x8000) ? -1 : 1;
+    const e = (h & 0x7C00) >> 10;
+    const f = h & 0x3FF;
+    if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
+    if (e === 0x1F) return f ? NaN : s * Infinity;
+    return s * Math.pow(2, e - 15) * (1 + f / 1024);
+}
 
 function parseFile(path) {
     const b = fs.readFileSync(path);
+    let meta = null;
+    try { meta = JSON.parse(fs.readFileSync(path.join(path.dirname(path), 'prefill_meta.json'), 'utf8')); } catch (e) {}
     const rdU32 = (o) => b.readUInt32LE(o);
     const rdU64 = (o) => b.readBigUInt64LE(o);
-    if (b.toString('ascii', 0, 8) !== 'PREFEXP1') throw new Error('bad magic');
+    const magic = b.toString('ascii', 0, 8);
+    if (magic !== 'PREFEXP1' && magic !== 'PREFEXP2') throw new Error('bad magic');
     let off = 8;
+    const metaSecs = meta && meta.files && meta.files['prefill_export_main.bin'] && meta.files['prefill_export_main.bin'].sections || [];
+    const secEsz = (i, binDt) => {
+        const md = metaSecs[i] && metaSecs[i].dtype;
+        if (md === 'f16') return 2;
+        if (md === 'f32') return 4;
+        return binDt === 1 ? 2 : 4; // fallback: bin GGML_TYPE marker / default f32
+    };
+    function readRows(n, nDim, esz) {
+        const rows = [];
+        for (let i = 0; i < n; i++) {
+            const pos = rdU32(off); off += 4;
+            const data = new Float32Array(nDim);
+            if (esz === 2) {
+                for (let j = 0; j < nDim; j++) data[j] = f16ToF32(b.readUInt16LE(off + j * 2));
+            } else {
+                for (let j = 0; j < nDim; j++) data[j] = b.readFloatLE(off + j * 4);
+            }
+            off += nDim * esz;
+            rows.push({ pos, data });
+        }
+        return rows;
+    }
     const nRows = rdU32(off); off += 4;
     const nDim = rdU32(off); off += 4;
-    const embd = []; // {pos, data}
-    for (let i = 0; i < nRows; i++) {
-        const pos = rdU32(off); off += 4;
-        const data = new Float32Array(nDim);
-        for (let j = 0; j < nDim; j++) { data[j] = b.readFloatLE(off + j * 4); }
-        off += nDim * 4;
-        embd.push({ pos, data });
-    }
+    let binDt = null;
+    if (magic === 'PREFEXP2') { binDt = rdU32(off); off += 4; }
+    const embd = readRows(nRows, nDim, secEsz(0, binDt));
     const nHRows = rdU32(off); off += 4;
     const nHDim = rdU32(off); off += 4;
-    const hidden = [];
-    for (let i = 0; i < nHRows; i++) {
-        const pos = rdU32(off); off += 4;
-        const data = new Float32Array(nHDim);
-        for (let j = 0; j < nHDim; j++) { data[j] = b.readFloatLE(off + j * 4); }
-        off += nHDim * 4;
-        hidden.push({ pos, data });
-    }
+    let binDtH = null;
+    if (magic === 'PREFEXP2') { binDtH = rdU32(off); off += 4; }
+    const hidden = readRows(nHRows, nHDim, secEsz(1, binDtH));
     const nCache = rdU32(off); off += 4;
     const caches = [];
     for (let ci = 0; ci < nCache; ci++) {
