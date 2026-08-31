@@ -34,11 +34,32 @@
 
 **route B 栈应用顺序**（`git apply --check` 已验证可在 vendored HEAD=f280b2698 上叠加应用）：
    ```
-   tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama
+   streammoe-macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama
    ```
+   `streammoe-macros.patch` = 共享文件宏骨架（common.h/common.cpp/arg.cpp/llama.h 的 ROUTE_B/PREFILL 空块），先应用建稳定锚点；功能 patch 只注入自己的宏块（见下"共享文件宏隔离"）。
 
 **当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
 StreamMoE 全部改动只存在于上述 patch（含 spec-stats/export-args 并入项，vulkan 走 build.bat），按顺序 apply 可完整复现。
+
+## 共享文件宏隔离（2026-08-31 约定，冲突文件一律这样搞）
+
+两个功能（route B 推理引擎 / prefill 导出）都挂在 `common_params` + context 参数传递——**patch 文本在同一结构相邻插入 → apply 顺序冲突**（hunk 上下文依赖生成时状态）。解法：**共享文件的改动用编译宏包裹**，冲突从 patch 层移到编译期功能开关：
+
+```cpp
+// common.h / common.cpp / arg.cpp / llama.h 等共享文件
+#ifdef STREAM_MOE_ROUTE_B
+    // route-b 的字段/参数/传递
+#endif
+#ifdef STREAM_MOE_PREFILL_EXPORT
+    std::string export_dir;   // --export-dir
+    std::string prefill_from; // --prefill-from
+#endif
+```
+
+- **宏**：`STREAM_MOE_ROUTE_B`（route B）、`STREAM_MOE_PREFILL_EXPORT`（prefill 导出）。`build.bat` 编译时传（完整栈全开；prefill 单独 = 只开 PREFILL）。
+- **共享文件**（common.h/common.cpp/arg.cpp/llama.h）：PREFILL 改动宏包裹 + 归 route-b patch（common 是 route-b 的）；prefill patch 只留 llama 层（llama-context/kv-cache/server.cpp/server-context.cpp）。
+- **效果**：一个 patch 可含两个功能的改动（宏隔离），apply 顺序无关；`-D` 控制运行时启用哪个功能。
+- **注意**：宏必须在声明/定义/使用处一致；新增共享文件改动一律宏包裹（不再靠 patch 文本顺序）。
 3. 应用前 `git apply --check`，应用后 `git apply --check -R`（验证可还原）。
 4. 涉及同一文件的两个 patch 位置不重叠，靠 `git apply` 的上下文 fuzz 叠加，应用顺序无关，但**还原顺序必须逆序**（先 -R 后应用的）。
 
