@@ -31,6 +31,7 @@ if "%CMD%"=="llamalibs" goto llamalibs
 if "%CMD%"=="build" goto build
 if "%CMD%"=="test" goto test
 if "%CMD%"=="clean" goto clean
+if "%CMD%"=="convertd" goto convertd
 echo Unknown command: %CMD%
 goto help
 
@@ -43,6 +44,14 @@ rem (multiple can be ON at once - llama.cpp schedules layers across registered
 rem backends via --split-mode/--tensor-split). LLAMA_BUILD_TOOLS controls the
 rem upstream llama-cli/llama-server build (default ON).
 if "%LLAMA_BUILD_TOOLS%"=="" set LLAMA_BUILD_TOOLS=ON
+rem STREAM_MOE feature macros by tag (build.bat llamalibs <tag>):
+rem   main            -> -DSTREAM_MOE_ROUTE_B          (route-B full inference, production)
+rem   upstream_dump   -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export, standard upstream baseline)
+rem   StreamMoE_dump  -> both                          (full StreamMoE export, vs upstream_dump)
+set STREAM_MOE_MACROS=
+if "%TAG%"=="main"           set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B
+if "%TAG%"=="upstream_dump"  set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
+if "%TAG%"=="StreamMoE_dump" set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B -DSTREAM_MOE_PREFILL_EXPORT
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=OFF
 if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF
@@ -65,7 +74,7 @@ if "%GGML_VULKAN%"=="ON" (
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc" ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_MACROS%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
@@ -123,6 +132,18 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [+] All unit tests passed for tag %TAG%!
 exit /b 0
 
+:convertd
+echo [StreamMoE] Building convertd (dumb GGUF TCP service) -> build\convertd\convertd.exe ...
+if not exist build\convertd mkdir build\convertd
+"%CLANG%" /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT ^
+    -I%CD:\=/%/third_party/llama.cpp/ggml/include ^
+    -I%CD:\=/%/third_party/llama.cpp/ggml/src ^
+    %CD:\=/%/build/main/llama-build/ggml/src/ggml-base.lib ^
+    %LIBOMP% ws2_32.lib /Fe:build\convertd\convertd.exe
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+echo [+] convertd built: build\convertd\convertd.exe
+exit /b 0
+
 :clean
 echo [StreamMoE] Removing build\ (all tags)...
 if exist build rmdir /s /q build
@@ -136,7 +157,11 @@ echo   build.bat build      - Build stream_moe.exe and stream_moe_server.exe
 echo   build.bat llamalibs  - Configure and build vendored libllama static libs only
 echo   build.bat test       - Build and run all unit tests
 echo   build.bat clean      - Remove build\ (all tags)
-echo Optional [tag] sub-path for each command (default: main).
-echo   build.bat build memwatch   - build under build\memwatch\bin
+echo Optional [tag] sub-path for llamalibs/build (default: main).
+echo   llamalibs main           - route-B llama-server (build\main)
+echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
+echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
+echo   build.bat convertd       - build converter TCP service (build\convertd)
+echo   build.bat build memwatch - build under build\memwatch\bin (legacy main-project build)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0
