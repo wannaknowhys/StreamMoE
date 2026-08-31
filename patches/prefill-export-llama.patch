@@ -57,7 +57,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..a50af2dbe 100644
+index 0402044da..cc644b2e0 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -68,15 +68,17 @@ index 0402044da..a50af2dbe 100644
  
  #include "ggml.h"
  #include "llama-arch.h"
-@@ -8,6 +11,7 @@
+@@ -8,6 +11,9 @@
  #include "llama-io.h"
  #include "llama-memory.h"
  #include "llama-mmap.h"
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +#include "tsc_timer.h"
++#endif
  #include "llama-model.h"
  #include "llama-ext.h"
  #include "llama-sampler.h"
-@@ -16,9 +20,14 @@
+@@ -16,9 +22,16 @@
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
@@ -86,24 +88,29 @@ index 0402044da..a50af2dbe 100644
  #include <string>
 +#include <filesystem>
 +
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +// STREAM_MOE_TEMP: graph-eval-callback export (defined near the export section)
 +static bool moe_export_eval_cb(ggml_tensor * t, bool ask, void * ud);
++#endif
  
  //
  // llama_context
-@@ -115,7 +124,7 @@ llama_context::llama_context(
+@@ -115,7 +128,9 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
 -    cparams.embeddings_nextn        = false;
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    cparams.embeddings_nextn        = !params.export_dir.empty(); // prefill cross-validation export needs t_h_nextn
++#endif
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -139,6 +148,18 @@ llama_context::llama_context(
+@@ -139,6 +154,20 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    // STREAM_MOE_TEMP: when exporting, replace cb_eval with the graph-eval
 +    // capture callback (original kept and chained). Captures embd/hidden/top-4
 +    // logits/routing ids right after each node computes.
@@ -115,24 +122,28 @@ index 0402044da..a50af2dbe 100644
 +        cparams.cb_eval          = moe_export_eval_cb;
 +        cparams.cb_eval_user_data = this;
 +    }
++#endif
 +
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -482,6 +503,9 @@ llama_context::~llama_context() {
+@@ -482,6 +511,11 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    export_prefill_final(); // prefill cross-validation export (env LLM_EXPORT_DIR)
 +    export_expert_history_final(); // expert access history (task 1)
++#endif
 +
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1365,6 +1389,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1365,6 +1399,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +        // STREAM_MOE: publish export target pointers BEFORE compute - the eval
 +        // callback runs during graph compute and must match against them.
 +        if (export_active) {
@@ -141,14 +152,16 @@ index 0402044da..a50af2dbe 100644
 +            export_t_logits = res->get_logits();
 +            if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] set t_embd=%p t_hidden=%p t_logits=%p\n", (void*) export_t_embd, (void*) export_t_hidden, (void*) export_t_logits);
 +        }
++#endif
 +
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,6 +1665,253 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1677,255 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +// Expert access history (task 1): one (layer, global_token, expert) triple per
 +// routed expert, in decode order. Written once at destruction to
 +// <LLM_EXPORT_DIR>/expert_history.bin ("EXPHIST1"). Read by tools/simulate_cache.js
@@ -395,14 +408,16 @@ index 0402044da..a50af2dbe 100644
 +    }
 +    std::fclose(f);
 +}
++#endif
 +
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2216,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2230,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +        // LM head input (result_norm), hidden state (t_h_nextn) and routing ids
 +        // are captured inside the graph via moe_export_eval_cb (set in ctor when
 +        // LLM_EXPORT_DIR); here we only publish the target tensor pointers for
@@ -413,15 +428,17 @@ index 0402044da..a50af2dbe 100644
 +            export_t_logits = res->get_logits();
 +            export_token_seq += ubatch.n_tokens;
 +        }
++#endif
 +
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2254,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2270,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
 +
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +            // STREAM_MOE_TEMP: record the actually sampled token ids (decode only)
 +            if (export_active && std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] samp has=%d nout=%d data=%d prev=%u\n", (int) has_samplers, (int) n_outputs, sampling.sampled.has_data() ? 1 : 0, (unsigned) n_outputs_prev);
 +            if (export_active && sampling.sampled.data) {
@@ -429,43 +446,51 @@ index 0402044da..a50af2dbe 100644
 +                    export_tokens.push_back(sampling.sampled.data[n_outputs_prev + i]);
 +                }
 +            }
++#endif
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3831,7 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3849,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +        /*.export_dir                  =*/ {},
++#endif
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3853,7 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3873,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    sm_tmr::timer _t("llama_init_from_model");
++#endif
      if (!model) {
          LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
          return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..a339751c9 100644
+index bf91daa8b..c77eb3ecc 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -253,6 +253,9 @@ public:
+@@ -253,6 +253,11 @@ public:
  
      bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    // StreamMoE: feed an actually sampled token into the export buffer (server calls this)
 +    void export_add_token(llama_token t);
++#endif
 +
  private:
      llm_graph_params graph_params(
                          llm_graph_result * res,
-@@ -367,6 +370,47 @@ private:
+@@ -367,6 +372,49 @@ private:
      llm_graph_result_ptr gf_res_prev;
      llm_graph_result_ptr gf_res_reserve;
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    // prefill cross-validation export (env LLM_EXPORT_DIR): accumulate per-token
 +    // LM head input (result_norm / t_embd) and hidden state (t_h_nextn), then
 +    // flush everything plus the final KV cache to a file on destruction.
@@ -506,61 +531,53 @@ index bf91daa8b..a339751c9 100644
 +    void export_capture_logits(struct ggml_tensor * t);
 +    void export_capture_experts(struct ggml_tensor * t);
 +    friend bool moe_export_eval_cb(struct ggml_tensor * t, bool ask, void * ud);
++#endif
 +
      // host buffer for the model output (logits and embeddings)
      ggml_backend_buffer_ptr buf_output;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index ec0f5a753..3582a597d 100644
+index ec0f5a753..fa71a2c9d 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1226,6 +1226,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+@@ -1226,6 +1226,14 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
      return layers[ikv].k;
  }
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
 +    const int32_t ikv = map_layer_ids.at(il);
 +
 +    return layers[ikv].v;
 +}
++#endif
 +
  const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
      GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 6cb6dbd2f..bfbcd6a62 100644
+index 6cb6dbd2f..3d1522068 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -163,6 +163,7 @@ public:
+@@ -163,6 +163,9 @@ public:
  
      std::vector<uint32_t> get_layer_ids() const;
      ggml_tensor * get_k_storage(int32_t il) const;
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    ggml_tensor * get_v_storage(int32_t il) const;
++#endif
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..160486e9b 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -3744,6 +3744,9 @@ private:
- 
-             common_sampler_accept(slot.smpl.get(), id, true);
- 
-+            // StreamMoE: record the actually sampled token for export (flush on destruction)
-+            llama_export_add_token(slot.ctx_tgt, id);
-+
-             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-             const int64_t t_now = ggml_time_us();
- 
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 5fe2729ba..ebda610b0 100644
+index 5fe2729ba..061512bac 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -112,6 +112,69 @@ int llama_server(int argc, char ** argv) {
+@@ -112,6 +112,71 @@ int llama_server(int argc, char ** argv) {
      return llama_server(params, argc, argv);
  }
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +// StreamMoE: prefill-only mode. Reads tokens (.bin = u32 id array) or plain text
 +// (.txt, auto-tokenized), prefills the KV cache via llama_decode, then frees the
 +// context (which flushes the LLM_EXPORT_DIR export) and exits without serving.
@@ -623,23 +640,26 @@ index 5fe2729ba..ebda610b0 100644
 +    llama_model_free(model);
 +    return rc == 0 ? 0 : 1;
 +}
++#endif
 +
  int llama_server(common_params & params, int argc, char ** argv) {
      bool is_run_by_cli = (argv == nullptr);
  
-@@ -163,6 +226,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -163,6 +228,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
          params.model_alias.insert(model_name);
      }
  
++#ifdef STREAM_MOE_PREFILL_EXPORT
 +    // StreamMoE: prefill-only mode - no HTTP server, just prefill + export + exit
 +    if (!params.prefill_from.empty()) {
 +        return server_prefill_only(params);
 +    }
++#endif
 +
      // note: this is guaranteed to out-live ctx_http and tools
      server_mcp mcp_mgr;
  
-@@ -244,6 +312,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -244,6 +316,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
      ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
@@ -655,3 +675,19 @@ index 5fe2729ba..ebda610b0 100644
      ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..c9d2ced1d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3744,6 +3768,11 @@ private:
+ 
+             common_sampler_accept(slot.smpl.get(), id, true);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++            // StreamMoE: record the actually sampled token for export (flush on destruction)
++            llama_export_add_token(slot.ctx_tgt, id);
++#endif
++
+             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+             const int64_t t_now = ggml_time_us();
+ 

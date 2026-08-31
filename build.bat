@@ -74,13 +74,14 @@ if "%GGML_VULKAN%"=="ON" (
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_MACROS%" ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual -mavx2 -mfma" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc -mavx2 -mfma %STREAM_MOE_MACROS%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 "%NINJA%" -C "%LLAMA_BUILD%" llama llama-cli llama-server
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+copy /Y "%LIBOMP:.lib=.dll%" "%LLAMA_BUILD%\bin\libomp.dll" >nul
 echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
