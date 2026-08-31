@@ -76,6 +76,14 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 | prefill 导出（--export-dir）| `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |
 | prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt|tokens.bin> --export-dir <dir> -c 1024 -t 8` |
 
+**run_export 前台窗口启动**（跑 cn/en/prefill10000 导出任务——脱离 opencode 管控但用户可见）：
+```bat
+agy-run -c "start cmd /k temp\run_export_win.bat"
+```
+- agy-run 绑 `WinSta0\Default` 在**交互桌面**弹新 cmd 窗口 → llama-server 在窗口里跑（**用户实时看**）。
+- `start` 立即返回 → **opencode/bash 不阻塞**。别用 `start /b` 后台（那才真正脱离管控且看不到）。
+- `temp\run_export_win.bat`：`call temp\sm_env.bat`（机器路径 env）+ `node tools\run_export.js --models ... --engines ... --tasks ...`。
+
 ---
 
 ## 4. 下一步（TODO）
