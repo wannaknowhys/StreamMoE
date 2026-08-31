@@ -43,23 +43,26 @@ StreamMoE 全部改动只存在于上述 patch（含 spec-stats/export-args 并�
 
 ## 共享文件宏隔离（2026-08-31 约定，冲突文件一律这样搞）
 
-两个功能（route B 推理引擎 / prefill 导出）都挂在 `common_params` + context 参数传递——**patch 文本在同一结构相邻插入 → apply 顺序冲突**（hunk 上下文依赖生成时状态）。解法：**共享文件的改动用编译宏包裹**，冲突从 patch 层移到编译期功能开关：
+两个功能（route B 推理引擎 / prefill 导出）都挂在 `common_params` + context 参数传递——**patch 文本在同一结构相邻插入 → apply 顺序冲突**。解法：**占位 patch 在共享文件只加宏保护的 include 片段，高层 patch 只新增 `.frag` 文件**（不碰共享文件）：
 
 ```cpp
-// common.h / common.cpp / arg.cpp / llama.h 等共享文件
-#ifdef STREAM_MOE_ROUTE_B
-    // route-b 的字段/参数/传递
-#endif
+// 占位 patch（streammoe-macros.patch）改共享文件：只加 include 宏块
+struct common_params {
 #ifdef STREAM_MOE_PREFILL_EXPORT
-    std::string export_dir;   // --export-dir
-    std::string prefill_from; // --prefill-from
+#include "stmoe_prefill_common_params.frag"   // 编译期文本替换进结构
 #endif
+    int32_t n_predict = -1;
+#ifdef STREAM_MOE_ROUTE_B
+#include "stmoe_routeb_common_params.frag"
+#endif
+    int32_t n_ctx = 0;
+};
+// route-b patch / prefill patch：只新增 include/ 下的 *.frag 文件（片段内容），不碰 common.h/common.cpp/arg.cpp/llama.h
 ```
 
-- **宏**：`STREAM_MOE_ROUTE_B`（route B）、`STREAM_MOE_PREFILL_EXPORT`（prefill 导出）。`build.bat` 编译时传（完整栈全开；prefill 单独 = 只开 PREFILL）。
-- **共享文件**（common.h/common.cpp/arg.cpp/llama.h）：PREFILL 改动宏包裹 + 归 route-b patch（common 是 route-b 的）；prefill patch 只留 llama 层（llama-context/kv-cache/server.cpp/server-context.cpp）。
-- **效果**：一个 patch 可含两个功能的改动（宏隔离），apply 顺序无关；`-D` 控制运行时启用哪个功能。
-- **注意**：宏必须在声明/定义/使用处一致；新增共享文件改动一律宏包裹（不再靠 patch 文本顺序）。
+- **宏**：`STREAM_MOE_ROUTE_B` / `STREAM_MOE_PREFILL_EXPORT`（`build.bat` 编译时传；宏未定义时 include 行被预处理跳过，占位单独可编译）。
+- **效果**：include 片段 = 编译期文本替换 = 等价 diff；共享文件只被占位改一次；高层 patch 只新增 `.frag`（放 `include/`）——**无 apply 冲突**；`-D` 选功能（prefill 独立 = 占位 + prefill + 只开 PREFILL）。
+- **注意**：片段文件放 vendored `include/`（共享文件的 include 路径）；新增共享改动一律"占位 include + 高层 .frag"。
 3. 应用前 `git apply --check`，应用后 `git apply --check -R`（验证可还原）。
 4. 涉及同一文件的两个 patch 位置不重叠，靠 `git apply` 的上下文 fuzz 叠加，应用顺序无关，但**还原顺序必须逆序**（先 -R 后应用的）。
 
