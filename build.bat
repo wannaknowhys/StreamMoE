@@ -52,7 +52,16 @@ set STREAM_MOE_MACROS=
 if "%TAG%"=="main"           set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B
 if "%TAG%"=="upstream_dump"  set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
 if "%TAG%"=="StreamMoE_dump" set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B -DSTREAM_MOE_PREFILL_EXPORT
-if "%GGML_VULKAN%"=="" set GGML_VULKAN=OFF
+rem ---- CPU arch + backend by tag ----
+rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
+rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
+rem         to znver3 (5950X) for now.
+rem   upstream_dump / StreamMoE_dump: dump tools, local - znver3 + vulkan backend.
+set STREAM_MOE_CPU_FLAGS=-march=znver3
+set GGML_VULKAN_DEFAULT=OFF
+if "%TAG%"=="upstream_dump"  set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="StreamMoE_dump" set GGML_VULKAN_DEFAULT=ON
+if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
 if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF
 if "%GGML_METAL%"=="" set GGML_METAL=OFF
@@ -74,7 +83,7 @@ if "%GGML_VULKAN%"=="ON" (
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual -mavx2 -mfma" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc -mavx2 -mfma %STREAM_MOE_MACROS%" ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS% %STREAM_MOE_MACROS%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
