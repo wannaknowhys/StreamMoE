@@ -1,6 +1,6 @@
 {
   "engine": "moe-temp0",
-  "bin": "rbexport",
+  "bin": "StreamMoE_dump",
   "extra": [
     "--expert-backend",
     "--moe-ram-pool",

@@ -1,11 +1,11 @@
 {
   "engine": "moe",
-  "bin": "rbexport",
+  "bin": "StreamMoE_dump",
   "extra": [
     "--expert-backend",
     "--moe-ram-pool",
     "${pool}",
     "--temp",
-    "1.0"
+    "1"
   ]
 }

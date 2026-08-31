@@ -1,9 +1,9 @@
 {
-  "engine": "upstream",
+  "engine": "upstream-vulkan",
   "bin": "upstream_dump",
   "extra": [
     "--n-gpu-layers",
-    "0",
+    "2",
     "--temp",
     "1"
   ]

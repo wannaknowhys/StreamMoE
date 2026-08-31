@@ -164,7 +164,7 @@ async function runOne(run) {
     fs.mkdirSync(dir, { recursive: true });
     const bin = binPath(run);
     const args = ['-m', run.modelPath, '--fit', 'off', '--no-warmup', '-c', '15000', '-t', '16',
-        '--temp', '1.0', '--top-p', '0.95', '--host', '127.0.0.1', '--port', String(PORT), '--no-webui'];
+        '--top-p', '0.95', '--host', '127.0.0.1', '--port', String(PORT), '--no-webui'];
     if (run.draft) args.push('--model-draft', run.draft, '--spec-draft-n-max', '5', '--spec-draft-n-min', '1', '--spec-draft-p-min', '0.6');
     if (run.extra) args.push(...run.extra);
     args.push('--export-dir', dir); // StreamMoE: export via arg (replaces LLM_EXPORT_DIR env)
