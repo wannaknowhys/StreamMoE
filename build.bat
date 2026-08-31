@@ -76,7 +76,7 @@ if "%GGML_VULKAN%"=="ON" (
     rem of (x86) as the end of the for list -> "此时不应有 \VMware\VMware").
     for %%I in ("%NINJA%") do set NINJA_DIR=%%~dpI
     for %%I in ("%CLANG%") do set CLANG_DIR=%%~dpI
-    set PATH=%NINJA_DIR%;%CLANG_DIR%;%PATH%
+    set PATH=!NINJA_DIR!;!CLANG_DIR!;!PATH!
     set VULKAN_TOOLCHAIN_ARGS=
 ) else set VULKAN_TOOLCHAIN_ARGS=
 "%CMAKE%" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
