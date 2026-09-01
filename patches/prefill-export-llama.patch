@@ -57,7 +57,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..b2ead0e59 100644
+index 0402044da..aa35d5bec 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -139,7 +139,7 @@ index 0402044da..b2ead0e59 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1365,6 +1399,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1365,6 +1399,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -150,14 +150,13 @@ index 0402044da..b2ead0e59 100644
 +            export_t_embd   = res->get_embd();
 +            export_t_hidden = res->get_h_nextn();
 +            export_t_logits = res->get_logits();
-+            if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] set t_embd=%p t_hidden=%p t_logits=%p\n", (void*) export_t_embd, (void*) export_t_hidden, (void*) export_t_logits);
 +        }
 +#endif
 +
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,6 +1677,318 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1676,310 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -173,11 +172,6 @@ index 0402044da..b2ead0e59 100644
 +        if (!ctx->export_prev_cb_eval(t, ask, ctx->export_prev_cb_eval_ud)) return false;
 +    }
 +    if (ask) return true;
-+    if (std::getenv("STREAM_MOE_DBG")) {
-+        if (t == ctx->export_t_embd || t == ctx->export_t_hidden || t == ctx->export_t_logits
-+            || (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[0]->name && std::strstr(t->src[0]->name, "_exps")))
-+            fprintf(stderr, "[dbg] cb hit op=%d name=%s type=%d ne0=%d ne1=%d\n", (int) t->op, t->name ? t->name : "?", (int) t->type, (int) t->ne[0], (int) t->ne[1]);
-+    }
 +    if (t == ctx->export_t_embd)   { ctx->export_capture_embd(t);   return true; }
 +    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
 +    if (t == ctx->export_t_logits) { ctx->export_capture_logits(t); return true; }
@@ -343,8 +337,6 @@ index 0402044da..b2ead0e59 100644
 +    const uint32_t n_hid_dim   = export_hidden_dim;
 +    const size_t   esz_embd    = ggml_type_size(export_embd_type);
 +    const size_t   esz_hidden  = ggml_type_size(export_hidden_type);
-+    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] exp embd=%zu/%s hidden=%zu/%s top4=%zu active=%d\n",
-+        export_embd_pos.size(), ggml_type_name(export_embd_type), export_hidden_pos.size(), ggml_type_name(export_hidden_type), export_lse_pos.size(), (int) export_active);
 +
 +    fwrite("PREFEXP2", 1, 8, f);
 +    fwrite(&n_embd_rows, 4, 1, f);
@@ -420,7 +412,6 @@ index 0402044da..b2ead0e59 100644
 +        }
 +    }
 +    // STREAM_MOE_TEMP: sampled token ids + detokenized text to separate files
-+    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] export_tokens=%zu export_active=%d\n", export_tokens.size(), (int) export_active);
 +    if (!export_tokens.empty()) {
 +        const std::string d = export_dir;
 +        const std::string tp = d + "/tokens_id.bin";
@@ -476,7 +467,7 @@ index 0402044da..b2ead0e59 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2293,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2284,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -496,14 +487,13 @@ index 0402044da..b2ead0e59 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2333,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2324,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
 +
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +            // STREAM_MOE_TEMP: record the actually sampled token ids (decode only)
-+            if (export_active && std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] samp has=%d nout=%d data=%d prev=%u\n", (int) has_samplers, (int) n_outputs, sampling.sampled.has_data() ? 1 : 0, (unsigned) n_outputs_prev);
 +            if (export_active && sampling.sampled.data) {
 +                for (int64_t i = 0; i < n_outputs; ++i) {
 +                    export_tokens.push_back(sampling.sampled.data[n_outputs_prev + i]);
@@ -513,7 +503,7 @@ index 0402044da..b2ead0e59 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3912,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3902,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -523,7 +513,7 @@ index 0402044da..b2ead0e59 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3936,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3926,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
