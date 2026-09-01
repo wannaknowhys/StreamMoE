@@ -139,12 +139,30 @@ exit /b 0
 
 :convertd
 echo [StreamMoE] Building convertd (dumb GGUF TCP service) -> build\convertd\convertd.exe ...
+if exist build\convertd\ggml-build\build.ninja goto convertd_build
+echo [StreamMoE] Configuring macro-enabled ggml (STREAM_MOE_GGUF_ALIGN) for convertd...
+"%CMAKE%" -S third_party/llama.cpp -B build/convertd/ggml-build -G Ninja ^
+    -DCMAKE_MAKE_PROGRAM=%NINJA% ^
+    -DCMAKE_C_COMPILER=%CLANG% ^
+    -DCMAKE_CXX_COMPILER=%CLANGXX% ^
+    -DCMAKE_RC_COMPILER=%RC% ^
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ^
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF ^
+    -DLLAMA_ALL_WARNINGS=OFF -DLLAMA_CURL=OFF -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF ^
+    -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_METAL=OFF -DGGML_SYCL=OFF ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual -DSTREAM_MOE_GGUF_ALIGN" ^
+    -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc -DSTREAM_MOE_GGUF_ALIGN"
+if errorlevel 1 exit /b 1
+:convertd_build
+"%NINJA%" -C build/convertd/ggml-build ggml-base
+if errorlevel 1 exit /b 1
 if not exist build\convertd mkdir build\convertd
-"%CLANG%" /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT ^
+"%CLANG%" /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT -DSTREAM_MOE_GGUF_ALIGN ^
     -I%CD:\=/%/third_party/llama.cpp/ggml/include ^
     -I%CD:\=/%/third_party/llama.cpp/ggml/src ^
-    %CD:\=/%/build/main/llama-build/ggml/src/ggml-base.lib ^
-    %LIBOMP% ws2_32.lib /Fe:build\convertd\convertd.exe
+    %CD:\=/%/build/convertd/ggml-build/ggml/src/ggml-base.lib ^
+    ws2_32.lib /Fe:build\convertd\convertd.exe
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [+] convertd built: build\convertd\convertd.exe
 exit /b 0
