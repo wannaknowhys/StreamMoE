@@ -734,3 +734,40 @@ index 5fe2729ba..98f21a20b 100644
      ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
+
+diff --git a/common/stmoe_prefill_server_nout.frag b/common/stmoe_prefill_server_nout.frag
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/common/stmoe_prefill_server_nout.frag
+@@ -0,0 +1,4 @@
++    // StreamMoE export: the LM head must fit up to n_batch output rows per
++    // decode call (all prefill tokens are marked as outputs).
++    params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_batch);
++
+diff --git a/include/stmoe_prefill_decode_logits.frag b/include/stmoe_prefill_decode_logits.frag
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/include/stmoe_prefill_decode_logits.frag
+@@ -0,0 +1,19 @@
++    // StreamMoE export: the LM head must produce logits for EVERY prefill token
++    // so exported embd/logits cover the whole sequence with no gaps. The server
++    // only marks the last token; force the whole prefill batch's logits flag on
++    // here (before balloc derives n_outputs / out_ids from it). Some server
++    // paths (first prefill ubatch) pass a null logits array - substitute a temp
++    // all-1 array. Decode batches are single-token and left alone to keep
++    // server-side sampling working. batch_inp.logits is int8_t*.
++    if (export_active && batch_inp.n_tokens > 1) {
++        if (batch_inp.logits) {
++            for (int32_t i = 0; i < batch_inp.n_tokens; i++) {
++                batch_inp.logits[i] = 1;
++            }
++        } else {
++            static std::vector<int8_t> tmp;
++            tmp.assign((size_t) batch_inp.n_tokens, 1);
++            const_cast<llama_batch &>(batch_inp).logits = tmp.data();
++        }
++    }
++
+

@@ -107,4 +107,31 @@ index a04177f9f..a62d2ad8b 100644
 +#endif
  
      LLAMA_API int64_t llama_time_us(void);
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1635,8 +1635,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ int llama_context::decode(const llama_batch & batch_inp) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_decode_logits.frag"
++#endif
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -968,4 +968,7 @@
+         params_base.n_outputs_max = output_limits.total;
+         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_server_nout.frag"
++#endif
+         const bool has_mmproj = !params.mmproj.path.empty();
  
