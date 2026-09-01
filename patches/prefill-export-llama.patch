@@ -63,7 +63,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..74c5324ae 100644
+index 0402044da..f2b87e79a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -162,7 +162,7 @@ index 0402044da..74c5324ae 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,11 +1676,336 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,11 +1676,357 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -181,7 +181,7 @@ index 0402044da..74c5324ae 100644
 +    if (t == ctx->export_t_embd)   { ctx->export_capture_embd(t);   return true; }
 +    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
 +    if (t == ctx->export_t_logits) { ctx->export_capture_logits(t); return true; }
-+    if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->src[0]->name
++    if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2]
 +            && std::strstr(t->src[0]->name, "_exps")) {
 +        ctx->export_capture_experts(t);
 +    }
@@ -353,13 +353,27 @@ index 0402044da..74c5324ae 100644
 +    }
 +
 +    std::vector<std::pair<llama_kv_cache *, const char *>> caches;
-+    llama_kv_cache_dsv4 * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(get_memory());
++    llama_memory_i * mem = get_memory();
++    llama_kv_cache_dsv4 * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(mem);
++    llama_kv_cache_iswa * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
++    llama_kv_cache * kv_gen = dynamic_cast<llama_kv_cache *>(mem);
++    if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] kv export: memory_type=%s dsv4=%d iswa=%d kv=%d\n", typeid(*mem).name(), dsv4 != nullptr, iswa != nullptr, kv_gen != nullptr);
 +    if (dsv4) {
++        // DeepSeek dsv4: multiple sub-caches (raw_base/raw_swa/csa/hca/lid)
 +        caches.push_back({dsv4->get_raw()->get_base(), "raw_base"});
 +        caches.push_back({dsv4->get_raw()->get_swa (), "raw_swa" });
 +        caches.push_back({dsv4->get_csa(), "csa"});
 +        caches.push_back({dsv4->get_hca(), "hca"});
 +        caches.push_back({dsv4->get_lid(), "lid"});
++    } else if (iswa) {
++        // interleaved SWA (gemma4): base + swa sub-caches
++        caches.push_back({iswa->get_base(), "base"});
++        caches.push_back({iswa->get_swa (), "swa" });
++    } else {
++        // generic: any llama_kv_cache (all attention KV derive from it)
++        if (kv_gen) {
++            caches.push_back({kv_gen, "kv"});
++        }
 +    }
 +    uint32_t n_cache = (uint32_t) caches.size();
 +    fwrite(&n_cache, 4, 1, f);
@@ -377,8 +391,15 @@ index 0402044da..74c5324ae 100644
 +            ggml_tensor * tk = kc->get_k_storage(il);
 +            ggml_tensor * tv = kc->get_v_storage(il);
 +            for (ggml_tensor * t : {tk, tv}) {
-+                uint32_t ty = t ? (uint32_t) t->type : 0;
 +                uint64_t nb = t ? (uint64_t) ggml_nbytes(t) : 0;
++                if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] kv t=%p nb=%llu cache=%s layer=%u\n", (void*) t, (unsigned long long) nb, name, il);
++                if (t && nb > 1073741824ull) { t = nullptr; nb = 0; }
++                uint32_t ty = t ? (uint32_t) t->type : 0;
++                // tensor layout (ne/nb) so readers can slice per-token
++                const int64_t * ne4 = t ? t->ne : nullptr;
++                const size_t  * nb4 = t ? t->nb : nullptr;
++                for (int i = 0; i < 4; i++) { const int64_t v = ne4 ? ne4[i] : 0; fwrite(&v, 8, 1, f); }
++                for (int i = 0; i < 4; i++) { const int64_t v = nb4 ? (int64_t) nb4[i] : 0; fwrite(&v, 8, 1, f); }
 +                fwrite(&ty, 4, 1, f);
 +                fwrite(&nb, 8, 1, f);
 +                if (t && nb > 0) {
@@ -499,7 +520,7 @@ index 0402044da..74c5324ae 100644
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -1936,6 +2305,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2326,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -519,7 +540,7 @@ index 0402044da..74c5324ae 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2345,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2366,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -527,7 +548,7 @@ index 0402044da..74c5324ae 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3915,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3936,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -537,7 +558,7 @@ index 0402044da..74c5324ae 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3939,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3960,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
