@@ -35,13 +35,57 @@ index 000000000..3d96d4bf1
 +++ b/common/stmoe_prefill_ctx.frag
 @@ -0,0 +1 @@
 +    cparams.export_dir        = params.export_dir;
+diff --git a/common/stmoe_prefill_server_nout.frag b/common/stmoe_prefill_server_nout.frag
+new file mode 100644
+index 000000000..ddce01f0f
+--- /dev/null
++++ b/common/stmoe_prefill_server_nout.frag
+@@ -0,0 +1,4 @@
++    // StreamMoE export: the LM head must fit up to n_batch output rows per
++    // decode call (all prefill tokens are marked as outputs).
++    params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_batch);
++
+diff --git a/common/stmoe_prefill_server_tokens.frag b/common/stmoe_prefill_server_tokens.frag
+new file mode 100644
+index 000000000..f13410842
+--- /dev/null
++++ b/common/stmoe_prefill_server_tokens.frag
+@@ -0,0 +1,32 @@
++        // StreamMoE: dump the processed input token ids (the slot's KV
++        // prefix-matching sequence) + detokenized text to the export dir on
++        // exit. Written here (before destroy()) so ctx_tgt/vocab are alive.
++        // slot.prompt.tokens is server_tokens (index/size access, no range-for).
++        if (!params_base.export_dir.empty()) {
++            for (auto & slot : slots) {
++                const size_t nt = slot.prompt.tokens.size();
++                if (nt == 0) continue;
++                const std::string d = params_base.export_dir;
++                FILE * tf = std::fopen((d + "/tokens_id.bin").c_str(), "wb");
++                if (tf) {
++                    const uint32_t n = (uint32_t) nt;
++                    fwrite(&n, 4, 1, tf);
++                    for (size_t i = 0; i < nt; i++) {
++                        const llama_token t = slot.prompt.tokens[i];
++                        fwrite(&t, 4, 1, tf);
++                    }
++                    std::fclose(tf);
++                }
++                FILE * ttf = std::fopen((d + "/tokens_text.txt").c_str(), "wb");
++                if (ttf) {
++                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
++                    char buf[256];
++                    for (size_t i = 0; i < nt; i++) {
++                        const int n = llama_token_to_piece(vocab, slot.prompt.tokens[i], buf, sizeof(buf), 0, false);
++                        if (n > 0) fwrite(buf, 1, (size_t) n, ttf);
++                    }
++                    std::fclose(ttf);
++                }
++                break;
++            }
++        }
 diff --git a/include/stmoe_prefill_llama_apis.frag b/include/stmoe_prefill_llama_apis.frag
 new file mode 100644
-index 000000000..16e7b7639
---- /dev/null
-+++ b/include/stmoe_prefill_llama_apis.frag
-@@ -0,0 +1 @@
-+LLAMA_API void llama_export_add_token(struct llama_context * ctx, llama_token token);
+index 000000000..e69de29bb
 diff --git a/include/stmoe_prefill_llama_includes.frag b/include/stmoe_prefill_llama_includes.frag
 new file mode 100644
 index 000000000..d5a732287
@@ -57,7 +101,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..aa35d5bec 100644
+index 0402044da..86aff9a84 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -156,7 +200,7 @@ index 0402044da..aa35d5bec 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,6 +1676,310 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,11 +1676,304 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -289,14 +333,6 @@ index 0402044da..aa35d5bec 100644
 +    }
 +}
 +
-+void llama_context::export_add_token(llama_token t) {
-+    if (export_active) export_tokens.push_back(t);
-+}
-+
-+void llama_export_add_token(struct llama_context * ctx, llama_token token) {
-+    ctx->export_add_token(token);
-+}
-+
 +void llama_context::export_expert_history_final() {
 +    const char * dir = export_dir.empty() ? nullptr : export_dir.c_str();
 +    if (!dir || export_expert_id.empty()) return;
@@ -411,29 +447,6 @@ index 0402044da..aa35d5bec 100644
 +            fwrite(&export_lse[i], 4, 1, f);
 +        }
 +    }
-+    // STREAM_MOE_TEMP: sampled token ids + detokenized text to separate files
-+    if (!export_tokens.empty()) {
-+        const std::string d = export_dir;
-+        const std::string tp = d + "/tokens_id.bin";
-+        FILE * tf = std::fopen(tp.c_str(), "wb");
-+        if (tf) {
-+            const uint32_t n = (uint32_t) export_tokens.size();
-+            fwrite(&n, 4, 1, tf);
-+            for (auto & t : export_tokens) fwrite(&t, 4, 1, tf);
-+            std::fclose(tf);
-+        }
-+        const std::string ttp = d + "/tokens_text.txt";
-+        FILE * ttf = std::fopen(ttp.c_str(), "wb");
-+        if (ttf) {
-+            char buf[256];
-+            const llama_vocab * vocab = llama_model_get_vocab(&model);
-+            for (auto & t : export_tokens) {
-+                const int n = llama_token_to_piece(vocab, t, buf, sizeof(buf), 0, false);
-+                if (n > 0) fwrite(buf, 1, (size_t) n, ttf);
-+            }
-+            std::fclose(ttf);
-+        }
-+    }
 +    // prefill_meta.json: describe the bins (dtype/layout) so readers (verify)
 +    // never hardcode element sizes.
 +    {
@@ -452,8 +465,7 @@ index 0402044da..aa35d5bec 100644
 +            m += "        { \"id\": \"top4\", \"id_dtype\": \"u32\", \"logit_dtype\": \"f32\", \"lse_dtype\": \"f32\", \"n\": " + std::to_string((uint32_t) export_lse_pos.size()) + " }\n";
 +            m += "      ]\n";
 +            m += "    },\n";
-+            m += "    \"expert_history_main.bin\": { \"record\": [\"layer u32\", \"token u32\", \"expert u32\"], \"n\": " + std::to_string((uint32_t) export_expert_id.size()) + " },\n";
-+            m += "    \"tokens_id.bin\": { \"dtype\": \"u32\", \"n\": " + std::to_string((uint32_t) export_tokens.size()) + " }\n";
++            m += "    \"expert_history_main.bin\": { \"record\": [\"layer u32\", \"token u32\", \"expert u32\"], \"n\": " + std::to_string((uint32_t) export_expert_id.size()) + " }\n";
 +            m += "  }\n";
 +            m += "}\n";
 +            fwrite(m.data(), 1, m.size(), mf);
@@ -467,7 +479,33 @@ index 0402044da..aa35d5bec 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2284,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++    // StreamMoE export: the LM head must produce logits for EVERY prefill token
++    // so exported embd/logits cover the whole sequence with no gaps. The server
++    // only marks the last token; force the whole prefill batch's logits flag on
++    // here (before balloc derives n_outputs / out_ids from it). Some server
++    // paths (first prefill ubatch) pass a null logits array - substitute a temp
++    // all-1 array. Decode batches are single-token and left alone to keep
++    // server-side sampling working. batch_inp.logits is int8_t*.
++    if (export_active && batch_inp.n_tokens > 1) {
++        if (batch_inp.logits) {
++            for (int32_t i = 0; i < batch_inp.n_tokens; i++) {
++                batch_inp.logits[i] = 1;
++            }
++        } else {
++            static std::vector<int8_t> tmp;
++            tmp.assign((size_t) batch_inp.n_tokens, 1);
++            const_cast<llama_batch &>(batch_inp).logits = tmp.data();
++        }
++    }
++#endif
++
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -1936,6 +2273,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -487,23 +525,15 @@ index 0402044da..aa35d5bec 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2324,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2313,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
 +
-+#ifdef STREAM_MOE_PREFILL_EXPORT
-+            // STREAM_MOE_TEMP: record the actually sampled token ids (decode only)
-+            if (export_active && sampling.sampled.data) {
-+                for (int64_t i = 0; i < n_outputs; ++i) {
-+                    export_tokens.push_back(sampling.sampled.data[n_outputs_prev + i]);
-+                }
-+            }
-+#endif
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3902,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3883,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -513,7 +543,7 @@ index 0402044da..aa35d5bec 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3926,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3907,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
@@ -524,22 +554,18 @@ index 0402044da..aa35d5bec 100644
          LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
          return nullptr;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..8d639079e 100644
+index bf91daa8b..3be1b002d 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -253,6 +253,11 @@ public:
+@@ -253,6 +253,7 @@ public:
  
      bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
-+#ifdef STREAM_MOE_PREFILL_EXPORT
-+    // StreamMoE: feed an actually sampled token into the export buffer (server calls this)
-+    void export_add_token(llama_token t);
-+#endif
 +
  private:
      llm_graph_params graph_params(
                          llm_graph_result * res,
-@@ -367,6 +372,53 @@ private:
+@@ -367,6 +368,52 @@ private:
      llm_graph_result_ptr gf_res_prev;
      llm_graph_result_ptr gf_res_reserve;
  
@@ -582,7 +608,6 @@ index bf91daa8b..8d639079e 100644
 +    std::vector<float>               export_top4_logit;         // n_rows x 4
 +    std::vector<float>               export_lse;                // logsumexp per row
 +    std::vector<uint32_t>            export_lse_pos;            // per-row pos
-+    std::vector<llama_token>         export_tokens;             // sampled token ids (decode only)
 +    void export_capture_embd(struct ggml_tensor * t);
 +    void export_capture_hidden(struct ggml_tensor * t);
 +    void export_capture_logits(struct ggml_tensor * t);
@@ -734,40 +759,3 @@ index 5fe2729ba..98f21a20b 100644
      ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
      ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-
-diff --git a/common/stmoe_prefill_server_nout.frag b/common/stmoe_prefill_server_nout.frag
-new file mode 100644
-index 000000000..000000000
---- /dev/null
-+++ b/common/stmoe_prefill_server_nout.frag
-@@ -0,0 +1,4 @@
-+    // StreamMoE export: the LM head must fit up to n_batch output rows per
-+    // decode call (all prefill tokens are marked as outputs).
-+    params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_batch);
-+
-diff --git a/include/stmoe_prefill_decode_logits.frag b/include/stmoe_prefill_decode_logits.frag
-new file mode 100644
-index 000000000..000000000
---- /dev/null
-+++ b/include/stmoe_prefill_decode_logits.frag
-@@ -0,0 +1,19 @@
-+    // StreamMoE export: the LM head must produce logits for EVERY prefill token
-+    // so exported embd/logits cover the whole sequence with no gaps. The server
-+    // only marks the last token; force the whole prefill batch's logits flag on
-+    // here (before balloc derives n_outputs / out_ids from it). Some server
-+    // paths (first prefill ubatch) pass a null logits array - substitute a temp
-+    // all-1 array. Decode batches are single-token and left alone to keep
-+    // server-side sampling working. batch_inp.logits is int8_t*.
-+    if (export_active && batch_inp.n_tokens > 1) {
-+        if (batch_inp.logits) {
-+            for (int32_t i = 0; i < batch_inp.n_tokens; i++) {
-+                batch_inp.logits[i] = 1;
-+            }
-+        } else {
-+            static std::vector<int8_t> tmp;
-+            tmp.assign((size_t) batch_inp.n_tokens, 1);
-+            const_cast<llama_batch &>(batch_inp).logits = tmp.data();
-+        }
-+    }
-+
-
