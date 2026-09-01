@@ -1,63 +1,5 @@
-diff --git a/common/stmoe_prefill_args.frag b/common/stmoe_prefill_args.frag
-new file mode 100644
-index 000000000..3e342d83e
---- /dev/null
-+++ b/common/stmoe_prefill_args.frag
-@@ -0,0 +1,16 @@
-+    add_opt(common_arg(
-+        {"--export-dir"}, "DIR",
-+        "StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env). "
-+        "When set, embd/hidden/top-4 logits/tokens are captured in-graph and flushed on exit.",
-+        [](common_params & params, const std::string & value) {
-+            params.export_dir = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--prefill-from"}, "PATH",
-+        "StreamMoE: prefill-only mode - read tokens (.bin = u32 id array) or plain text (.txt, "
-+        "auto-tokenized), prefill the KV cache, export it, then exit.",
-+        [](common_params & params, const std::string & value) {
-+            params.prefill_from = value;
-+        }
-+    ));
-diff --git a/common/stmoe_prefill_common_params.frag b/common/stmoe_prefill_common_params.frag
-new file mode 100644
-index 000000000..83940ea08
---- /dev/null
-+++ b/common/stmoe_prefill_common_params.frag
-@@ -0,0 +1,2 @@
-+    std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
-+    std::string prefill_from; // StreamMoE: prefill-only mode - read tokens (.bin) or prompt (.txt), prefill KV, export, exit
-diff --git a/common/stmoe_prefill_ctx.frag b/common/stmoe_prefill_ctx.frag
-new file mode 100644
-index 000000000..3d96d4bf1
---- /dev/null
-+++ b/common/stmoe_prefill_ctx.frag
-@@ -0,0 +1 @@
-+    cparams.export_dir        = params.export_dir;
-diff --git a/include/stmoe_prefill_llama_apis.frag b/include/stmoe_prefill_llama_apis.frag
-new file mode 100644
-index 000000000..16e7b7639
---- /dev/null
-+++ b/include/stmoe_prefill_llama_apis.frag
-@@ -0,0 +1 @@
-+LLAMA_API void llama_export_add_token(struct llama_context * ctx, llama_token token);
-diff --git a/include/stmoe_prefill_llama_includes.frag b/include/stmoe_prefill_llama_includes.frag
-new file mode 100644
-index 000000000..d5a732287
---- /dev/null
-+++ b/include/stmoe_prefill_llama_includes.frag
-@@ -0,0 +1 @@
-+#include <string>
-diff --git a/include/stmoe_prefill_llama_params.frag b/include/stmoe_prefill_llama_params.frag
-new file mode 100644
-index 000000000..c3c97d478
---- /dev/null
-+++ b/include/stmoe_prefill_llama_params.frag
-@@ -0,0 +1 @@
-+        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..a59c574e8 100644
+index 0402044da..b2ead0e59 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -157,7 +99,7 @@ index 0402044da..a59c574e8 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,6 +1677,312 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,6 +1677,318 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -182,7 +124,7 @@ index 0402044da..a59c574e8 100644
 +    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
 +    if (t == ctx->export_t_logits) { ctx->export_capture_logits(t); return true; }
 +    if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->src[0]->name
-+            && t->src[0]->name[0] == 'b' && std::strstr(t->src[0]->name, "_exps")) {
++            && std::strstr(t->src[0]->name, "_exps")) {
 +        ctx->export_capture_experts(t);
 +    }
 +    return true;
@@ -275,10 +217,16 @@ index 0402044da..a59c574e8 100644
 +
 +void llama_context::export_capture_experts(ggml_tensor * t) {
 +    ggml_tensor * w0 = t->src[0], * ids = t->src[2];
-+    if (!ids->data || !w0->name || std::strncmp(w0->name, "blk.", 4) != 0) return;
-+    const int layer = std::atoi(w0->name + 4);
++    if (!ids->data || !w0->name || std::strstr(w0->name, "blk.") == nullptr) return;
++    const char * blk = std::strstr(w0->name, "blk.");
++    const int layer = blk ? std::atoi(blk + 4) : -1;
 +    const size_t isz = ggml_element_size(ids);
-+    const int32_t * base = (const int32_t *) ids->data;
++    // ids may live on a device backend (e.g. Vulkan0) mid-graph; read via sched
++    std::vector<uint8_t> raw(ggml_nbytes(ids));
++    ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(get_sched(), ids);
++    ggml_backend_tensor_get_async(ib, ids, raw.data(), 0, raw.size());
++    ggml_backend_synchronize(ib);
++    const int32_t * base = (const int32_t *) raw.data();
 +    for (int tt = 0; tt < ids->ne[1]; ++tt) {
 +        for (int k = 0; k < ids->ne[0]; ++k) {
 +            const int32_t e = base[(size_t) tt * (ids->nb[1] / isz) + (size_t) k * (ids->nb[0] / isz)];
@@ -470,7 +418,7 @@ index 0402044da..a59c574e8 100644
  int llama_context::decode(const llama_batch & batch_inp) {
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
-@@ -1936,6 +2287,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2293,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -490,7 +438,7 @@ index 0402044da..a59c574e8 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +2327,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2333,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -507,7 +455,7 @@ index 0402044da..a59c574e8 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -3532,6 +3906,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3912,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -517,7 +465,7 @@ index 0402044da..a59c574e8 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3930,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3936,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
@@ -629,22 +577,6 @@ index 6cb6dbd2f..3d1522068 100644
 +#endif
  
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
- 
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..4293ffe28 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -3744,6 +3744,11 @@ private:
- 
-             common_sampler_accept(slot.smpl.get(), id, true);
- 
-+#ifdef STREAM_MOE_PREFILL_EXPORT
-+            // StreamMoE: record the actually sampled token for export (flush on destruction)
-+            llama_export_add_token(slot.ctx_tgt, id);
-+#endif
-+
-             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-             const int64_t t_now = ggml_time_us();
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
 index 5fe2729ba..98f21a20b 100644

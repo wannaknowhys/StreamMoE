@@ -56,7 +56,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **prefill 数值一致**（token#0 hidden/embd cos≈1，4e-9 ulp），非 bit 级。
 - KV（f16 默认）逐层 cos ~0.98（f16 精度 + 生成部分）。
 - **prefill10000 产物保留为回归基准**（upstream 跑太慢）：`O:\1\deepseek\upstream|moe\prefill10000\`。
-- **专家历史 upstream 导出无效**（ids buffer 被 sched 回收）——**不做**（B4 决策）。
+- **专家历史 upstream 导出（2026-08-31 修复）**：VULKAN=ON 时 prefill 大图（如 119-token）的 MUL_MAT_ID 被 sched 分配到 Vulkan0，权重名带 `Vulkan0#` 前缀，旧的 `name[0]=='b'` / `strncmp("blk.",4)` 检查失败 + `ids->data` 不可直接读（GPU 内存）→ 中间 token 专家路由全缺。**修复（3 处，已并入 prefill-export-llama.patch）**：① 条件改 `strstr(name, "_exps")` 容忍前缀；② 层号用 `strstr("blk.")` 定位；③ ids 读取改 sched `get_async`（Vulkan0 GPU 内存不可直接 ids->data）。验证：131-token prefill + 16 decode = 148 token 专家历史完整（n=71040 = 148x30x16，ids 0-127 合法），与 VULKAN=OFF 一致。
 
 ### 引擎 spec（2026-08-30）
 - `moe.json`/`upstream.json`：`--temp 1.0`；`moe-temp0`/`upstream-temp0`：测试专用（temp 0 + top-k 1）。KV 无显式 cache-type（默认 f16）。`temp/gen_engines.js` 生成。
@@ -100,7 +100,6 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 **明确不做**（用户决策）
 - deepseek prefill 追 bit 级（A1）。
-- 专家历史 upstream 导出修复（B4）。
 - prefill 全 token 层状态验证（B5）。
 - v1 张量级分片（C6）。
 
