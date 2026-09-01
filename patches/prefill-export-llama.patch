@@ -63,7 +63,7 @@ index 000000000..c3c97d478
 @@ -0,0 +1 @@
 +        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..5624937b7 100644
+index 0402044da..ddf6b8207 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -406,7 +406,7 @@ index 0402044da..5624937b7 100644
 +            for (ggml_tensor * t : {tk, tv}) {
 +                uint64_t nb = t ? (uint64_t) ggml_nbytes(t) : 0;
 +                if (std::getenv("STREAM_MOE_DBG")) fprintf(stderr, "[dbg] kv t=%p nb=%llu cache=%s layer=%u\n", (void*) t, (unsigned long long) nb, name, il);
-+                if (t && nb > 1073741824ull) { t = nullptr; nb = 0; }
++                if (t && (!t->data || nb > 1073741824ull)) { t = nullptr; nb = 0; }
 +                uint32_t ty = t ? (uint32_t) t->type : 0;
 +                // tensor layout (ne/nb) so readers can slice per-token
 +                const int64_t * ne4 = t ? t->ne : nullptr;
@@ -681,10 +681,10 @@ index 6cb6dbd2f..3d1522068 100644
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 5fe2729ba..98f21a20b 100644
+index 5fe2729ba..d7a5265c2 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -112,6 +112,73 @@ int llama_server(int argc, char ** argv) {
+@@ -112,6 +112,84 @@ int llama_server(int argc, char ** argv) {
      return llama_server(params, argc, argv);
  }
  
@@ -741,9 +741,20 @@ index 5fe2729ba..98f21a20b 100644
 +    }
 +
 +    std::vector<int8_t> lg(toks.size(), 0);
-+    lg.back() = 1; // output only the last token
-+    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) toks.size());
-+    batch.logits = lg.data();
++    // use a full batch with explicit pos/seq_id - llama_batch_get_one leaves
++    // pos/seq_id null (auto-tracked) which hits a different batch-allocr path;
++    // the server's own decode always passes a fully populated batch.
++    const int32_t n_toks = (int32_t) toks.size();
++    llama_batch batch = llama_batch_init(n_toks, 0, 1);
++    batch.n_tokens = n_toks;
++    for (int32_t i = 0; i < n_toks; ++i) {
++        batch.token[i]     = toks[i];
++        batch.pos[i]       = i;
++        batch.n_seq_id[i]  = 1;
++        batch.seq_id[i][0] = 0;
++        batch.logits[i]    = 0;
++    }
++    batch.logits[n_toks - 1] = 1; // output only the last token
 +    const int rc = llama_decode(ctx, batch);
 +    llama_batch_free(batch);
 +    if (rc != 0) SRV_WRN("prefill-from: llama_decode returned %d\n", rc);
@@ -758,7 +769,7 @@ index 5fe2729ba..98f21a20b 100644
  int llama_server(common_params & params, int argc, char ** argv) {
      bool is_run_by_cli = (argv == nullptr);
  
-@@ -163,6 +230,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -163,6 +241,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
          params.model_alias.insert(model_name);
      }
  
@@ -772,7 +783,7 @@ index 5fe2729ba..98f21a20b 100644
      // note: this is guaranteed to out-live ctx_http and tools
      server_mcp mcp_mgr;
  
-@@ -244,6 +318,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -244,6 +329,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
      ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
      ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
