@@ -1,0 +1,8 @@
+{
+  "input": "en_long",
+  "feed": {
+    "type": "jsonl",
+    "path": "benchmark/prompts/en_long.jsonl",
+    "maxTurns": 1
+  }
+}
