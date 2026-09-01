@@ -1,11 +1,10 @@
 # StreamMoE build dispatcher (POSIX). Build rules live in CMakeLists.txt;
 # this Makefile only forwards to cmake + make/ninja.
-# Targets mirror build.bat: llamalibs | build | test | clean
+# Targets mirror build.bat: llamalibs | test | clean
 #   llamalibs: build vendored libllama static libs into build/<tag>/llama-build
-#   build    : configure + build stream_moe / stream_moe_server into build/<tag>/bin
 #   test     : build + run unit tests
 #   clean    : remove build/
-# Usage: make llamalibs TAG=main  |  make build TAG=main  |  make test TAG=main
+# Usage: make llamalibs TAG=main  |  make test TAG=main
 TAG ?= main
 BUILD := build/$(TAG)
 LLAMA_BUILD := $(BUILD)/llama-build
@@ -15,7 +14,7 @@ UNAME_S := $(shell uname -s)
 GENERATOR := $(if $(filter Linux%,$(UNAME_S)),Unix Makefiles,Ninja)
 NPROC := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 
-.PHONY: llamalibs build test clean help
+.PHONY: llamalibs test clean help
 
 llamalibs:
 	@mkdir -p $(LLAMA_BUILD)
@@ -25,13 +24,6 @@ llamalibs:
 		-DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON
 	$(CMAKE) --build $(LLAMA_BUILD) -j $(NPROC) --target llama llama-common-base
 	@echo [+] llamalibs done for tag $(TAG)
-
-build:
-	@test -f $(LLAMA_BUILD)/src/libllama.a || { echo "[-] run: make llamalibs TAG=$(TAG) first"; exit 1; }
-	$(CMAKE) -S . -B $(BUILD)/cmake -G $(GENERATOR) -DCMAKE_BUILD_TYPE=Release \
-		-DLLAMA_BUILD_DIR=$(abspath $(LLAMA_BUILD))
-	$(CMAKE) --build $(BUILD)/cmake -j $(NPROC) --target stream_moe stream_moe_server
-	@echo [+] Build SUCCESS: $(BUILD)/bin/stream_moe, $(BUILD)/bin/stream_moe_server
 
 test:
 	@test -f $(LLAMA_BUILD)/src/libllama.a || { echo "[-] run: make llamalibs TAG=$(TAG) first"; exit 1; }

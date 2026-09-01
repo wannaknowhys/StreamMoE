@@ -13,6 +13,11 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ## 2. 当前状态（✅ 已完成）
 
+### M4 收编：自研主项目删除（2026-08-31）
+- 删除 `src/main.cpp`、`src/server_main.cpp`、`src/engine/llama_engine.*`、`src/server/http_server.*`、`patches/prefill-export-streammoe.patch`（见 docs/UPSTREAM_TOOLS_MIGRATION.md）。
+- CMakeLists 去 `stream_moe`/`stream_moe_server` 目标（保留 test_*）；build.bat/Makefile 去 `build` 子命令（保留 llamalibs/test/convertd/clean）。
+- 推理/导出全走 vendored `llama-server`/`llama-cli`（route B 插件经 `src/server/route_b_inject.*` 注入）。
+
 ### vendored patch 体系（2026-08-31 重构，phase 结构 + 宏隔离，vendored 永不 commit）
 - **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
 - **5 个 patch**（`patches/`，phase 结构，`git apply --check` 验证叠加）：

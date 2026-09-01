@@ -27,11 +27,11 @@ build.bat llamalibs main && build.bat build main
 
 rem 2) 标准 run（无 --expert-backend）
 set "LLM_EXPORT_DIR=temp\export_std"
-build\main\bin\stream_moe.exe -m <model> --moe-ram-pool 71680 --temp 0 -p "..." -n 2
+build\main\llama-build\bin\llama-cli.exe -m <model> --moe-ram-pool 71680 --temp 0 -p "..." -n 2
 
 rem 3) StreamMoE run（--expert-backend）
 set "LLM_EXPORT_DIR=temp\export_moe"
-build\main\bin\stream_moe.exe -m <model> --moe-ram-pool 71680 --expert-backend --temp 0 -p "..." -n 2
+build\main\llama-build\bin\llama-cli.exe -m <model> --moe-ram-pool 71680 --expert-backend --temp 0 -p "..." -n 2
 
 rem 4) 对比
 node tools\verify_prefill.js temp\export_std\prefill_export.bin temp\export_moe\prefill_export.bin

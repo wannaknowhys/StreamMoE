@@ -73,19 +73,18 @@ StreamMoE/
 
 ```text
 src/
-├── main.cpp               CLI 入口（llama_engine）
-├── server_main.cpp        API server 入口
-├── common/                types.h（对齐/内存发现）、logger.h
+├── common/                types.h（对齐/内存发现）、logger.h、crash.cpp
 ├── backend/               route B：moe_backend（buft/backend 注册）、minigraph_exec（MUL_MAT_ID 委托）、scheduler（槽控制面/DIO/EST1）
-├── engine/                llama_engine（真实推理核心）
 ├── io/                    async_dio（Win IOCP 真异步）、staging_reader（扇区对齐读计划）
 ├── loader/                moe_loader（GGUF 拓扑 + 专家 read plan）
 ├── pool/                  expert_stats（EST1 热度）
 ├── profile/               profiler（RDTSCP + JSONL）
-└── server/                http_server（OpenAI 兼容 + SSE）
+└── server/                route_b_inject（route B 接线：tensor_buft_overrides + backend 注册）
 ```
 
 已删除 mock/废弃模块：`src/scheduler/`、`src/kv/`、`src/tokenizer/`、`engine/subgraph_executor`、`engine/speculative_engine`、`engine/state_machine`、`pool/expert_pool`。
+
+已删除自研主项目（M4，2026-08-31，迁移到 vendored llama-cli/llama-server）：`src/main.cpp`、`src/server_main.cpp`、`src/engine/llama_engine.*`、`src/server/http_server.*`、`patches/prefill-export-streammoe.patch`。推理/导出全走 vendored `llama-server`/`llama-cli`（route B 插件经 `server/route_b_inject.*` 注入）。
 
 ## 7. tests/（UT）
 

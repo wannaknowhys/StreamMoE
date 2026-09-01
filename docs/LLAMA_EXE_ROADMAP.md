@@ -8,8 +8,8 @@
 
 | 目标可执行程序 | 对标 llama.cpp 工具 | 核心职责与 StreamMoE 增强特性 | 状态 / 路线 |
 | :--- | :--- | :--- | :--- |
-| **`stream_moe`** | `llama-cli` / `llama-run` | **交互式多轮对话 REPL & 单次推理**：<br>• 支持流式 Token 实时打字机输出<br>• 支持多轮对话历史上下文保持与 Prompt Cache 复用<br>• 有界专家池（`--moe-ram-pool`）与多线程调度<br>• 显式输出 Context 长度与精确 KV Cache 显存/内存开销 | **✅ Ready**（build\main\bin\stream_moe.exe）|
-| **`stream_moe_server`** | `llama-server` | **OpenAI 兼容高并发流式 API 服务端**：<br>• `/v1/chat/completions` (支持 SSE 流式传输)<br>• `/v1/models`、`/health` 与 `/stats` 实时暴露专家命中、池占用<br>• 内置轻量异步 HTTP/JSON 引擎，零外部重量级依赖 | **✅ Ready**（build\main\bin\stream_moe_server.exe）|
+| **`stream_moe`** | `llama-cli` / `llama-run` | **交互式多轮对话 REPL & 单次推理**：<br>• 支持流式 Token 实时打字机输出<br>• 支持多轮对话历史上下文保持与 Prompt Cache 复用<br>• 有界专家池（`--moe-ram-pool`）与多线程调度<br>• 显式输出 Context 长度与精确 KV Cache 显存/内存开销 | **✅ 已迁移**（build\main\llama-build\bin\llama-cli.exe，原自研 stream_moe 已删，M4）|
+| **`stream_moe_server`** | `llama-server` | **OpenAI 兼容高并发流式 API 服务端**：<br>• `/v1/chat/completions` (支持 SSE 流式传输)<br>• `/v1/models`、`/health` 与 `/stats` 实时暴露专家命中、池占用<br>• 官方 server 全模块（OpenAI API、多槽、context-shift、tools） | **✅ 已迁移**（build\main\llama-build\bin\llama-server.exe，原自研 stream_moe_server 已删，M4）|
 | **`stream_moe_bench`** | `llama-bench` | **MoE 专属多维基准评测工具**：<br>• 自动化扫描缓存池容量下的 Cache Hit Rate 曲线<br>• 测量 Prefill 与 Decode 的 TPS、DIO 延迟分布<br>• 评估投机推理 (Speculative Decoding) 在不同 K 步长下的实际加速比 | **[ ] Phase 8** |
 | **`stream_moe_convert`** | `llama-quantize` / `convert_hf_to_gguf` | **4KB 扇区对齐零拷贝 GGUF 优化工具**：<br>• 重排 GGUF 文件：将 Header、Dense 权重与各专家数组强制 4KB 扇区对齐<br>• **革命性收益**：彻底消除 Staging 临时缓冲区与 `memcpy` 开销，实现 Direct I/O 直接直刷进 Pinned Slot 物理内存 | **[ ] Phase 9** |
 | **`stream_moe_perplexity`**| `llama-perplexity` | **困惑度与量化精度验证工具**：<br>• 在 Wikitext-2 等标准数据集上评估流式 Offload 下的 PPL 准确性<br>• 验证动态专家调度与指针重绑定的数值一致性 | **[ ] Phase 10** |

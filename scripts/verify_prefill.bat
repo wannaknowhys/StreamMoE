@@ -3,9 +3,9 @@ rem Quick prefill cross-validation on ONE prompt: std vs --expert-backend export
 rem Uses the UPSTREAM llama-cli (build\<tag>\llama-build\bin).
 rem Usage: verify_prefill.bat ["prompt text"]   (default: "Say hi.")
 rem
-rem NOTE: the prefill/KV/expert-history EXPORT (LLM_EXPORT_DIR + prefill-export
-rem patch) is NOT yet re-wired for the upstream CLI - verify/simulate will
-rem report missing files until then.
+rem NOTE: export is env-gated below (legacy llama_engine style). The vendored
+rem llama.cpp path uses `--export-dir` instead (llama-context.cpp cb_eval capture,
+rem prefill-export-llama.patch); re-wiring this script to `--export-dir` is pending.
 setlocal
 set "PROMPT=%~1"
 if "%PROMPT%"=="" set "PROMPT=Say hi."

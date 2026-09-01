@@ -15,7 +15,7 @@
 ```bat
 rem 应用 patch 并重建后（见 patches/README.md 或 PREFILL_CROSS_VALIDATION.md）
 set "LLM_EXPORT_DIR=temp\export_std"
-build\main\bin\stream_moe.exe -m <model> --moe-ram-pool 71680 --expert-backend --temp 0 -p "<长 prompt>" -n <N>
+build\main\llama-build\bin\llama-cli.exe -m <model> --moe-ram-pool 71680 --expert-backend --temp 0 -p "<长 prompt>" -n <N>
 rem 产出 temp\export_std\expert_history.bin
 node tools\simulate_cache.js temp\export_std\expert_history.bin [maxSlots]
 ```

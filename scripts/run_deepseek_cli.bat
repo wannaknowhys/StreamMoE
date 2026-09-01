@@ -20,7 +20,7 @@ set MODEL=N:\AI_LLM\DeepSeek-V4-Flash-0731\DeepSeek-V4-Flash-0731-UD-Q8_K_XL-000
 set BIN=build\main\llama-build\bin\llama-cli.exe
 
 if not exist "%BIN%" (
-    echo [-] %BIN% missing. Run: build.bat llamalibs main ^&^& build.bat build main
+    echo [-] %BIN% missing. Run: build.bat llamalibs main
     pause
     exit /b 1
 )

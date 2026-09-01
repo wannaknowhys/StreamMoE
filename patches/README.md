@@ -44,14 +44,14 @@
 - **`gguf-alignment.patch` 独立**：转换器工具（`tools/stream_moe_layout.js` 需要 `gguf_set_alignment`），改 ggml gguf.h/cpp——**与推理构建无关，不入 phase 2b 构建过程**；可任意时 apply。
 - **组合任意**：只 2a / 只 2b / 2a+2b / 都不——各功能 patch 只新增自己的文件 + 各自命名的 .frag（不同名），apply 层零交集；编译时 `-D` 宏选功能（`STREAM_MOE_ROUTE_B` / `STREAM_MOE_PREFILL_EXPORT`）。
 
-**编译目录（vendored llama-server 变体，主项目 stream_moe 已废弃）**：
+**编译目录（vendored llama-server 变体；自研主项目 stream_moe/stream_moe_server 已于 M4 删除，见 docs/UPSTREAM_TOOLS_MIGRATION.md）**：
    ```
    build/main             phase 2a（route-b 完整推理，生产主线）
    build/upstream_dump    phase 2b（prefill 导出——标准上游行为基准，无 route-b）
    build/StreamMoE_dump   2a+2b（完整 StreamMoE 导出，与 upstream_dump 对比）
    build/convertd         转换器哑服务（独立工具，裸 TCP + ws2_32.lib）
    ```
-   `build.bat llamalibs/build <tag>` 按 tag 传宏：`main`→`-DSTREAM_MOE_ROUTE_B`；`upstream_dump`→`-DSTREAM_MOE_PREFILL_EXPORT`；`StreamMoE_dump`→两者；`convertd` 无宏。
+   `build.bat llamalibs <tag>` 按 tag 传宏：`main`→`-DSTREAM_MOE_ROUTE_B`；`upstream_dump`→`-DSTREAM_MOE_PREFILL_EXPORT`；`StreamMoE_dump`→两者；`convertd` 无宏。
 
 **当前状态（2026-08-30 整理）**：vendored 子模块 HEAD 已回滚到纯上游 `f280b2698`，工作区完全干净；
 StreamMoE 全部改动只存在于上述 patch（含 spec-stats/export-args 并入项，vulkan 走 build.bat），按顺序 apply 可完整复现。
@@ -123,7 +123,7 @@ build.bat build memwatch
 ```
 
 **运行与观测**：
-- 单 prompt：`build\memwatch\bin\stream_moe.exe -m <model> --moe-ram-pool 71680 -c 4096 -t 16 -p "..." -n 24`
+- 单 prompt：`build\main\llama-build\bin\llama-cli.exe -m <model> --moe-ram-pool 71680 -c 4096 -t 16 -p "..." -n 24`
 - 长测试：`scripts\run_long_horizon_test.bat en memwatch`
 - 日志：`%TEMP%\memwatch_<pid>.log`，每行含 `调用点|size|ptr|WS|PRIV|COMMIT|FILEBK|SYS_AVAIL|SYS_TOTAL`。
 - **判定**：`WS` 大而 `PRIV` 小 → file-backed 页驻留；`PRIV` 也大 → 真实私有拷贝/泄漏。`FILEBK` = WS-PRIV。

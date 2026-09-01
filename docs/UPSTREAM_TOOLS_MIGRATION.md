@@ -1,6 +1,6 @@
 # 迁移到原版 llama.cpp Tools：CLI + Server 重构计划 (UPSTREAM_TOOLS_MIGRATION.md)
 
-> 状态：**计划（草案）**。目标：废弃自研 `main.cpp` / `server_main.cpp` / `http_server`，改用 vendored llama.cpp 原版 `llama-cli`（CLI）与 `llama-server`（OpenAI 兼容服务端），复用原版 `common/` 库，route B 作为插件注入。
+> 状态：**M4 已完成（2026-08-31）**。自研 `main.cpp` / `server_main.cpp` / `http_server` / `engine/llama_engine.*` 已删除（含 `prefill-export-streammoe.patch`），推理/导出全部走 vendored llama.cpp 原版 `llama-cli`（CLI）与 `llama-server`（OpenAI 兼容服务端），route B 作为插件注入（`server/route_b_inject.*`）。prefill 导出的 LLM_EXPORT_DIR 功能已由 `--export-dir` + cb_eval 捕获取代（llama-context.cpp，prefill-export-llama.patch）。
 > 前提结论：**我们的 KV cache 一直是原版**（llama.cpp 原版流程），之前"自研 server 报告"是唯一偏离点，已改为原版 API。本次迁移把"外壳"也全部交给原版。
 
 ---
@@ -124,7 +124,7 @@ llama-server --expert-backend --moe-ram-pool 71680 -m deepseek4.gguf
 2. **M1 构建接入**：`build.bat` 构建 `llama-cli llama-server`（链接 llama-common），产出到 `build/<tag>/bin/`；跑通原版 server 加载 deepseek4（无 route B）。
 3. **M2 参数迁移**：删我们 `--cache-type/--no-swa-full/--kv-placement`；脚本/文档改用原版 `--cache-type-k/-v/--swa-full/-ngl`；验证 KV 报告（原版 `/metrics` 与启动日志 cells）。
 4. **M3 route B 注入**：common/arg.cpp 4 参数 + server-context 注入；`--expert-backend` 跑通并复跑数值等价回归（compare_trace / verify_prefill）。
-5. **M4 收编**：删 `http_server/server_main/main/llama_engine`；profile/prompt-log 按 §4.2 挂钩；crash 兜底接入；tests 适配（原版参数名）。
+5. **M4 收编**：~~删 `http_server/server_main/main/llama_engine`~~（**已完成 2026-08-31**：删除 `src/main.cpp`/`src/server_main.cpp`/`src/engine/llama_engine.*`/`src/server/http_server.*`/`prefill-export-streammoe.patch`；CMakeLists 去 stream_moe 目标，build.bat/Makefile 去 build 子命令；profile/prompt-log 按 §4.2 挂钩；crash 兜底接入；tests 适配（原版参数名）。
 6. **M5 长程回归**：`run_long_horizon_test.bat` / `run_prefill_verify.bat` 改用原版 server 命令 + `--swa-full` 与否两组对比。
 7. **M6 设备后端**：CMake/构建暴露 GGML_VULKAN/CUDA/... 开关（本机先 Vulkan）。
 
@@ -142,7 +142,7 @@ llama-server --expert-backend --moe-ram-pool 71680 -m deepseek4.gguf
 
 ## 9. 决策点（评审时拍板）
 
-1. 删除 `llama_engine` 的导出功能（任务一/二）降级为 diagnostics 工具，还是迁移到原版 server 注入？
+1. ~~删除 `llama_engine` 的导出功能（任务一/二）降级为 diagnostics 工具，还是迁移到原版 server 注入？~~ **已决（2026-08-31）**：导出已在 llama-context.cpp 以 `--export-dir` + cb_eval 实现（prefill-export-llama.patch），llama_engine 直接删除，无需 diagnostics 迁移。
 2. `--profile-log`（JSONL 遥测）：保留自定义 JSONL，还是直接用原版 `--metrics`（Prometheus）？
 3. 首期是否直接支持 `--parallel` 多槽，还是先 `--parallel 1`？
 4. models/*.cpp 保留（已定）；设备后端开关是否首期就加 Vulkan？

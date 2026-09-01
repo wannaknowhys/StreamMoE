@@ -33,7 +33,6 @@ set(CORE_SRCS
     src/io/staging_reader.cpp
     src/loader/moe_loader.cpp
     src/pool/expert_stats.cpp
-    src/engine/llama_engine.cpp
     src/profile/profiler.cpp
 )
 if(WIN32)
@@ -72,12 +71,6 @@ function(streammoe_target tgt)
             "${LLAMA_BUILD_DIR}/ggml/src/libggml-cpu.a")
     endif()
 endfunction()
-
-add_executable(stream_moe ${CORE_SRCS} src/main.cpp)
-streammoe_target(stream_moe)
-
-add_executable(stream_moe_server ${CORE_SRCS} src/server/http_server.cpp src/server_main.cpp)
-streammoe_target(stream_moe_server)
 
 # ---- unit tests ----
 enable_testing()

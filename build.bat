@@ -102,29 +102,6 @@ copy /Y "%LIBOMP:.lib=.dll%" "%LLAMA_BUILD%\bin\libomp.dll" >nul
 echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
-:build
-if not exist "%LLAMA_BUILD%\src\llama.lib" (
-    echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
-    exit /b 1
-)
-echo [StreamMoE] Configuring StreamMoE (cmake+ninja, tag %TAG%) ...
-"%CMAKE%" -S . -B "%OUT%\cmake" -G Ninja ^
-    -DCMAKE_MAKE_PROGRAM=%NINJA% ^
-    -DCMAKE_C_COMPILER=%CLANG% ^
-    -DCMAKE_CXX_COMPILER=%CLANGXX% ^
-    -DCMAKE_RC_COMPILER=%RC% ^
-    -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
-    -DLLAMA_BUILD_DIR="%CD:\=/%/%LLAMA_BUILD:\=/%" ^
-    -DSTREAMMOE_LIBOMP=%LIBOMP%
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-echo [StreamMoE] Building stream_moe + stream_moe_server ...
-"%NINJA%" -C "%OUT%\cmake" stream_moe stream_moe_server
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
-echo [+] Build SUCCESS: %OUT%\bin\stream_moe.exe, %OUT%\bin\stream_moe_server.exe
-exit /b 0
-
 :test
 if not exist "%LLAMA_BUILD%\src\llama.lib" (
     echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
@@ -171,7 +148,6 @@ exit /b 0
 :help
 echo StreamMoE Build Utility (thin dispatcher over cmake+ninja; rules in CMakeLists.txt)
 echo Usage:
-echo   build.bat build      - Build stream_moe.exe and stream_moe_server.exe
 echo   build.bat llamalibs  - Configure and build vendored libllama static libs only
 echo   build.bat test       - Build and run all unit tests
 echo   build.bat clean      - Remove build\ (all tags)
@@ -180,6 +156,5 @@ echo   llamalibs main           - route-B llama-server (build\main)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
 echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
 echo   build.bat convertd       - build converter TCP service (build\convertd)
-echo   build.bat build memwatch - build under build\memwatch\bin (legacy main-project build)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0
