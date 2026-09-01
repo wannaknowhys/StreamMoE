@@ -119,19 +119,3 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +#include "stmoe_prefill_server_nout.frag"
 +#endif
          const bool has_mmproj = !params.mmproj.path.empty();
- 
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -811,7 +811,10 @@
-     ~server_context_impl() {
-         if (!sleeping) {
-             // destroy() is already called when entering sleeping state
-             // we don't call it again here to avoid double free
-+#ifdef STREAM_MOE_PREFILL_EXPORT
-+#include "stmoe_prefill_server_tokens.frag"
-+#endif
-             destroy();
-         }
-     }
- 
