@@ -1,3 +1,61 @@
+diff --git a/common/stmoe_prefill_args.frag b/common/stmoe_prefill_args.frag
+new file mode 100644
+index 000000000..3e342d83e
+--- /dev/null
++++ b/common/stmoe_prefill_args.frag
+@@ -0,0 +1,16 @@
++    add_opt(common_arg(
++        {"--export-dir"}, "DIR",
++        "StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env). "
++        "When set, embd/hidden/top-4 logits/tokens are captured in-graph and flushed on exit.",
++        [](common_params & params, const std::string & value) {
++            params.export_dir = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--prefill-from"}, "PATH",
++        "StreamMoE: prefill-only mode - read tokens (.bin = u32 id array) or plain text (.txt, "
++        "auto-tokenized), prefill the KV cache, export it, then exit.",
++        [](common_params & params, const std::string & value) {
++            params.prefill_from = value;
++        }
++    ));
+diff --git a/common/stmoe_prefill_common_params.frag b/common/stmoe_prefill_common_params.frag
+new file mode 100644
+index 000000000..83940ea08
+--- /dev/null
++++ b/common/stmoe_prefill_common_params.frag
+@@ -0,0 +1,2 @@
++    std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
++    std::string prefill_from; // StreamMoE: prefill-only mode - read tokens (.bin) or prompt (.txt), prefill KV, export, exit
+diff --git a/common/stmoe_prefill_ctx.frag b/common/stmoe_prefill_ctx.frag
+new file mode 100644
+index 000000000..3d96d4bf1
+--- /dev/null
++++ b/common/stmoe_prefill_ctx.frag
+@@ -0,0 +1 @@
++    cparams.export_dir        = params.export_dir;
+diff --git a/include/stmoe_prefill_llama_apis.frag b/include/stmoe_prefill_llama_apis.frag
+new file mode 100644
+index 000000000..16e7b7639
+--- /dev/null
++++ b/include/stmoe_prefill_llama_apis.frag
+@@ -0,0 +1 @@
++LLAMA_API void llama_export_add_token(struct llama_context * ctx, llama_token token);
+diff --git a/include/stmoe_prefill_llama_includes.frag b/include/stmoe_prefill_llama_includes.frag
+new file mode 100644
+index 000000000..d5a732287
+--- /dev/null
++++ b/include/stmoe_prefill_llama_includes.frag
+@@ -0,0 +1 @@
++#include <string>
+diff --git a/include/stmoe_prefill_llama_params.frag b/include/stmoe_prefill_llama_params.frag
+new file mode 100644
+index 000000000..c3c97d478
+--- /dev/null
++++ b/include/stmoe_prefill_llama_params.frag
+@@ -0,0 +1 @@
++        std::string export_dir;   // StreamMoE: prefill/embedding/logit export directory (replaces LLM_EXPORT_DIR env)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 0402044da..b2ead0e59 100644
 --- a/src/llama-context.cpp

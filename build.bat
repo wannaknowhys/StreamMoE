@@ -45,22 +45,25 @@ rem backends via --split-mode/--tensor-split). LLAMA_BUILD_TOOLS controls the
 rem upstream llama-cli/llama-server build (default ON).
 if "%LLAMA_BUILD_TOOLS%"=="" set LLAMA_BUILD_TOOLS=ON
 rem STREAM_MOE feature macros by tag (build.bat llamalibs <tag>):
-rem   main            -> -DSTREAM_MOE_ROUTE_B          (route-B full inference, production)
-rem   upstream_dump   -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export, standard upstream baseline)
-rem   StreamMoE_dump  -> both                          (full StreamMoE export, vs upstream_dump)
+rem   main                  -> -DSTREAM_MOE_ROUTE_B          (route-B full inference, production)
+rem   upstream_dump         -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export, no vulkan baseline)
+rem   upstream_vulkan_dump  -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export + vulkan, for Vulkan0 comparison)
+rem   StreamMoE_dump        -> both                          (full StreamMoE export, vs upstream_dump)
 set STREAM_MOE_MACROS=
-if "%TAG%"=="main"           set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B
-if "%TAG%"=="upstream_dump"  set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
-if "%TAG%"=="StreamMoE_dump" set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B -DSTREAM_MOE_PREFILL_EXPORT
+if "%TAG%"=="main"                 set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B
+if "%TAG%"=="upstream_dump"        set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
+if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
+if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B -DSTREAM_MOE_PREFILL_EXPORT
 rem ---- CPU arch + backend by tag ----
 rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
 rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
 rem         to znver3 (5950X) for now.
-rem   upstream_dump / StreamMoE_dump: dump tools, local - znver3 + vulkan backend.
+rem   upstream_dump: prefill export, no vulkan (clean upstream baseline).
+rem   upstream_vulkan_dump / StreamMoE_dump: vulkan backend for Vulkan0 comparison.
 set STREAM_MOE_CPU_FLAGS=-march=znver3
 set GGML_VULKAN_DEFAULT=OFF
-if "%TAG%"=="upstream_dump"  set GGML_VULKAN_DEFAULT=ON
-if "%TAG%"=="StreamMoE_dump" set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
 if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF
