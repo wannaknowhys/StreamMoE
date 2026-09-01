@@ -63,7 +63,7 @@ rem   upstream_vulkan_dump / StreamMoE_dump: vulkan backend for Vulkan0 comparis
 set STREAM_MOE_CPU_FLAGS=-march=znver3
 set GGML_VULKAN_DEFAULT=OFF
 if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
-if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
+rem StreamMoE_dump (route-B moe) is CPU-only - vulkan is for upstream comparison only.
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
 if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF

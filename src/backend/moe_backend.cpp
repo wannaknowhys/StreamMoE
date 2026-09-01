@@ -200,6 +200,16 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     backend->iface.synchronize = [](ggml_backend_t) {};
     backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
         auto* bctx = static_cast<moe_backend_ctx*>(b->context);
+        // If this sub-graph has no MoE (MUL_MAT_ID) compute - pure view/layout or
+        // other nodes (data is already computed by their src) - there is nothing
+        // for the expert pool to do: succeed without touching anything.
+        bool has_moe = false;
+        for (int i = 0; i < cgraph->n_nodes && !has_moe; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) has_moe = true;
+        }
+        if (!has_moe) {
+            return GGML_STATUS_SUCCESS;
+        }
         // resolve the owning scheduler by the weight buft of this graph's nodes
         // (each model pool has its own expert buft - see MULTI_MODEL_POOL.md)
         expert_scheduler* sched = nullptr;
