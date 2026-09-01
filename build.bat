@@ -101,7 +101,14 @@ if "%GGML_VULKAN%"=="ON" (
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 "%NINJA%" -C "%LLAMA_BUILD%" llama llama-cli llama-server
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-copy /Y "%LIBOMP:.lib=.dll%" "%LLAMA_BUILD%\bin\libomp.dll" >nul
+rem OpenMP runtime DLL lives in the LLVM bin dir (lib/libomp.dll does not exist) -
+rem copy it next to the binaries or llama-server dies with STATUS_DLL_NOT_FOUND.
+for %%I in ("%CLANG%") do set LLVM_BIN_DIR=%%~dpI
+copy /Y "%LLVM_BIN_DIR%libomp.dll" "%LLAMA_BUILD%\bin\libomp.dll" >nul
+if %ERRORLEVEL% NEQ 0 (
+    echo [-] failed to copy libomp.dll from "%LLVM_BIN_DIR%"
+    exit /b %ERRORLEVEL%
+)
 echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
