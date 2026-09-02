@@ -173,31 +173,20 @@ intermediates never leaving the block, so cross-device traffic is only the small
 items (§5). Watch: in-place overwrite ordering per chain step (layers are serial
 so safe; explicit read/write windows needed).
 
-### 4.1 Multi-location scheduling primitives
+### 4.1 Scheduling: slot-level mechanics (per-pool local)
 
-The directory already models "**non-inclusive, non-exclusive read-mostly
-multi-location cache**": entries `(layer, expert) x pool` let one expert hold
-positions on several devices at once (like a page cache with replicas); `scan`
-finds the first available. Scheduler scope = one (model, expert-kind) x all
-`device_pool[]` copies (main + draft pools included; heterogeneous expert kinds
-kept as separate pools).
+Mechanism level operates on **slots**, not on an expert-placement policy:
 
-Primitives (VRAM<->VRAM relocation deliberately skipped - a GPU-to-GPU move is
-not worth it; re-read/DIO instead):
-
-| primitive | semantics | essence |
-|---|---|---|
-| `ensure(ram)` | expert usable in RAM (pin) | directory RAM entry + DIO load |
-| `ensure(vram)` | expert usable in VRAM | directory VRAM entry + load (DIO-into-VRAM or RAM->copy) |
-| `move ram->vram` | relocate residency to VRAM | vram alloc + content copy/re-read + dual-entry transition + release old |
-| `move vram->ram` | reverse | reverse |
-
-- `ensure` = read-to-X, idempotent (= today's pin/wait with a target-pool
-  parameter).
-- `move` = build the new-location copy first, then drop the old (dual entries
-  briefly - the non-exclusive model allows it, nothing is ever lost).
-- Replicas make eviction "evict a copy": each pool's entry is scored/evicted
-  independently.
+- the directory records (L,E) -> (pool, slot); one expert may hold several
+  positions at once (non-inclusive, non-exclusive read-only replicas); `scan`
+  finds the first usable.
+- a pool is a bounded set of slots with its own budget and its **own local
+  eviction**: eviction happens because THAT pool is full - look inside that pool
+  for what leaves; never a cross-pool judgement about the expert.
+- primitives: load content into a slot (DIO into RAM or VRAM), move slot content
+  between pools (RAM<->VRAM; no VRAM<->VRAM - a GPU-to-GPU move is not worth it,
+  re-read/DIO instead), release a slot (evict that copy).
+- replicas make eviction per-copy: each pool evicts its own slots.
 
 ## 5. Gate vs expert chain: the boundary rule
 
@@ -263,10 +252,12 @@ then decide whether a custom layer table earns its keep.
 
 ## 8. Milestones (risk-decreasing)
 
-- **M1** - CPU-only self-scheduling skeleton: two fake device_pools (both CPU,
-  independent pools + arenas) to pin down ids-grouping / dispatch / per-pool
-  subset chain / merge logic and numerics == official (v2 alignment). Defines
-  the self-scheduler interface.
+- **M1** - CPU-only private-chain skeleton: per-layer private mini-graph
+  (topology replayer for the gemma arch; official kernels, intermediates in our
+  arena, only cur/moe_out on the main graph) + two fake device_pools (both CPU,
+  independent pools + arenas) to pin down ids-grouping / per-pool subset chain /
+  merge logic and numerics == official (v2 alignment). Defines the
+  self-scheduler interface and the chain-topology replayer.
 - **M2** - device_pool[] lands (backend handle / slot addressing / fixed arena);
   one real Vulkan device + CPU mixed, exercise gate-follows-dense + lead-merge
   live + the graph_compute exit sync discipline.
@@ -284,3 +275,31 @@ then decide whether a custom layer table earns its keep.
 - `GGML_VULKAN=ON` builds clean; `libomp.dll` must sit next to the exe.
   Realistic target stays: dense on Vulkan + hot experts on GPU + most experts
   in RAM.
+
+## 10. Structural clarifications (2026-09, post-review)
+
+Calibration notes so the design is not misread later.
+
+1. **Execution form = private chain mini-graph, NOT a second scheduling tree.**
+   "Execute the original, own the data": replay the main graph's chain topology
+   (official kernels, original order) in a private ctx per layer; intermediates
+   live in our arena; only cur (in) and moe_out (out) touch the main graph.
+   No second orchestration tree - the private mini-graph topology is a mirror of
+   the main-graph chain segment, so consistency is by construction, not by
+   runtime agreement.
+2. **Cross-split synchronisation is accepted.** Per layer = one dense split +
+   one of-our split alternation is the original sched structure anyway; sync
+   cost vs tokens/s is not a bottleneck - do not optimise for it.
+3. **Verify**: Check 1 (build-time: no external consumer of a privatised
+   intermediate) is the admission gate. Check 2 (chain integrity inside
+   `graph_compute`) stays as a cheap execution-side self-check - not a
+   cross-layer interface.
+4. **Scheduling is slot-level and per-pool local** (§4.1): eviction happens only
+   because that pool is full; the directory is a location record, not a policy.
+5. **The real structural cost is the chain-topology replayer**: rebuilding a
+   layer's chain in the private ctx must mirror `build_moe_ffn` per arch (gemma:
+   fused gate_up + view split; deepseek: separate gate/up/down; ...). One
+   replayer to keep in sync per arch. M1 implements the gemma topology only;
+   the interface leaves arch branches open.
+6. **Multi-copy pipeline (n_copies > 1)**: coding note - the split must read
+   the `cur_copy`'s inputs; not a design-direction issue.
