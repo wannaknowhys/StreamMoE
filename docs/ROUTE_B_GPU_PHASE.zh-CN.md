@@ -1,79 +1,132 @@
 [English](ROUTE_B_GPU_PHASE.md) | [简体中文](ROUTE_B_GPU_PHASE.zh-CN.md)
 
-# Route B GPU 混合池设计方案（Phase B）
+# Route B 多设备专家池设计方案（Phase B）
 
-> 状态：设计（2026-08-29）。基于 route B 第三路径（官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽池，`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7）。
-> 已在 vendored llama.cpp @ 5ab785cf8 核实：Vulkan 与 CUDA 均原生支持 `MUL_MAT_ID` 与池槽 3D 布局。
-> 相关：`docs/MULTI_MODEL_POOL.md`（每模型池）、`docs/MULTI_SUBPOOL.md`（按专家种类子池）、`docs/Backend.md` §1（CPU/GPU 双池并发）。
+> 状态：设计，**2026-09 重写**（取代 2026-08-29 旧版——旧版的"cb_eval pin/unpin + 逐节点
+> hijack + HOST_VISIBLE 放置"模型被下述"整层自调度"主线替换）。基于 route B 第三路径
+> （官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽池，`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7）。
+> 保留的已验证事实：Vulkan 与 CUDA 原生支持 `MUL_MAT_ID` 与池槽 3D 布局；RX 590 暴露真实
+> 8 GiB `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` 堆；GGML_VULKAN=ON 可干净构建。
+> 相关：`docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md`、`docs/Backend.md`。
 
-## 目标
+## 1. 目标与主线
 
-扩展 route B，让部分专家可驻留 GPU 池（VRAM），其余留在 CPU 池；物理内存仍受池预算约束（`--moe-ram-pool` / `--moe-vram-pool`）。模型无关，不改 llama.cpp 数学 / 图拓扑 / 调度。
+被选专家分布到多个设备池（CPU RAM + GPU 显存），各池由预算有界；GPU 是一等算力节点
+（不是存储）。MoE 执行**不是**在 llama 图上逐节点：stream_moe backend 在 `graph_compute`
+里**收整层 MoE** 并**自调度**——读 ids → 解析每个专家的池 → 按设备分派子集 → 每设备在
+自己的固定执行区内跑专家链 → 汇总 → 写回层输出。
 
-## 架构：三根柱子，各管一摊
+**2026-09 已确认主线**：compute 收整层、自调度到各设备——这是必选项不是可选项。
 
-| 柱子 | 归属 | 职责 |
-| :--- | :--- | :--- |
-| 计算劫持 | `stream_moe` backend | 所有消费 ids 的 `MUL_MAT_ID` 被劫持——src0 就地改指池槽布局，官方内核执行。 |
-| pin/unpin 生命周期 | `cb_eval` 钩子 | 产生 ids 处 pin、专家用完处（汇合节点）unpin。与计算解耦。 |
-| 异步加载引擎 | scheduler | IOCP（Win）/ io_uring（Linux）/ io_submit fallback——并发 in-flight 读、wait-on-address 唤醒。 |
+## 2. 现状机制（哪些保留、哪些扩展）
 
-## 1. 计算劫持（就地池槽改写）
+- **为何注册 backend**：注册 ggml backend/device 拿到调度器的正式 `graph_compute` 回调。
+  `supports_op` 只认 `*_exps` 的 MUL_MAT_ID（+ 源在我们 host compute buft 的视图）；sched
+  恰把这类节点交给我们（每节点一次、顺序正确）。不计划用图手术替代它。
+- **mini-graph 现状**：每个原 MUL_MAT_ID 在私有 leaf-only mini-graph 里用**官方内核**重算：
+  `w3d` leaf 把池的紧凑槽伪装成 `[ne0, ne1, group_slots]`（data=池基址+分支偏移，nb[2]=槽
+  stride），`ids_slot` 把专家 id 翻译成槽索引，`b_leaf` 包主图激活，结果写主图 dst。
+  CPU-only、零拷贝（同 RAM）。
+- **通知协议**：compute→调度 = MPSC 入队 + 睡在 per-(L,E) 版本字；调度→compute = 版本
+  bump + `WakeByAddressAll`/futex 唤醒（目录 set/clear + slot_meta 状态机）。该协议
+  **与设备无关、保留**——compute 等"(L,E) 可用"，醒来重扫所有池。
 
-MoE 节点保留在主图（`build_moe_ffn` 的 `ggml_mul_mat_id`）。backend 的 `graph_compute` 收集它们，用官方内核按池槽布局执行：
+到"整层自调度"的差距不是"多收节点"：而是**层内激活链（gate_up→view gate/up→silu→加权
+→down）的执行权**——今天它在 llama 各 buffer 间跑。链不在手里，跨设备必然拷大中间。
 
-- src0 就地改三字段：`ne[2]: n_expert→n_slots`、`nb[2]: 专家stride→槽stride`、`data: dummy→池基址+分支off`（`ne[0]/ne[1]` 不变——每专家权重形状相同；官方内核按 `e*nb[2]` 索引，正好吃槽号）。
-- ids 翻译：专家 id → 槽索引（pin 时映射已定）。
-- `ggml_backend_graph_compute(backend, 子图)` 官方内核执行。
+## 3. 目标模型：整层自调度
 
-CPU-only 今天：一个子图，委托 `cpu_backend`。GPU 混合：按专家所在池把 ids 拆成 `cpu_ids` / `gpu_ids` -> **每池一个子图**（单个 src0 无法同时描述两个池）——CPU 子图到 `cpu_backend`、GPU 子图到 `vulkan_backend`，按 token/专家归属拼回 dst，两组并发。
+llama 主图照常构建每层 MoE 节点（can_reuse/plan 稳定）。`supports_op` 扩展到整层 MoE
+域（`blk.N.ffn_moe_*` 名字：gate_up/silu/down/视图/加/乘）。执行时 `graph_compute` 收到
+一层的 MoE split，然后：
 
-已在 vendored llama.cpp @ 5ab785cf8 核实的关键事实：
+1. 读 ids（`ffn_moe_topk-N`；softmax/topk 门控留在图/dense 侧——ids 已算好）
+2. 每个 (L,E) 解析到池槽（目录 scan，pin/wait 同现状）
+3. 选该层**主执行设备**（§5）
+4. 分派：非主设备各拿子集（ids 切片 + weights 切片）
+5. 每设备：在自己的固定区内跑专家链（该 backend 的官方 mul_mat_id + silu/mul/add）；
+   大中间不离开区
+6. 汇总专家贡献（embd 维小量）回主设备，写主图 `ffn_moe_out-N` dst
 
-- Vulkan：`supports_op` 处理 `MUL_MAT_ID`（`ggml-vulkan.cpp:18120`）；AMD vendor 分支启用 `mul_mat_id_s/m`（small/medium warp tile，`mul_mat_id_l=false`）；src0 类型覆盖 Q4_K / Q5_1 / Q8_0（gemma 异构全类型）。
-- CUDA：原生 `MUL_MAT_ID` 支持（`ggml-cuda.cu:2252` supports_op + 专用 `mul_mat_id` / up-gate 融合内核 `:1684`）。
-- **注意**：后端的 `supports_buft` 不认 stream_moe 池 buft——所以 GPU 子图 src0 必须是**后端自己的 buffer（GPU 池）**，不是池 buft。GPU 池 = 一块 vulkan buffer（DEVICE_LOCAL 或 HOST_VISIBLE），槽权重拷入（DIO→host→device，或 HOST_VISIBLE 直写）。
+动态（哪些专家、在哪个设备、主设备选择）全在执行层；图/reuse 形状静态。这是自调度路线
+的架构核心收益。
 
-## 2. pin/unpin 生命周期（cb_eval）
+## 4. device_pool[] + 每设备固定执行区
 
-pin 需要 ids 的**值**（运行时张量）——所以"产生 ids 处 pin"实际是"ids 就绪的图执行点 pin"：
+现状单池代码的目录已带 pool 维（entries 是 (L,E)×pool，scan 扫多池）——保留。要改的是
+**物理槽寻址**（今天一个基址 carve 层组）：
 
-- **hash 层**（`il < dsv4_hash_layer_count`，`deepseek4.cpp:1279`——确定性 `get_rows(ffn_gate_tid2eid, tokens)`）：token 已知即 ids 已知 -> **构建期**就异步 pin（免费完美预取）。注意：hash 是浅层，argsort 是深层。
-- **argsort 层**：`cb_eval` 没有"执行后"回调，所以 pin 落在**该层第一个 `MUL_MAT_ID`**（拓扑序保证 ids 已就绪）：读 `src[2]`、对未预取的专家异步补 pin、等 ready（wake-on-ready，非忙等）、放行。
-- **unpin 挂汇合节点**（`mul(expert_out, weights)` / `add`）：这些是消费 down 输出的 CPU 逐元素节点——sched 的边界事件同步保证 GPU 子图在它们执行前已完成——所以在此 unpin 是 GPU 完成的**权威确认点**（搭 sched 事件同步便车，无需额外 `backend_synchronize`）。unpin 略晚安全（只是多占一会槽）。
+```
+device_pool[] = {
+  ggml_backend 句柄,
+  物理基址(显存/内存), 槽 stride, 容量,
+  每池层组划分(subpools_), 每池槽 meta(state/refcount/generation) 或带 pool 维的全局索引,
+  固定执行区,
+}
+```
 
-`cb_eval` 是每节点回调且强制同步——CPU-only 无妨，GPU 混合会吃掉异步收益。GPU 阶段 pin/unpin 可能回归 `graph_compute` 内部（天然有每 split 的前后位置、能与后端事件同步耦合），异步加载引擎保留。
+**每设备固定执行区**（"一个可复用结果区"的点）：预分配一块，按该设备要处理的最坏层形状：
 
-## 3. 异步加载引擎（scheduler）
+```
+arena = [ staging(cur 广播副本) | exec 区(链中间 gate_up/silu/down 原位覆盖)
+          | result(专家贡献) ]
+```
 
-pin = 提交异步读（scheduler MPSC 队列）立即返回——计算线程绝不阻塞在 IO 上。scheduler 跑 IOCP（Win）/ io_uring（Linux）/ io_submit fallback，多 in-flight 并发（QD 扫描：1/4/16/64）。IO 完成写槽 READY（memory_order_release）+ WakeByAddressAll / futex_wake；计算线程 wait-on-address 等 `slot_meta[slot]`（64 位原子字：state+refcount+generation）变 READY（acquire），绝不忙等。GPU 槽在 IO 后多一步 host→device 拷贝（或直写 HOST_VISIBLE VRAM，ReBAR 属 Phase C）。
+价值**不在省分配**（llama gallocr + 我们的 scratch arena 已复用）——在于让每设备专家链
+中间不离开这块，跨设备只搬小量（§5）。注意：原位覆盖顺序纪律（每步读旧值前不覆盖；层间
+串行安全，但显式读写窗口仍要）。
 
-## 4. 多 GPU
+## 5. 计算归属规则（数据流按构造最小化）
 
-`ggml_backend` 原生多设备（sched `n_backends`，vulkan 枚举 `physical_devices.size()`）。池加设备维度：**每模型 × 每设备一个池实例**。池选择（pin 时）决定专家进哪个 GPU（空闲 / 热度 / 层偏好）。每个 GPU 一个 vulkan backend，MoE 子图按专家分配到的 GPU 委托对应 backend。dense 的 `-ngl` 分片机制不动。
+- **门控**（`cur×gate_proj`、softmax、topk）是 **dense 计算** → 在该层 **dense 设备**上
+  算（静态，由层排布决定——dense 权重绝不为门控搬迁/拷贝）。ids + per-expert weights
+  再分发到各执行池（小：n_used×tokens）。
+- **主执行设备**（汇聚点）= 该层**当前驻留专家最多**的池（目录启发式——池驻留变化慢；
+  不能用本次 ids 选，因为门控产出前 ids 不存在）。多数专家贡献就地相加。
+- **cur 广播**：每个要算专家的池都需要 cur——每个执行池拷一次（不可避免的最小量）。
+- **汇总**：主设备把本地 + 非主设备送回（embd 维小）的贡献相加 → `ffn_moe_out-N` →
+  送回 dense 设备给 residual/add/norm。
 
-## 5. 通用 ggml 后端抽象
+大中间（gate_up/silu/down 输出）永不跨设备；只搬 ids/weights/cur 广播/专家贡献/moe_out
+——全小量。
 
-整个方案走 `ggml_backend_graph_compute(backend, 子图)`——GPU 阶段只是把 `cpu_backend` 换成 `vulkan_backend`。不写任何 shader / 内核 / 后端专属内存代码：池（槽 / DIO / pin / 翻译 / 池选择）是 backend 无关的，在 stream_moe 层。
+## 6. dense/KV 按层分配（独立后续）
 
-性能要点：
+把 dense 权重按层剥离、每层指派设备（静态、不搬迁），KV 跟该层 dense 设备。例子：后 N 层
+dense+KV 放 RX 590。价值：dense 设备 = 门控设备 = 该层理想主设备 → 这些层零跨设备。
 
-- **权重搬运是主要开销**：GPU 池槽权重来自 DIO 读，要拷进 vulkan buffer。用 HOST_VISIBLE（AMD 直写）缓解 + EST1 热度让高频专家常驻 VRAM；ReBAR（HOST_VISIBLE|DEVICE_LOCAL 零拷贝）是 Phase C。
-- **每层委托调度开销**：每个 MoE 子图一次 vulkan `graph_compute`（命令提交 / descriptor 绑定）——llama.cpp vulkan 后端有 pipeline 缓存；对计算密集的大 GEMM，GPU 收益远大于调度开销。
-- 代价：放弃融合/定制 shader（如 swiglu 融合进 GEMM）——可接受，符合"不改 llama 数学 / 依赖通用后端"的取向。
+两点：
+- llama 原生层 offload 是**连续段**（`-ngl N`、split-mode layer）——任意层设备表
+  （"layer 27-29 上 GPU"）要改 loader/`dev_layer`，是独立工程块。
+- 只有专家池动态/可迁移；dense+KV 加载/初始化时定死。动手前先量每层 dense/KV 尺寸，
+  算显存账。
 
-## 6. 异构专家
+不阻塞主线：先走 M1/M2，用原生连续 offload 摸交互，再决定自定义层表值不值。
 
-`docs/MULTI_SUBPOOL.md` 的按专家种类分组（子池、预算按字节占比）继续适用。GPU 侧加两点：
+## 7. 数值/正确性基准
 
-- GPU 池也要按组；池选择（pin 时）要带"组量化 × 目标后端能力"（某组可能只进 CPU 池——vulkan 不认其类型）。
-- src0 的 `nb[2]`（槽 stride）按层/组解析（已有 `branch_layout(layer,...)`）；CPU/GPU 槽各自按组/后端对齐。
+- 单专家结果用官方内核 + 同权重 → 一致；专家间 add 顺序可能与官方图不同 → ulp。用
+  v2/deepseek 对齐把关（路由 IDENTICAL + cos~ulp）——工具链现成。
+- 池大小绝不改变数值：不同 `--moe-ram-pool` 必须导出 IDENTICAL（8192 vs 71680 已验证）
+  ——GPU 阶段保持为回归护栏。
+- 2026-09 分歧分析（docs/BACKEND_DIVERGENCE_ANALYSIS.md）：任意两后端约 5% 路由翻转 +
+  hidden 放大是固有噪声非 bug——GPU 阶段同样会见到这一级噪声。
 
-## 7. 数值等价
+## 8. 里程碑（风险递减）
 
-GPU 内核浮点累加路径不同——预期 ulp 级差异（与 repack-vs-普通 同类）。回归必须覆盖三种分布（`docs/Backend.md` 上线门槛）：全 CPU / 全 GPU / 混合。
+- **M1** — CPU-only 自调度骨架：两个"伪 device_pool"（都 CPU、独立池 + 执行区），钉死
+  ids 分组/分派/每池子集链/汇总逻辑与数值 == 官方（v2 对齐）。不碰真 GPU；这一步定义
+  自调度器接口。
+- **M2** — device_pool[] 抽象落地（backend 句柄/槽寻址/固定区）；接一个真 Vulkan 设备 +
+  CPU 混合（部分层上 GPU 走原生 offload），实跑"门控跟 dense + 汇总回主设备"。
+- **M3** — 同层跨设备分散（2 GPU0 / 2 GPU1 / 3 CPU 那类）+ 固定区读写窗口纪律全速跑。
+- **M4** — 设备间迁移（目录 set/clear 协议已支持）。
 
-## 8. 构建前置（环境）
+## 9. 保留的已验证事实（构建/硬件）
 
-- Vulkan SDK（glslc shader 编译器、vulkan.hpp、vulkan-1.lib）——构建期必需；build.bat 已透传 `GGML_VULKAN=ON`（默认 OFF）。运行时只需 GPU 驱动（vulkan-1.dll 已存在 1.3.250.0）。
-- RX 590 8GB 仅 Vulkan；VRAM 池预算因此很小——现实目标是 dense 上 Vulkan + 小部分专家上 GPU + 大部分专家留 RAM。
+- Vulkan + CUDA 原生 `MUL_MAT_ID` + 槽 3D 布局（src0 ne[2]=n_slots、nb[2]=slot stride）
+  ——w3d 伪装槽技术跨后端可移植。
+- RX 590 8 GiB BAR1 是真 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` 堆——设备池成型后
+  专家加载仍可零拷贝 DIO 进映射显存（fallback：RAM staging + 拷贝）。
+- `GGML_VULKAN=ON` 干净构建（vendored CMake hook 传工具链）；`libomp.dll` 要放 exe 旁。
+  现实目标不变：dense 上 Vulkan + 热专家上 GPU + 多数专家留 RAM。
