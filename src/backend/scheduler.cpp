@@ -86,8 +86,13 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
             }
             if (gmax > load_staging_size_) load_staging_size_ = gmax;
         }
-        if (load_staging_size_ == 0) load_staging_size_ = 1024 * 1024;
     }
+    // Concurrency = one layer's worst-case expert touch set (n_expert) scaled by
+    // device sub-pool count and layout cost. v2/direct has no staging so it can
+    // afford 2x for aggressive prefetch; v1/original (staging per slot) stays 1x.
+    const uint32_t dev_factor    = 1; // CPU-only today; GPU sub-pools multiply later
+    const uint32_t layout_factor = topo.needs_staging() ? 1u : 2u;
+    max_in_flight_ = std::max<uint32_t>(16u, topo.n_expert * dev_factor * layout_factor);
     const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
     load_stride_ = header_sz + align_ceil(load_staging_size_, DIO_SECTOR_SIZE);
     load_pool_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(load_stride_ * max_in_flight_));
