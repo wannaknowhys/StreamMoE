@@ -2,11 +2,9 @@
 
 # Route B Multi-Device Expert Pool - Design (Phase B)
 
-> Status: design, **revised 2026-09** (supersedes the 2026-08-29 draft - the old
-> "cb_eval pin/unpin + per-node hijack + HOST_VISIBLE placement" model is replaced
-> by the whole-layer self-scheduling mainline below). Builds on route B third
-> path (official `ggml_mul_mat_id` kernel + uniform-stride slot pool,
-> `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7).
+> Status: design, **revised 2026-09** (supersedes the 2026-08-29 draft). Builds
+> on route B third path (official `ggml_mul_mat_id` kernel + uniform-stride slot
+> pool, `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7).
 > Verified facts carried over: Vulkan and CUDA natively support `MUL_MAT_ID`
 > with the pool-slot 3D layout; RX 590 exposes a real 8 GiB
 > `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap; GGML_VULKAN=ON builds clean.
@@ -21,16 +19,15 @@ takes a **whole MoE layer** in `graph_compute` and **self-schedules** it - read
 ids, resolve each expert's pool, dispatch per-device subsets, run each subset's
 expert chain inside that device, merge results, write the layer output back.
 
-Confirmed mainline decision (2026-09): **compute takes the whole layer and
-self-schedules to each device** - this is required, not optional.
+Confirmed mainline (2026-09): **compute takes the whole layer and self-schedules
+to each device** - required, not optional.
 
 ## 2. Current mechanisms (what stays, what extends)
 
 - **Why a backend**: registering a ggml backend/device gives us the scheduler's
-  formal `graph_compute` callback. `supports_op` claims only `*_exps`
-  `MUL_MAT_ID` (+ views whose source is our host compute buft); the scheduler
-  hands us exactly those nodes, once each, correctly ordered. Replacing this
-  with graph surgery is not planned.
+  formal `graph_compute` callback. `supports_op` claims only the MoE expert
+  `MUL_MAT_ID` domain (+ views whose source is our host compute buft); the
+  scheduler hands us exactly those nodes, once each, correctly ordered.
 - **mini-graph today**: each original `MUL_MAT_ID` is re-executed in a private
   leaf-only mini-graph with the **official kernel**: `w3d` leaf fakes the pool's
   compact slots as `[ne0, ne1, group_slots]` (data = pool base + branch offset,
@@ -39,177 +36,251 @@ self-schedules to each device** - this is required, not optional.
   copy (all one RAM).
 - **Notify protocol**: compute -> scheduler = MPSC push + sleep on a per-(L,E)
   version word; scheduler -> compute = version bump + `WakeByAddressAll`/futex
-  wake (directory `set`/`clear`, `slot_meta` state machine). This protocol is
-  **device-agnostic and stays** - compute waits for "(L,E) available", wakes and
-  rescans all pools.
+  wake. This protocol is **device-agnostic and stays**.
 
-The gap to self-scheduling is not "collect more nodes": it is **execution of the
-in-layer activation chain** (gate_up -> view gate/up -> silu -> weighting -> down)
-which today runs on llama buffers between nodes. Until we own that chain,
-per-device dispatch would still copy big intermediates between backends.
-
-## 3. Target model: whole-layer self-scheduling
+## 3. Whole-layer self-scheduling
 
 The llama main graph still builds every MoE layer node (`can_reuse`/plan
-stable). `supports_op` extends to the layer's whole MoE domain
-(`blk.N.ffn_moe_*` names: gate_up / silu / down / views / adds / mul). At
-execution, `graph_compute` receives one layer's MoE split and runs:
+stable). `supports_op` extends to the layer's whole MoE chain domain. At
+execution `graph_compute` receives one layer's MoE chain and runs:
 
-1. read ids (`ffn_moe_topk-N`; the gate softmax/topk stays on the graph / dense
-   side - ids arrive computed)
+1. read ids (`ffn_moe_topk-N`; gating stays on the graph / dense side - ids arrive computed)
 2. resolve every (L,E) to its pool slot (directory scan, pin/wait as today)
-3. choose the **lead device** for the layer (see §5)
-4. dispatch: per non-lead device a subset (ids slice + weights slice)
+3. choose the **lead device** (see §5)
+4. dispatch per non-lead device a subset (ids slice + weights slice)
 5. per device: run its expert chain in the device's fixed arena (official
-   `mul_mat_id` + official silu/mul/add on that backend); big intermediates never
-   leave the arena
+   `mul_mat_id` + official silu/mul/add on that backend); big intermediates
+   never leave the arena
 6. merge expert contributions (embedding-dim, small) back to the lead device,
    write main `ffn_moe_out-N` dst
 
 Dynamic (which experts, which device, lead choice) lives entirely in the
-execution layer; the graph/reuse shape is static. This is the core architectural
-win of self-scheduling.
+execution layer; the graph/reuse shape is static.
 
-**Execution boundary**: the whole per-layer MoE chain (gate_up -> view -> silu ->
-weighting -> down -> merge) is executed by us into our own fixed arenas; the main
-graph only carries the two ends - the layer input (`cur`) and the layer output
-(`ffn_moe_out-N`). Cross-device "copying" is not a physical law - it only appears
-when intermediates live in llama-managed buffers where the scheduler inserts cpy
-by backend ownership. Intermediates in our own arena are never copied (llama
-does not manage them); the price is that the chain execution is ours to
-orchestrate, and the main graph cannot keep individual MoE-chain nodes between
-the two ends.
+**Execution boundary**: the whole per-layer MoE chain is executed by us into our
+own fixed arenas; the main graph only carries the two ends - layer input (`cur`)
+and layer output (`ffn_moe_out-N`). Cross-device "copying" is not a physical law
+- it only appears when intermediates live in llama-managed buffers where the
+scheduler inserts cpy by backend ownership. Intermediates in our own arena are
+never copied; the price is the chain execution is ours to orchestrate and the
+main graph cannot keep individual MoE-chain nodes between the two ends.
 
 ### 3.1 Privatization admission check (fail-fast, no fallback)
 
 Hiding intermediates (real results in our arenas, main-graph node dst left
 uncomputed) is only safe if no node OUTSIDE the layer's MoE chain consumes them.
-That is an architectural assumption about the model, not a runtime detail - if a
-model variant routes an MoE intermediate somewhere else, our results are
-invisible to that consumer. So we verify, loud, and refuse to run:
+We verify, loud, and refuse to run:
 
 - **Hook**: after each of the three `model.build_graph()` call sites
   (`llama-context.cpp`: process_ubatch / graph_reserve / llama_encode), call
-  `stream_moe_verify_graph(gf)` - our function; llama-context.cpp only gains the
-  three calls + a macro gate, the chain/exemption logic lives on our side.
-  verify only runs when the graph is actually rebuilt (`can_reuse` skips build
-  entirely, so no per-decode cost).
-- **Check**: for every MoE-chain intermediate we intend to privatize, enumerate
-  its consumers in the whole graph and assert they all lie inside the same
-  layer's MoE chain (name domain `blk.N.ffn_moe_*`, eventually converging on
-  `ffn_moe_out-N`). Exemptions: `ffn_moe_out-N` itself (it is the output end,
-  consumed by the residual add - allowed); the gating segment
-  (logits/probs/topk/weights - dense-domain, not privatized - not checked).
-- **Failure mode**: any external consumer -> log the full context (which
-  intermediate, which external consumer, layer, arch) and exit. **No silent
-  fallback, no escape hatch** - a violation means we misunderstood the model
-  architecture and must learn about it immediately, not paper over it.
-- **Define the privatized set narrowly**: when unsure whether a node is chain
-  or gating, keep it out of the privatized set rather than risk a false
-  positive that kills a healthy model.
+  `stream_moe_verify_graph(gf)` - our function; the chain/exemption logic lives
+  on our side. verify only runs when the graph is actually rebuilt (`can_reuse`
+  skips build entirely).
+- **Check 1 - no external consumer**: for every privatized MoE-chain
+  intermediate, its consumers in the whole graph must lie inside the same
+  layer's MoE chain (eventually converging on `ffn_moe_out-N`). Exemptions:
+  `ffn_moe_out-N` itself (output end, consumed by residual add); the gating
+  segment (dense-domain, not privatized - not checked).
+- **Check 2 - chain integrity**: our `graph_compute` verifies the split it
+  received actually contains the full expected chain for the layer (all
+  expert-buft `MUL_MAT_ID` + the chain views/silu/mul/add). A missing/misplaced
+  node means the scheduler's heuristic backend expansion put a chain node on the
+  wrong side - the failure mode is loud, not a silent wrong number.
+- **Failure mode**: any violation -> log full context (intermediate, external
+  consumer or missing node, layer, arch) and exit. **No silent fallback, no
+  escape hatch.**
+- **Narrow privatized set**: when unsure whether a node is chain or gating,
+  keep it out of the privatized set rather than risk a false positive.
+
+### 3.2 Why the whole layer lands in one split (scheduler mechanics, verified)
+
+ggml-backend-sched (`ggml/src/ggml-backend.cpp`) splits by contiguous backend:
+
+- **pass1-4 (backend assignment)**: nodes with weights follow the weight
+  buffer's backend; weightless nodes are expanded to adjacent backends (GPU
+  priority, CPU lowest), gated by `supports_op`. View/reshape/transpose have a
+  **deterministic rule** (pass4: views always share their `view_src` backend).
+- **pass5 (split)**: a run of nodes on the same backend forms one split; a new
+  split starts on a backend change or incompatible weight input.
+- **Cross-split inputs** (lines ~1400-1420): an src on a different incompatible
+  backend gets an automatic copy in the split's backend and `node->src` is
+  re-pointed at it.
+
+Consequences: if `supports_op` claims the whole layer chain, the chain is
+contiguous -> it lands as **one split** in our `graph_compute`. The gating
+segment stays in the dense split; ids / weights / `cur` arrive as our split's
+inputs - **the scheduler copies them, no manual broadcast at the llama layer**.
+
+### 3.3 The two ends: cur / moe_out
+
+- **cur**: the scheduler handles the cross-split input copy. Optimisation: the
+  copy happens only if `ggml_backend_sched_buffer_supported` fails - if our
+  `supports_buft` accepts CPU's host buft (both host memory), cur is shared
+  zero-copy by pointer. Broadcasting cur to the per-device pools **inside** our
+  self-scheduler is our own staging (outside the llama layer).
+- **moe_out**: chain output-end node -> its backend is ours -> gallocr allocates
+  its dst in our buffer -> we write the real merged result there (the graph
+  output end must be real - the residual reads it). The residual add (dense
+  backend) consumes it; the scheduler handles that cross-split hop (host share
+  or small copy).
+- **Hidden nodes** (chain intermediates): we do not truly compute their dst, but
+  gallocr still allocates space for them in our buffer (dead space - cheap host
+  memory; can be optimised later). Check 1 guarantees no external reader, so a
+  hole is safe.
+
+### 3.4 Async discipline: graph_compute exit synchronisation
+
+Scheduler-level cross-split ordering is explicit and **independent of copy
+nodes** - at each split boundary the scheduler synchronises the previous
+backend's async work (event or `synchronize`, because the allocator reuses
+buffer regions across splits). So a zero-copy host pointer share does **not**
+lose ordering between our split and the dense split.
+
+The real ordering risk is **inside our self-scheduler**: `graph_compute`'
+contract is "return = this split finished, dst ready". If we asynchronously
+submit per-device sub-chains (e.g. Vulkan queues) and return without waiting,
+the next split trusts a dst that is not ready. Discipline (required, not a
+test): **before graph_compute returns, wait on all internally-submitted
+per-device work** (backend event / synchronize per device), then write moe_out.
+CPU-only today is naturally synchronous; the rule bites with GPU async - keep a
+"slow-down and check" regression at M3.
 
 ## 4. device_pool[] + fixed per-device execution arena
 
 Current single-pool code already keeps a pool dimension in the directory
-(`entries` is (L,E) x pool, `scan` iterates pools) - keep that. What changes is
-the **physical slot addressing** (today one base carved into layer groups):
+(entries is (L,E) x pool, `scan` iterates pools) - keep that. What changes is
+physical slot addressing (today one base carved into layer groups):
 
 ```
 device_pool[] = {
   ggml_backend handle,
   physical base (VRAM or RAM), slot stride, capacity,
-  per-pool layer-group carve (subpools_),
-  per-pool slot meta (state/refcount/generation) or global index with pool dim,
+  per-pool layer-group carve (subpools_), per-pool slot meta,
   fixed execution arena,
 }
 ```
 
-**Fixed arena per device** (the point of "one reusable result region"): one
-preallocated block sized for the worst-case layer the device will process:
+**Fixed arena per device**: one preallocated block sized for the worst-case
+layer the device will process:
 
 ```
-arena = [ staging(cur broadcast copy) | exec region (chain intermediates
-          gate_up/silu/down overwrite in place) | result (expert contributions) ]
+arena = [ staging(cur copy) | exec region (chain intermediates overwrite in
+          place) | result (expert contributions) ]
 ```
 
-Value is **not** saving allocation (llama gallocr + our scratch arena already
-reuse) - it is making per-device expert chains run with intermediates never
-leaving the block, so cross-device traffic is only the small items (§5). Watch:
-in-place overwrite ordering (read-before-overwrite per chain step; layers are
-serial so safe, but explicit read/write windows needed).
+Value is not saving allocation - it makes per-device expert chains run with
+intermediates never leaving the block, so cross-device traffic is only the small
+items (§5). Watch: in-place overwrite ordering per chain step (layers are serial
+so safe; explicit read/write windows needed).
 
-## 5. Computation placement rules (data flow is minimal by construction)
+### 4.1 Multi-location scheduling primitives
 
-- **Gate** (`cur x gate_proj`, softmax, topk) is a **dense** computation ->
-  runs on the layer's **dense device** (static, decided by layer placement -
-  dense weights are never moved/copied for gating). ids + per-expert weights
-  then fan out to the executing pools (small: n_used x tokens).
-- **Lead device** (merge point) = the pool holding the **most of this run's
-  selected experts**. Chosen AFTER every expert is pinned/resolved (stage 2) -
-  the actual per-pool distribution of this run's ids is known then, so lead =
-  argmax over pools of this run's real residency (no heuristic needed; gating
-  order only matters for the gate location, which follows the dense device and
-  does not need the distribution). Most expert contributions are summed locally
-  at the lead.
-- **cur broadcast**: every pool that computes experts needs cur - one copy per
-  executing pool (unavoidable minimum).
-- **Merge**: lead device sums its own + returning non-lead contributions
-  (embedding-dim, small) -> `ffn_moe_out-N` -> back to the dense device for
-  residual/add/norm.
+The directory already models "**non-inclusive, non-exclusive read-mostly
+multi-location cache**": entries `(layer, expert) x pool` let one expert hold
+positions on several devices at once (like a page cache with replicas); `scan`
+finds the first available. Scheduler scope = one (model, expert-kind) x all
+`device_pool[]` copies (main + draft pools included; heterogeneous expert kinds
+kept as separate pools).
 
-Big intermediates (gate_up / silu / down outputs) never cross devices; only ids /
-weights / cur-broadcast / expert-contributions / moe_out move - all small.
+Primitives (VRAM<->VRAM relocation deliberately skipped - a GPU-to-GPU move is
+not worth it; re-read/DIO instead):
+
+| primitive | semantics | essence |
+|---|---|---|
+| `ensure(ram)` | expert usable in RAM (pin) | directory RAM entry + DIO load |
+| `ensure(vram)` | expert usable in VRAM | directory VRAM entry + load (DIO-into-VRAM or RAM->copy) |
+| `move ram->vram` | relocate residency to VRAM | vram alloc + content copy/re-read + dual-entry transition + release old |
+| `move vram->ram` | reverse | reverse |
+
+- `ensure` = read-to-X, idempotent (= today's pin/wait with a target-pool
+  parameter).
+- `move` = build the new-location copy first, then drop the old (dual entries
+  briefly - the non-exclusive model allows it, nothing is ever lost).
+- Replicas make eviction "evict a copy": each pool's entry is scored/evicted
+  independently.
+
+## 5. Gate vs expert chain: the boundary rule
+
+**Boundary judgement**: the gate segment (`cur x gate_proj` = dense mm,
+softmax, topk) only touches the dense `gate_proj`; topk produces ids but never
+fetches an expert weight by id. The chain segment (`mul_mat_id(w, cur, ids)` for
+gate_up/up/down) **accesses expert weights by id** - that is what needs the
+pool. So the rule is **"does the node access expert weights by id"** (not "does
+it have an id tensor").
+
+**Implementation**: don't guess by name - check `src[0]`'s buffer type: an
+expert-buft `src[0]` (MUL_MAT_ID) is chain; everything else (dense gate_inp,
+etc.) is gating. Weightless chain nodes (view/silu/mul/add) are attributed by
+backend expansion + Check 2 (chain integrity) makes that safe instead of
+hoped-for.
+
+Placement rules inside a layer:
+
+- **Gate** is a dense computation -> runs on the layer's **dense device**
+  (static, decided by layer placement; dense weights are never moved for
+  gating). ids + per-expert weights fan out to the executing pools (small:
+  n_used x tokens).
+- **Lead device** (merge point) = pool holding the **most of this run's
+  selected experts**, chosen AFTER every expert is pinned/resolved (the actual
+  per-pool distribution of this run is known then - argmax, no heuristic).
+- **cur broadcast**: every executing pool needs cur - one copy per pool
+  (unavoidable minimum).
+- **Merge**: lead sums its own + returning contributions (embedding-dim, small)
+  -> `ffn_moe_out-N` -> back to the dense device for residual/add/norm.
+
+Data flow: big intermediates never cross devices; only ids/weights/cur
+broadcast/expert contributions/moe_out move - all small.
 
 ## 6. dense / KV per-layer assignment (independent follow-up)
 
 Decouple dense weights per layer and assign a device per layer (static, no
-runtime migration), KV follows the layer's dense device. Example: put the last N
-layers' dense + KV on the RX 590. Value: dense device = gate device = ideal
-lead device for that layer -> zero cross-device for those layers.
+runtime migration); KV follows the layer's dense device (e.g. last N layers'
+dense + KV on the RX 590). Value: dense device = gate device = ideal lead for
+that layer -> zero cross-device.
 
-Two notes:
-- llama.cpp's native layer offload is **contiguous** (`-ngl N`, split-mode
-  layer) - an arbitrary per-layer device table ("layer 27-29 on GPU") is a
-  loader/`dev_layer` change, an independent work item.
+- llama's native layer offload is **contiguous** (`-ngl N`) - an arbitrary
+  per-layer table ("layers 27-29 on GPU") is a loader/`dev_layer` change
+  (independent work item).
 - Only the expert pool is dynamic/migratable; dense + KV are fixed at
-  load/init. Size the VRAM budget (dense/KV per layer) before doing this.
+  load/init. Size the VRAM budget per layer before doing this.
 
-Not blocking the mainline - do M1/M2 first, exercise native contiguous offload
-to learn the interactions, then decide whether a custom layer table earns its
-keep.
+Not blocking the mainline: M1/M2 first, exercise native contiguous offload,
+then decide whether a custom layer table earns its keep.
 
 ## 7. Numerical / correctness baseline
 
-- Per-expert results use official kernels + same weights -> identical; the
-  expert-add order may differ from the official graph -> ulp level. Gate on
-  v2/deepseek alignment (route IDENTICAL + cos ~ ulp) - the toolchain exists.
-- Pool size must never change numerics: different `--moe-ram-pool` sizes must
-  produce IDENTICAL exports (already verified 8192 vs 71680) - keep as a
-  regression guard across the GPU work.
-- The 2026-09 divergence analysis (docs/BACKEND_DIVERGENCE_ANALYSIS.md): any
-  two backends show ~5% routing flips + hidden amplification - it is inherent,
-  not a bug; GPU phases will show the same class of noise.
+- Per-expert results use official kernels + same weights -> identical;
+  expert-add order may differ -> ulp. Gate on v2/deepseek alignment (route
+  IDENTICAL + cos ~ ulp).
+- Pool size must never change numerics (8192 vs 71680 already verified
+  IDENTICAL) - keep as a regression guard.
+- Boundary misclassification is caught structurally by Check 2 before any
+  number is produced (not by end-to-end value checks). Add one targeted
+  regression at M3 (a weightless node adjacent to both dense and expert
+  backends) as a numeric backstop, but it is not the primary guard.
+- Any two backends show ~5% routing flips + hidden amplification - inherent
+  noise (docs/BACKEND_DIVERGENCE_ANALYSIS.md), not a bug.
 
 ## 8. Milestones (risk-decreasing)
 
-- **M1** - CPU-only self-scheduling skeleton: two "fake device_pools" (both CPU,
+- **M1** - CPU-only self-scheduling skeleton: two fake device_pools (both CPU,
   independent pools + arenas) to pin down ids-grouping / dispatch / per-pool
-  subset chain / merge logic and its numerics == official (v2 alignment). No
-  real GPU yet; this defines the self-scheduler interface.
-- **M2** - device_pool[] abstraction lands (backend handle / slot addressing /
-  fixed arena); one real Vulkan device + CPU mixed (some layers on GPU via
-  native offload), exercise gate-follows-dense + lead-device merge live.
-- **M3** - same-layer cross-device dispersion (2 experts GPU0 / 2 GPU1 / 3 CPU
-  style) + arena read/write-window discipline at full speed.
-- **M4** - device migration (directory set/clear already supports the protocol).
+  subset chain / merge logic and numerics == official (v2 alignment). Defines
+  the self-scheduler interface.
+- **M2** - device_pool[] lands (backend handle / slot addressing / fixed arena);
+  one real Vulkan device + CPU mixed, exercise gate-follows-dense + lead-merge
+  live + the graph_compute exit sync discipline.
+- **M3** - same-layer cross-device dispersion (2 GPU0 / 2 GPU1 / 3 CPU style) +
+  arena read/write-window discipline at full speed + slow-down correctness
+  regression.
+- **M4** - device migration (directory set/clear + move primitives).
 
 ## 9. Kept verified facts (build / hardware)
 
-- Vulkan + CUDA native `MUL_MAT_ID` with the slot-3D layout (src0 ne[2]=n_slots,
-  nb[2]=slot stride) - the pool-slot w3d trick is backend-portable.
+- Vulkan + CUDA native `MUL_MAT_ID` with the slot-3D layout - the w3d trick is
+  backend-portable.
 - RX 590 8 GiB BAR1 is a real `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap -
-  zero-copy DIO into mapped VRAM remains available for expert loading once a
-  device pool exists (fallback: RAM staging + copy).
-- `GGML_VULKAN=ON` builds clean (vendored CMake hook forwards toolchain);
-  `libomp.dll` must sit next to the exe. Realistic target stays: dense on
-  Vulkan + hot experts on GPU + most experts in RAM.
+  zero-copy DIO into mapped VRAM remains available once a device pool exists.
+- `GGML_VULKAN=ON` builds clean; `libomp.dll` must sit next to the exe.
+  Realistic target stays: dense on Vulkan + hot experts on GPU + most experts
+  in RAM.
