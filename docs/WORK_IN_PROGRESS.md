@@ -14,11 +14,11 @@
 
 ### A. patch 手术（patch 对齐工作区）
 - [x] A0 盘点：patch 落后清单已确认（macros 缺根 CMakeLists/server-context 锚点；route-b/prefill 含过时 frag new-file + route-b 含旧 server-context 段）
-- [ ] A1 macros patch 重生成：`git diff HEAD -- CMakeLists.txt common/arg.cpp common/common.cpp common/common.h include/llama.h tools/server/server-context.cpp`（纯锚点/机制，无污染）
-- [ ] A2 route-b patch 重生成：`git diff HEAD -- common/CMakeLists.txt common/speculative.cpp common/speculative.h src/llama-model-loader.cpp src/llama-model.cpp src/llama.cpp`（frag + server-context 自动消失）
-- [ ] A3 prefill patch 重生成：`git diff HEAD -- src/llama-context.cpp src/llama-context.h src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server.cpp`
-- [ ] A4 干净 apply 验证：临时检出 vendored HEAD(f280b2698) → 按序 apply（macros → tsc_timer → route-b → prefill → gguf-alignment）→ 文件 hash 与工作区逐字节一致
-- [ ] A5 提交 patches + push
+- [x] A1 macros patch 重生成：`git diff HEAD -- CMakeLists.txt common/arg.cpp common/common.cpp common/common.h include/llama.h tools/server/server-context.cpp`（纯锚点/机制，无污染）
+- [x] A2 route-b patch 重生成：`git diff HEAD -- common/CMakeLists.txt common/speculative.cpp common/speculative.h src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model.cpp src/llama.cpp`（frag + server-context 自动消失；llama-model-loader.h 补入）
+- [x] A3 prefill patch 重生成：`git diff HEAD -- src/llama-context.cpp src/llama-context.h src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server.cpp`
+- [x] A4 干净 apply 验证：临时 worktree HEAD(f280b2698) → 按序 apply（macros → tsc_timer → route-b → gguf-alignment → prefill）→ **21 文件 hash 与工作区逐字节一致**
+- [x] A5 提交 patches + push
 - [ ] A6 apply.bat（phase 顺序 + --check）—— 可选（update_routeb_patch.js 已能文件级更新）
 
 ### B. ASan 子命令整合 build.bat

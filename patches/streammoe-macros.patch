@@ -1,3 +1,33 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4caff55d1..9d7eccf69 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,6 +2,25 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit
+ project("llama.cpp" C CXX)
+ include(CheckIncludeFileCXX)
+ 
++# StreamMoE features. The dispatcher sets -DSTREAM_MOE_FEATURES=route_b[,prefill_export]
++# (feature macros are NOT passed via CMAKE_CXX_FLAGS). Applied to the whole build so
++# any file/target that later grows #ifdef STREAM_MOE_* code is never silently skipped.
++# Feature frags live in the parent repo (patches/<phase>/...) and are reachable through
++# the global include dirs below; anchor #include lines in shared files stay short-named.
++if(STREAM_MOE_FEATURES)
++    if(STREAM_MOE_FEATURES MATCHES "route_b")
++        add_compile_definitions(STREAM_MOE_ROUTE_B)
++    endif()
++    if(STREAM_MOE_FEATURES MATCHES "prefill_export")
++        add_compile_definitions(STREAM_MOE_PREFILL_EXPORT)
++    endif()
++    include_directories(
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../patches/route-b/common
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../patches/prefill-export/common
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../patches/prefill-export/include)
++endif()
++
++
+ ### llama.cpp version
+ set(LLAMA_VERSION_MAJOR 0)
+ set(LLAMA_VERSION_MINOR 2)
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 86f8610a5..66dd9dd3e 100644
 --- a/common/arg.cpp
@@ -107,11 +137,33 @@ index a04177f9f..a62d2ad8b 100644
 +#endif
  
      LLAMA_API int64_t llama_time_us(void);
-
+ 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..3a0ac9829 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -968,4 +968,7 @@
+@@ -634,7 +634,9 @@ struct server_slot {
+                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+         }
+ 
+-        common_speculative_print_stats(spec);
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_sc_slot_stats.frag"
++#endif
+     }
+ 
+     json to_json(bool only_metrics = false) const {
+@@ -809,6 +811,9 @@ public:
+     }
+ 
+     ~server_context_impl() {
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_sc_dtor_stats.frag"
++#endif
+         if (!sleeping) {
+             // destroy() is already called when entering sleeping state
+             // we don't call it again here to avoid double free
+@@ -967,6 +972,9 @@ private:
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
@@ -119,3 +171,5 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +#include "stmoe_prefill_server_nout.frag"
 +#endif
          const bool has_mmproj = !params.mmproj.path.empty();
+         const bool has_draft = params.speculative.has_dft();
+         const bool spec_mtp = std::find(params_base.speculative.types.begin(),

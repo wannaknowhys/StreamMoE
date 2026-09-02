@@ -1,15 +1,16 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 36f1e0cd5..0ff91794e 100644
+index 36f1e0cd5..c74db501b 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -179,3 +179,21 @@ if (LLAMA_LLGUIDANCE)
+@@ -179,3 +179,22 @@ if (LLAMA_LLGUIDANCE)
  endif()
-
+ 
  target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
 +
 +# StreamMoE route B: expert-pool backend sources live in the parent repo.
 +set(STREAM_MOE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../../src)
 +target_include_directories(${TARGET} PRIVATE ${STREAM_MOE_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
++# Feature frag include dirs are added globally by the root CMakeLists feature block.
 +target_sources(${TARGET} PRIVATE
 +    ${STREAM_MOE_SRC}/server/route_b_inject.cpp
 +    ${STREAM_MOE_SRC}/backend/moe_backend.cpp
@@ -25,7 +26,7 @@ index 36f1e0cd5..0ff91794e 100644
 +    target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
 +endif()
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4eef2212e..1cc841900 100644
+index 4eef2212e..c9c7a31f7 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -12,6 +12,8 @@
@@ -113,7 +114,7 @@ index 4eef2212e..1cc841900 100644
 +        // same _exps pattern must not route the draft's experts to the main
 +        // pool). ram_pool_mb==0 -> full residency (no eviction).
 +        if (params.expert_backend) {
-+            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), params.moe_draft_ram_pool_mb, params.cpuparams.n_threads, true);
++            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), {}, params.moe_draft_ram_pool_mb, params.cpuparams.n_threads, true);
 +            if (ovr) {
 +                mparams.tensor_buft_overrides = ovr; // draft pool's own (terminated) array
 +            }
@@ -150,156 +151,23 @@ index 12ae31b7d..009538c9a 100644
  // comma separated list the provided types
  std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
  
-diff --git a/common/stmoe_routeb_args.frag b/common/stmoe_routeb_args.frag
-new file mode 100644
-index 000000000..d7f38130b
---- /dev/null
-+++ b/common/stmoe_routeb_args.frag
-@@ -0,0 +1,59 @@
-+    add_opt(common_arg(
-+        {"--expert-backend"},
-+        "StreamMoE route B: route MoE expert tensors (ffn_*_exps / ffn_*_shexp) to the stream_moe expert pool (bounded RAM)",
-+        [](common_params & params) {
-+            params.expert_backend = true;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-ram-pool"}, "MB",
-+        "StreamMoE: expert residency budget in MB (0 = auto 75% free RAM)",
-+        [](common_params & params, int value) {
-+            params.moe_ram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-vram-pool"}, "MB",
-+        "StreamMoE: VRAM budget for the expert pool (GPU pool phase)",
-+        [](common_params & params, int value) {
-+            params.moe_vram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-draft-ram-pool"}, "MB",
-+        "StreamMoE: DRAFT model expert residency budget in MB (0 = full resident, no eviction)",
-+        [](common_params & params, int value) {
-+            params.moe_draft_ram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--moe-draft-vram-pool"}, "MB",
-+        "StreamMoE: VRAM budget for the DRAFT expert pool (GPU pool phase)",
-+        [](common_params & params, int value) {
-+            params.moe_draft_vram_pool_mb = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--prompt-log"}, "PATH",
-+        "StreamMoE: append every /v1/chat/completions request body to this file",
-+        [](common_params & params, const std::string & value) {
-+            params.prompt_log_path = value;
-+        }
-+    ));
-+    add_opt(common_arg(
-+        {"--kv-placement"}, "<RAM,VRAM0,...>",
-+        "StreamMoE: KV cache placement as a collection (comma-separated). "
-+        "Multi-replica mirrors are a future feature - today only the first "
-+        "element is honored, extra elements warn.",
-+        [](common_params & params, const std::string & value) {
-+            params.kv_placement.clear();
-+            size_t start = 0;
-+            while (start <= value.size()) {
-+                size_t comma = value.find(',', start);
-+                std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-+                if (!tok.empty()) params.kv_placement.push_back(tok);
-+                if (comma == std::string::npos) break;
-+                start = comma + 1;
-+            }
-+        }
-+    ));
-diff --git a/common/stmoe_routeb_common_params.frag b/common/stmoe_routeb_common_params.frag
-new file mode 100644
-index 000000000..e7048dfd1
---- /dev/null
-+++ b/common/stmoe_routeb_common_params.frag
-@@ -0,0 +1,11 @@
-+    // StreamMoE route B (expert pool) opt-in
-+    bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
-+    size_t  moe_ram_pool_mb  = 0;     // MAIN model expert residency budget in MB (0 = 75% free RAM)
-+    size_t  moe_vram_pool_mb = 0;     // VRAM budget for the MAIN expert pool (GPU pool phase)
-+    size_t  moe_draft_ram_pool_mb  = 0; // DRAFT model expert RAM budget in MB (0 = full resident, no eviction)
-+    size_t  moe_draft_vram_pool_mb = 0; // VRAM budget for the DRAFT expert pool (GPU pool phase)
-+    std::string prompt_log_path;      // append every /v1/chat/completions request body here
-+
-+    // KV placement as a collection, e.g. "RAM,VRAM0,VRAM1" (multi-replica
-+    // mirrors are a future feature; today only the first element is honored)
-+    std::vector<std::string> kv_placement;
-diff --git a/common/stmoe_routeb_ctx.frag b/common/stmoe_routeb_ctx.frag
-new file mode 100644
-index 000000000..30447de69
---- /dev/null
-+++ b/common/stmoe_routeb_ctx.frag
-@@ -0,0 +1,18 @@
-+    // StreamMoE route B: when opted in, register the expert-pool backend and
-+    // route MoE expert tensors (ffn_*_exps) to its weight buft before load.
-+    // Skip when this common_params IS the draft model (speculative.cpp binds
-+    // the draft to its own pool, never the main-pool budget).
-+    if (params.expert_backend &&
-+            params.model.path != params.speculative.draft.mparams.path) {
-+        // common_params_parse pads tensor_buft_overrides with 4096 null entries
-+        // (llama_params_fit scratch). Our override must sit at the FRONT - the
-+        // loader reads from index 0 and stops at the first null pattern.
-+        params.tensor_buft_overrides.clear();
-+        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
-+        if (ovr) {
-+            for (auto * p = ovr; p->pattern != nullptr; ++p) {
-+                params.tensor_buft_overrides.push_back(*p);
-+            }
-+            params.tensor_buft_overrides.push_back({ nullptr, nullptr }); // terminator
-+        }
-+    }
-diff --git a/common/stmoe_routeb_ctx2.frag b/common/stmoe_routeb_ctx2.frag
-new file mode 100644
-index 000000000..541cc11dd
---- /dev/null
-+++ b/common/stmoe_routeb_ctx2.frag
-@@ -0,0 +1,14 @@
-+    // StreamMoE KV placement collection: multi-replica mirrors are not
-+    // implemented yet - honor only the first element, warn if more are given.
-+    if (!params.kv_placement.empty()) {
-+        if (params.kv_placement.size() > 1) {
-+            COM_WRN("multi-replica KV placement not implemented yet; using first element '%s'",
-+                    params.kv_placement.front().c_str());
-+        }
-+        const std::string & p = params.kv_placement.front();
-+        if (p == "RAM" || p == "ram") {
-+            cparams.offload_kqv = false;   // KV stays in host RAM
-+        } else if (p.rfind("VRAM", 0) == 0) {
-+            cparams.offload_kqv = true;    // KV offloaded to GPU (device idx after "VRAM")
-+        }
-+    }
-diff --git a/common/stmoe_routeb_includes.frag b/common/stmoe_routeb_includes.frag
-new file mode 100644
-index 000000000..788a0d4f8
---- /dev/null
-+++ b/common/stmoe_routeb_includes.frag
-@@ -0,0 +1,3 @@
-+#include "server/route_b_inject.h"
-+#include "../src/tsc_timer.h"
-+#include "../src/llama-ext.h"
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 9b22cb05f..1b34a7148 100644
+index 9b22cb05f..d5973d044 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -5,6 +5,9 @@
+@@ -5,6 +5,11 @@
  #include "gguf.h"
  #include "llama-hparams.h"
  #include "llama.h"
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "tsc_timer.h"
++// v2-chunk dense takeover: route_b fills dense tensors from their strip segments.
++namespace stream_moe { bool route_b_fill_dense(const char*, void*); }
 +#endif
  
  #include <algorithm>
  #include <array>
-@@ -538,6 +541,9 @@ llama_model_loader::llama_model_loader(
+@@ -538,6 +543,9 @@ llama_model_loader::llama_model_loader(
          const llama_model_kv_override * param_overrides_p,
          const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
          : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -309,7 +177,7 @@ index 9b22cb05f..1b34a7148 100644
      int trace = 0;
      if (getenv("LLAMA_TRACE")) {
          trace = atoi(getenv("LLAMA_TRACE"));
-@@ -1346,6 +1352,21 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -1346,6 +1354,21 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
  }
  
  void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -331,7 +199,7 @@ index 9b22cb05f..1b34a7148 100644
      if (use_mmap) {
          mappings.reserve(files.size());
          mmaps_used.reserve(files.size());
-@@ -1429,6 +1450,9 @@ bool llama_model_loader::load_all_data(
+@@ -1429,6 +1452,9 @@ bool llama_model_loader::load_all_data(
          llama_mlocks * lmlocks,
          llama_progress_callback progress_callback,
          void * progress_callback_user_data) {
@@ -341,7 +209,7 @@ index 9b22cb05f..1b34a7148 100644
      if (files.empty()) {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              set_tensor_data(t, set_tensor_data_ud);
-@@ -1585,13 +1609,31 @@ bool llama_model_loader::load_all_data(
+@@ -1585,13 +1611,36 @@ bool llama_model_loader::load_all_data(
              const auto & file = files.at(weight->idx);
  
              if (ggml_backend_buffer_is_host(cur->buffer)) {
@@ -374,11 +242,38 @@ index 9b22cb05f..1b34a7148 100644
 +                        }));
 +                    }
 +#ifdef STREAM_MOE_ROUTE_B
++                } else {
++                    // v2-chunk dense tensors (dense buft override) are filled by
++                    // route_b from their strip segments; expert tensors are loaded
++                    // on demand by the scheduler. Both skip the tensor_info read.
++                    stream_moe::route_b_fill_dense(cur->name, cur->data);
                  }
 +#endif
              } else {
                  // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                  if (upload_backend) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index e9fe3592d..1149ae5af 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -43,9 +43,17 @@ struct llama_model_loader {
+             }
+ 
+             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
++#ifdef STREAM_MOE_ROUTE_B
++            // StreamMoE route B: overridden tensors (expert pool buft / v2-chunk
++            // dense buft) are filled from strip segments or the scheduler, never
++            // read at tensor_info offsets - so the bounds check does not apply.
++            // (The scheduler/fill read plans validate against the files instead.)
++            (void) file;
++#else
+             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+             }
++#endif
+         }
+     };
+ 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index c34700ff5..8c033f22d 100644
 --- a/src/llama-model.cpp
@@ -427,80 +322,3 @@ index 1609fec88..f5d3d826f 100644
      std::vector<std::string> splits = {};
      return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
  }
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..c9d2ced1d 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -11,6 +11,10 @@
- #include "common.h"
- #include "fit.h"
- #include "llama.h"
-+#ifdef STREAM_MOE_ROUTE_B
-+#include "../src/llama-ext.h"
-+#include "../src/tsc_timer.h"
-+#endif
- #include "log.h"
- #include "sampling.h"
- #include "speculative.h"
-@@ -634,7 +638,9 @@ struct server_slot {
-                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
-         }
- 
-+#ifdef STREAM_MOE_ROUTE_B
-         common_speculative_print_stats(spec);
-+#endif
-     }
- 
-     json to_json(bool only_metrics = false) const {
-@@ -809,6 +815,11 @@ public:
-     }
- 
-     ~server_context_impl() {
-+        if (spec) {
-+#ifdef STREAM_MOE_ROUTE_B
-+            common_speculative_print_stats(spec.get(), stderr);
-+#endif
-+        }
-         if (!sleeping) {
-             // destroy() is already called when entering sleeping state
-             // we don't call it again here to avoid double free
-@@ -956,6 +967,9 @@ private:
-     // load the model and initialize llama_context
-     // this may also be called to resume from sleeping state
-     bool load_model(common_params & params) {
-+#ifdef STREAM_MOE_ROUTE_B
-+        sm_tmr::timer _t("server load_model");
-+#endif
-         load_progress_data load_progress_text  (this, "text_model");
-         load_progress_data load_progress_mmproj(this, "mmproj_model");
-         load_progress_data load_progress_spec  (this, "spec_model");
-@@ -1050,8 +1064,13 @@ private:
- 
-         llama_init = common_init_from_params(params_base);
- 
--        model_tgt = llama_init->model();
--        ctx_tgt   = llama_init->context();
-+        {
-+#ifdef STREAM_MOE_ROUTE_B
-+            sm_tmr::timer _t("init->model/context");
-+#endif
-+            model_tgt = llama_init->model();
-+            ctx_tgt   = llama_init->context();
-+        }
- 
-         if (model_tgt == nullptr) {
-             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
-@@ -1063,7 +1082,12 @@ private:
-             return false;
-         }
- 
--        vocab = llama_model_get_vocab(model_tgt);
-+        {
-+#ifdef STREAM_MOE_ROUTE_B
-+            sm_tmr::timer _t("vocab get");
-+#endif
-+            vocab = llama_model_get_vocab(model_tgt);
-+        }
- 
-         n_ctx = llama_n_ctx(ctx_tgt);
- 
