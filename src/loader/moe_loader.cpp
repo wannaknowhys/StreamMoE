@@ -13,4 +13,10 @@ moe_model_topology_t moe_loader::parse_gguf_topology(const std::string& main_ggu
     return build_topology(m, main_gguf_path);
 }
 
+moe_model_topology_t moe_loader::parse_gguf_topology(const std::vector<std::string>& paths) {
+    if (paths.empty()) throw std::runtime_error("parse_gguf_topology: no paths");
+    const model_t m = parse_model(paths);
+    return build_topology(m, paths[0]);
+}
+
 } // namespace stream_moe

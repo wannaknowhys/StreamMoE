@@ -44,6 +44,7 @@ struct moe_model_topology_t {
     uint32_t                 n_layer = 0;
     uint32_t                 n_expert = 0;
     uint32_t                 n_expert_used = 0;
+    bool                     incomplete = false; // v2 chunk (strip files): dense tensors strip-scattered, need takeover
     bool needs_staging() const { return layout != gguf_layout_t::V2_EXPERT_BLOCKS; }
     
     // Attention & Context metadata
@@ -102,6 +103,8 @@ public:
     // Parse GGUF header & metadata across single or multi-shard files
     // Dynamically extracts MoE topology, MLA latent attention params, and performs homogeneity validation
     static moe_model_topology_t parse_gguf_topology(const std::string& main_gguf_path);
+    // Multi-file variant (v2 chunk): explicit file list (c1.gguf;c2.gguf;...)
+    static moe_model_topology_t parse_gguf_topology(const std::vector<std::string>& paths);
 };
 
 } // namespace stream_moe

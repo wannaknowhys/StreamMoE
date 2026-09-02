@@ -285,6 +285,16 @@ model_t parse_model(const std::vector<std::string>& paths) {
         gguf_context* tf = gguf_init_from_file(model.files[0].c_str(), params);
         if (!tf) throw std::runtime_error("cannot open " + model.files[0]);
         const uint64_t data_off = gguf_get_data_offset(tf);
+        // whole-block source segments: v2 single-file = 1 seg; v2 chunk = N file
+        // strip segments (in_off = segment offset inside the block).
+        model.block_srcs.resize(blocks.size());
+        for (size_t bi = 0; bi < blocks.size(); ++bi) {
+            if (model.incomplete) {
+                model.block_srcs[bi] = range_to_segs(model, true, static_cast<uint32_t>(bi), 0, blocks[bi].size);
+            } else {
+                model.block_srcs[bi].push_back({ 0, data_off + blocks[bi].off, blocks[bi].size, 0 });
+            }
+        }
         const int n_t = gguf_get_n_tensors(tf);
         for (int i = 0; i < n_t; ++i) {
             const char* tname = gguf_get_tensor_name(tf, i);

@@ -10,15 +10,27 @@
 
 #include "llama.h"
 
+#include <vector>
+#include <string>
+
 namespace stream_moe {
 
 // Allocate the bounded expert pool for ONE model, register the stream_moe
 // backend, and hand the MoE expert tensor patterns to this pool's weight buft.
 // Idempotent per model path (returns the existing overrides on repeat calls).
+// `extra_files`: v2-chunk strip files beyond the main -m model (may be empty).
 // `pool_full_when_zero`: when ram_pool_mb == 0, size the pool to the FULL
 // expert byte size (full residency, no eviction) instead of 75% free RAM.
 // Returns a per-pool tensor_buft_overrides array (terminated by {nullptr,nullptr})
 // or nullptr on failure.
-llama_model_tensor_buft_override* route_b_setup(const char* model_path, size_t ram_pool_mb, int threads, bool pool_full_when_zero);
+llama_model_tensor_buft_override* route_b_setup(
+    const char* model_path,
+    const std::vector<std::string>& extra_files,
+    size_t ram_pool_mb, int threads, bool pool_full_when_zero);
+
+// v2-chunk: fill a dense tensor from its strip-file segments (called by the
+// llama.cpp loader where it would otherwise skip the override read). Expert
+// tensors / unknown names are a no-op. Returns true if the tensor was filled.
+bool route_b_fill_dense(const char* tensor_name, void* data);
 
 } // namespace stream_moe

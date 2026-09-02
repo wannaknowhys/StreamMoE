@@ -27,6 +27,11 @@ namespace stream_moe {
 // expert buft anymore.
 ggml_backend_buffer_type_t stream_moe_create_expert_buft();
 
+// Dense weight buft for v2-chunk strip models: a real malloc-backed host buft
+// with per-pool identity (like the expert buft) so llama.cpp's override skips
+// its tensor_info read and route_b fills the tensor from dense.srcs segments.
+ggml_backend_buffer_type_t stream_moe_create_dense_buft();
+
 // Default (compute) buffer type for this backend: plain host memory for the
 // node outputs (cur/ids/dst) that other backends consume across splits.
 ggml_backend_buffer_type_t stream_moe_compute_buft();

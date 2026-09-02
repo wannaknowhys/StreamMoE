@@ -78,6 +78,9 @@ struct model_t {
     // planners that need block/strip geometry.
     std::vector<uint64_t> dense_section;    // [0, denseEnd]
     std::vector<uint64_t> expert_sections;  // [off, size, nsub] per block
+    std::vector<std::vector<src_seg_t>> block_srcs; // v2/v2chunk: whole-block source segments
+                                          // (in_off = segment offset inside the block;
+                                          //  v2 single-file = 1 seg, v2 chunk = N file segs)
     std::vector<std::vector<std::string>> branch_names; // per-layer branch names
     std::vector<std::vector<uint64_t>>    branch_sizes; // per-layer perExpert bytes
     std::vector<std::vector<uint64_t>>    chunk_slices; // per file: [denseBlocks, blockSlices...]

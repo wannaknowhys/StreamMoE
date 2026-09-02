@@ -353,6 +353,30 @@ ggml_backend_buffer_type_t stream_moe_create_expert_buft() {
     return buft;
 }
 
+// Dense weight buft (v2-chunk strip models): real malloc-backed host buffer
+// (same allocator as the compute buft) with a distinct per-pool identity so the
+// override skips llama.cpp's tensor_info read and route_b fills dense.srcs.
+ggml_backend_buffer_type_t stream_moe_create_dense_buft() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("stream_moe");
+    if (!reg) { stream_moe_register_backend(); reg = ggml_backend_reg_by_name("stream_moe"); }
+    if (!reg) return nullptr;
+    ggml_backend_dev_t dev = reg->iface.get_device(reg, 0);
+    if (!dev) return nullptr;
+    auto* dctx = static_cast<moe_dev_ctx*>(dev->context);
+    auto* buft = static_cast<ggml_backend_buffer_type*>(std::calloc(1, sizeof(ggml_backend_buffer_type)));
+    auto* ctx  = new expert_buft_ctx(); // name ctx reused from the expert buft
+    ctx->dev = dev;
+    const int ordinal = static_cast<int>(dctx->expert_bufts.size()) - 1; // pair with the model pool's expert buft
+    std::snprintf(ctx->name, sizeof(ctx->name), "STREAMMOE_DENSE%s", ordinal >= 0 ? std::to_string(ordinal).c_str() : "");
+    buft->iface.get_name      = expert_buft_get_name;
+    buft->iface.alloc_buffer  = host_buft_alloc_buffer; // real malloc-backed
+    buft->iface.get_alignment = expert_buft_get_alignment;
+    buft->iface.is_host       = [](ggml_backend_buffer_type_t) { return true; };
+    buft->device              = dev;
+    buft->context             = ctx;
+    return buft;
+}
+
 ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("stream_moe");
     if (!reg) return nullptr;

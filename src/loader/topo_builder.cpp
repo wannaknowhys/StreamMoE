@@ -48,6 +48,7 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
         case model_layout_t::V2_CHUNK:         topo.layout = gguf_layout_t::V2_EXPERT_BLOCKS; break;
         default:                               topo.layout = gguf_layout_t::ORIGINAL; break;
     }
+    topo.incomplete = m.incomplete; // v2 chunk: dense tensors need route_b takeover
 
     // Attention / MLA metadata is not carried by model_t - read it from the
     // source GGUF KV directly (same defaults as moe_loader before).
@@ -122,27 +123,28 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
             uint64_t cur_slot = 0;
 
             if (is_v2) {
-                // read_plan: one whole (layer,e) block, 4K-aligned, straight into
-                // the slot base (block layout == slot layout). Branch slices are
-                // NOT 4K-aligned inside the block, so a single whole-block read
-                // is the only correct DIO form.
+                // read_plan: whole block via block_srcs - v2 single-file = 1
+                // aligned segment; v2 chunk = N per-file strip segments. All
+                // segments are 4K-aligned (strip layout) so direct DIO works.
                 const size_t flat = (size_t) l * topo.n_expert + e;
-                const uint64_t boff  = m.expert_sections[flat * 3];
                 const uint64_t bsize = m.expert_sections[flat * 3 + 1];
-                sub_tensor_req_t blk;
-                blk.shard_idx = 0;
-                blk.file_offset = m.data_offs[0] + boff;
-                blk.byte_size = bsize;
-                blk.slot_offset = 0;
-                reqs.push_back(blk);
                 exp.total_expert_bytes = bsize;
+                const auto& segs = m.block_srcs[flat];
+                for (const auto& s : segs) {
+                    sub_tensor_req_t req;
+                    req.shard_idx = s.file;
+                    req.file_offset = s.off;
+                    req.byte_size = s.len;
+                    req.slot_offset = s.in_off; // segment position inside the block
+                    reqs.push_back(req);
+                }
                 // sub_tensors: per-branch mapping into the block (drives the
                 // llama.cpp tensor -> slot pointer via slot_offset)
                 for (const auto* b : branches) {
                     sub_tensor_info_t st;
                     st.name = b->name;
                     st.shard_idx = 0;
-                    st.abs_file_offset = m.data_offs[0] + boff + b->branch_off;
+                    st.abs_file_offset = 0; // informational; reads use block_srcs
                     st.byte_size = b->per_expert;
                     st.slot_offset = b->branch_off;
                     st.ggml_type = b->type;
