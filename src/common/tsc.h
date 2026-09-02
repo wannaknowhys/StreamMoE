@@ -71,4 +71,13 @@ inline int64_t tsc_to_ns(uint64_t raw) {
            static_cast<int64_t>(static_cast<double>(raw - detail::tsc_calib_base_tsc) / tpn);
 }
 
+// Convert a TSC interval (e.g. done_tsc - req_tsc) to ns. Single division, no
+// base term (absolutes cancel); profile path only, calibration runs once.
+inline int64_t tsc_delta_ns(uint64_t delta_ticks) {
+    std::call_once(detail::tsc_calib_flag, detail::tsc_calibrate);
+    const double tpn = detail::tsc_calib_ticks_per_ns;
+    if (tpn <= 0.0) return 0;
+    return static_cast<int64_t>(static_cast<double>(delta_ticks) / tpn);
+}
+
 } // namespace stream_moe
