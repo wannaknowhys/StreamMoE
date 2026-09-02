@@ -53,3 +53,11 @@
 - [x] F2 分歧调查 + CPU-vs-Vulkan 对照：分歧=任意后端固有噪声（同路由 0.9996/翻放大 0.96-0.98/~5% 专家条目）——moe 非分歧来源
 - [x] F3 verify_prefill.js KV ne/nb 修复（4bf25d3）；kv_cos.js 验证 OK（自洽全1）
 - [x] F4 结论文档 docs/BACKEND_DIVERGENCE_ANALYSIS.md
+
+
+### G. GPU/Multi-device M1 - CPU-only private-chain skeleton (2026-09 开工)
+- [ ] G1 调研 gemma 链拓扑事实（build_moe_ffn 实际调用参数：gate_up merged/up_down_mm_id/norm_w/gating/down 等）+ 现状 minigraph 接口
+- [ ] G2 私有链重建器设计（输入契约 cur/ids/weights/槽布局 -> 私有 ctx 重建 gemma 层链 -> moe_out）
+- [ ] G3 实现：graph_compute 收整层 -> 重建 -> 官方核执行（中间 arena 不写主图链中间）
+- [ ] G4 CPU 伪双 device_pool + ids 分组/汇总逻辑
+- [ ] G5 数值对齐官方（v2/prefill 对比）
