@@ -97,6 +97,23 @@ dst。纪律（必选非测试）：**graph_compute 返回前，等所有内部�
 （每设备事件/synchronize），再写 moe_out。CPU-only 现在天然同步；GPU 异步才触发——M3 留
 "故意变慢验证正确性"回归。
 
+### 3.5 执行器实现定案（M1/G3，已固定）
+
+- **单一链节点判定** `is_moe_chain_node(node)`，`supports_op`（收编）、verify Check1/Check2、
+  执行遍历三处共用（一份定义、一个模块，如 `route_b_chain.*`）。判定 = src 链最终到达
+  expert-buft 的 `MUL_MAT_ID`（+ 名字域辅助）。收编**靠 sched 机制而非判定聪明**：pass1
+  按 buft 归有权重节点；pass2 连续扩展无权重节点（链节点在 nodes 数组连续）；链首尾由两端
+  dense 权重节点界定（前门控权重、后 post_norm）。pass3 升级需同 buft——dense 侧同 op 节点
+  不会被抢。verify Check2 兜底任何错配。
+- **私有化一步到位（B2）**：直接藏中间。verify Check1 随 G3 一起落地当安全网。
+- **pin/unpin 生命周期**：阶段 1 **一次性**收 ids（gate_up 与 down 共用同一 ids）→ pin
+  （缺的 push 请求给调度、睡版本字）→ 跑完整链 → **链尾合并节点（add/moe_out）后才 unpin**
+  ——专家用到链最末（比现状 down 后 release 更晚）。
+- **verify Check1 结论缓存**：外部消费者关系只由拓扑决定（arch/层），与形状无关——是架构级
+  结论。按**模型拓扑签名**缓存（arch + n_layer + 每层配置；主/草稿是不同模型）。首次全图
+  扫描记录 `{signature: PASS}`；同签名后续 rebuild 跳过扫描。Check2（执行侧廉价节点计数）
+  每次执行都跑、不缓存。结论缓存放 route_b_chain 模块；私有化集合是判定的输出——两者分开。
+
 ## 4. device_pool[] + 每设备固定执行区
 
 现状单池目录已带 pool 维（entries 是 (L,E)×pool、scan 扫多池）——保留。要改的是物理槽

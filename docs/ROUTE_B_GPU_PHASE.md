@@ -145,6 +145,34 @@ per-device work** (backend event / synchronize per device), then write moe_out.
 CPU-only today is naturally synchronous; the rule bites with GPU async - keep a
 "slow-down and check" regression at M3.
 
+### 3.5 Executor implementation decisions (M1/G3, fixed)
+
+- **Single chain-node predicate** `is_moe_chain_node(node)`, shared by
+  `supports_op` (collection), verify Check1/Check2, and the execution traversal
+  (one definition, one module, e.g. `route_b_chain.*`). Judgement: the src chain
+  reaches an expert-buft `MUL_MAT_ID` (+ name-domain assist). Collection relies
+  on the scheduler mechanics, not on the predicate being clever:
+  pass1 assigns weights by buft; pass2 contiguously expands weightless nodes
+  (the chain nodes are contiguous in the nodes array); the chain bounds are
+  delimited by dense-weight nodes at both ends (gating weights before, post-norm
+  after). pass3 needs equal buft to upgrade, so same-op nodes on the dense side
+  are not stolen. Verify Check2 backstops any mis-assignment.
+- **Privatization lands in one step (B2)**: hide intermediates immediately.
+  verify Check1 ships together with G3 as the safety net.
+- **pin/unpin lifecycle**: phase 1 collects ids ONCE (gate_up and down share the
+  same ids) -> pin (missing experts push a request to the scheduler and wait on
+  the version word) -> run the whole chain -> **unpin after the merge node
+  (chain-tail add / moe_out)** - experts are used to the very end of the chain
+  (moves later than today's release-after-down).
+- **verify Check1 verdict is cached**: the external-consumer relation is
+  topology-only (arch/layers), shape-independent - an architectural conclusion.
+  Cache it by **model-topology signature** (arch + n_layer + per-layer config;
+  main and draft are separate models). First full-graph scan records
+  `{signature: PASS}`; later rebuilds of the same signature skip scanning.
+  Check2 (cheap execution-side node count) still runs every execution and is not
+  cached. The verdict cache lives in the route_b_chain module; the privatized
+  set is the predicate's output - two distinct things.
+
 ## 4. device_pool[] + fixed per-device execution arena
 
 Current single-pool code already keeps a pool dimension in the directory
