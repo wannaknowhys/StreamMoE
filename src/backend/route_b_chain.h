@@ -12,8 +12,16 @@
 // fallback). Chain/gating/verdict logic lives here, llama-context only calls in.
 
 struct ggml_cgraph;
+struct ggml_tensor;
 
 namespace stream_moe {
+
+// Single chain-node predicate, shared by supports_op (collection), verify and
+// the executor traversal (docs/ROUTE_B_GPU_PHASE.md §3.5). True for nodes of the
+// MoE expert chain that we take over: the routed expert MUL_MAT_IDs, the hidden
+// (privatised) chain intermediates (named ffn_moe_* minus gating/output), and
+// the output end (ffn_moe_out - written to the main dst, not hidden).
+bool moe_chain_node_is_privatizable(const ggml_tensor * node);
 
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and

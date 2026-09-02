@@ -49,6 +49,21 @@ bool is_hidden_name(const char * n) {
 
 } // namespace
 
+// ---- single chain-node predicate -----------------------------------------
+
+bool moe_chain_node_is_privatizable(const ggml_tensor * node) {
+    if (!node) return false;
+    // routed expert MUL_MAT_ID: weight name carries "_exps" but not shared "_shexp"
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_tensor * w = node->src[0];
+        if (w && w->name && has(w->name, "_exps") && !has(w->name, "_shexp")) return true;
+    }
+    const char * nm = node->name ? node->name : "";
+    if (!nm[0]) return false;
+    // hidden chain intermediate or the output end (both named in the ffn_moe_ domain)
+    return is_hidden_name(nm) || is_output_name(nm);
+}
+
 bool moe_chain_verify_graph(ggml_cgraph * gf) {
     if (!gf) return true;
 
