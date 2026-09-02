@@ -19,7 +19,8 @@
 - [x] A3 prefill patch 重生成：`git diff HEAD -- src/llama-context.cpp src/llama-context.h src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server.cpp`
 - [x] A4 干净 apply 验证：临时 worktree HEAD(f280b2698) → 按序 apply（macros → tsc_timer → route-b → gguf-alignment → prefill）→ **21 文件 hash 与工作区逐字节一致**
 - [x] A5 提交 patches + push
-- [x] A6 apply.bat —— 暂缓（update_routeb_patch.js 已能文件级更新；干净 apply 已由 A4 验证）
+- [x] A6 清理残留 spec-stats.patch（已并入 route-b）
+- [x] A7 apply.bat —— 暂缓（update_routeb_patch.js 已能文件级更新；干净 apply 已由 A4 验证）
 
 ### B. ASan 子命令整合 build.bat
 - [x] B1 build.bat 加 asan 子命令（已验证构建成功 + dll copy）
