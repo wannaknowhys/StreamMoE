@@ -77,11 +77,16 @@ function parseFile(path) {
         const layers = [];
         for (let li = 0; li < nLayer; li++) {
             const il = rdU32(off); off += 4;
-            const kType = rdU32(off); off += 4; const kNb = rdU64(off); off += 8;
-            const k = b.subarray(off, off + Number(kNb)); off += Number(kNb);
-            const vType = rdU32(off); off += 4; const vNb = rdU64(off); off += 8;
-            const v = b.subarray(off, off + Number(vNb)); off += Number(vNb);
-            layers.push({ il, kType, kNb, k, vType, vNb, v });
+            const rdTensor = () => {
+                off += 64; // 4x ne + 4x nb (int64 each): layout for per-token slicing
+                const ty = rdU32(off); off += 4;
+                const nn = rdU64(off); off += 8;
+                const d = b.subarray(off, off + Number(nn)); off += Number(nn);
+                return { ty, nn, d };
+            };
+            const tk = rdTensor();
+            const tv = rdTensor();
+            layers.push({ il, kType: tk.ty, kNb: tk.nn, k: tk.d, vType: tv.ty, vNb: tv.nn, v: tv.d });
         }
         caches.push({ name, layers });
     }
