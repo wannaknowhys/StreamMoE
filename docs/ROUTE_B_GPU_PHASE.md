@@ -70,6 +70,16 @@ Dynamic (which experts, which device, lead choice) lives entirely in the
 execution layer; the graph/reuse shape is static. This is the core architectural
 win of self-scheduling.
 
+**Execution boundary**: the whole per-layer MoE chain (gate_up -> view -> silu ->
+weighting -> down -> merge) is executed by us into our own fixed arenas; the main
+graph only carries the two ends - the layer input (`cur`) and the layer output
+(`ffn_moe_out-N`). Cross-device "copying" is not a physical law - it only appears
+when intermediates live in llama-managed buffers where the scheduler inserts cpy
+by backend ownership. Intermediates in our own arena are never copied (llama
+does not manage them); the price is that the chain execution is ours to
+orchestrate, and the main graph cannot keep individual MoE-chain nodes between
+the two ends.
+
 ## 4. device_pool[] + fixed per-device execution arena
 
 Current single-pool code already keeps a pool dimension in the directory
@@ -106,10 +116,13 @@ serial so safe, but explicit read/write windows needed).
   runs on the layer's **dense device** (static, decided by layer placement -
   dense weights are never moved/copied for gating). ids + per-expert weights
   then fan out to the executing pools (small: n_used x tokens).
-- **Lead device** (merge point) = the pool holding the **most resident experts
-  of this layer** (heuristic from the directory - pool residency changes slowly;
-  we cannot use this run's ids to choose, they do not exist before gating). Most
-  expert contributions are summed locally at the lead.
+- **Lead device** (merge point) = the pool holding the **most of this run's
+  selected experts**. Chosen AFTER every expert is pinned/resolved (stage 2) -
+  the actual per-pool distribution of this run's ids is known then, so lead =
+  argmax over pools of this run's real residency (no heuristic needed; gating
+  order only matters for the gate location, which follows the dense device and
+  does not need the distribution). Most expert contributions are summed locally
+  at the lead.
 - **cur broadcast**: every pool that computes experts needs cur - one copy per
   executing pool (unavoidable minimum).
 - **Merge**: lead device sums its own + returning non-lead contributions

@@ -51,6 +51,12 @@ llama 主图照常构建每层 MoE 节点（can_reuse/plan 稳定）。`supports
 动态（哪些专家、在哪个设备、主设备选择）全在执行层；图/reuse 形状静态。这是自调度路线
 的架构核心收益。
 
+**执行边界**：整段层内 MoE 链（gate_up→view→silu→加权→down→汇总）由我们执行、写进我们
+自己的固定区；主图只保留两头——层输入（`cur`）与层输出（`ffn_moe_out-N`）。"跨 device
+搬运"不是物理定律——只有当中间放在 llama 管 buffer、sched 按 backend 归属插 cpy 时才会
+出现。中间在我们的区里永不拷贝（llama 不管理我们的区）；代价是链执行归我们编排，主图
+在两头之间不能保留单独的 MoE 链节点。
+
 ## 4. device_pool[] + 每设备固定执行区
 
 现状单池代码的目录已带 pool 维（entries 是 (L,E)×pool，scan 扫多池）——保留。要改的是
@@ -81,8 +87,10 @@ arena = [ staging(cur 广播副本) | exec 区(链中间 gate_up/silu/down 原�
 - **门控**（`cur×gate_proj`、softmax、topk）是 **dense 计算** → 在该层 **dense 设备**上
   算（静态，由层排布决定——dense 权重绝不为门控搬迁/拷贝）。ids + per-expert weights
   再分发到各执行池（小：n_used×tokens）。
-- **主执行设备**（汇聚点）= 该层**当前驻留专家最多**的池（目录启发式——池驻留变化慢；
-  不能用本次 ids 选，因为门控产出前 ids 不存在）。多数专家贡献就地相加。
+- **主执行设备**（汇聚点）= 本次被选专家驻留**最多**的池。在**所有专家 pin/解析完之后**选
+  （阶段 2）——本次 ids 的实际逐池分布已确定，主设备 = 对本次真实分布取 argmax（不需要
+  启发式；门控位置才受门控先后影响，而它跟 dense device 走、本就不看分布）。多数专家贡献
+  就地相加。
 - **cur 广播**：每个要算专家的池都需要 cur——每个执行池拷一次（不可避免的最小量）。
 - **汇总**：主设备把本地 + 非主设备送回（embd 维小）的贡献相加 → `ffn_moe_out-N` →
   送回 dense 设备给 residual/add/norm。
