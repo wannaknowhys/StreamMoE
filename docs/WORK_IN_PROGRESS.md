@@ -1,7 +1,7 @@
 ﻿# Work In Progress - patch 体系手术 + 收尾
 
 > 会话任务清单，边做边更新（多 commit，每步成功即提交）。
-> 目标态 = vendored 工作区（features 机制 + frag 全主仓库 + server-context 纯锚点）已编译验证通过；剩余：patch 文件对齐工作区 + ASan 整合 + 文档同步。
+> **状态：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
 
 ## 背景状态（已落地，commit 403a5d2）
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
