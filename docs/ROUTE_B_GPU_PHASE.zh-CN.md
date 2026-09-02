@@ -57,6 +57,25 @@ llama 主图照常构建每层 MoE 节点（can_reuse/plan 稳定）。`supports
 出现。中间在我们的区里永不拷贝（llama 不管理我们的区）；代价是链执行归我们编排，主图
 在两头之间不能保留单独的 MoE 链节点。
 
+### 3.1 私有化准入验证（fail-fast，无 fallback）
+
+把中间藏进私有区（真实结果在我们区、主图节点 dst 不算）只在"该层 MoE 链之外没有节点
+消费它们"时才安全。这是对模型的**架构假设**不是运行时细节——若某模型变体把 MoE 中间
+引到别处，我们的结果对那个消费者不可见。所以大声验证、拒绝运行：
+
+- **挂点**：三个 `model.build_graph()` 调用点（`llama-context.cpp`：process_ubatch /
+  graph_reserve / llama_encode）之后调 `stream_moe_verify_graph(gf)`——函数在我们侧；
+  llama-context.cpp 只加三行调用 + 宏 gate，链/豁免判定全在我们代码。verify 只在图真的
+  重建时跑（`can_reuse` 直接跳过 build，无 per-decode 开销）。
+- **判定**：对每个打算私有化的 MoE 链中间，枚举它在全图中的消费者，断言全部落在同一层
+  MoE 链内（名字域 `blk.N.ffn_moe_*`，最终汇聚到 `ffn_moe_out-N`）。豁免：`ffn_moe_out-N`
+  本身（输出端，被残差 add 消费——允许）；门控段（logits/probs/topk/weights——dense 域、
+  不私有化——不验）。
+- **失败模式**：任何外部消费者 → log 完整上下文（哪个中间、哪个外部消费者、层、arch）
+  后退出。**无静默 fallback、无逃生门**——违规意味着我们误解了模型架构，必须立刻知道，
+  而不是掩盖。
+- **私有化集合定义从严**：拿不准是链还是门控的节点，宁可不私有化，也别误报误杀健康模型。
+
 ## 4. device_pool[] + 每设备固定执行区
 
 现状单池代码的目录已带 pool 维（entries 是 (L,E)×pool，scan 扫多池）——保留。要改的是

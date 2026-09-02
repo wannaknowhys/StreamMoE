@@ -80,6 +80,34 @@ does not manage them); the price is that the chain execution is ours to
 orchestrate, and the main graph cannot keep individual MoE-chain nodes between
 the two ends.
 
+### 3.1 Privatization admission check (fail-fast, no fallback)
+
+Hiding intermediates (real results in our arenas, main-graph node dst left
+uncomputed) is only safe if no node OUTSIDE the layer's MoE chain consumes them.
+That is an architectural assumption about the model, not a runtime detail - if a
+model variant routes an MoE intermediate somewhere else, our results are
+invisible to that consumer. So we verify, loud, and refuse to run:
+
+- **Hook**: after each of the three `model.build_graph()` call sites
+  (`llama-context.cpp`: process_ubatch / graph_reserve / llama_encode), call
+  `stream_moe_verify_graph(gf)` - our function; llama-context.cpp only gains the
+  three calls + a macro gate, the chain/exemption logic lives on our side.
+  verify only runs when the graph is actually rebuilt (`can_reuse` skips build
+  entirely, so no per-decode cost).
+- **Check**: for every MoE-chain intermediate we intend to privatize, enumerate
+  its consumers in the whole graph and assert they all lie inside the same
+  layer's MoE chain (name domain `blk.N.ffn_moe_*`, eventually converging on
+  `ffn_moe_out-N`). Exemptions: `ffn_moe_out-N` itself (it is the output end,
+  consumed by the residual add - allowed); the gating segment
+  (logits/probs/topk/weights - dense-domain, not privatized - not checked).
+- **Failure mode**: any external consumer -> log the full context (which
+  intermediate, which external consumer, layer, arch) and exit. **No silent
+  fallback, no escape hatch** - a violation means we misunderstood the model
+  architecture and must learn about it immediately, not paper over it.
+- **Define the privatized set narrowly**: when unsure whether a node is chain
+  or gating, keep it out of the privatized set rather than risk a false
+  positive that kills a healthy model.
+
 ## 4. device_pool[] + fixed per-device execution arena
 
 Current single-pool code already keeps a pool dimension in the directory
