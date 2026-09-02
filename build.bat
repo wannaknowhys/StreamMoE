@@ -44,16 +44,18 @@ rem (multiple can be ON at once - llama.cpp schedules layers across registered
 rem backends via --split-mode/--tensor-split). LLAMA_BUILD_TOOLS controls the
 rem upstream llama-cli/llama-server build (default ON).
 if "%LLAMA_BUILD_TOOLS%"=="" set LLAMA_BUILD_TOOLS=ON
-rem STREAM_MOE feature macros by tag (build.bat llamalibs <tag>):
-rem   main                  -> -DSTREAM_MOE_ROUTE_B          (route-B full inference, production)
-rem   upstream_dump         -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export, no vulkan baseline)
-rem   upstream_vulkan_dump  -> -DSTREAM_MOE_PREFILL_EXPORT   (prefill export + vulkan, for Vulkan0 comparison)
-rem   StreamMoE_dump        -> both                          (full StreamMoE export, vs upstream_dump)
-set STREAM_MOE_MACROS=
-if "%TAG%"=="main"                 set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B
-if "%TAG%"=="upstream_dump"        set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
-if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_MACROS=-DSTREAM_MOE_PREFILL_EXPORT
-if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_MACROS=-DSTREAM_MOE_ROUTE_B -DSTREAM_MOE_PREFILL_EXPORT
+rem STREAM_MOE features by tag (build.bat llamalibs <tag>). Feature macros are
+rem defined by the vendored root CMakeLists from -DSTREAM_MOE_FEATURES (whole
+rem build), not passed via CMAKE_CXX_FLAGS.
+rem   main                  -> route_b          (route-B full inference, production)
+rem   upstream_dump         -> prefill_export   (prefill export, no vulkan baseline)
+rem   upstream_vulkan_dump  -> prefill_export   (prefill export + vulkan, for Vulkan0 comparison)
+rem   StreamMoE_dump        -> route_b,prefill_export (full StreamMoE export, vs upstream_dump)
+set STREAM_MOE_FEATURES=
+if "%TAG%"=="main"                 set STREAM_MOE_FEATURES=route_b
+if "%TAG%"=="upstream_dump"        set STREAM_MOE_FEATURES=prefill_export
+if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_FEATURES=prefill_export
+if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_FEATURES=route_b,prefill_export
 rem ---- CPU arch + backend by tag ----
 rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
 rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
@@ -94,7 +96,8 @@ if "%GGML_VULKAN%"=="ON" (
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS% %STREAM_MOE_MACROS%" ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS%" ^
+    -DSTREAM_MOE_FEATURES="%STREAM_MOE_FEATURES%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
     -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
