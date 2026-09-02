@@ -2,7 +2,7 @@
 
 > 会话任务清单，边做边更新（多 commit，每步成功即提交）。
 > **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
-> **本轮（新开）：Linux async DIO 真异步化（评估待做）**。
+> **本轮：Linux async DIO 真异步化（评估待做）仍在。** 另完成：E3 死锁修复验证、verify_prefill.js 修复、backend 分歧分析（docs/BACKEND_DIVERGENCE_ANALYSIS.md）。
 
 ## 背景状态（已落地，commit 403a5d2）
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
@@ -46,3 +46,10 @@
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）
 - 手术前快照 + 主仓库 commit（README 叠加铁律）
 - vendored 永不 commit，改动靠 patch 记录
+
+
+### F. prefill-from 死锁修复 + 分歧验证收尾（2026-09-03）
+- [x] F1 死锁修复验证：8192 vs 71680 IDENTICAL（6111cc7 零数值影响）；512 fail-fast
+- [x] F2 分歧调查 + CPU-vs-Vulkan 对照：分歧=任意后端固有噪声（同路由 0.9996/翻放大 0.96-0.98/~5% 专家条目）——moe 非分歧来源
+- [x] F3 verify_prefill.js KV ne/nb 修复（4bf25d3）；kv_cos.js 验证 OK（自洽全1）
+- [x] F4 结论文档 docs/BACKEND_DIVERGENCE_ANALYSIS.md
