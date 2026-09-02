@@ -5,6 +5,12 @@
 #   test     : build + run unit tests
 #   clean    : remove build/
 # Usage: make llamalibs TAG=main  |  make test TAG=main
+#
+# NOTE: Linux route-B is NOT yet wired up. The feature frags + macros follow the
+# same -DSTREAM_MOE_FEATURES mechanism as build.bat, but the route-b engine
+# source list (common/CMakeLists.txt, STREAM_MOE_SRC) hardcodes the Windows
+# async_dio_win.cpp - a POSIX selection is needed before enabling features here.
+# Until then this dispatcher stays featureless (pure upstream libs for tests).
 TAG ?= main
 BUILD := build/$(TAG)
 LLAMA_BUILD := $(BUILD)/llama-build

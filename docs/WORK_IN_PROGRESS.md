@@ -26,9 +26,9 @@
 - [x] B2 ASAN_BUILD.md 修过时（build.bat asan + features 说明）
 
 ### C. 文档同步
-- [ ] C1 patches/README.md 重写新体系（frag 主仓库 + features + apply 顺序）
-- [ ] C2 docs/CHECKPOINT.md 更新状态段（patch 体系 + 构建机制）
-- [ ] C3 Makefile 加 features 映射（Linux 若要功能构建）
+- [x] C1 patches/README.md 重写新体系（frag 主仓库 + features + apply 顺序 + 文件归属）
+- [x] C2 docs/CHECKPOINT.md 更新状态段（patch 体系 + features 机制）
+- [x] C3 Makefile 注明 Linux route-b 未支持（STREAM_MOE_SRC 硬编码 async_dio_win.cpp，需 posix 源选择后方可启用）
 
 ## 关键纪律
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）

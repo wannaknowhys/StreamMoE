@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-08-31。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-03（patch 体系重构收尾）。维护者每阶段收尾更新"当前状态"与"下一步"。
 
 ---
 
@@ -18,20 +18,18 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - CMakeLists 去 `stream_moe`/`stream_moe_server` 目标（保留 test_*）；build.bat/Makefile 去 `build` 子命令（保留 llamalibs/test/convertd/clean）。
 - 推理/导出全走 vendored `llama-server`/`llama-cli`（route B 插件经 `src/server/route_b_inject.*` 注入）。
 
-### vendored patch 体系（2026-08-31 重构，phase 结构 + 宏隔离，vendored 永不 commit）
+### vendored patch 体系（2026-09-03 重构：frag 全主仓库 + features 宏机制）
 - **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
-- **5 个 patch**（`patches/`，phase 结构，`git apply --check` 验证叠加）：
-  - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（共享文件 include 锚点）+ `tsc_timer.patch`（[TMR]）
-  - **Phase 2a（可选）**：`route-b-inject.patch`（route B：5 个 `stmoe_routeb_*.frag` + 专属文件）
-  - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 导出：6 个 `stmoe_prefill_*.frag` + llama 层）
-  - **`gguf-alignment.patch`**（转换器工具独立，不入推理构建）
-- **宏隔离**（编译时 -D 选功能，专属文件代码也包宏）：
-  - `main` → `-D STREAM_MOE_ROUTE_B`（route-b 完整推理）
-  - `upstream_dump` → `-D STREAM_MOE_PREFILL_EXPORT`（prefill 导出，标准上游基准）
-  - `StreamMoE_dump` → 两者（完整 StreamMoE 导出）
-  - **无宏 = 原版行为**（已编译 + llama-server help 验证无 StreamMoE 参数）
-- **应用顺序**：`streammoe-macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama`（temp 干净重建逐字节一致）。
-- vulkan 构建修复**无 patch**：`build.bat` 经上游 `VULKAN_SHADER_GEN_CMAKE_ARGS` hook 传工具链。
+- **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b / prefill_export / route_b,prefill_export）→ vendored 根 `CMakeLists.txt` features 块全局 `add_compile_definitions` + `include_directories`（主仓库 frag 目录）。**宏不拼 CXX_FLAGS**。宏对当次构建全部 target 生效（防静默丢弃）。
+- **frag 全在主仓库**（随主仓库 commit）：`patches/route-b/common/`、`patches/prefill-export/common/`、`patches/prefill-export/include/`——vendored `include/` 已清空。
+- **5 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
+  - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（根 CMakeLists features 块 + 共享文件 include 锚点：arg/common.cpp/h/llama.h/server-context 3 锚点）+ `tsc_timer.patch`（[TMR] `sm_tmr`，`STREAM_MOE_TMR` env 门控）
+  - **Phase 2a（可选）**：`route-b-inject.patch`（route-b 专属：common/CMakeLists STREAM_MOE_SRC + speculative + llama-model-loader.cpp/h + llama-model.cpp + llama.cpp）——**无 frag new-file、无 server-context 段**
+  - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 专属：llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）——**无 frag new-file**
+  - **`gguf-alignment.patch`**（独立）：ggml gguf.h/cpp（convertd 工具用）
+- **应用顺序**：macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama（临时 worktree 逐字节一致验证过，21 文件）。
+- **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。
+- **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
