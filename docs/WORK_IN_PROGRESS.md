@@ -1,4 +1,4 @@
-# Work In Progress - patch 体系手术 + 收尾
+﻿# Work In Progress - patch 体系手术 + 收尾
 
 > 会话任务清单，边做边更新（多 commit，每步成功即提交）。
 > 目标态 = vendored 工作区（features 机制 + frag 全主仓库 + server-context 纯锚点）已编译验证通过；剩余：patch 文件对齐工作区 + ASan 整合 + 文档同步。
@@ -19,11 +19,11 @@
 - [x] A3 prefill patch 重生成：`git diff HEAD -- src/llama-context.cpp src/llama-context.h src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server.cpp`
 - [x] A4 干净 apply 验证：临时 worktree HEAD(f280b2698) → 按序 apply（macros → tsc_timer → route-b → gguf-alignment → prefill）→ **21 文件 hash 与工作区逐字节一致**
 - [x] A5 提交 patches + push
-- [ ] A6 apply.bat（phase 顺序 + --check）—— 可选（update_routeb_patch.js 已能文件级更新）
+- [x] A6 apply.bat —— 暂缓（update_routeb_patch.js 已能文件级更新；干净 apply 已由 A4 验证）
 
 ### B. ASan 子命令整合 build.bat
-- [ ] B1 build.bat 加 asan 子命令（vcvars64 探测 + cl.exe + /fsanitize=address /MD + -DSTREAM_MOE_FEATURES=route_b + ninja llama-server）
-- [ ] B2 ASAN_BUILD.md 修过时（补 features + 走 build.bat asan 说明 + 改日期）
+- [x] B1 build.bat 加 asan 子命令（已验证构建成功 + dll copy）
+- [x] B2 ASAN_BUILD.md 修过时（build.bat asan + features 说明）
 
 ### C. 文档同步
 - [ ] C1 patches/README.md 重写新体系（frag 主仓库 + features + apply 顺序）

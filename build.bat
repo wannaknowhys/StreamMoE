@@ -32,6 +32,7 @@ if "%CMD%"=="build" goto build
 if "%CMD%"=="test" goto test
 if "%CMD%"=="clean" goto clean
 if "%CMD%"=="convertd" goto convertd
+if "%CMD%"=="asan" goto asan
 echo Unknown command: %CMD%
 goto help
 
@@ -140,6 +141,44 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [+] All unit tests passed for tag %TAG%!
 exit /b 0
 
+:asan
+rem ASan (AddressSanitizer) llama-server with route-B, using MSVC cl.exe - see
+rem docs/ASAN_BUILD.md. clang-cl ASan conflicts with CMake TryCompile /RTC1, so
+rem this deliberately does NOT reuse the clang-cl toolchain above.
+echo [StreamMoE] Building ASan llama-server (MSVC cl + /fsanitize=address) -> build\asan\llama-build ...
+set "VSVARS=%VS_PATH%"
+if "%VSVARS%"=="" set "VSVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VSVARS%" (
+    echo [-] vcvars64 not found: %VSVARS% ^(set VS_PATH to the vcvars64.bat location^)
+    exit /b 1
+)
+call "%VSVARS%" >nul
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+if not exist build\asan\llama-build mkdir build\asan\llama-build
+"%CMAKE%" -S third_party/llama.cpp -B build/asan/llama-build -G Ninja ^
+    -DCMAKE_MAKE_PROGRAM=%NINJA% ^
+    -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe ^
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TRY_COMPILE_CONFIGURATION=Release ^
+    -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF ^
+    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_ALL_WARNINGS=OFF -DLLAMA_CURL=OFF ^
+    -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF ^
+    -DCMAKE_C_FLAGS="/W0 /fsanitize=address /Zi /O2" ^
+    -DCMAKE_CXX_FLAGS="/W0 /EHsc /fsanitize=address /Zi /O2" ^
+    -DSTREAM_MOE_FEATURES="route_b"
+if errorlevel 1 exit /b 1
+"%NINJA%" -C build/asan/llama-build llama-server
+if errorlevel 1 exit /b 1
+rem ASan runtime dll must match the MSVC version that just configured (vswhere /
+rem VCINSTALLDIR is set by vcvars64); copy it next to the exe.
+for /d %%m in ("%VCINSTALLDIR%\Tools\MSVC\*") do set MSVC_VER_DIR=%%m
+copy /Y "%MSVC_VER_DIR%\bin\Hostx64\x64\clang_rt.asan_dynamic-x86_64.dll" build\asan\llama-build\bin\ >nul
+if errorlevel 1 (
+    echo [-] failed to copy clang_rt.asan_dynamic-x86_64.dll from "%MSVC_VER_DIR%"
+    exit /b 1
+)
+echo [+] ASan llama-server built: build\asan\llama-build\bin\llama-server.exe
+exit /b 0
+
 :convertd
 echo [StreamMoE] Building convertd (dumb GGUF TCP service) -> build\convertd\convertd.exe ...
 if exist build\convertd\ggml-build\build.ninja goto convertd_build
@@ -187,5 +226,6 @@ echo   llamalibs main           - route-B llama-server (build\main)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
 echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
 echo   build.bat convertd       - build converter TCP service (build\convertd)
+echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0
