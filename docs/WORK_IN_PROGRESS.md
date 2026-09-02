@@ -1,7 +1,8 @@
 ﻿# Work In Progress - patch 体系手术 + 收尾
 
 > 会话任务清单，边做边更新（多 commit，每步成功即提交）。
-> **状态：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
+> **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
+> **本轮（新开）：Linux async DIO 真异步化（评估待做）**。
 
 ## 背景状态（已落地，commit 403a5d2）
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
@@ -30,6 +31,11 @@
 - [x] C1 patches/README.md 重写新体系（frag 主仓库 + features + apply 顺序 + 文件归属）
 - [x] C2 docs/CHECKPOINT.md 更新状态段（patch 体系 + features 机制）
 - [x] C3 Makefile 注明 Linux route-b 未支持（STREAM_MOE_SRC 硬编码 async_dio_win.cpp，需 posix 源选择后方可启用）
+
+### D. Linux async DIO 真异步化（新开，评估待做）
+- [ ] D1 现状已确认：`src/io/async_dio_posix.cpp` 是同步 `pread` 套 async 接口壳（submit_batch 阻塞读；wait_events 无等待语义）——正确性可用、并发/吞吐不合格（对比 win IOCP 真异步）
+- [ ] D2 达标设计（按性能底线）：io_uring 主路径 → 探测失败 fallback io_submit/libaio → 再失败同步 pread（现实现降级为它）；需 sqe/cqe ring + O_DIRECT 4K 对齐（v2 直读 slot 已满足）
+- [ ] D3 决策点：Linux 是否已是/将成为生产目标（若非——维持占位，仅当 Linux 正经跑 route-b 大 prefill 前做）
 
 ## 关键纪律
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）
