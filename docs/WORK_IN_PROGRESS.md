@@ -57,7 +57,7 @@
 
 ### G. GPU/Multi-device M1 - CPU-only private-chain skeleton (2026-09 开工)
 - [x] G1 调研完成：gemma4 门控自定义在 gemma4.cpp（attn_out 上 rms_norm+scale+gate_inp_s+mm，dense 域），probs_in 传入 build_moe_ffn；链 = softmax/topk/weights(norm_w) -> fused gate_up MUL_MAT_ID -> view gate/up -> geglu_split -> down MUL_MAT_ID -> mul weights -> 逐expert view/add -> moe_out；每层 2 个 MUL_MAT_ID；post_norm_2 在链外 dense 域（build_moe_ffn 实际调用参数：gate_up merged/up_down_mm_id/norm_w/gating/down 等）+ 现状 minigraph 接口
-- [ ] G2 私有链重建器设计（输入契约 cur/ids/weights/槽布局 -> 私有 ctx 重建 gemma 层链 -> moe_out）
+- [x] G2 定案：执行形态 A = 逐节点 mini-graph + 数据私有（不建影子链/不重建拓扑，拓扑来自主图 -> 无 per-arch 重建器）；私有 arena 中间 / view 指针偏移 / moe_out 直写主图 dst；专家视图接口 = resolve(L,E)->{pool,slot 基址/stride}；mock 点清单见 docs/MOCK.md
 - [ ] G3 实现：graph_compute 收整层 -> 重建 -> 官方核执行（中间 arena 不写主图链中间）
 - [ ] G4 CPU 伪双 device_pool + ids 分组/汇总逻辑
 - [ ] G5 数值对齐官方（v2/prefill 对比）

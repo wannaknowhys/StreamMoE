@@ -196,17 +196,21 @@ dense 按层剥离、每层指派设备（静态、不迁移）；KV 跟层 dens
 
 校准记录，避免日后误读本设计。
 
-1. **执行形态 = 私有链 mini-graph，不是第二棵调度树。** "执行走原版、数据私有"：照主图链
-   拓扑在私有 ctx 重建（官方内核、原版顺序），中间在我们 arena；只 cur（入）/moe_out（出）
-   碰主图。无第二棵编排树——私有 mini-graph 拓扑 = 主图链段的镜像，一致性是构造保证而非
-   运行时约定。
+1. **执行形态 = 逐节点 mini-graph + 数据私有，不是链重建器、不是第二棵树。** "执行走原版、
+   数据私有"：`graph_compute` 收到该层原版链节点就用（我们绝不重建拓扑）。对每个**计算节点**
+   （mul_mat_id/激活/mul/add——一切非 view 的）建一个单节点 mini-graph：输入 leaf 指
+   （主图输入 cur/ids/weights，或已在私有 arena 的上一结果），官方内核跑，dst data 落我们
+   私有 arena（moe_out 例外——写主图 dst）。view 节点不建：consumer 的输入 leaf = 上游
+   data + view 偏移（C 风格指针算术）。**不维持影子链**——各单节点 mini-graph 独立，靠
+   arena 槽衔接；顺序 = 我们遍历 split 的顺序。主图只碰 cur（入）/moe_out（出）。
 2. **跨 split 同步接受。** 每层 = 一个 dense split + 一个我们 split 交替，本来就是原版
    sched 结构；同步开销 vs tokens/s 不是瓶颈——不为它优化。
 3. **verify**：Check 1（build 时：私有化中间无外部消费者）是准入点。Check 2（graph_compute
    内链完整性）保留为执行侧廉价自检——不是跨层接口。
 4. **调度是槽级、每池本地**（§4.1）：驱逐只因为该池满；目录是位置记录不是策略。
-5. **真正的结构成本是链拓扑重建器**：在私有 ctx 重建一层链必须逐 arch 镜像
-   `build_moe_ffn`（gemma：fused gate_up + view 切分；deepseek：分开 gate/up/down；...）。
-   每 arch 维护一个重建器。M1 只实现 gemma 拓扑；接口留 arch 分支。
+5. **不需要 per-arch 链重建器**：因为我们逐节点 mini-graph 执行原版节点（第 1 条），拓扑
+   来自主图——gemma 的 fused gate_up+view 和 deepseek 的分开 gate/up/down 都按构造成立。
+   需要维护的只是小的"per-op leaf 包装清单"（我们包装哪些 op），与 arch 无关。M1 枚举
+   gemma 实际命中的 op。
 6. **多 copy 流水（n_copies>1）**：编码注意——split 要读 `cur_copy` 那版输入；非设计方向
    问题。

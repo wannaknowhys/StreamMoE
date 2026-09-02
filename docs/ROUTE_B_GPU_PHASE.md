@@ -280,13 +280,18 @@ then decide whether a custom layer table earns its keep.
 
 Calibration notes so the design is not misread later.
 
-1. **Execution form = private chain mini-graph, NOT a second scheduling tree.**
-   "Execute the original, own the data": replay the main graph's chain topology
-   (official kernels, original order) in a private ctx per layer; intermediates
-   live in our arena; only cur (in) and moe_out (out) touch the main graph.
-   No second orchestration tree - the private mini-graph topology is a mirror of
-   the main-graph chain segment, so consistency is by construction, not by
-   runtime agreement.
+1. **Execution form = per-node mini-graph with private data, NOT a chain
+   replayer and NOT a second tree.** "Execute the original, own the data":
+   `graph_compute` receives the layer's original chain nodes as-is (we never
+   rebuild topology). For every compute node (mul_mat_id / activation / mul /
+   add - anything non-view) we build a one-node mini-graph: input leaf points at
+   (main-graph inputs cur/ids/weights, or the previous result already in our
+   arena), the official kernel runs, dst data lands in our private arena
+   (moe_out is the exception - it writes the main-graph dst). View nodes are not
+   built: the consumer's input leaf is just upstream data + view offset (C-style
+   pointer math). No shadow chain is maintained - per-node mini-graphs are
+   independent, chained by arena slots; the order is our traversal of the split.
+   Main graph only touches cur (in) and moe_out (out).
 2. **Cross-split synchronisation is accepted.** Per layer = one dense split +
    one of-our split alternation is the original sched structure anyway; sync
    cost vs tokens/s is not a bottleneck - do not optimise for it.
@@ -296,10 +301,10 @@ Calibration notes so the design is not misread later.
    cross-layer interface.
 4. **Scheduling is slot-level and per-pool local** (§4.1): eviction happens only
    because that pool is full; the directory is a location record, not a policy.
-5. **The real structural cost is the chain-topology replayer**: rebuilding a
-   layer's chain in the private ctx must mirror `build_moe_ffn` per arch (gemma:
-   fused gate_up + view split; deepseek: separate gate/up/down; ...). One
-   replayer to keep in sync per arch. M1 implements the gemma topology only;
-   the interface leaves arch branches open.
+5. **No per-arch chain replayer is needed**: because we execute the original
+   nodes one mini-graph at a time (item 1), topology comes from the main graph -
+   gemma's fused gate_up+view and deepseek's separate gate/up/down both work by
+   construction. The per-op leaf-wrapper coverage list (which ops we wrap) is
+   small and arch-independent. M1 enumerates the gemma ops actually hit.
 6. **Multi-copy pipeline (n_copies > 1)**: coding note - the split must read
    the `cur_copy`'s inputs; not a design-direction issue.
