@@ -61,3 +61,6 @@
 - [ ] G3 实现：graph_compute 收整层 -> 重建 -> 官方核执行（中间 arena 不写主图链中间）
 - [ ] G4 CPU 伪双 device_pool + ids 分组/汇总逻辑
 - [ ] G5 数值对齐官方（v2/prefill 对比）
+
+- [x] G3a verify 安全网落地（494f670）：route_b_chain 模块 + llama-context 三处 build 挂点 + CMake 源；gemma 验证 420 hidden/0 external。**patch 欠账**：vendored llama-context.cpp（route-b 挂点 hunk，与 prefill 同文件需手动 hunk）+ common/CMakeLists.txt（route_b_chain.cpp 源）待补进 route-b patch
+- [ ] G3b 执行器：supports_op 收编整层链计算节点（is_moe_chain_node 单一判定）+ moe_exec 扩到非 MUL_MAT_ID 计算节点（geglu/mul/add 官方核 mini-graph）+ 私有 arena 藏中间 + moe_out 直写主图 dst + 链尾 unpin
