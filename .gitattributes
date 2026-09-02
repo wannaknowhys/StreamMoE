@@ -1,0 +1,4 @@
+# Patch files must stay LF: git apply rejects CRLF line endings ("corrupt patch").
+patches/*.patch text eol=lf
+# cmd.exe misbehaves with LF-only batch files (goto/label parsing).
+*.bat text eol=crlf
