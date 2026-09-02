@@ -399,7 +399,7 @@ async function writeV1(model, out) {
         cmd: 'write_meta', out, in: model.files.map((f) => f.path),
         skip_kv: ['split.', 'stream_moe.', 'general.alignment'],
         set_kv: { 'general.alignment': ALIGN, 'stream_moe.layout': 'sections-v1' },
-        tensors: tensors.map((t) => ({ name: t.name, ne: t.ne, type: t.type })),
+        tensors: tensors.map((t) => ({ name: t.name, ne: t.ne, type: t.type, ...(t.perExpert ? { per_expert: t.perExpert } : {}) })),
         alignment: ALIGN,
     });
     if (!meta.ok) throw new Error('write_meta v1: ' + meta.error);
@@ -407,8 +407,11 @@ async function writeV1(model, out) {
     const ops = [];
     model.dense.forEach((t, i) => { for (const s of t.srcs) ops.push([s.fi, s.off, s.len, meta.offsets[i] + s.inOff]); });
     model.expert.forEach((t, i) => {
+        // per-expert slices are 4K-padded in the output (convertd reflows the
+        // expert section) so each slice starts 4K-aligned for straight DIO.
+        const stride = alignUp(t.perExpert, ALIGN);
         t.perExpertSrcs.forEach((segs, e) => {
-            for (const s of segs) ops.push([s.fi, s.off, s.len, meta.offsets[nD + i] + e * t.perExpert + s.inOff]);
+            for (const s of segs) ops.push([s.fi, s.off, s.len, meta.offsets[nD + i] + e * stride + s.inOff]);
         });
     });
     await call({ cmd: 'copy', src: model.files.map((f) => f.path), dst: out, ops }).then((r) => { if (!r.ok) throw new Error('copy v1: ' + r.error); });

@@ -1,19 +1,20 @@
 diff --git a/ggml/include/gguf.h b/ggml/include/gguf.h
-index b3a1e1230..b49a52565 100644
+index b3a1e1230..65ab9fdfe 100644
 --- a/ggml/include/gguf.h
 +++ b/ggml/include/gguf.h
-@@ -93,6 +93,9 @@ extern "C" {
+@@ -93,6 +93,10 @@ extern "C" {
  
      GGML_API uint32_t gguf_get_version    (const struct gguf_context * ctx);
      GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
 +#ifdef STREAM_MOE_GGUF_ALIGN
 +    GGML_API void     gguf_set_alignment  (struct gguf_context * ctx, size_t alignment);
++    GGML_API void     gguf_set_tensor_offset(struct gguf_context * ctx, const char * name, size_t offset);
 +#endif
      GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);  // padded to gguf_get_alignment if and only if the gguf_context contains at least one tensor
  
      GGML_API int64_t      gguf_get_n_kv(const struct gguf_context * ctx);
 diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
-index 6c7b58178..654b9998c 100644
+index 6c7b58178..223759bc3 100644
 --- a/ggml/src/gguf.cpp
 +++ b/ggml/src/gguf.cpp
 @@ -1022,6 +1022,18 @@ size_t gguf_get_alignment(const struct gguf_context * ctx) {
@@ -35,3 +36,21 @@ index 6c7b58178..654b9998c 100644
  size_t gguf_get_data_offset(const struct gguf_context * ctx) {
      return ctx->offset;
  }
+@@ -1430,6 +1442,17 @@ void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const vo
+     ctx->info[tensor_id].t.data = (void *)(uintptr_t)data; // double cast suppresses warning about casting away const
+ }
+ 
++#ifdef STREAM_MOE_GGUF_ALIGN
++// Set a tensor's data offset directly (convertd lays out v1 per-expert slices
++// 4K-aligned by reflowing the expert section). Does NOT reflow later tensors -
++// the caller owns the full layout when using this.
++void gguf_set_tensor_offset(struct gguf_context * ctx, const char * name, size_t offset) {
++    const int64_t tensor_id = gguf_find_tensor(ctx, name);
++    GGML_ASSERT(tensor_id >= 0 && "tensor not found");
++    ctx->info[tensor_id].offset = offset;
++}
++#endif
++
+ struct gguf_writer_base {
+     size_t written_bytes {0u};
+ 

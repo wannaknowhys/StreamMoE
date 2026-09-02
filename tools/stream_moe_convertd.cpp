@@ -337,6 +337,7 @@ static void cmd_write_meta(const JV & j, std::string & out) {
         ggml_init_params gprm = { 16 * 1024 * 1024, nullptr, true };
         ggml_context * gctx = ggml_init(gprm);
         if (!gctx) throw std::runtime_error("write_meta: ggml_init");
+        std::vector<uint64_t> per_expert;
         if (const JV * tarr = obj_arr(j, "tensors")) {
             for (auto & t : tarr->arr) {
                 const std::string name = obj_str(t, "name");
@@ -346,6 +347,7 @@ static void cmd_write_meta(const JV & j, std::string & out) {
                 if (const JV * n = obj_arr(t, "ne")) {
                     for (auto & e : n->arr) if (e.t == JV::NUM && nd < 4) ne[nd++] = (int64_t) e.num;
                 }
+                per_expert.push_back((uint64_t) obj_num(t, "per_expert", 0));
                 ggml_tensor * gt = ggml_new_tensor(gctx, (ggml_type) ty, nd, ne);
                 if (!gt) throw std::runtime_error("write_meta: ggml_new_tensor failed");
                 ggml_set_name(gt, name.c_str());
@@ -353,6 +355,25 @@ static void cmd_write_meta(const JV & j, std::string & out) {
             }
         }
         ggml_free(gctx);
+
+        // v1 per-expert 4K padding: reflow the expert section so every expert
+        // slice starts 4K-aligned (writeV1 sends per_expert > 0 for expert
+        // tensors; dense stays as gguf_add_tensor laid it out).
+        {
+            const int nt = gguf_get_n_tensors(dst);
+            uint64_t cur = 0;
+            bool started = false;
+            for (int i = 0; i < nt; ++i) {
+                const uint64_t pe = i < (int) per_expert.size() ? per_expert[i] : 0;
+                if (!pe) continue;
+                const char * nm = gguf_get_tensor_name(dst, i);
+                if (!started) { cur = gguf_get_tensor_offset(dst, i); started = true; }
+                gguf_set_tensor_offset(dst, nm, cur);
+                const int64_t * ne = gguf_get_tensor_ne(dst, i);
+                const uint64_t n_ex = ne[2] > 0 ? (uint64_t) ne[2] : 0;
+                cur += n_ex * align_up(pe, alignment);
+            }
+        }
 
         if (!gguf_write_to_file(dst, outp.c_str(), /*only_meta=*/ true)) throw std::runtime_error("write_meta: gguf_write_to_file");
         FILE * f = std::fopen(outp.c_str(), "r+b");

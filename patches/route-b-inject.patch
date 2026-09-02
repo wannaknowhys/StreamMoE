@@ -2,9 +2,9 @@ diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
 index 36f1e0cd5..0ff91794e 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -179,3 +179,19 @@ if (LLAMA_LLGUIDANCE)
+@@ -179,3 +179,21 @@ if (LLAMA_LLGUIDANCE)
  endif()
- 
+
  target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
 +
 +# StreamMoE route B: expert-pool backend sources live in the parent repo.
@@ -18,6 +18,8 @@ index 36f1e0cd5..0ff91794e 100644
 +    ${STREAM_MOE_SRC}/io/async_dio_win.cpp
 +    ${STREAM_MOE_SRC}/io/staging_reader.cpp
 +    ${STREAM_MOE_SRC}/loader/moe_loader.cpp
++    ${STREAM_MOE_SRC}/loader/model_builder.cpp
++    ${STREAM_MOE_SRC}/loader/topo_builder.cpp
 +    ${STREAM_MOE_SRC}/pool/expert_stats.cpp)
 +if (WIN32)
 +    target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
