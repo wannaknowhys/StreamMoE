@@ -6,11 +6,11 @@
 #   clean    : remove build/
 # Usage: make llamalibs TAG=main  |  make test TAG=main
 #
-# NOTE: Linux route-B is NOT yet wired up. The feature frags + macros follow the
-# same -DSTREAM_MOE_FEATURES mechanism as build.bat, but the route-b engine
-# source list (common/CMakeLists.txt, STREAM_MOE_SRC) hardcodes the Windows
-# async_dio_win.cpp - a POSIX selection is needed before enabling features here.
-# Until then this dispatcher stays featureless (pure upstream libs for tests).
+# NOTE: Linux route-B is not yet exercised here. The async DIO source is already
+# platform-selected (common/CMakeLists.txt: async_dio_win.cpp on WIN32 else
+# async_dio_posix.cpp - and the POSIX backend is still a sync-pread shell, see
+# docs/WORK_IN_PROGRESS.md D). Features are not passed yet, so this dispatcher
+# stays featureless (pure upstream libs for tests) until Linux is a real target.
 TAG ?= main
 BUILD := build/$(TAG)
 LLAMA_BUILD := $(BUILD)/llama-build

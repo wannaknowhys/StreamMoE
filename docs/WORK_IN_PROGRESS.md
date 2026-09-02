@@ -37,6 +37,11 @@
 - [ ] D2 达标设计（按性能底线）：io_uring 主路径 → 探测失败 fallback io_submit/libaio → 再失败同步 pread（现实现降级为它）；需 sqe/cqe ring + O_DIRECT 4K 对齐（v2 直读 slot 已满足）
 - [ ] D3 决策点：Linux 是否已是/将成为生产目标（若非——维持占位，仅当 Linux 正经跑 route-b 大 prefill 前做）
 
+### E. features 重构运行时验证（2026-09-03）
+- [x] E1 HTTP 推理冒烟（用户手动 curl hi）——OK（features 重构非运行时回归）
+- [x] E2 `node tools/run_export.js` hi（moe-temp0/StreamMoE_dump/gemma original）——rc=0，导出产物齐（chat/prefill_export/expert_history/tokens_id/text/meta）
+- [ ] E3 **`--prefill-from` 命令行模式卡（StreamMoE_dump + route-b）**：日志停在 `init_mappings` 后无输出，rc=1/挂起——独立问题（HTTP/run_export 正常证明非 features 回归）。待查：与 121-token 时成功路径的差异（当时可能 upstream tag 或不同构建）、export-dir 交互、init_mappings 后卡点
+
 ## 关键纪律
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）
 - 手术前快照 + 主仓库 commit（README 叠加铁律）
