@@ -1,8 +1,8 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 36f1e0cd5..c74db501b 100644
+index 36f1e0cd5..7ead0ee54 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -179,3 +179,22 @@ if (LLAMA_LLGUIDANCE)
+@@ -179,3 +179,25 @@ if (LLAMA_LLGUIDANCE)
  endif()
  
  target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
@@ -16,14 +16,17 @@ index 36f1e0cd5..c74db501b 100644
 +    ${STREAM_MOE_SRC}/backend/moe_backend.cpp
 +    ${STREAM_MOE_SRC}/backend/minigraph_exec.cpp
 +    ${STREAM_MOE_SRC}/backend/scheduler.cpp
-+    ${STREAM_MOE_SRC}/io/async_dio_win.cpp
 +    ${STREAM_MOE_SRC}/io/staging_reader.cpp
 +    ${STREAM_MOE_SRC}/loader/moe_loader.cpp
 +    ${STREAM_MOE_SRC}/loader/model_builder.cpp
 +    ${STREAM_MOE_SRC}/loader/topo_builder.cpp
 +    ${STREAM_MOE_SRC}/pool/expert_stats.cpp)
++# Async DIO backend by platform: IOCP (Windows) vs pread/io_uring (POSIX).
 +if (WIN32)
++    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_win.cpp)
 +    target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
++else()
++    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_posix.cpp)
 +endif()
 diff --git a/common/speculative.cpp b/common/speculative.cpp
 index 4eef2212e..c9c7a31f7 100644
