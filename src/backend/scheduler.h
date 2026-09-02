@@ -53,6 +53,9 @@ struct async_load_t {
     bool failed = false;
     bool direct = false;      // v2: reqs read straight into the slot
     uint8_t* staging = nullptr;
+    uint64_t req_tsc = 0;     // [TMR] raw TSC: async load requested
+    uint64_t dio_tsc = 0;     // [TMR] raw TSC: all DIO reads completed
+    uint64_t done_tsc = 0;    // [TMR] raw TSC: drain settled the slot
     class expert_scheduler* sched = nullptr;
     aio_req_t reqs[MAX_SUB_TENSORS_PER_EXPERT];
 };

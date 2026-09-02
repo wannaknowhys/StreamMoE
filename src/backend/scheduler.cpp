@@ -1,5 +1,6 @@
 #include "backend/scheduler.h"
 #include "common/logger.h"
+#include "common/tsc.h"
 #include "common/types.h"
 
 #include <cstring>
@@ -208,6 +209,7 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
     t->staging = t->direct ? nullptr
                            : (load_pool_ + static_cast<size_t>(idx) * load_stride_ + header_sz);
     t->pending = 0;
+    t->req_tsc = tsc_now();   // [TMR] request time: submission begins
     for (uint32_t s = 0; s < t->plan.num_tensors; ++s) {
         const auto& sl = t->plan.slices[s];
         aio_req_t& r = t->reqs[s];
@@ -248,6 +250,7 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
         }
         --t->pending;
         if (t->pending == 0) {
+            t->dio_tsc = tsc_now();   // [TMR] all sub-tensor DIO reads complete
             if (!t->failed) {
                 slots_[t->slot].mark_ready();
                 dir_->set(t->layer, t->expert, t->pool, t->slot);
@@ -256,6 +259,7 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 slots_[t->slot].mark_failed();
                 LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
             }
+            t->done_tsc = tsc_now();   // [TMR] slot settled (ready or failed)
             const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
             const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
             load_free_.push_back(idx);
