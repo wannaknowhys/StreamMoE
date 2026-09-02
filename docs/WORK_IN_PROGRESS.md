@@ -40,7 +40,7 @@
 ### E. features 重构运行时验证（2026-09-03）
 - [x] E1 HTTP 推理冒烟（用户手动 curl hi）——OK（features 重构非运行时回归）
 - [x] E2 `node tools/run_export.js` hi（moe-temp0/StreamMoE_dump/gemma original）——rc=0，导出产物齐（chat/prefill_export/expert_history/tokens_id/text/meta）
-- [ ] E3 **`--prefill-from` 命令行模式卡（StreamMoE_dump + route-b）**：日志停在 `init_mappings` 后无输出，rc=1/挂起——独立问题（HTTP/run_export 正常证明非 features 回归）。待查：与 121-token 时成功路径的差异（当时可能 upstream tag 或不同构建）、export-dir 交互、init_mappings 后卡点
+- [x] E3 **--prefill-from 卡死——已定位并修复（6111cc7）**：根因 = 组容量 < 单层专家数——129-token 单次 decode 在 layer 29（group1 仅 76 slots）活跃集超容量，compute 整层 pin（rc>0）不可驱逐 → worker NO_VICTIM 无限 requeue + compute 死等。验证：8192 池跑通（g1→128 slots，rc=0）、71680 池本就不卡、512 池 fail-fast（报 needs>=983MB）。修复 = 每组分池保底 = 一层全量专家 + 剩余按字节比例 + 预算不足 init 即报错退出
 
 ## 关键纪律
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）
