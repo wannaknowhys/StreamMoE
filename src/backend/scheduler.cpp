@@ -27,9 +27,14 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     dio_  = &dio;
     files_ = files;
 
-    // Carve per-expert-group sub-pools by byte fraction (docs/MULTI_SUBPOOL.md).
-    // Slot count = group budget / group expert size, so both the slot ratio and
-    // the byte ratio match the source model's expert composition.
+    // Carve per-expert-group sub-pools. Hard floor per group: enough slots to
+    // hold one full layer's expert set (per_layer x expert_size). A single
+    // decode may pin any subset of one layer, and eviction cannot reclaim slots
+    // pinned by the very layer being computed - a group smaller than one full
+    // layer deadlocks (NO_VICTIM requeue storm) once a layer's active set
+    // exceeds the group. Spare budget (pool - sum of floors) is split by byte
+    // fraction so multi-layer groups keep eviction head-room. If the pool cannot
+    // even meet the floors, fail fast at init instead of deadlocking at runtime.
     uint64_t total_bytes = 0;
     for (const auto& g : topo.groups) total_bytes += g.total_bytes;
     if (total_bytes == 0) {
@@ -37,14 +42,31 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
         return false;
     }
 
+    const uint32_t per_layer = topo.n_expert;   // experts per layer = one layer's worst-case active set
+    size_t sum_floor = 0;
+    std::vector<size_t> floor_bytes(topo.groups.size());
+    for (size_t i = 0; i < topo.groups.size(); ++i) {
+        floor_bytes[i] = static_cast<size_t>(per_layer) * topo.groups[i].expert_size;
+        sum_floor += floor_bytes[i];
+    }
+    if (sum_floor > pool_bytes) {
+        LOG_ERROR("expert_scheduler: pool " << (pool_bytes / (1024 * 1024)) << " MB too small: needs at least "
+                  << (sum_floor / (1024 * 1024)) << " MB to hold one full expert layer per group ("
+                  << per_layer << " experts/layer). Increase --moe-ram-pool.");
+        return false;
+    }
+    const size_t spare = pool_bytes - sum_floor;
+
     num_slots_ = 0;
-    for (const auto& g : topo.groups) {
-        // byte-fraction budget; use double to avoid 64-bit overflow for big pools
-        size_t budget = static_cast<size_t>(
-            static_cast<double>(pool_bytes) * (static_cast<double>(g.total_bytes) / static_cast<double>(total_bytes)));
-        uint32_t ns = static_cast<uint32_t>(std::max<size_t>(1, budget / g.expert_size));
-        uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * topo.n_expert;
-        if (ns > g_experts_total) ns = g_experts_total;
+    for (size_t i = 0; i < topo.groups.size(); ++i) {
+        const auto& g = topo.groups[i];
+        // floor + byte-fraction share of the spare (double to avoid 64-bit overflow)
+        size_t budget = floor_bytes[i] + static_cast<size_t>(
+            static_cast<double>(spare) * (static_cast<double>(g.total_bytes) / static_cast<double>(total_bytes)));
+        uint32_t ns = static_cast<uint32_t>(budget / g.expert_size);
+        const uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * per_layer;
+        if (ns < per_layer) ns = per_layer;             // never below one full layer
+        if (ns > g_experts_total) ns = g_experts_total; // never more than the group's real experts
         subpools_.push_back({ num_slots_, ns, g.expert_size, nullptr });
         num_slots_ += ns;
     }
