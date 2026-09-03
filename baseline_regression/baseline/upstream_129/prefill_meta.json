@@ -1,0 +1,15 @@
+{
+  "format": "PREFEXP2",
+  "model": "gemma4",
+  "files": {
+    "prefill_export_main.bin": {
+      "byte_order": "little",
+      "sections": [
+        { "id": "embd", "dtype": "f32", "n": 129, "dim": 2816 },
+        { "id": "hidden", "dtype": "f32", "n": 129, "dim": 2816 },
+        { "id": "top4", "id_dtype": "u32", "logit_dtype": "f32", "lse_dtype": "f32", "n": 129 }
+      ]
+    },
+    "expert_history_main.bin": { "record": ["layer u32", "token u32", "expert u32"], "n": 61920 }
+  }
+}
