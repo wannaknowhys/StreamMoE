@@ -225,20 +225,27 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     // 2. evict victim: READY && refcount==0, lowest hybrid score then oldest.
     //    score = alpha * 1/(1+recency) + (1-alpha) * freq   (smaller = evict first)
     //    recency = max(0, cur_token - last_used_token); alpha = clamp(1-hit_rate_ema, .1, .9)
+    //    Freshly-loaded, never-pinned slots are protected (evicting one would
+    //    undo an in-flight load) UNLESS the pool has no other victim - a pool
+    //    full of protected slots must still make room or the scheduler stalls.
     int32_t victim = -1;
     double  best_score = std::numeric_limits<double>::infinity();
     const uint64_t cur = token_.load(std::memory_order_relaxed);
     const double a = alpha_.load(std::memory_order_relaxed);
-    for (uint32_t i = lo; i < hi; ++i) {
-        uint64_t w = slots_[i].load();
-        if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
-        const uint64_t last = dir_->last_used(owner_[i].first, owner_[i].second);
-        const uint64_t recency = (cur > last) ? (cur - last) : 0;
+    for (int pass = 0; pass < 2 && victim < 0; ++pass) {
+        const bool allow_fresh = (pass == 1);
+        for (uint32_t i = lo; i < hi; ++i) {
+            uint64_t w = slots_[i].load();
+            if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
+            const uint64_t last = dir_->last_used(owner_[i].first, owner_[i].second);
+            if (!allow_fresh && last == 0) continue;
+            const uint64_t recency = (cur > last) ? (cur - last) : 0;
         const double freq = stats_.get_adaptive_frequency(owner_[i].first, owner_[i].second);
         const double score = a * (1.0 / (1.0 + static_cast<double>(recency))) + (1.0 - a) * freq;
         if (score < best_score) {
             best_score = score;
             victim = static_cast<int32_t>(i);
+        }
         }
     }
     if (victim < 0) return -1; // all slots pinned/in-flight
@@ -376,18 +383,19 @@ bool expert_scheduler::accept_requests() {
         uint32_t pool = 0;
         if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
         if (load_free_.empty()) { requests_.push(req); break; }
-        // Placement (Phase A): if the group has an attached device region, load
-        // there first (hot experts on VRAM); a full/unusable device region falls
-        // back to the CPU-RAM region.
+        // Placement: spread loads across the group's pools by capacity ratio
+        // (the pool with the lowest occupancy fraction wins), instead of
+        // cramming everything into the device region. Deterministic baseline -
+        // the future prefetch policy skews this. Fall back to the next-best
+        // pool when the preferred one cannot make room.
         uint32_t gidx = group_of(req.layer);
-        const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
         int32_t slot = -1;
-        if (dsp) {
-            slot = alloc_or_evict(req.layer, req.expert, dsp->pool);
-        }
-        if (slot < 0) {
-            slot = alloc_or_evict(req.layer, req.expert, 0);
-        }
+        // Device region first (keeps the active set on one region so a layer
+        // stays single-region while the executor has no per-region split yet).
+        // The future prefetch policy replaces this with a capacity-aware skew.
+        const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
+        if (dsp) slot = alloc_or_evict(req.layer, req.expert, dsp->pool);
+        if (slot < 0) slot = alloc_or_evict(req.layer, req.expert, 0);
         if (slot < 0) { requests_.push(req); break; }
         async_load_t* t = start_async_load(slot, req.layer, req.expert);
         if (!t) { requests_.push(req); break; }
