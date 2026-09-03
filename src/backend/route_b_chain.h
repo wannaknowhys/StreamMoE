@@ -73,6 +73,7 @@ struct moe_layer_exec_t {
     int32_t layer = -1;
     std::vector<ggml_tensor*>   compute;        // compute nodes, exec order
     std::vector<moe_view_alias_t> view_aliases; // views over hidden producers
+    std::vector<ggml_tensor*>   input_layouts;  // layout tensors feeding compute
 };
 // Layer of the privatised exec sequence containing `node` (pointer match), or
 // -1 when `node` is not a captured privatised compute node.

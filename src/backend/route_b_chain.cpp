@@ -3,10 +3,12 @@
 #include "backend/alloc.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace stream_moe {
@@ -74,8 +76,6 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
     int n_anchors = 0;
     collect_chain(gf, chain, layer, n_anchors);
     g_layer_exec.clear();
-    int n = 0;
-    size_t tot_bytes = 0;
     for (int i = 0; i < gf->n_nodes; ++i) {
         if (!chain[i]) continue;
         ggml_tensor * nd = gf->nodes[i];
@@ -86,14 +86,77 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             if (ex.compute.empty()) ex.layer = L;
             ex.compute.push_back(nd);
         }
-        // set_tensor_backend stays on the NAMED predicate until the whole-layer
-        // burst executor lands: assigning the anonymous convergence adds now
-        // (per-node splits, ping-pong hide) clobbers the weighted output they
-        // read at >1-step distance. The capture above already includes them.
-        if (!moe_chain_node_is_privatizable(nd)) continue;
-        ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
-        tot_bytes += ggml_nbytes(nd);
-        n++;
+    }
+
+    // ---- input-producer closure -------------------------------------------
+    // Privatise weightless compute that feeds the chain from llama's side
+    // (REPEAT / GET_ROWS of the expert scales, ...) so the whole-layer burst
+    // runs without waiting on llama to interleave those steps. Gating-segment
+    // outputs (logits/probs/argsort/topk/weights) stay dense - they are ready
+    // before the layer's first privatised split anyway.
+    auto is_gating_nm = [](const char * nm) -> bool {
+        if (!nm) return false;
+        return strstr(nm, "ffn_moe_logits") != nullptr || strstr(nm, "ffn_moe_probs") != nullptr ||
+               strstr(nm, "ffn_moe_argsort") != nullptr || strstr(nm, "ffn_moe_topk") != nullptr ||
+               strstr(nm, "ffn_moe_group") != nullptr || strstr(nm, "ffn_moe_weights") != nullptr;
+    };
+    std::unordered_map<const ggml_tensor*, int> pos;
+    for (int i = 0; i < gf->n_nodes; ++i) pos[gf->nodes[i]] = i;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto & kv : g_layer_exec) {
+            moe_layer_exec_t & ex = kv.second;
+            auto has = [&](const ggml_tensor * nd) -> bool {
+                for (const auto * x : ex.compute) if (x == nd) return true;
+                return false;
+            };
+            std::vector<ggml_tensor*> add;
+            for (const auto * cn : ex.compute) {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * t = cn->src[s];
+                    if (!t) continue;
+                    while (t && is_view_op(t)) t = t->src[0];
+                    if (!t || t->op == GGML_OP_NONE) continue;      // weight/input leaf
+                    if (t->op == GGML_OP_MUL_MAT_ID) continue;      // already in the closure
+                    // Only chain-side helpers join: anonymous tensors (llama
+                    // node_N / our STREAMMOE# buft names) or ffn_moe_* names
+                    // outside the gating segment. Dense-named producers (norm,
+                    // attn, embd, ...) stay on llama's dense side - they are
+                    // ready before the layer's first privatised split.
+                    const char * nm = t->name;
+                    const bool anonymous = !nm || !nm[0] ||
+                        strncmp(nm, "node_", 5) == 0 || strncmp(nm, "STREAMMOE#", 10) == 0;
+                    const bool moe_named = nm && strncmp(nm, "ffn_moe_", 8) == 0 && !is_gating_nm(nm);
+                    if (!anonymous && !moe_named) continue;
+                    if (has(t)) continue;
+                    add.push_back(const_cast<ggml_tensor*>(t));
+                }
+            }
+            if (add.empty()) continue;
+            changed = true;
+            for (auto * nd : add) ex.compute.push_back(nd);
+            // keep topological order (producer precedes consumer in the graph)
+            std::stable_sort(ex.compute.begin(), ex.compute.end(),
+                             [&](const ggml_tensor * a, const ggml_tensor * b) {
+                auto ia = pos.find(a), ib = pos.find(b);
+                return ia != pos.end() && ib != pos.end() ? ia->second < ib->second
+                     : ia != pos.end();
+            });
+        }
+    }
+
+    // Privatise the whole per-layer compute closure (named + anonymous
+    // convergence adds + input producers). Their later llama splits are served
+    // as no-ops by the burst executor.
+    int n = 0;
+    size_t tot_bytes = 0;
+    for (auto & kv : g_layer_exec) {
+        for (auto * nd : kv.second.compute) {
+            ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
+            tot_bytes += ggml_nbytes(nd);
+            n++;
+        }
     }
 #ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",
@@ -127,6 +190,29 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         }
         if (prod_in_exec) ex.view_aliases.push_back({ nd, t, off });
     }
+
+    // Input-side layout tensors that feed the privatised compute (e.g. the
+    // reshaped expert-scale views of the down path). Their producer is a
+    // weight/leaf or llama-side tensor, so the burst executor must fix their
+    // data pointer (view -> src data + offset) before running the layer.
+    for (auto & kv : g_layer_exec) {
+        moe_layer_exec_t & ex = kv.second;
+        auto push_layout = [&](ggml_tensor * lt) {
+            for (const auto * x : ex.input_layouts) if (x == lt) return;
+            ex.input_layouts.push_back(lt);
+        };
+        for (const auto * cn : ex.compute) {
+            if (!cn) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                ggml_tensor * t = cn->src[s];
+                while (t && is_view_op(t)) {
+                    push_layout(t);
+                    t = t->src[0];
+                }
+            }
+        }
+    }
+
     return true;
 }
 

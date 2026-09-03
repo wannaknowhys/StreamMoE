@@ -83,6 +83,12 @@ static int s_hide_flip = 0;
 static std::vector<int>    s_layer_cnt;
 static std::vector<size_t> s_layer_off;
 
+static bool is_view_op(const ggml_tensor * n) {
+    return n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+           n->op == GGML_OP_PERMUTE || n->op == GGML_OP_CONT;
+}
+
+
 static void ensure_layer_state(int layer) {
     if ((int) s_layer_cnt.size() <= layer) {
         s_layer_cnt.resize(layer + 1);
@@ -138,7 +144,7 @@ static bool hide_output(ggml_tensor * nd, int layer) {
 // Pin lifecycle (docs/LLAMA_MOE_NO_MMAP_RESEARCH.md §4.8, role-based):
 //   - split with only non-down nodes: pin experts here (no release)
 //   - split with a down node: wait_ready, compute, then release
-enum ggml_status moe_exec_mul_mat_id(
+static enum ggml_status exec_split_legacy_impl(
     ggml_context* ctx,
     ggml_backend_t cpu_backend,
     expert_scheduler& sched,
@@ -374,6 +380,267 @@ enum ggml_status moe_exec_mul_mat_id(
     }
 
     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+
+// ========================= whole-layer burst executor ======================
+// M2 executor (docs/M2_DEVICE_EXECUTOR.md 2.2): llama delivers the privatised
+// chain one node per graph_compute; on the layer's first node we run the WHOLE
+// captured sequence at once. Hidden outputs go to a per-layer full-alloc buffer
+// (each node its own range - the anonymous convergence adds read weighted views
+// several steps back, so ping-pong would clobber). Views over hidden producers
+// get their data pointer refreshed when the producer output lands, so later
+// (even dense-side) readers see the right memory.
+
+// ---- per-layer full-alloc hide (unconditional; burst knows the layer) -----
+static bool hide_burst(ggml_tensor * nd, int32_t layer) {
+    ensure_layer_state(layer);
+    const size_t need = ggml_nbytes(nd);
+    void * pb = moe_chain_fullalloc_buffer(s_layer_off[layer] + need);
+    if (!pb) return false;
+    nd->data = static_cast<char*>(pb) + s_layer_off[layer];
+    s_layer_off[layer] += need;
+    return true;
+}
+
+// Refresh every view alias of `prod` inside `layer`'s capture so the views
+// point at the producer's current (possibly hidden) output.
+static void refresh_aliases(int32_t layer, const ggml_tensor * prod) {
+    const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+    if (!ex) return;
+    for (const auto & va : ex->view_aliases) {
+        if (va.prod == prod) {
+            va.view->data = static_cast<char*>(prod->data) + va.off;
+        }
+    }
+}
+
+// Slot of a pinned (layer, expert), or -1.
+static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer, uint32_t expert) {
+    for (const auto & h : pins) {
+        if (h.pinned && h.layer == layer && h.expert == expert) return h.slot;
+    }
+    return -1;
+}
+
+
+// Execute one captured compute node (view aliases already refreshed by the
+// producers). mm / weightless compute both run as single-node CPU graphs.
+static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_scheduler& sched,
+                           const moe_model_topology_t& topo, ggml_tensor * nd,
+                           int32_t layer, const std::vector<expert_handle_t>& pins) {
+    if (is_view_op(nd)) {   // capture excludes views; defensive only
+        ggml_tensor * mut = const_cast<ggml_tensor*>(nd);
+        mut->data = nd->op == GGML_OP_VIEW
+                    ? static_cast<char*>(nd->src[0]->data) + nd->view_offs
+                    : nd->src[0]->data;
+        return true;
+    }
+
+    if (nd->op == GGML_OP_MUL_MAT_ID) {
+        ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+        ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+        ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
+        ggml_tensor * dst = nd;
+        if (!ids->data) return false;
+        if (!hide_burst(dst, layer)) return false;
+
+        parsed_node_t pn = parse_weight_name(w->name);
+        if (!pn.ok) { LOG_ERROR("stream_moe: cannot parse weight name " << w->name); return false; }
+
+        size_t off = 0, bytes = 0;
+        if (!sched.branch_layout(pn.layer, 0, w->name, off, bytes)) {
+            LOG_ERROR("stream_moe: no slot layout for " << w->name);
+            return false;
+        }
+
+        uint32_t gidx = sched.group_of(pn.layer);
+        if (gidx == static_cast<uint32_t>(-1)) return false;
+        const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+        std::vector<int32_t> slotbuf(n_ids, -1);
+        const expert_scheduler::subpool_t* use_sp = nullptr;
+        for (int t = 0; t < ids->ne[1]; ++t) {
+            for (int k = 0; k < ids->ne[0]; ++k) {
+                const int32_t e = MOE_ID_AT(ids, t, k);
+                if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) return false;
+                const int32_t slot = pin_slot(pins, pn.layer, static_cast<uint32_t>(e));
+                if (slot < 0) return false;
+                const expert_scheduler::subpool_t* osp = sched.subpool_of_slot(slot);
+                if (!osp) return false;
+                if (use_sp && use_sp != osp) {
+                    LOG_ERROR("stream_moe: mixed-region active set for " << w->name
+                              << " (pool " << use_sp->pool << " + pool " << osp->pool << ") - device split pending");
+                    return false;
+                }
+                if (!use_sp) use_sp = osp;
+                slotbuf[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
+            }
+        }
+        if (!use_sp) return true;   // no active experts
+        const expert_scheduler::subpool_t& sp = *use_sp;
+
+        const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+        ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+        w3d->ne[2] = g_n_slots;
+        w3d->nb[2] = sp.expert_size;
+        w3d->nb[3] = sp.expert_size * g_n_slots;
+        w3d->data  = sp.base + off;
+
+        ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+        auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+        for (size_t i = 0; i < n_ids; ++i) {
+            ids_slot_data[i] = slotbuf[i] - static_cast<int32_t>(sp.slot_begin);
+        }
+
+        ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+        b_leaf->data = cur->data;
+        std::memcpy(b_leaf->nb, cur->nb, sizeof(b_leaf->nb));
+
+        ggml_cgraph* gf = ggml_new_graph(ctx);
+        ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_slot);
+        mm->data = dst->data;
+        ggml_build_forward_expand(gf, mm);
+        if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("stream_moe: burst mm compute failed for " << w->name);
+            return false;
+        }
+        refresh_aliases(layer, nd);
+        return true;
+    }
+
+    // weightless chain compute (or the moe_out end)
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (nd->src[s] && !nd->src[s]->data) {
+            LOG_ERROR("stream_moe: burst chain compute src without data for " << ggml_op_name(nd->op));
+            return false;
+        }
+    }
+    const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+    if (!is_out) {
+        if (!hide_burst(nd, layer)) return false;
+    }
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    gf->nodes[0] = nd;
+    gf->n_nodes  = 1;
+    if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: burst chain compute failed for " << (nd->name ? nd->name : ggml_op_name(nd->op)));
+        return false;
+    }
+    if (!is_out) {
+        refresh_aliases(layer, nd);
+    } else {
+        reset_layer(layer);   // layer end: release the full-alloc ranges
+    }
+    return true;
+}
+
+// Burst one whole layer from its captured sequence.
+static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
+                                         ggml_backend_t cpu, expert_scheduler& sched,
+                                         int /*n_threads*/) {
+    const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+    if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
+    const moe_model_topology_t& topo = sched.topology();
+
+    // Per-layer full-alloc capacity for the hidden intermediates.
+    size_t lsum = 0;
+    for (const auto * cn : ex->compute) {
+        if (!(cn->name && strstr(cn->name, "ffn_moe_out"))) lsum += ggml_nbytes(cn);
+    }
+    moe_chain_set_full_alloc(lsum);
+    reset_layer(layer);
+
+    // Fix input-side layout tensors (views/reshapes feeding the compute, whose
+    // producer is a weight/leaf or a llama-side tensor).
+    for (const auto * lt : ex->input_layouts) {
+        if (!lt || !lt->src[0] || !lt->src[0]->data) continue;
+        ggml_tensor * mut = const_cast<ggml_tensor*>(lt);
+        mut->data = lt->op == GGML_OP_VIEW
+                    ? static_cast<char*>(lt->src[0]->data) + lt->view_offs
+                    : lt->src[0]->data;
+    }
+
+    // Pin the layer's whole active expert set (all mm nodes share the ids).
+    std::vector<keyed_expert_t> keys;
+    auto add_key = [&](uint32_t l, uint32_t e) {
+        for (const auto & x : keys) if (x.layer == l && x.expert == e) return;
+        keys.push_back({ l, e });
+    };
+    for (const auto * cn : ex->compute) {
+        if (!cn || cn->op != GGML_OP_MUL_MAT_ID || !cn->src[0] || !cn->src[2]) continue;
+        parsed_node_t pn = parse_weight_name(cn->src[0]->name);
+        if (!pn.ok) continue;
+        const ggml_tensor * ids = cn->src[2];
+        if (!ids->data) continue;
+        for (int t = 0; t < ids->ne[1]; ++t)
+            for (int k = 0; k < ids->ne[0]; ++k) {
+                const int32_t e = MOE_ID_AT(ids, t, k);
+                if (e >= 0 && e < static_cast<int32_t>(topo.n_expert)) add_key(pn.layer, static_cast<uint32_t>(e));
+            }
+    }
+    std::vector<expert_handle_t> pins;
+    pins.reserve(keys.size());
+    for (const auto & k : keys) {
+        expert_handle_t h = sched.pin_expert(k.layer, k.expert);
+        if (!h.pinned) {
+            LOG_ERROR("stream_moe: burst pin failed L" << k.layer << " E" << k.expert);
+            for (const auto & hh : pins) sched.unpin(hh);
+            return GGML_STATUS_FAILED;
+        }
+        pins.push_back(h);
+    }
+
+    bool ok = true;
+    for (const auto * cn : ex->compute) {
+        if (!ok) break;
+        ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
+    }
+    for (const auto & h : pins) sched.unpin(h);
+    return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+
+// graph_compute entry: dispatch to the whole-layer burst on the layer's first
+// privatised node; later same-layer splits are no-ops (already produced by the
+// burst). Nodes outside the capture fall back to the per-split legacy path.
+enum ggml_status moe_exec_mul_mat_id(
+    ggml_context* ctx,
+    ggml_backend_t cpu_backend,
+    expert_scheduler& sched,
+    const ggml_tensor* const* nodes,
+    int n_nodes,
+    int n_threads)
+{
+    if (n_nodes == 0) return GGML_STATUS_SUCCESS;
+
+    if (std::getenv("STREAM_MOE_DUMP_CHAIN")) {
+        fprintf(stderr, "[chain] graph_compute first=%s(%s)\n",
+                nodes[0]->name ? nodes[0]->name : "?",
+                ggml_op_name(nodes[0]->op));
+        fflush(stderr);
+    }
+
+    const ggml_tensor * first = nodes[0];
+    const int32_t layer = moe_chain_layer_of_node(first);
+    if (layer < 0) {
+        // Not a captured privatised node: legacy per-split execution.
+        return exec_split_legacy_impl(ctx, cpu_backend, sched, nodes, n_nodes, n_threads);
+    }
+    const int32_t idx = moe_chain_layer_index(layer, first);
+    static thread_local int32_t g_bl = -1;
+    if (std::getenv("STREAM_MOE_BURST_DBG")) {
+        fprintf(stderr, "[exec] %s(%s) layer=%d idx=%d g_bl=%d\n",
+                first->name ? first->name : "?", ggml_op_name(first->op),
+                (int) layer, (int) idx, g_bl);
+        fflush(stderr);
+    }
+    if (idx > 0 && g_bl == layer) {
+        return GGML_STATUS_SUCCESS;   // already produced by this pass's burst
+    }
+    const enum ggml_status st = exec_layer_burst(layer, ctx, cpu_backend, sched, n_threads);
+    if (st != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "[exec] BURST L%d FAILED\n", (int) layer);
+    }
+    g_bl = layer;
+    return st;
 }
 
 } // namespace stream_moe
