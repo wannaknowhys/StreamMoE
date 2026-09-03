@@ -17,6 +17,11 @@
         "StreamMoE route B: route MoE expert tensors (ffn_*_exps / ffn_*_shexp) to the stream_moe expert pool (bounded RAM)",
         [](common_params & params) {
             params.expert_backend = true;
+            // route B owns where experts compute. Keep llama.cpp from
+            // auto-offloading host compute to a GPU backend (op_offload):
+            // it steals VRAM for device compute buffers and pulls CPU-numeric
+            // runs through device kernels even at -ngl 0.
+            params.no_op_offload = true;
         }
     ));
     add_opt(common_arg(
