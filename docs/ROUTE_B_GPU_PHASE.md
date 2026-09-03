@@ -147,16 +147,20 @@ CPU-only today is naturally synchronous; the rule bites with GPU async - keep a
 
 ### 3.5 Executor implementation decisions (M1/G3, fixed)
 
-- **Single chain-node predicate** `is_moe_chain_node(node)`, shared by
-  `supports_op` (collection), verify Check1/Check2, and the execution traversal
-  (one definition, one module, e.g. `route_b_chain.*`). Judgement: the src chain
-  reaches an expert-buft `MUL_MAT_ID` (+ name-domain assist). Collection relies
-  on the scheduler mechanics, not on the predicate being clever:
-  pass1 assigns weights by buft; pass2 contiguously expands weightless nodes
-  (the chain nodes are contiguous in the nodes array); the chain bounds are
-  delimited by dense-weight nodes at both ends (gating weights before, post-norm
-  after). pass3 needs equal buft to upgrade, so same-op nodes on the dense side
-  are not stolen. Verify Check2 backstops any mis-assignment.
+- **Single chain-node predicate** `moe_chain_node_is_privatizable(node)`, shared
+  by `supports_op` (collection backstop), verify Check1/Check2, and the executor
+  traversal (one definition, one module, `route_b_chain.*`). Judgement: src-chain
+  reaches an expert-buft `MUL_MAT_ID` / hidden `ffn_moe_*` intermediate name /
+  the moe_out end.
+- **Collection is EXPLICIT, not heuristic** (2026-09 correction): declaring the
+  ops in `supports_op` is NOT enough - the scheduler also runs these generic ops
+  (geglu/mul/add) on the CPU backend and won on best-supported ties, so the
+  chain never lands as one split. Instead, right after `build_graph` (the verify
+  hook), assign every privatizable chain **compute** node to the stream_moe
+  backend via `ggml_backend_sched_set_tensor_backend` - the scheduler's pass1
+  "do not overwrite user assignments" respects it, so the chain forms one split.
+  View/layout nodes are left to pass4 (they follow `view_src` automatically).
+  `supports_op` still declares privatizable as a backstop.
 - **Privatization lands in one step (B2)**: hide intermediates immediately.
   verify Check1 ships together with G3 as the safety net.
 - **pin/unpin lifecycle**: phase 1 collects ids ONCE (gate_up and down share the

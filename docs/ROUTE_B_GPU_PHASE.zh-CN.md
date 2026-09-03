@@ -99,12 +99,15 @@ dst。纪律（必选非测试）：**graph_compute 返回前，等所有内部�
 
 ### 3.5 执行器实现定案（M1/G3，已固定）
 
-- **单一链节点判定** `is_moe_chain_node(node)`，`supports_op`（收编）、verify Check1/Check2、
-  执行遍历三处共用（一份定义、一个模块，如 `route_b_chain.*`）。判定 = src 链最终到达
-  expert-buft 的 `MUL_MAT_ID`（+ 名字域辅助）。收编**靠 sched 机制而非判定聪明**：pass1
-  按 buft 归有权重节点；pass2 连续扩展无权重节点（链节点在 nodes 数组连续）；链首尾由两端
-  dense 权重节点界定（前门控权重、后 post_norm）。pass3 升级需同 buft——dense 侧同 op 节点
-  不会被抢。verify Check2 兜底任何错配。
+- **单一链节点判定** `moe_chain_node_is_privatizable(node)`，`supports_op`（收编后备）、
+  verify Check1/Check2、执行遍历三处共用（一份定义、一个模块 `route_b_chain.*`）。判定 =
+  src 链达 expert-buft `MUL_MAT_ID` / hidden `ffn_moe_*` 中间名 / moe_out 输出端。
+- **收编是显式、非启发式（2026-09 修正）**：只在 `supports_op` 声明不够——sched 也会把
+  geglu/mul/add 这类通用 op 分给 CPU backend 跑（best-supported 平手倾向 CPU），链永远
+  落不成一个 split。改为在 `build_graph` 后（verify 挂点）对每个私有化链**计算**节点调
+  `ggml_backend_sched_set_tensor_backend` 预设到 stream_moe backend——sched pass1 的
+  "do not overwrite user assignments" 会尊重，链聚成一个 split。view/layout 不预设
+  （pass4 自动跟 `view_src`）。`supports_op` 仍声明 privatizable 作后备。
 - **私有化一步到位（B2）**：直接藏中间。verify Check1 随 G3 一起落地当安全网。
 - **pin/unpin 生命周期**：阶段 1 **一次性**收 ids（gate_up 与 down 共用同一 ids）→ pin
   （缺的 push 请求给调度、睡版本字）→ 跑完整链 → **链尾合并节点（add/moe_out）后才 unpin**
