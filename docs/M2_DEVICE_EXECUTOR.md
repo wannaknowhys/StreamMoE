@@ -39,6 +39,35 @@ that actually holds active experts:
   executor is "whole-chain sole owner", which must become slice-aware once a
   layer's active set spans pools).
 
+## 2.1 Layer-local convergence: the anonymous per-k adds are privatised
+
+Audit fact (gemma4): the layer chain is delivered as one graph_compute **per
+node** (each `n_nodes=1`), and the per-topk-k convergence of the weighted
+views is a tree of **anonymous add nodes** (no `ffn_moe_` name) that llama's
+graph leaves on its CPU default backend, reading our hidden intermediates by
+their host pointer. That only works while hidden outputs live in host memory;
+once weighted columns live in VRAM (vulkan shell data) those dense-side adds
+would read a fake pointer. Decision: **extend privatisation to the anonymous
+convergence adds** - a weightless op whose srcs trace (through views) to a
+privatised intermediate is privatised too, so the whole per-layer convergence
+runs inside our merge (exits via moe_out to the main dst as today). The
+privatisable predicate becomes recursive/closure-based, consistent with the
+verify chain BFS instead of the current name heuristic.
+
+## 2.2 Execution trigger: whole-layer burst at the first split
+
+Because the layer arrives as one split per node, the per-device column mini
+graph has no whole-layer view at execution time. Decision: **cache the
+privatised layer topology at build/verify** (the per-layer node sequence,
+shapes and edges are already traversable on `gf`), then at execution the FIRST
+privatised split of a layer triggers the whole layer: build each device's
+column mini graph, async-submit VRAM devices, run CPU columns on the main
+thread, merge at the layer tail into the main dst. Subsequent same-layer
+privatised splits of that layer are served as no-op returns (their data was
+already produced by the burst). The burst must run strictly after the layer's
+dense-side inputs (cur/ids) are ready - they are produced before llama invokes
+the first privatised split.
+
 Column mapping (which device produced global column (k,t)) is recorded by
 route B and consumed by the exit merge.
 

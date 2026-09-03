@@ -29,6 +29,14 @@ graph_compute 主线程沿用现有逐节点路径算；只有出口 merge 跨�
 
 列映射（哪个设备产出了全局列 (k,t)）由 route B 记录，出口 merge 消费。
 
+### 2.1 层内收敛：匿名 per-k add 纳入私有链
+
+勘察事实（gemma4）：层链每次 graph_compute **只收 1 个节点**（`n_nodes=1`）；weighted 各 k 视图的求和是**匿名 add 节点树**（无 `ffn_moe_` 名），llama 把它们留在 CPU 默认后端、按 host 指针读我们的隐藏中间。这只在隐藏输出在 host 内存时成立；weighted 列一旦在 vram（vulkan 壳 data），dense 侧匿名 add 会读假指针。决策：**匿名收敛 add 纳入私有化**——weightless op 且其 src（经 view 追溯）到私有化中间则同样私有化，整层收敛在我们 merge 内完成（经 moe_out 写主 dst 同现状）。privatizable 判定改为闭包/递归式，与 verify 的 chain BFS 一致（弃用名字启发）。
+
+### 2.2 执行触发：首节点整层爆发
+
+层按每节点一个 split 到达，执行期没有整层视图。决策：**build/verify 时缓存私有化层拓扑**（per-layer 节点序列/形状/边，gf 上已可遍历）；执行时该层**第一个私有化 split 触发整层**：建各设备列 mini graph、vram 异步提交、CPU 列主线程算、层尾 merge 写主 dst；同层后续私有化 split 空转返回（数据已被爆发产出）。爆发必须在该层 dense 侧输入（cur/ids）就绪后——它们在 llama 调用首个私有化 split 前已算好。
+
 ## 3. 并行与同步（无额外 worker 线程）
 
 事实（已核实）：`ggml_backend_graph_compute_async` 直通 `iface.graph_compute`——异步由后端决定。
