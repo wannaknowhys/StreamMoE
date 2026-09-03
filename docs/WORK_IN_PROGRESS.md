@@ -84,3 +84,13 @@
 - [x] I7 **--expert-backend 隐含 no-op-offload（3932d33）**：route B 拥有专家放置权——禁 llama 把 host 计算自动 offload 到 GPU（op_offload 默认 true，llama.h:402）。价值：无 -ngl 也省掉 Vulkan0 compute buffer（~1.3G，sched_reserve 分配，context 构造即发生）+ 不空手把计算搬 GPU。GGML_SCHED_DEBUG 实测 Vulkan0 splits=0（见 I4 归因修正）。llama 机制溯源：llama.cpp:224-258 无条件收 GPU 进 model.devices（不查 -ngl）→ llama-context.cpp:364-382 backends 含 vulkan+ACCEL+CPU → ggml_backend_sched_new(op_offload=true) → host 计算节点 2.sup offload。禁用参数对照：`--no-op-offload`（sched 级）vs `--split-mode none -mg -1`（设备级，llama.cpp:291-293 devices.clear()，连 vulkan context 都省）——目标态用前者
 - [x] I8 **vk 数值基线 + run_baseline 参数化（5db4a52）**：`baseline_regression/baseline/moe_129_8192_vk`（默认 GGML_VULKAN=ON 构建 + 自动 no-op-offload 产物）；`run_baseline.bat [baseline_moe_dir] [verify_dir]`——CPU 基线 moe_129_8192 / vulkan 基线 moe_129_8192_vk 按构建形态选；upstream 固定 upstream_129；`*_vk` 自动放宽 KL 阈值 1.0→4.5。README 同步。验证：vk 模式双 IDENTICAL PASS；默认（vulkan binary vs CPU 基线）正确报 DIVERGED + 0 unexplained
 
+### J. VRAM 数据层 - 池真驻留 + CPU 读 vram 执行（2026-09）
+> 路线 A 落地（数据层先行，执行仍 CPU；为 GPU 阶段铺数据硬前置）。主仓代码直接 commit；唯一 vendored 改动 = ggml-vulkan host map 导出（patch）。
+
+- [x] J1 **host map 通道（patch streammoe-vk-hostmap, 511cc7a）**：ggml-vulkan `get_base` 固定返回假 `vk_ptr_base=(void*)0x1000`（:2407）——vulkan 内部靠 `tensor->data - vk_ptr_base` 算偏移（:2411），**不能改**。加后端导出 `stmoe_vk_buffer_host_ptr(buffer)` 返回真 `vkMapMemory` ptr（HOST_VISIBLE buffer，:3548-3550）。RX590 分配即 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（rebar/BAR1，create_buffer_device :3597-3606）。实测 4MB pattern RW-OK
+- [x] J2 **v2 模型开发路径（5265d0a）**：gemma v2 chunk（专家独立化 direct）——moe(v2) 与 moe_129_8192_vk(v1) 基线 **IDENTICAL**（chunk 重排数值无损）；run_baseline 拆 MODEL_MOE(v2)/MODEL_UP(v1，upstream 不认识 v2)
+- [x] J3 **vram 区并入槽空间（7f33b00）**：`subpool_t` → per-(group,pool) 区（pool 0=RAM，1+=device）；`init` 收 `vram_region_t{pool,group,base(n=host map),n_slots}`；槽号全局连续、`slot_mem` 覆盖 vram map；RAM carve/驱逐不变；`ram_subpool`/`subpool_of_slot` API。RAM-only 与 RAM+Vulkan0 均 IDENTICAL
+- [x] J4 **read_to_vram + CPU 从 vram 读权重执行（b691c90）**：`alloc_or_evict` pool 感知；`accept_requests` 优先该 group 的 device 区（RAM fallback）；DIO（v2 direct）/staging 写进 vram slot（slot_mem = vram map）；目录记 pool 1；minigraph_exec **激活集动态单区**（w3d/ids 区局部化；mixed RAM/VRAM active set 报错 = J6）。实测全 vram "reads pool 1" + IDENTICAL
+- [x] J5 **device 驱逐 demote 回 RAM（77b0bbe）**：vram victim（READY+ref0）内容 memcpy 进 group 的 RAM 区（RAM 先丢最冷腾位），目录迁移 pool；RAM victim 仍丢弃（盘为下一层）。Vulkan0:1024（139 槽 group0）129-token 触发 **1987 次 demote 仍 IDENTICAL**——move 数据路径正确
+- [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
+

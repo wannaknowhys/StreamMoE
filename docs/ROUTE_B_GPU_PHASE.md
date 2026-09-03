@@ -284,6 +284,15 @@ then decide whether a custom layer table earns its keep.
 
 ## 8. Milestones (risk-decreasing)
 
+> Status (2026-09): M1's CPU private-chain skeleton is complete (G3 stages,
+> IDENTICAL). A **data-layer-first subset of M2 landed ahead of the executor**
+> (docs/WORK_IN_PROGRESS.md J): vram pool allocation -> host-map channel
+> (`stmoe_vk_buffer_host_ptr`, RX590 DEVICE_LOCAL|HOST_VISIBLE) -> experts load
+> into vram and the CPU executes straight from its host mapping -> device
+> eviction demotes to RAM. The executor still runs one region at a time (single
+> region per active set); per-region dispersion (J6) shares its structure with
+> the M2/M3 per-device sub-computes and is deferred to the GPU-execution work.
+
 - **M1** - CPU-only private-chain skeleton: per-layer private mini-graph
   (topology replayer for the gemma arch; official kernels, intermediates in our
   arena, only cur/moe_out on the main graph) + two fake device_pools (both CPU,

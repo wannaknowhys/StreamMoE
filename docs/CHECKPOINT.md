@@ -33,6 +33,12 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
+### VRAM 数据层（2026-09，路线 A：数据层先行）
+- **vram 池真驻留 + CPU 从 vram 读权重执行**（`--moe-expert-pools RAM:N,Vulkan0:N`）：分配（slot 对齐降档，seg 登记）→ host map 通道（patch `streammoe-vk-hostmap`：ggml vulkan `get_base` 是假 base `0x1000`，改**导出** `stmoe_vk_buffer_host_ptr` 返回真 vkMapMemory ptr）→ scheduler 槽空间并入 vram 区（subpool 变 per-(group,pool)）→ 请求优先装 vram → CPU 执行从 vram map 读权重（"reads pool 1"，IDENTICAL）→ **vram 驱逐 demote 回 RAM**（Vulkan0:1024 触发 1987 demote 仍 IDENTICAL）。
+- 开发模型 = **v2 chunk**（专家独立化 direct，moe(v2) 与 v1 基线 IDENTICAL）；upstream 对照仍 v1（不认识 v2）。
+- 已知限制：执行器**单区**（同层激活集须同池）；mixed 分区执行（WIP J6）与 GPU 每-device 分区同构，GPU 阶段前铺。
+- 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J 节。
+
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
 - **机制**：`--export-dir <dir>` 参数替代 `LLM_EXPORT_DIR` env（llama_context_params.export_dir，`common_context_params_to_llama` 传递；`run_export.js` 已适配传参）。
 - **抓取**：llama.cpp 现成的 `cparams.cb_eval` 评估回调（每个图节点算完触发）——图内抓 embd（result_norm）/ hidden（t_h_nextn）/ **top-4 logits + logsumexp**（t_logits）/ 路由 ids（MUL_MAT_ID src[2]）。**不依赖强制输出 + ids 时机在 compute 流内**（根治 sched 回收）。
@@ -79,7 +85,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 | gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |
 | prefill 导出（--export-dir）| `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |
 | prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt|tokens.bin> --export-dir <dir> -c 1024 -t 8` |
-| **基线回归** | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；布局/重建基线见 `baseline_regression/README.md`）|
+| **基线回归** | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；CPU 编对 `moe_129_8192`、默认 vulkan 编对 `moe_129_8192_vk`，见其 README）|
+| vram 池驻留 | `llama-server -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <dir> -c 2048 -t 16 --expert-backend --moe-expert-pools RAM:8192,Vulkan0:4096 --fit off --no-warmup`（全量专家进 vram；池 1024 触发 demote）→ 产物对 `moe_129_8192_vk` IDENTICAL |
 
 **run_export 前台窗口启动**（跑 cn/en/prefill10000 导出任务——脱离 opencode 管控但用户可见）：
 ```bat
