@@ -112,6 +112,7 @@
   5. mm v2：dst 即 hide_dev 的 arena off（不再 readback host）；手工 mm 图 leaf 同 v1；
   6. moe_out：记录原主 dst host 指针 → arena off 计算 → memcpy(arena_map+off → 主 dst)；
   7. 域内 view alias 衔接走 arena（mm 输出 view = arena+off，buffer=arena）；CPU 域路径不动。
+- [x] **v2 尝试结论（64d77c2，device chain 已禁用）**：arena 中途 realloc 会废掉已 hide 输出（需层首一次性 reserve 全量）；mm 的 cur 分 device-resident/上传两路（cur_on_dev）。**致命问题**：直接改主图 tensor 的 buffer 后，llama sched 对 burst 之后该 tensor 的 buffer 归属/copy 处理崩（moe_out 后崩）。**下一方向 = arena-clone 执行器：不动主图任何 tensor，为每链节点在 arena 建独立 clone（leaf+op node），链中间在 clone 张量间引用，仅 moe_out 结果 memcpy 回主 dst**——exec_device_chain 保留为骨架参考。
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
