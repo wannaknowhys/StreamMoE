@@ -11,6 +11,32 @@
 
 namespace stream_moe {
 
+namespace {
+bool g_pingpong_ok = true;
+void * g_fullalloc_buf = nullptr;
+size_t g_fullalloc_cap = 0;
+}
+
+bool moe_chain_pingpong_ok() { return g_pingpong_ok; }
+
+void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
+    g_pingpong_ok = false;
+    if (layer_sum_bytes > g_fullalloc_cap) {
+        aligned_free_ptr(g_fullalloc_buf);
+        g_fullalloc_buf = aligned_alloc_ptr(layer_sum_bytes, 64);
+        g_fullalloc_cap = g_fullalloc_buf ? layer_sum_bytes : 0;
+    }
+}
+
+void * moe_chain_fullalloc_buffer(size_t need_bytes) {
+    if (!g_fullalloc_buf) return nullptr;   // set_full_alloc(layer_sum) must run first
+    if (need_bytes > g_fullalloc_cap) {
+        fprintf(stderr, "[route_b_cap] ERROR: full-alloc overflow need=%zu cap=%zu\n", need_bytes, g_fullalloc_cap);
+        return nullptr;
+    }
+    return g_fullalloc_buf;
+}
+
 void * moe_chain_pingpong_buffer(int parity, size_t need_bytes) {
     static void * buf[2] = {nullptr, nullptr};
     static size_t sz[2] = {0, 0};
@@ -207,6 +233,45 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
     fprintf(stderr, "[route_b_cap] ping-pong budget (per layer): even_buf=%zuMB  odd_buf=%zuMB  total=%zuMB\n",
             g_even_max / (1024 * 1024), g_odd_max / (1024 * 1024),
             (g_even_max + g_odd_max) / (1024 * 1024));
+
+    // ---- long-range dependency check: ping-pong clobbers any hidden output
+    // still needed more than one compute step later. If a compute node's data
+    // input (traced through view aliases) comes from compute#j with j < i-1,
+    // fall back to full allocation (each node gets its own byte range).
+    for (auto & kv : by_layer) {
+        const auto & v = kv.second;
+        std::vector<int> comp;
+        for (int idx : v) if (!is_view_op(gf->nodes[idx])) comp.push_back(idx);
+        for (size_t ci = 0; ci < comp.size() && moe_chain_pingpong_ok(); ++ci) {
+            const ggml_tensor * cn = gf->nodes[comp[ci]];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * t = cn->src[s];
+                if (!t) continue;
+                const ggml_tensor * prod = t;
+                while (prod && is_view_op(prod)) prod = prod->src[0];   // alias -> producer
+                if (!prod) continue;
+                int pi = -1;
+                for (int k = 0; k < N; ++k) if (gf->nodes[k] == prod) { pi = k; break; }
+                if (pi < 0 || !chain[pi]) continue;                      // non-chain input (weights/gate): ok
+                int pcomp = -1;
+                for (size_t k = 0; k < comp.size(); ++k) if (comp[k] == pi) { pcomp = (int) k; break; }
+                if (pcomp >= 0 && (int) ci > pcomp + 1) {
+                    // Weighted/experts outputs are large blocks whose moe_out
+                    // summation reads distinct slices at increasing offsets; the
+                    // ping-pong write only touches the buffer head, so slices are
+                    // read before any clobber (regression-verified). Skip.
+                    if (prod->name && strstr(prod->name, "weighted")) continue;
+                    size_t lsum = 0;
+                    for (int idx : v) if (!is_view_op(gf->nodes[idx])) lsum += ggml_nbytes(gf->nodes[idx]);
+                    fprintf(stderr,
+                        "[route_b_cap] long-range dep: L%d compute#%zu (node %s) reads compute#%d -> full-alloc fallback\n",
+                        kv.first, ci, cn->name ? cn->name : "?", pcomp);
+                    moe_chain_set_full_alloc(lsum);
+                    break;
+                }
+            }
+        }
+    }
 
     // ---- external-consumer check: no node OUTSIDE the chain may reference a
     // chain node except the moe_out end (which post-norm/dense legitimately

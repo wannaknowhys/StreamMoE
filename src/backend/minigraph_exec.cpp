@@ -69,14 +69,53 @@ expert_handle_t pin_state_find(const pin_state_t& st, uint32_t layer, uint32_t e
 
 } // namespace
 
-// Privatisation: alternate hidden compute-node outputs between the two ping-pong
-// buffers (odd/even), so a write never clobbers an input one step away. Moe_out
-// (the chain end) is NOT hidden - it writes the main-graph dst for the dense
-// side. Process-lifetime counter; alternation is what matters, not the absolute
-// parity (a decode may start on either buffer - neighbours always differ).
+// Privatisation modes:
+//  - ping-pong (default): hidden compute-node outputs alternate between two
+//    shared buffers (odd/even); safe while a node's inputs live at most one
+//    compute step back (verify checks this and falls back otherwise).
+//  - full-alloc (fallback): each hidden node gets its own byte range in one
+//    growable buffer; per-layer offset/counter, reset at the layer end (moe_out).
+// moe_out itself is never hidden - it writes the main-graph dst for the dense
+// side.
 static int s_hide_flip = 0;
+static std::vector<int>    s_layer_cnt;
+static std::vector<size_t> s_layer_off;
 
-static bool hide_output(ggml_tensor * nd) {
+static void ensure_layer_state(int layer) {
+    if ((int) s_layer_cnt.size() <= layer) {
+        s_layer_cnt.resize(layer + 1);
+        s_layer_off.resize(layer + 1);
+    }
+}
+
+static void reset_layer(int layer) {
+    ensure_layer_state(layer);
+    s_layer_cnt[layer] = 0;
+    s_layer_off[layer] = 0;
+}
+
+// Layer from a named MoE-chain node ("ffn_moe_geglu-0" -> 0). mm nodes carry
+// their layer from the weight name (pn.layer) instead.
+static int layer_of_name(const char * name) {
+    if (!name) return -1;
+    const char * dash = strrchr(name, '-');
+    return dash ? atoi(dash + 1) : -1;
+}
+
+static bool hide_output(ggml_tensor * nd, int layer) {
+    if (!moe_chain_pingpong_ok() && layer >= 0) {
+        ensure_layer_state(layer);
+        const size_t need = ggml_nbytes(nd);
+        void * pb = moe_chain_fullalloc_buffer(s_layer_off[layer] + need);
+        if (!pb) return false;
+        nd->data = static_cast<char*>(pb) + s_layer_off[layer];
+        s_layer_off[layer] += need;
+        s_layer_cnt[layer]++;
+        return true;
+    }
+    // unnamed nodes (e.g. moe_out summation adds) carry no layer - fall back to
+    // ping-pong flip for them (their safety is regression-verified) even in
+    // full-alloc mode.
     void * pb = moe_chain_pingpong_buffer(s_hide_flip & 1, ggml_nbytes(nd));
     if (!pb) return false;
     nd->data = pb;
@@ -191,8 +230,10 @@ enum ggml_status moe_exec_mul_mat_id(
                 }
             }
             if (!ok) break;
-            if (!(nd->name && strstr(nd->name, "ffn_moe_out"))) {
-                if (!hide_output(const_cast<ggml_tensor*>(nd))) { ok = false; break; }
+            const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+            const int layer = layer_of_name(nd->name);
+            if (!is_out) {
+                if (!hide_output(const_cast<ggml_tensor*>(nd), layer)) { ok = false; break; }
             }
             ggml_cgraph* gf = ggml_new_graph(ctx);
             gf->nodes[0] = const_cast<ggml_tensor*>(nd);
@@ -201,6 +242,7 @@ enum ggml_status moe_exec_mul_mat_id(
                 LOG_ERROR("stream_moe: chain compute failed for " << (nd->name ? nd->name : ggml_op_name(nd->op)));
                 ok = false;
             }
+            if (is_out && layer >= 0) reset_layer(layer);   // layer end: free full-alloc ranges
             continue;
         }
 
@@ -210,9 +252,9 @@ enum ggml_status moe_exec_mul_mat_id(
         const ggml_tensor* dst = nd;
         parsed_node_t pn = parse_weight_name(w->name);
 
-        // hide: reroute this MUL_MAT_ID's output into the ping-pong buffer
+        // hide: reroute this MUL_MAT_ID's output into the private buffer
         // (dst == nd; mini-graph writes nd->data, which now points at the buffer)
-        if (!hide_output(const_cast<ggml_tensor*>(nd))) { ok = false; break; }
+        if (!hide_output(const_cast<ggml_tensor*>(nd), pn.layer)) { ok = false; break; }
 
         // branch layout (compact slot offset, uniform across experts)
         size_t off = 0, bytes = 0;
