@@ -268,6 +268,7 @@ llama_model_tensor_buft_override* route_b_setup(
             r.group = seg.group;
             r.base = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(seg.buf));
             r.n_slots = static_cast<uint32_t>(seg.n_slots);
+            r.buf = seg.buf;
             vregions.push_back(r);
         }
 

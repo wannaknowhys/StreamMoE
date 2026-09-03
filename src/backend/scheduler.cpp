@@ -86,7 +86,7 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
             continue;
         }
         const size_t es = topo.groups[reg.group].expert_size;
-        subpools_.push_back({ reg.pool, reg.group, num_slots_, reg.n_slots, es, reg.base });
+        subpools_.push_back({ reg.pool, reg.group, num_slots_, reg.n_slots, es, reg.base, reg.buf });
         num_slots_ += reg.n_slots;
         if (reg.pool > max_pool) max_pool = reg.pool;
     }

@@ -38,6 +38,7 @@ struct vram_region_t {
     uint32_t  group  = 0;   // expert group this region serves
     uint8_t*  base   = nullptr;   // host-mapped base (nullptr -> region skipped)
     uint32_t  n_slots = 0;
+    void*     buf    = nullptr;   // device buffer handle (executor tensor shells)
 };
 
 struct expert_handle_t {
@@ -128,6 +129,7 @@ public:
         uint32_t n_slots    = 0;
         size_t   expert_size = 0;
         uint8_t* base       = nullptr;
+        void*    dev_buf    = nullptr;   // device buffer handle (executor shells)
     };
     // Group index owning `layer`, or (uint32_t)-1.
     uint32_t group_of(uint32_t layer) const;
