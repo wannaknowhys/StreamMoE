@@ -64,9 +64,15 @@ bool moe_chain_verify_graph(struct ggml_cgraph * gf);
 // (stable while llama reuses the built graph across decodes; capture is
 // refreshed on every rebuild). Includes the anonymous per-topk convergence
 // adds and the moe_out end.
+struct moe_view_alias_t {
+    ggml_tensor * view = nullptr;   // chain view of a hidden producer
+    ggml_tensor * prod = nullptr;   // underlying producer compute node
+    int64_t        off = 0;         // byte offset inside the producer output
+};
 struct moe_layer_exec_t {
     int32_t layer = -1;
-    std::vector<ggml_tensor*> compute;   // main-graph compute nodes, exec order
+    std::vector<ggml_tensor*>   compute;        // compute nodes, exec order
+    std::vector<moe_view_alias_t> view_aliases; // views over hidden producers
 };
 // Layer of the privatised exec sequence containing `node` (pointer match), or
 // -1 when `node` is not a captured privatised compute node.

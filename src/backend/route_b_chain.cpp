@@ -99,9 +99,34 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
     fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",
             n_anchors, n, tot_bytes / (1024 * 1024));
     for (const auto & kv : g_layer_exec) {
-        fprintf(stderr, "  L%d: %zu compute nodes\n", kv.first, kv.second.compute.size());
+        fprintf(stderr, "  L%d: %zu compute nodes, %zu view aliases\n",
+                kv.first, kv.second.compute.size(), kv.second.view_aliases.size());
     }
 #endif
+
+    // Chain views over hidden producers (the burst executor refreshes their
+    // data pointer whenever the producer output is hidden/recomputed). Resolve
+    // each view through nested layout ops to its producer + cumulative offset.
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        if (!chain[i]) continue;
+        ggml_tensor * nd = gf->nodes[i];
+        if (!is_view_op(nd)) continue;
+        const int L = layer[i];
+        if (L < 0) continue;
+        ggml_tensor * t = nd;
+        int64_t off = 0;
+        while (t && is_view_op(t)) {
+            if (t->op == GGML_OP_VIEW) off += t->view_offs;
+            t = t->src[0];
+        }
+        if (!t) continue;
+        moe_layer_exec_t & ex = g_layer_exec[L];
+        bool prod_in_exec = false;
+        for (const auto * cn : ex.compute) {
+            if (cn == t) { prod_in_exec = true; break; }
+        }
+        if (prod_in_exec) ex.view_aliases.push_back({ nd, t, off });
+    }
     return true;
 }
 
