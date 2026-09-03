@@ -93,18 +93,6 @@ enum ggml_status moe_exec_mul_mat_id(
 
     const moe_model_topology_t& topo = sched.topology();
 
-    {
-        int n_mm = 0, n_layout = 0, n_manual = 0;
-        for (int i = 0; i < n_nodes; ++i) {
-            const ggml_tensor* nd = nodes[i];
-            if (nd->op == GGML_OP_MUL_MAT_ID) n_mm++;
-            else if (nd->op == GGML_OP_VIEW || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_TRANSPOSE ||
-                     nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_CONT) n_layout++;
-            else n_manual++;
-        }
-        fprintf(stderr, "[moe_db] exec split: nodes=%d mm=%d layout=%d manual=%d\n", n_nodes, n_mm, n_layout, n_manual);
-    }
-
     // ---- phase 1: parse + pin (non-down) / wait (down) ----
     std::vector<keyed_expert_t> pin_keys, down_keys;
     std::vector<expert_handle_t> pins;
@@ -187,15 +175,10 @@ enum ggml_status moe_exec_mul_mat_id(
                 }
             }
             if (!ok) break;
-            fprintf(stderr, "[moe_db] manual-run node=%s op=%s dst=%p\n",
-                    nd->name ? nd->name : "?", ggml_op_name(nd->op), nd->data);
             ggml_cgraph* gf = ggml_new_graph(ctx);
             gf->nodes[0] = const_cast<ggml_tensor*>(nd);
             gf->n_nodes  = 1;
-            const enum ggml_status rc_m = ggml_backend_graph_compute(cpu_backend, gf);
-            fprintf(stderr, "[moe_db] manual done rc=%d dst0=%.4f\n", (int) rc_m,
-                    nd->data ? *(const float*) nd->data : -1.0f);
-            if (rc_m != GGML_STATUS_SUCCESS) {
+            if (ggml_backend_graph_compute(cpu_backend, gf) != GGML_STATUS_SUCCESS) {
                 LOG_ERROR("stream_moe: chain compute failed for " << (nd->name ? nd->name : ggml_op_name(nd->op)));
                 ok = false;
             }

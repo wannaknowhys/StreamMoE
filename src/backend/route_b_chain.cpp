@@ -10,22 +10,17 @@ namespace stream_moe {
 
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
     if (!gf || !sched || !our_backend) return false;
-    int n = 0, n_mm = 0, n_skipped_layout = 0, n_not_chain = 0;
+    int n = 0;
     for (int i = 0; i < gf->n_nodes; ++i) {
         ggml_tensor * nd = gf->nodes[i];
-        if (!moe_chain_node_is_privatizable(nd)) { n_not_chain++; continue; }
+        if (!moe_chain_node_is_privatizable(nd)) continue;
         const enum ggml_op op = nd->op;
         if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE ||
-            op == GGML_OP_PERMUTE || op == GGML_OP_CONT) { n_skipped_layout++; continue; }
+            op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
         ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
-        if (op == GGML_OP_MUL_MAT_ID) n_mm++;
         n++;
-        if (n <= 6) {
-            fprintf(stderr, "[route_b_verify] assign op=%s name=%s\n", ggml_op_name(op), nd->name ? nd->name : "?");
-        }
     }
-    fprintf(stderr, "[route_b_verify] assign: total=%d (mul_mat_id=%d other=%d) skipped_layout=%d not_chain=%d\n",
-            n, n_mm, n - n_mm, n_skipped_layout, n_not_chain);
+    fprintf(stderr, "[route_b_verify] chain backend assigned: %d compute nodes -> stream_moe\n", n);
     return true;
 }
 

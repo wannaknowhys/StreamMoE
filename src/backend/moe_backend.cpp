@@ -199,7 +199,6 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     };
     backend->iface.synchronize = [](ggml_backend_t) {};
     backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
-        fprintf(stderr, "[moe_db] graph_compute called: nodes=%d\n", cgraph ? cgraph->n_nodes : -1);
         auto* bctx = static_cast<moe_backend_ctx*>(b->context);
         // This backend now receives whole privatised MoE splits: splits with
         // routed MUL_MAT_ID nodes AND weightless chain-compute splits (no mm -
