@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// ggml-vulkan route-B extension: host mapping of a host-visible buffer.
+void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
 #include <string>
 #include <vector>
 
@@ -388,5 +391,54 @@ void stream_moe_backend_bind_scheduler(ggml_backend_buffer_type_t buft, expert_s
     g_bindings.push_back({ buft, sched });
 }
 void stream_moe_backend_set_threads(int threads) { g_threads = threads > 0 ? threads : 1; }
+
+// ---- M2 device-exec resources -------------------------------------------------
+
+namespace {
+std::vector<device_exec_ctx_t> g_dev_execs;   // index = pool - 1 (pool 1 = first device)
+
+device_exec_ctx_t* exec_ctx(uint32_t pool) {
+    if (pool == 0) return nullptr;
+    return (pool - 1 < g_dev_execs.size()) ? &g_dev_execs[pool - 1] : nullptr;
+}
+
+bool ensure_buffer(ggml_backend_buffer_t& buf, size_t& cap, uint8_t*& map,
+                   ggml_backend_buffer_type_t buft, size_t need) {
+    if (need <= cap) return true;
+    if (buf) ggml_backend_buffer_free(buf);
+    buf = ggml_backend_buft_alloc_buffer(buft, need);
+    if (!buf) {
+        cap = 0;
+        map = nullptr;
+        return false;
+    }
+    cap = need;
+    map = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(buf));   // null when not host-mapped
+    return true;
+}
+} // namespace
+
+void stream_moe_backend_bind_device_exec(uint32_t pool, ggml_backend_t be,
+                                         ggml_backend_buffer_type_t arena_buft,
+                                         ggml_backend_buffer_type_t stage_buft) {
+    if (pool == 0 || !be) return;
+    if (pool - 1 >= g_dev_execs.size()) g_dev_execs.resize(pool);   // 1-based
+    auto& e = g_dev_execs[pool - 1];
+    e.be         = be;
+    e.arena_buft = arena_buft;
+    e.stage_buft = stage_buft;
+}
+
+device_exec_ctx_t* stream_moe_backend_device_exec(uint32_t pool) {
+    return exec_ctx(pool);
+}
+
+bool stream_moe_backend_device_ensure(uint32_t pool, size_t arena_bytes, size_t stage_bytes) {
+    auto* e = exec_ctx(pool);
+    if (!e || !e->be || !e->arena_buft || !e->stage_buft) return false;
+    if (!ensure_buffer(e->arena, e->arena_cap, e->arena_map, e->arena_buft, arena_bytes)) return false;
+    if (!ensure_buffer(e->stage, e->stage_cap, e->stage_map, e->stage_buft, stage_bytes)) return false;
+    return true;
+}
 
 } // namespace stream_moe

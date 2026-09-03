@@ -49,4 +49,30 @@ ggml_backend_buffer_type_t stream_moe_register_backend_helper_compute_buft();
 void stream_moe_backend_bind_scheduler(ggml_backend_buffer_type_t buft, class expert_scheduler* sched);
 void stream_moe_backend_set_threads(int threads);
 
+// ---- M2 device-exec resources (per device pool) --------------------------
+// One exec context per device pool (pool index 1 = first device region /
+// Vulkan0). route_b registers the backend + buffer types once its vram pool is
+// allocated; the executor lazily ensures the arena (chain intermediates +
+// per-expert contribution) and staging (cur/ids upload) buffers before a build.
+struct device_exec_ctx_t {
+    ggml_backend_t             be         = nullptr;
+    ggml_backend_buffer_type_t arena_buft = nullptr;  // device compute buft
+    ggml_backend_buffer_type_t stage_buft = nullptr;  // host-visible staging buft
+    ggml_backend_buffer_t      arena      = nullptr;
+    size_t                     arena_cap  = 0;
+    uint8_t*                   arena_map  = nullptr;
+    ggml_backend_buffer_t      stage      = nullptr;
+    size_t                     stage_cap  = 0;
+    uint8_t*                   stage_map  = nullptr;
+};
+// Register pool `pool`'s device exec backend. Idempotent per pool.
+void stream_moe_backend_bind_device_exec(uint32_t pool, ggml_backend_t be,
+                                         ggml_backend_buffer_type_t arena_buft,
+                                         ggml_backend_buffer_type_t stage_buft);
+// Exec context of device pool `pool`, or nullptr when unregistered.
+device_exec_ctx_t* stream_moe_backend_device_exec(uint32_t pool);
+// Lazily (re)allocate the arena / staging buffers to cover the requested bytes.
+// Returns false on allocation failure. No-op sizes keep existing buffers.
+bool stream_moe_backend_device_ensure(uint32_t pool, size_t arena_bytes, size_t stage_bytes);
+
 } // namespace stream_moe
