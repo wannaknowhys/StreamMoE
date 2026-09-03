@@ -1,0 +1,24 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c1d86aaac..de8956fad 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -18872,6 +18872,19 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
+     }
+ }
+ 
++// StreamMoE route-B extension: expose the host mapping of a vulkan buffer when
++// it is host-visible (DEVICE_LOCAL|HOST_VISIBLE vidmem / rebar BAR1). The
++// route-B expert pool reads/writes VRAM-resident expert weights straight from
++// the host through this pointer. Returns nullptr for non-host-visible buffers
++// (allocation fell back to pure device-local memory).
++void * stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer) {
++    if (buffer == nullptr || buffer->context == nullptr) {
++        return nullptr;
++    }
++    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    return ctx->dev_buffer ? ctx->dev_buffer->ptr : nullptr;
++}
++
+ // Extension availability
+ static bool ggml_vk_instance_layer_settings_available() {
+ #ifdef GGML_VULKAN_VALIDATE
