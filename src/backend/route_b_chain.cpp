@@ -167,21 +167,27 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
         size_t even_max = 0, odd_max = 0;
         const ggml_tensor * even_node = nullptr, * odd_node = nullptr;
         int ncomp = 0;
+#ifdef STREAM_MOE_CHAIN_DEBUG
         fprintf(stderr, "  L%d chain (%zu):\n", L, v.size());
+#endif
         for (size_t k = 0; k < v.size(); ++k) {
             const ggml_tensor * nd = gf->nodes[v[k]];
+#ifdef STREAM_MOE_CHAIN_DEBUG
             fprintf(stderr, "    [%2zu] %-14s %-40s nb=%zu\n", k, ggml_op_name(nd->op),
                     nd->name ? nd->name : "?", ggml_nbytes(nd));
+#endif
             if (is_view_op(nd)) continue;
             const size_t nb = ggml_nbytes(nd);
             if ((ncomp & 1) == 0) { if (nb > even_max) { even_max = nb; even_node = nd; } }
             else                  { if (nb > odd_max)  { odd_max  = nb; odd_node  = nd; } }
             ncomp++;
         }
+#ifdef STREAM_MOE_CHAIN_DEBUG
         fprintf(stderr, "  L%d compute=%d -> even_buf=%zuMB (nb %s)  odd_buf=%zuMB (nb %s)\n",
                 L, ncomp,
                 even_max / (1024 * 1024), even_node && even_node->name ? even_node->name : "?",
                 odd_max / (1024 * 1024), odd_node && odd_node->name ? odd_node->name : "?");
+#endif
         if (even_max > g_even_max) g_even_max = even_max;
         if (odd_max > g_odd_max) g_odd_max = odd_max;
     }
