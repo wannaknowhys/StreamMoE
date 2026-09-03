@@ -8,6 +8,9 @@ rem    1. moe (route-B, 8GB pool)  vs baseline moe     -> IDENTICAL expected
 rem    2. upstream (no route-B)    vs baseline upstream -> IDENTICAL expected
 rem    3. per-token KL  baseline-upstream vs new moe    -> report (loose thresh)
 rem    4. kv_cos       baseline moe      vs new moe     -> all ~1.0
+rem    5. div_match    baseline moe      vs new moe     -> if DIVERGED, shows
+rem       whether every high-divergence token is explained by an expert flip
+rem       (known gemma-4 gate noise) or whether some divergence is unexplained.
 rem  Usage: run from repo root: baseline_regression\run_baseline.bat
 rem =====================================================================
 setlocal
@@ -71,6 +74,10 @@ echo   see docs/BACKEND_DIVERGENCE_ANALYSIS.md. FAIL below only if thresh 1.0 tr
 echo.
 echo [5/5] kv_cos (baseline moe vs new moe, expect ~1.0) ...
 node %BR%\tools\kv_cos.js %BR%\baseline\moe_129_8192\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin > "%OUT%\kv_cos.txt"
+
+echo.
+echo [6/6] expert-flip vs divergence match (moe vs baseline moe) ...
+node %BR%\tools\div_match.js %BR%\baseline\moe_129_8192 %OUT%\moe
 set "OUTP=%OUT:\=/%"
 node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0,min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' cos_min='+(min===2?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
 
