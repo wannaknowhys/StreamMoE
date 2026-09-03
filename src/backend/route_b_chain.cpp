@@ -49,23 +49,34 @@ void * moe_chain_pingpong_buffer(int parity, size_t need_bytes) {
     return buf[p];
 }
 
+namespace {
+// Forward declarations (definitions live further down the file).
+bool is_routed_mm(const ggml_tensor * n);
+int  mm_layer(const ggml_tensor * n);
+bool is_view_op(const ggml_tensor * n);
+void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
+                   std::vector<int>& layer, int& n_anchors);
+} // namespace
+
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
     if (!gf || !sched || !our_backend) return false;
+    // Assign the NAMED privatised nodes (routed mm + ffn_moe_* hidden/output).
+    // The anonymous per-topk convergence adds are intentionally NOT privatised
+    // yet: executed per-node on CPU they read a hidden weighted output whose
+    // ping-pong region gets clobbered by the add tree (interval > 1 step).
+    // They join the privatised set together with the whole-layer burst executor
+    // (docs/M2_DEVICE_EXECUTOR.md 2.1/2.2).
     int n = 0;
     size_t tot_bytes = 0;
     for (int i = 0; i < gf->n_nodes; ++i) {
         ggml_tensor * nd = gf->nodes[i];
         if (!moe_chain_node_is_privatizable(nd)) continue;
-        const enum ggml_op op = nd->op;
-        if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE ||
-            op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+        if (is_view_op(nd)) continue;
         ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
         tot_bytes += ggml_nbytes(nd);
         n++;
     }
 #ifdef STREAM_MOE_CHAIN_DEBUG
-    fprintf(stderr, "[route_b_verify] chain intermediates: %d nodes, total %zu MB (%.1f MB/layer)\n",
-            n, tot_bytes / (1024 * 1024), (double) tot_bytes / (1024.0 * 1024.0 * 30.0));
     fprintf(stderr, "[route_b_verify] chain backend assigned: %d compute nodes -> stream_moe\n", n);
 #endif
     return true;
@@ -135,36 +146,20 @@ bool is_view_op(const ggml_tensor * n) {
            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_CONT;
 }
 
-} // namespace
-
-// ---- single chain-node predicate -----------------------------------------
-
-bool moe_chain_node_is_privatizable(const ggml_tensor * node) {
-    if (!node) return false;
-    // routed expert MUL_MAT_ID: weight name carries "_exps" but not shared "_shexp"
-    if (node->op == GGML_OP_MUL_MAT_ID) {
-        const ggml_tensor * w = node->src[0];
-        if (w && w->name && has(w->name, "_exps") && !has(w->name, "_shexp")) return true;
-    }
-    const char * nm = node->name ? node->name : "";
-    if (!nm[0]) return false;
-    // hidden chain intermediate or the output end (both named in the ffn_moe_ domain)
-    return is_hidden_name(nm) || is_output_name(nm);
-}
-
-bool moe_chain_verify_graph(ggml_cgraph * gf) {
-    if (!gf) return true;
+// Privatised chain closure over one built graph: forward BFS from every routed
+// expert MUL_MAT_ID anchor along consumers, stopping expansion at ffn_moe_out
+// (the chain end - included, its own consumers excluded). Used by both verify
+// (external-consumer / ping-pong checks) and assign_backend (which privatises
+// the WHOLE closure - including the anonymous per-topk convergence adds that
+// carry no ffn_moe_ name).
+static void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
+                          std::vector<int>& layer, int& n_anchors) {
     const int N = gf->n_nodes;
-
-    // ---- capture: topological closure. Anchors = routed expert MUL_MAT_ID
-    // (layer from weight name). Forward BFS along consumers, stopping expansion
-    // at ffn_moe_out (the chain end - included, its own consumers excluded).
-    // Layer id propagates along edges.
-    std::vector<int> layer(N, -1);
-    std::vector<char> inq(N, 0);
-    std::vector<char> chain(N, 0);
+    chain.assign(N, 0);
+    layer.assign(N, -1);
+    n_anchors = 0;
     std::vector<int> q;
-    int n_anchors = 0;
+    std::vector<char> inq(N, 0);
     for (int i = 0; i < N; ++i) {
         if (is_routed_mm(gf->nodes[i])) {
             layer[i] = mm_layer(gf->nodes[i]);
@@ -191,6 +186,35 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
         chain[i] = 1;
         inq[i] = 0;
     }
+}
+
+} // namespace
+
+// ---- single chain-node predicate -----------------------------------------
+
+bool moe_chain_node_is_privatizable(const ggml_tensor * node) {
+    if (!node) return false;
+    // routed expert MUL_MAT_ID: weight name carries "_exps" but not shared "_shexp"
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_tensor * w = node->src[0];
+        if (w && w->name && has(w->name, "_exps") && !has(w->name, "_shexp")) return true;
+    }
+    const char * nm = node->name ? node->name : "";
+    if (!nm[0]) return false;
+    // hidden chain intermediate or the output end (both named in the ffn_moe_ domain)
+    return is_hidden_name(nm) || is_output_name(nm);
+}
+
+bool moe_chain_verify_graph(ggml_cgraph * gf) {
+    if (!gf) return true;
+    const int N = gf->n_nodes;
+
+    // ---- capture: topological closure (BFS from routed mm anchors), shared
+    // with assign_backend.
+    std::vector<int> layer;
+    std::vector<char> chain;
+    int n_anchors = 0;
+    collect_chain(gf, chain, layer, n_anchors);
 
     // ---- debug print: per-layer tree (graph order = execution order), capture
     // span, and odd/even ping-pong buffer budgets (compute nodes only, views

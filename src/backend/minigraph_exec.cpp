@@ -3,6 +3,8 @@
 #include "common/logger.h"
 #include "ggml-impl.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -145,6 +147,29 @@ enum ggml_status moe_exec_mul_mat_id(
     int n_threads)
 {
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
+
+    // Chain-topology audit (STREAM_MOE_DUMP_CHAIN=1): log every privatised
+    // node once per graph_compute. Dev tool for the M2 executor work.
+    if (std::getenv("STREAM_MOE_DUMP_CHAIN")) {
+        fprintf(stderr, "[chain] split n_nodes=%d\n", n_nodes);
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor* nd = nodes[i];
+            fprintf(stderr, "  [%3d] op=%-14s name=%-46s ne=%lldx%lldx%lldx%lld nb=%zu view_off=%zu data=%p",
+                    i, ggml_op_name(nd->op), nd->name ? nd->name : "?",
+                    (long long) nd->ne[0], (long long) nd->ne[1],
+                    (long long) nd->ne[2], (long long) nd->ne[3],
+                    ggml_nbytes(nd), nd->view_offs, (void*) nd->data);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (nd->src[s]) {
+                    fprintf(stderr, " |s%d=%s(%s)", s,
+                            nd->src[s]->name ? nd->src[s]->name : "?",
+                            ggml_op_name(nd->src[s]->op));
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
 
     const moe_model_topology_t& topo = sched.topology();
 
