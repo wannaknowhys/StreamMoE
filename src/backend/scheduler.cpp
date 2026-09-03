@@ -203,10 +203,13 @@ void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
     }
 }
 
-int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
+int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32_t pool) {
     uint32_t gidx = group_of(layer);
     if (gidx == static_cast<uint32_t>(-1)) return -1;
-    const subpool_t* sp = ram_subpool(gidx);
+    const subpool_t* sp = nullptr;
+    for (const auto& s : subpools_) {
+        if (s.pool == pool && s.group == gidx) { sp = &s; break; }
+    }
     if (!sp) return -1;
     const uint32_t lo = sp->slot_begin, hi = sp->slot_begin + sp->n_slots;
 
@@ -240,15 +243,26 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     }
     if (victim < 0) return -1; // all slots pinned/in-flight
 
-    // 3. evict: READY -> EVICTING, clear directory, drain refcount, reuse
+    // 3. evict: READY -> EVICTING, clear this pool's directory entry, drain
+    //    refcount, reuse
     if (!slots_[victim].begin_evict()) return -1;
-    clear_directory(owner_[victim].first, owner_[victim].second);
+    dir_->clear(owner_[victim].first, owner_[victim].second, sp->pool);
     while (slot_word_refcount(slots_[victim].load()) != 0) {
         std::this_thread::yield();
     }
     slots_[victim].begin_reload();
     owner_[victim] = {layer, expert};
     return victim;
+}
+
+const expert_scheduler::subpool_t* expert_scheduler::subpool_of_slot(int32_t slot) const {
+    if (slot < 0 || slot >= static_cast<int32_t>(num_slots_)) return nullptr;
+    for (const auto& sp : subpools_) {
+        if (slot >= static_cast<int32_t>(sp.slot_begin) && slot < static_cast<int32_t>(sp.slot_begin + sp.n_slots)) {
+            return &sp;
+        }
+    }
+    return nullptr;
 }
 
 async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, uint32_t expert) {
@@ -260,7 +274,8 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
     t->layer = layer;
     t->expert = expert;
     t->slot = static_cast<uint32_t>(slot);
-    t->pool = 0;   // CPU RAM in Phase A
+    const subpool_t* osp = subpool_of_slot(slot);
+    t->pool = osp ? osp->pool : 0;   // directory entry lands on the owning pool
     t->sched = this;   // shared-dio completions are dispatched by owner
     const expert_info_t& info = topo_->get_expert(layer, expert);
     t->plan = info.read_plan;
@@ -337,7 +352,18 @@ bool expert_scheduler::accept_requests() {
         uint32_t pool = 0;
         if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
         if (load_free_.empty()) { requests_.push(req); break; }
-        int32_t slot = alloc_or_evict(req.layer, req.expert);
+        // Placement (Phase A): if the group has an attached device region, load
+        // there first (hot experts on VRAM); a full/unusable device region falls
+        // back to the CPU-RAM region.
+        uint32_t gidx = group_of(req.layer);
+        const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
+        int32_t slot = -1;
+        if (dsp) {
+            slot = alloc_or_evict(req.layer, req.expert, dsp->pool);
+        }
+        if (slot < 0) {
+            slot = alloc_or_evict(req.layer, req.expert, 0);
+        }
         if (slot < 0) { requests_.push(req); break; }
         async_load_t* t = start_async_load(slot, req.layer, req.expert);
         if (!t) { requests_.push(req); break; }

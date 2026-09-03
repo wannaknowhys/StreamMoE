@@ -135,6 +135,13 @@ public:
     // group has no RAM region. Device regions of the group are later in the
     // sub-pool list.
     const subpool_t* ram_subpool(uint32_t group) const;
+    // Sub-pool (region) owning global slot `slot`, or nullptr.
+    const subpool_t* subpool_of_slot(int32_t slot) const;
+    // The first attached (non-RAM) region of `group`, or nullptr.
+    const subpool_t* vram_subpool(uint32_t group) const {
+        for (const auto& sp : subpools_) if (sp.pool != 0 && sp.group == group) return &sp;
+        return nullptr;
+    }
     const subpool_t* subpool_at(size_t idx) const { return &subpools_[idx]; }
     size_t subpools_count() const { return subpools_.size(); }
 
@@ -179,7 +186,7 @@ public:
     uint32_t num_slots() const { return num_slots_; }
 
 private:
-    int32_t alloc_or_evict(uint32_t layer, uint32_t expert);
+    int32_t alloc_or_evict(uint32_t layer, uint32_t expert, uint32_t pool);
     async_load_t* start_async_load(int32_t slot, uint32_t layer, uint32_t expert);
     void clear_directory(uint32_t layer, uint32_t expert);
     async_load_t* load_task(uint32_t idx) {

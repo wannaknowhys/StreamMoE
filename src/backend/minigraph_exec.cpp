@@ -1,4 +1,4 @@
-﻿#include "backend/minigraph_exec.h"
+#include "backend/minigraph_exec.h"
 #include "backend/route_b_chain.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
@@ -263,32 +263,21 @@ enum ggml_status moe_exec_mul_mat_id(
             ok = false; break;
         }
 
-        // w3d leaf: [ne00, ne01, group_slots], data = group base + branch offset,
-        // nb[2] = group slot stride (per-expert-group sub-pools)
+        // Resolve the resident region(s) of this MUL_MAT_ID's active experts.
+        // All active experts must share ONE region (single-region execution);
+        // a mixed RAM/VRAM active set needs per-region sub-computes, which only
+        // appear once device moves land (phase B).
         uint32_t gidx = sched.group_of(pn.layer);
         if (gidx == static_cast<uint32_t>(-1)) {
             LOG_ERROR("stream_moe: no subpool group for layer " << pn.layer);
             ok = false; break;
         }
-        const auto* rsp = sched.ram_subpool(gidx);   // executor host path (CPU RAM)
-        if (!rsp) {
-            LOG_ERROR("stream_moe: no CPU-RAM subpool for layer " << pn.layer);
-            ok = false; break;
-        }
-        const auto& sp = *rsp;
-        const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
-        ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
-        w3d->ne[2] = g_n_slots;
-        w3d->nb[2] = sp.expert_size;
-        w3d->nb[3] = sp.expert_size * g_n_slots;
-        w3d->data  = sp.base + off;
-
-        // ids_slot: translate expert ids -> slot indices (private, main graph untouched)
-        ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
-        auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+        const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+        std::vector<int32_t> slotbuf(n_ids, -1);
+        const expert_scheduler::subpool_t* use_sp = nullptr;
         for (int t = 0; t < ids->ne[1] && ok; ++t)
             for (int k = 0; k < ids->ne[0] && ok; ++k) {
-                int32_t e = MOE_ID_AT(ids, t, k);
+                const int32_t e = MOE_ID_AT(ids, t, k);
                 int32_t slot = -1;
                 if (pn.down) {
                     slot = sched.slot_of(pn.layer, static_cast<uint32_t>(e));
@@ -296,9 +285,43 @@ enum ggml_status moe_exec_mul_mat_id(
                     expert_handle_t h = pin_state_find(pin_state(), pn.layer, static_cast<uint32_t>(e));
                     if (h.pinned) slot = h.slot;
                 }
-                if (slot < 0 || slot >= static_cast<int32_t>(sp.slot_begin + sp.n_slots)) { ok = false; break; }
-                ids_slot_data[static_cast<size_t>(t) * ids->ne[0] + k] = slot - static_cast<int32_t>(sp.slot_begin);
+                if (slot < 0) { ok = false; break; }
+                const expert_scheduler::subpool_t* osp = sched.subpool_of_slot(slot);
+                if (!osp) { ok = false; break; }
+                if (use_sp && use_sp != osp) {
+                    LOG_ERROR("stream_moe: mixed-region active set for " << w->name
+                              << " (pool " << use_sp->pool << " + pool " << osp->pool << ") not yet supported");
+                    ok = false; break;
+                }
+                if (!use_sp) use_sp = osp;
+                slotbuf[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
             }
+        if (!ok) break;
+        if (!use_sp) {
+            // No active experts (empty routing): nothing to compute for this node.
+            break;
+        }
+        const expert_scheduler::subpool_t& sp = *use_sp;
+        static bool logged_region = false;
+        if (!logged_region && sp.pool != 0) {
+            logged_region = true;
+            LOG_INFO("stream_moe: expert execution reads pool " << sp.pool
+                     << " (device region, host-mapped VRAM)");
+        }
+        const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+        ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+        w3d->ne[2] = g_n_slots;
+        w3d->nb[2] = sp.expert_size;
+        w3d->nb[3] = sp.expert_size * g_n_slots;
+        w3d->data  = sp.base + off;
+
+        // ids_slot: translate expert ids -> region-local slot indices
+        ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+        auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+        for (size_t i = 0; i < n_ids; ++i) {
+            if (slotbuf[i] < 0) { ok = false; break; }
+            ids_slot_data[i] = slotbuf[i] - static_cast<int32_t>(sp.slot_begin);
+        }
         if (!ok) break;
 
         // b_leaf: wrap the main graph's activation (contiguous CPU buffer)
