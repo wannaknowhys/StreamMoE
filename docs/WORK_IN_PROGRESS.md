@@ -73,3 +73,11 @@
 
 ### H. 长线：消灭 phase2a/2b patch（2026-09 定，不立刻整理）
 - [ ] 目标：vendored 改动全经 phase1 打桩（include 锚点）+ 主仓库内容（frag / 独立 cpp via STREAM_MOE_SRC）表达，route-b-inject.patch / prefill-export-llama.patch 最终消失，只留 streammoe-macros.patch。纪律写入 patches/README：小插入→锚点+frag；大块→独立 cpp 或大 frag；不得不直接改 vendored→先问用户。
+
+### I. GPU M1 过渡 - 参数 collection 化 + Vulkan 显存池真申请调查（2026-09）
+- [x] I1 pool collection 参数落地（cf0e61a）：`--moe-expert-pools <dev>:<MB>[,...]`（main/draft 统一）；route_b_setup 接 pool list；非 RAM 设备排队 lazy alloc（首次 graph_compute 触发——vulkan 注册晚）；回归 IDENTICAL
+- [x] I2 vulkan 注册机制查清：ggml_backend_registry **静态注册**（ggml-backend-reg.cpp:129-136，GGML_USE_VULKAN 编译期 + 无 GGML_DISABLE_VULKAN env），非 llama 初始化/惰性。之前拿不到 Vulkan0 = StreamMoE_dump 默认 CPU-only（build.bat:69 设计），需 `GGML_VULKAN=ON` env 重编
+- [x] I3 Vulkan0 真分配：2048MB 成功；3G/4G/5G/6G/7G 全 OOM。两层限制：① RX590 驱动 maxBufferSize 偏低（ggml-vulkan.cpp:6377，需 `GGML_VK_FORCE_MAX_BUFFER_SIZE` env 绕过）② 绕过后 vkAllocateMemory 真 OOM——8GB 卡实际空闲 ~2.5GB（-ngl 2 dense + vulkan 运行时 + 系统占用）。M2+ 分段分配规避，不依赖单 buffer
+- [x] I4 **新发现待查**：GGML_VULKAN=ON 编入 StreamMoE_dump 后，纯 CPU decode（-ngl 0）结果也分歧（embd token#0 cos 0.985）——vulkan backend 存在改变图执行路径（即使无 offload）。**别用 vulkan 版 StreamMoE_dump 跑回归**（回归 binary = CPU 版）
+- [x] I5 div_match 工具整合（63824cb）：`baseline_regression/tools/div_match.js` = 专家翻转 token 集 vs 高散 token 集匹配度。实测 vulkan 版分歧：34 个高散 token 34/34（100%）有专家翻转、0 无翻转——分歧完全由 gemma-4 专家翻转（gate 边界噪声）解释，非 bug；层 29（末层）翻转最频繁（放大最直接）。run_baseline.bat 加 [6/6] div_match 步——DIVERGED 时自动归因（unexplained>0 = bug 信号），IDENTICAL 时一行确认
+
