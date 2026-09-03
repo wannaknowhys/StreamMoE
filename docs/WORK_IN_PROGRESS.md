@@ -66,7 +66,7 @@
 - [ ] G3b 执行器（方案已定）：supports_op 接 moe_chain_node_is_privatizable（非 view 计算节点）；moe_exec phase2 对非 MUL_MAT_ID 计算节点（geglu/mul/add/moe_out——无权重、src 主图真写）用**手动 1 节点 cgraph**（ggml_new_graph + nodes[0]=原节点）官方 cpu 核直跑，**无需 per-op 重建**；view 衔接 + MUL_MAT_ID w3d 不变；顺序=split 节点序。第一版真写 dst 对齐数值，再切藏 arena + 链尾 unpin
 
 - [x] G3b stage-1 完成（d9f5bbb）：显式收编（preset 180 链计算节点 -> stream_moe）+ 修 has_moe 早退 + resolve 单池 fallback + 手动 1-node cgraph 执行无权重链节点；**回归 IDENTICAL**（整层链我们执行、真写主图 dst）。debug log 已清。patch 欠账：llama-context 3 处 assign 调用（vendored，route-b patch 待补）
-- [ ] G3b stage-2 私有化：前置 = sched 每节点仍单 split（不聚合整层——中间跨 split 必须真写主图），需先查 pass5 为何预设同 backend 仍拆单节点（聚合后中间才可在同 graph_compute 内自己区迭代）；再改 moe_exec 中间 dst -> 私有 arena + 链尾 unpin
+- [x] G3b stage-2 私有化完成（0829d50/双模式）：乒乓+fullalloc 双模式回归 IDENTICAL（前置聚合问题经乒乓共享持久区绕开）。原内容：：前置 = sched 每节点仍单 split（不聚合整层——中间跨 split 必须真写主图），需先查 pass5 为何预设同 backend 仍拆单节点（聚合后中间才可在同 graph_compute 内自己区迭代）；再改 moe_exec 中间 dst -> 私有 arena + 链尾 unpin
 
-- [ ] PATCH-DEBT-1（2026-09）：llama-context.cpp 的 route-b 挂点（顶部 ROUTE_B include route_b_chain.h + 3 处 build_graph 后 verify/assign 块，均 STREAM_MOE_ROUTE_B 宏 gate）需进 route-b-inject.patch——manual hunk against HEAD（行 1358/2431/3418 + include 区）；**连环**：prefill patch 的 llama-context hunk context 需含 route-b 插入行（prefill 后 apply）——两 patch 一起改 + clean-apply 验证
+- [x] PATCH-DEBT-1（已清，ae990d7）：llama-context 缝 frag 化——macros 4 锚点 + stmoe_routeb_lctx_*.frag + prefill 段重生成，clean-apply 21 文件逐字节一致。原内容：：llama-context.cpp 的 route-b 挂点（顶部 ROUTE_B include route_b_chain.h + 3 处 build_graph 后 verify/assign 块，均 STREAM_MOE_ROUTE_B 宏 gate）需进 route-b-inject.patch——manual hunk against HEAD（行 1358/2431/3418 + include 区）；**连环**：prefill patch 的 llama-context hunk context 需含 route-b 插入行（prefill 后 apply）——两 patch 一起改 + clean-apply 验证
 - [x] PATCH-DEBT-2：common/CMakeLists.txt 的 route_b_chain.cpp 源已补进 route-b patch（CMakeLists 段替换完成）
