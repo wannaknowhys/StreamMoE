@@ -200,7 +200,9 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
     for (int i = 0; i < N; ++i) {
         if (chain[i]) { by_layer[layer[i]].push_back(i); chain_total++; }
     }
+#ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_cap] anchors=%d chain_nodes=%d/%d\n", n_anchors, chain_total, N);
+#endif
     size_t g_even_max = 0, g_odd_max = 0;
     for (auto & kv : by_layer) {
         const int L = kv.first;
@@ -232,9 +234,11 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
         if (even_max > g_even_max) g_even_max = even_max;
         if (odd_max > g_odd_max) g_odd_max = odd_max;
     }
+#ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_cap] ping-pong budget (per layer): even_buf=%zuMB  odd_buf=%zuMB  total=%zuMB\n",
             g_even_max / (1024 * 1024), g_odd_max / (1024 * 1024),
             (g_even_max + g_odd_max) / (1024 * 1024));
+#endif
 
     // ---- long-range dependency check: ping-pong clobbers any hidden output
     // still needed more than one compute step later. If a compute node's data
