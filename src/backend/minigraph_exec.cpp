@@ -3,6 +3,7 @@
 #include "backend/moe_backend.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
+#include "ggml-backend-impl.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -385,29 +386,36 @@ static bool hide_burst(ggml_tensor * nd, int32_t layer) {
 }
 
 // Refresh every view alias of `prod` inside `layer`'s capture so the views
-// point at the producer's current (possibly hidden) output.
+// point at the producer's current (possibly hidden) output. Buffer follows the
+// producer (device execution reads views through the producer's vk buffer).
 static void refresh_aliases(int32_t layer, const ggml_tensor * prod) {
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex) return;
     for (const auto & va : ex->view_aliases) {
         if (va.prod == prod) {
-            va.view->data = static_cast<char*>(prod->data) + va.off;
+            ggml_tensor * mut = const_cast<ggml_tensor*>(va.view);
+            mut->buffer = const_cast<ggml_tensor*>(prod)->buffer;
+            // Offset folded into data; view_offs cleared so device kernels
+            // (which add view_offs themselves) do not double-count.
+            mut->data = static_cast<char*>(prod->data) + va.off;
+            mut->view_offs = 0;
         }
     }
 }
 
 // Vulkan mm execution (C2b4): the MUL_MAT_ID runs on the device backend inside
 // VRAM. Weight shell points at the pool buffer slot; cur and the translated
-// ids are uploaded to a host-visible staging buffer; the result is computed
-// into the device arena and copied back to the hidden host dst (the weightless
-// chain below still runs on the host until it moves into the arena too).
-// `slotbuf` carries the global slot per (k,t); `sp` is the single resident
-// region (single-region active set).
+// ids are uploaded into the staging buffer (bumped by stage_off); the result is
+// computed at arena offset dst_off. When readback is true the result is copied
+// to the hidden host dst; in the whole-layer device-resident mode (readback
+// false) it stays in the arena for the host-free chain. `slotbuf` carries the
+// global slot per (k,t).
 static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
                        device_exec_ctx_t & dv, ggml_tensor * nd,
                        const parsed_node_t & pn,
                        const std::vector<int32_t> & slotbuf,
-                       const expert_scheduler::subpool_t & sp, size_t branch_off) {
+                       const expert_scheduler::subpool_t & sp, size_t branch_off,
+                       size_t dst_off, size_t & stage_off, bool readback) {
     ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
     ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
     const ggml_tensor * w  = nd->src[0];
@@ -416,8 +424,8 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
     const size_t cur_bytes = ggml_nbytes(cur);
     const size_t ids_bytes = n_ids * sizeof(int32_t);
 
-    if (!stream_moe_backend_device_ensure(sp.pool, mm_bytes + 4u * 1024 * 1024,
-                                           ids_bytes + cur_bytes + 4u * 1024 * 1024)) {
+    if (!stream_moe_backend_device_ensure(sp.pool, dst_off + mm_bytes + 4u * 1024 * 1024,
+                                           stage_off + ids_bytes + cur_bytes + 4u * 1024 * 1024)) {
         LOG_ERROR("stream_moe: device arena/stage ensure failed (pool " << sp.pool << ")");
         return false;
     }
@@ -426,29 +434,35 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
         return false;
     }
 
-    // Contiguous check for the activation upload.
-    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-        if (cur->nb[d] != cur->nb[d - 1] * cur->ne[d - 1]) {
-            LOG_ERROR("stream_moe: vk mm activation is not contiguous (" << ggml_op_name(nd->op) << ")");
+    // cur already on the device (previous private arena node) or a host tensor
+    // that must be uploaded to the staging buffer.
+    const bool cur_on_dev = cur->buffer && cur->buffer->buft == dv.arena_buft;
+    if (!cur_on_dev) {
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (cur->nb[d] != cur->nb[d - 1] * cur->ne[d - 1]) {
+                LOG_ERROR("stream_moe: vk mm activation is not contiguous (" << ggml_op_name(nd->op) << ")");
+                return false;
+            }
+        }
+        if (!stream_moe_backend_device_ensure(sp.pool, 1, stage_off + ids_bytes + cur_bytes + 4u * 1024 * 1024)) {
+            LOG_ERROR("stream_moe: device stage ensure failed (pool " << sp.pool << ")");
             return false;
         }
     }
-
-    // Upload translated ids (region-local slots) and cur into the staging buffer.
-    const size_t ids_off = 0;
-    const size_t cur_off = (ids_bytes + 63u) & ~size_t(63u);
-    {
+    const size_t ids_off = (stage_off + 63u) & ~size_t(63u);
+    const size_t cur_off = (ids_off + ids_bytes + 63u) & ~size_t(63u);
+    if (!cur_on_dev) {
         auto * slot32 = reinterpret_cast<int32_t*>(dv.stage_map + ids_off);
         for (size_t i = 0; i < n_ids; ++i) {
             slot32[i] = slotbuf[i] - static_cast<int32_t>(sp.slot_begin);
         }
         std::memcpy(dv.stage_map + cur_off, cur->data, cur_bytes);
     }
+    stage_off = cur_off + cur_bytes;
 
     ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
     const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
 
-    // w3d shell over the device pool buffer (slot stride = expert_size).
     ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
     w3d->ne[2] = g_n_slots;
     w3d->nb[2] = sp.expert_size;
@@ -456,29 +470,35 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
     w3d->buffer = wbuf;
     w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, branch_off));
 
-    // ids leaf in the staging buffer.
     ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
     ids_leaf->buffer = dv.stage;
     ids_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.stage, ids_off));
 
-    // activation leaf in the staging buffer (contiguous upload, standard nb).
-    ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
-    b_leaf->buffer = dv.stage;
-    b_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.stage, cur_off));
+    ggml_tensor* b_leaf;
+    if (cur_on_dev) {
+        b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+        b_leaf->buffer = cur->buffer;
+        b_leaf->data   = cur->data;
+        std::memcpy(b_leaf->nb, cur->nb, sizeof(b_leaf->nb));
+    } else {
+        b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+        b_leaf->buffer = dv.stage;
+        b_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.stage, cur_off));
+    }
 
-    // mm node: dst at arena offset 0.
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_leaf);
     mm->buffer = dv.arena;
-    mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.arena, 0));
+    mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.arena, dst_off));
     ggml_build_forward_expand(gf, mm);
 
     if (ggml_backend_graph_compute(dv.be, gf) != GGML_STATUS_SUCCESS) {
         LOG_ERROR("stream_moe: vulkan mm compute failed for " << (w->name ? w->name : "?"));
         return false;
     }
-    // Copy the result back to the hidden host dst (weightless chain is on host).
-    std::memcpy(nd->data, dv.arena_map, mm_bytes);
+    if (readback) {
+        std::memcpy(nd->data, dv.arena_map + dst_off, mm_bytes);
+    }
     return true;
 }
 
@@ -555,7 +575,8 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
                 LOG_ERROR("stream_moe: no device exec context for pool " << sp.pool);
                 return false;
             }
-            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, off);
+            size_t stage_off = 0;
+            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, off, 0, stage_off, true);
         }
 
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
@@ -614,6 +635,158 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
 }
 
 // Burst one whole layer from its captured sequence.
+// ---- whole-layer device-resident execution (C2b4 v2) ----------------------
+// A layer whose active experts all live on one device pool runs entirely on
+// that device: hidden outputs are allocated in the device arena (buffer/data on
+// the main tensors), dense-side inputs are uploaded to the staging buffer as
+// device leaves, weightless nodes run as single-node graphs on the device
+// backend, and only moe_out copies its result back to the host main dst.
+static bool dev_arena_hide(ggml_tensor * nd, uint32_t pool, size_t & bump, size_t & off) {
+    device_exec_ctx_t * dv = stream_moe_backend_device_exec(pool);
+    if (!dv || !dv->be) return false;
+    const size_t need = ggml_nbytes(nd);
+    const size_t a = (bump + 63u) & ~size_t(63u);
+    if (!stream_moe_backend_device_ensure(pool, a + need + 4096, 1)) return false;
+    dv = stream_moe_backend_device_exec(pool);
+    if (!dv->arena_map) return false;
+    nd->buffer = dv->arena;
+    nd->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->arena, a));
+    bump = a + need;
+    off  = a;
+    return true;
+}
+
+// Return a device-side tensor for `src`: itself when it already lives on the
+// device, otherwise an uploaded copy leaf in the staging buffer.
+static ggml_tensor * dev_stage_leaf(ggml_context * ctx, ggml_tensor * src,
+                                    uint32_t pool, size_t & bump) {
+    device_exec_ctx_t * dv = stream_moe_backend_device_exec(pool);
+    if (!dv) return nullptr;
+    if (src->buffer && src->buffer->buft == dv->arena_buft) return src;
+    const size_t need = ggml_nbytes(src);
+    const size_t a = (bump + 63u) & ~size_t(63u);
+    if (!stream_moe_backend_device_ensure(pool, 1, a + need + 4096)) return nullptr;
+    dv = stream_moe_backend_device_exec(pool);
+    if (!dv->stage_map) return nullptr;
+    std::memcpy(dv->stage_map + a, src->data, need);
+    ggml_tensor * leaf = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], 1);
+    for (int d = 0; d < 4; ++d) { leaf->ne[d] = src->ne[d]; leaf->nb[d] = src->nb[d]; }
+    leaf->buffer = dv->stage;
+    leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, a));
+    bump = a + need;
+    return leaf;
+}
+
+[[maybe_unused]] static bool exec_device_chain(int32_t layer, ggml_context * ctx, expert_scheduler & sched,
+                              const moe_model_topology_t & topo, uint32_t pool,
+                              const std::vector<expert_handle_t> & pins) {
+    const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+    if (!ex || ex->compute.empty()) return true;
+    device_exec_ctx_t * dv = stream_moe_backend_device_exec(pool);
+    if (!dv || !dv->be) return false;
+    size_t arena_bump = 0, stage_bump = 0;
+    bool ok = true;
+    // Reserve the WHOLE layer's arena/stage up front: growing the arena mid-
+    // layer would invalidate already-hidden outputs (their buffer gets freed).
+    {
+        size_t need_total = 0;
+        for (const auto * cn : ex->compute) need_total += ggml_nbytes(cn);
+        if (!stream_moe_backend_device_ensure(pool, need_total + 64u * 1024 * 1024,
+                                               need_total + 64u * 1024 * 1024)) {
+            LOG_ERROR("stream_moe: device layer arena/stage reserve failed (pool " << pool << ")");
+            return false;
+        }
+    }
+    for (const auto * cn_ : ex->compute) {
+        if (!ok) break;
+        ggml_tensor * nd = const_cast<ggml_tensor*>(cn_);
+
+        if (nd->op == GGML_OP_MUL_MAT_ID) {
+            parsed_node_t pn = parse_weight_name(nd->src[0]->name);
+            if (!pn.ok) { ok = false; break; }
+            size_t off = 0, bytes = 0;
+            if (!sched.branch_layout(pn.layer, 0, nd->src[0]->name, off, bytes)) { ok = false; break; }
+            if (sched.group_of(pn.layer) == static_cast<uint32_t>(-1)) { ok = false; break; }
+            const ggml_tensor * ids = nd->src[2];
+            if (!ids->data) { ok = false; break; }
+            const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+            std::vector<int32_t> slotbuf(n_ids, -1);
+            const expert_scheduler::subpool_t * use_sp = nullptr;
+            for (int t = 0; t < ids->ne[1] && ok; ++t) {
+                for (int k = 0; k < ids->ne[0] && ok; ++k) {
+                    const int32_t e = MOE_ID_AT(ids, t, k);
+                    if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) { ok = false; break; }
+                    const int32_t slot = pin_slot(pins, pn.layer, static_cast<uint32_t>(e));
+                    if (slot < 0) { ok = false; break; }
+                    const auto * osp = sched.subpool_of_slot(slot);
+                    if (!osp) { ok = false; break; }
+                    if (use_sp && use_sp != osp) {
+                        LOG_ERROR("stream_moe: device-chain mixed-region active set for " << nd->src[0]->name);
+                        ok = false; break;
+                    }
+                    if (!use_sp) use_sp = osp;
+                    slotbuf[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
+                }
+            }
+            if (!ok) break;
+            if (!use_sp || use_sp->pool != pool) { ok = false; break; }
+            size_t dst_off = 0;
+            if (!dev_arena_hide(nd, pool, arena_bump, dst_off)) { ok = false; break; }
+            if (!exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, *use_sp, off, dst_off, stage_bump, false)) {
+                ok = false; break;
+            }
+            refresh_aliases(layer, nd);
+            continue;
+        }
+
+        if (is_view_op(nd)) {   // capture excludes views; defensive only
+            ggml_tensor * mut = nd;
+            mut->data = nd->op == GGML_OP_VIEW
+                        ? static_cast<char*>(nd->src[0]->data) + nd->view_offs
+                        : nd->src[0]->data;
+            continue;
+        }
+
+        // weightless compute (or the moe_out end)
+        const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+        for (int s = 0; s < GGML_MAX_SRC && ok; ++s) {
+            ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            ggml_tensor * leaf = dev_stage_leaf(ctx, src, pool, stage_bump);
+            if (!leaf) { ok = false; break; }
+            if (leaf != src) nd->src[s] = leaf;   // external (host) src -> device leaf
+        }
+        if (!ok) break;
+
+        if (is_out) {
+            void * host_dst = nd->data;
+            size_t off = 0;
+            if (!dev_arena_hide(nd, pool, arena_bump, off)) { ok = false; break; }
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            gf->nodes[0] = nd; gf->n_nodes = 1;
+            if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("stream_moe: device moe_out compute failed");
+                ok = false; break;
+            }
+            std::memcpy(host_dst, dv->arena_map + off, ggml_nbytes(nd));
+            nd->data = host_dst;   // restore the host dst for the dense side
+        } else {
+            size_t off = 0;
+            if (!dev_arena_hide(nd, pool, arena_bump, off)) { ok = false; break; }
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            gf->nodes[0] = nd; gf->n_nodes = 1;
+            if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("stream_moe: device chain compute failed for "
+                          << (nd->name ? nd->name : ggml_op_name(nd->op)));
+                ok = false; break;
+            }
+            refresh_aliases(layer, nd);
+        }
+    }
+    return ok;
+}
+
+// Burst one whole layer from its captured sequence.
 static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                                          ggml_backend_t cpu, expert_scheduler& sched,
                                          int /*n_threads*/) {
@@ -626,8 +799,6 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     for (const auto * cn : ex->compute) {
         if (!(cn->name && strstr(cn->name, "ffn_moe_out"))) lsum += ggml_nbytes(cn);
     }
-    moe_chain_set_full_alloc(lsum);
-    reset_layer(layer);
 
     // Fix input-side layout tensors (views/reshapes feeding the compute, whose
     // producer is a weight/leaf or a llama-side tensor).
@@ -670,6 +841,14 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     }
 
     bool ok = true;
+    // Device-resident whole-layer execution (b4-2) is disabled for now: it
+    // repurposes main-graph tensor buffers and fights llama's scheduler buffer
+    // bookkeeping after the burst. The CPU path below keeps v1 semantics for
+    // device pools (per-mm vulkan compute + host readback, host weightless
+    // chain). Re-enable once the arena-clone executor (no main-graph mutation)
+    // replaces exec_device_chain.
+    moe_chain_set_full_alloc(lsum);
+    reset_layer(layer);
     for (const auto * cn : ex->compute) {
         if (!ok) break;
         ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
