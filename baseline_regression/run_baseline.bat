@@ -11,13 +11,32 @@ rem    4. kv_cos       baseline moe      vs new moe     -> all ~1.0
 rem    5. div_match    baseline moe      vs new moe     -> if DIVERGED, shows
 rem       whether every high-divergence token is explained by an expert flip
 rem       (known gemma-4 gate noise) or whether some divergence is unexplained.
-rem  Usage: run from repo root: baseline_regression\run_baseline.bat
+rem  Usage: from repo root:
+rem    baseline_regression\run_baseline.bat [baseline_moe_dir] [verify_dir]
+rem    baseline_moe_dir : moe reference export folder (default:
+rem                       baseline_regression\baseline\moe_129_8192, the
+rem                       CPU-build baseline). A GGML_VULKAN=ON build only
+rem                       matches its own numeric flavor, so for vulkan builds
+rem                       (StreamMoE_dump default) pass the folder
+rem                       moe_129_8192_vk as reference. Upstream is always
+rem                       compared against the fixed baseline\upstream_129.
+rem    verify_dir       : folder where this run's moe/up exports are written
+rem                       (default baseline_regression\temp).
 rem =====================================================================
 setlocal
 set ROOT=%~dp0..
 cd /d "%ROOT%"
 set BR=baseline_regression
-set OUT=%BR%\temp
+
+set "BL=%~1"
+if "%BL%"=="" set "BL=%BR%\baseline\moe_129_8192"
+if not exist "%BL%\prefill_export_main.bin" (
+    echo [-] baseline moe folder not usable: %BL%
+    echo [-]   expected prefill_export_main.bin + expert_history_main.bin inside
+    exit /b 1
+)
+set "OUT=%~2"
+if "%OUT%"=="" set "OUT=%BR%\temp"
 if not exist "%OUT%\moe"  mkdir "%OUT%\moe"
 if not exist "%OUT%\up"   mkdir "%OUT%\up"
 
@@ -56,10 +75,10 @@ if errorlevel 1 ( echo [-] upstream run failed & exit /b 1 )
 echo.
 echo [3/5] embd/hidden/KV byte compare vs baseline ...
 echo   -- moe vs baseline moe (expect IDENTICAL):
-node %BR%\tools\verify_prefill.js %BR%\baseline\moe_129_8192\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin
+node %BR%\tools\verify_prefill.js %BL%\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin
 if not errorlevel 0 ( echo [-] moe DIVERGED from baseline & set PASS=0 )
 echo   -- expert history:
-node %BR%\tools\verify_expert_history.js %BR%\baseline\moe_129_8192\expert_history_main.bin %OUT%\moe\expert_history_main.bin
+node %BR%\tools\verify_expert_history.js %BL%\expert_history_main.bin %OUT%\moe\expert_history_main.bin
 if errorlevel 1 ( echo [-] moe expert history DIVERGED & set PASS=0 )
 echo   -- upstream vs baseline upstream (expect IDENTICAL):
 node %BR%\tools\verify_prefill.js %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\up\prefill_export_main.bin
@@ -68,16 +87,20 @@ if errorlevel 1 ( echo [-] upstream DIVERGED from baseline & set PASS=0 )
 echo.
 echo [4/5] per-token KL (baseline upstream vs new moe) - report only:
 echo   moe-vs-upstream KL is inherent backend noise (routing flips), NOT a bug;
-echo   see docs/BACKEND_DIVERGENCE_ANALYSIS.md. FAIL below only if thresh 1.0 trips.
-"%KL%" %MODEL% %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin --thresh 1.0
+echo   see docs/BACKEND_DIVERGENCE_ANALYSIS.md. FAIL below only if thresh trips.
+rem  A *_vk baseline (GGML_VULKAN=ON flavor) diverges more from the CPU
+rem  upstream reference than a CPU baseline does, so loosen the threshold.
+set "KLTHRESH=1.0"
+echo %BL% | findstr /C:"_vk" >nul && set "KLTHRESH=4.5"
+"%KL%" %MODEL% %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin --thresh %KLTHRESH%
 
 echo.
 echo [5/5] kv_cos (baseline moe vs new moe, expect ~1.0) ...
-node %BR%\tools\kv_cos.js %BR%\baseline\moe_129_8192\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin > "%OUT%\kv_cos.txt"
+node %BR%\tools\kv_cos.js %BL%\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin > "%OUT%\kv_cos.txt"
 
 echo.
 echo [6/6] expert-flip vs divergence match (moe vs baseline moe) ...
-node %BR%\tools\div_match.js %BR%\baseline\moe_129_8192 %OUT%\moe
+node %BR%\tools\div_match.js %BL% %OUT%\moe
 set "OUTP=%OUT:\=/%"
 node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0,min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' cos_min='+(min===2?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
 
