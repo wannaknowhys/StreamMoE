@@ -103,6 +103,16 @@
 > 策略（策略后置）。
 
 - [ ] M2-1 全 vram 单 device 真 vulkan 列链执行（vram 内 device arena/乒乓 + mini-leaf 提交 vulkan）→ IDENTICAL
+- [x] M2-1 **v1（31286fa）**：vram 激活集的 MUL_MAT_ID 已走 vulkan（w3d 壳指 pool buffer + cur/ids 上传默认 buft（Vulkan_Host buft 本驱动无 host map，改用 default）→ arena 计算 → 拷贝 host 隐藏 dst）。全 vram run embd/hidden/KV-used 与基线一致
+- [ ] M2-1 **v2（b4-2 备忘，整层 device 原地执行）**：
+  1. device 域判定（层激活单 pool>0）在 exec_layer_burst pin 后；
+  2. hide_dev：arena bump（dv.arena ensure 层 lsum），设主图节点 nd->buffer=dv.arena、nd->data=host_offset(arena,off)；**refresh_aliases 需同步 va.view->buffer=prod->buffer**；
+  3. 非私有 src（dense 输出 cur/ids/scale/weights_norm 等 host tensor）逐节点前 **stage 上传**：memcpy 到 dv.stage + 临时设其 buffer=dv.stage、data=offset（这些 tensor 每 step 重建，llama 不再读）；
+  4. weightless 单节点图直接用主图节点提交 dv.be（buffer 已设）——无需 arena 克隆；
+  5. mm v2：dst 即 hide_dev 的 arena off（不再 readback host）；手工 mm 图 leaf 同 v1；
+  6. moe_out：记录原主 dst host 指针 → arena off 计算 → memcpy(arena_map+off → 主 dst)；
+  7. 域内 view alias 衔接走 arena（mm 输出 view = arena+off，buffer=arena）；CPU 域路径不动。
+- [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
