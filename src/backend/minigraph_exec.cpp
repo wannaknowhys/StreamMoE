@@ -93,6 +93,18 @@ enum ggml_status moe_exec_mul_mat_id(
 
     const moe_model_topology_t& topo = sched.topology();
 
+    {
+        int n_mm = 0, n_layout = 0, n_manual = 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor* nd = nodes[i];
+            if (nd->op == GGML_OP_MUL_MAT_ID) n_mm++;
+            else if (nd->op == GGML_OP_VIEW || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_TRANSPOSE ||
+                     nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_CONT) n_layout++;
+            else n_manual++;
+        }
+        fprintf(stderr, "[moe_db] exec split: nodes=%d mm=%d layout=%d manual=%d\n", n_nodes, n_mm, n_layout, n_manual);
+    }
+
     // ---- phase 1: parse + pin (non-down) / wait (down) ----
     std::vector<keyed_expert_t> pin_keys, down_keys;
     std::vector<expert_handle_t> pins;
@@ -145,18 +157,47 @@ enum ggml_status moe_exec_mul_mat_id(
 
         // View / layout ops on our host compute buffer: pure views, no weight
         // read. Point the dst at the source slice (VIEW) or keep the data
-        // pointer (RESHAPE/TRANSPOSE/PERMUTE - nb already fixed by the graph).
+        // pointer (RESHAPE/TRANSPOSE/PERMUTE/CONT - nb already fixed by graph).
         if (nd->op != GGML_OP_MUL_MAT_ID) {
-            if (!nd->src[0] || !nd->src[0]->data) {
-                LOG_ERROR("stream_moe: view op without source data " << ggml_op_name(nd->op));
-                ok = false;
-                break;
+            const bool is_layout = nd->op == GGML_OP_VIEW || nd->op == GGML_OP_RESHAPE ||
+                                   nd->op == GGML_OP_TRANSPOSE || nd->op == GGML_OP_PERMUTE ||
+                                   nd->op == GGML_OP_CONT;
+            if (is_layout) {
+                if (!nd->src[0] || !nd->src[0]->data) {
+                    LOG_ERROR("stream_moe: view op without source data " << ggml_op_name(nd->op));
+                    ok = false;
+                    break;
+                }
+                ggml_tensor* mut = const_cast<ggml_tensor*>(nd);
+                if (nd->op == GGML_OP_VIEW) {
+                    mut->data = (char*)nd->src[0]->data + nd->view_offs;
+                } else {
+                    mut->data = nd->src[0]->data;
+                }
+                continue;
             }
-            ggml_tensor* mut = const_cast<ggml_tensor*>(nd);
-            if (nd->op == GGML_OP_VIEW) {
-                mut->data = (char*)nd->src[0]->data + nd->view_offs;
-            } else {
-                mut->data = nd->src[0]->data;
+            // Weightless MoE-chain compute node: srcs are materialised on the
+            // main graph (MUL_MAT_ID dsts written by our mini-graphs; views
+            // pointed into them). Run the ORIGINAL node via the CPU backend in a
+            // manual single-node graph.
+            for (int s = 0; s < GGML_MAX_SRC && ok; ++s) {
+                if (nd->src[s] && !nd->src[s]->data) {
+                    LOG_ERROR("stream_moe: chain compute src without data for " << ggml_op_name(nd->op));
+                    ok = false;
+                }
+            }
+            if (!ok) break;
+            fprintf(stderr, "[moe_db] manual-run node=%s op=%s dst=%p\n",
+                    nd->name ? nd->name : "?", ggml_op_name(nd->op), nd->data);
+            ggml_cgraph* gf = ggml_new_graph(ctx);
+            gf->nodes[0] = const_cast<ggml_tensor*>(nd);
+            gf->n_nodes  = 1;
+            const enum ggml_status rc_m = ggml_backend_graph_compute(cpu_backend, gf);
+            fprintf(stderr, "[moe_db] manual done rc=%d dst0=%.4f\n", (int) rc_m,
+                    nd->data ? *(const float*) nd->data : -1.0f);
+            if (rc_m != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("stream_moe: chain compute failed for " << (nd->name ? nd->name : ggml_op_name(nd->op)));
+                ok = false;
             }
             continue;
         }

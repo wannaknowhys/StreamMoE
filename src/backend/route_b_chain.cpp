@@ -8,6 +8,22 @@
 
 namespace stream_moe {
 
+bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
+    if (!gf || !sched || !our_backend) return false;
+    int n = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * nd = gf->nodes[i];
+        if (!moe_chain_node_is_privatizable(nd)) continue;
+        const enum ggml_op op = nd->op;
+        if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE ||
+            op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+        ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
+        n++;
+    }
+    fprintf(stderr, "[route_b_verify] chain backend assigned: %d compute nodes -> stream_moe\n", n);
+    return true;
+}
+
 namespace {
 
 bool has(const char * hay, const char * needle) {

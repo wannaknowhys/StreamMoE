@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml-backend.h"
+
 // Route B MoE-chain privatisation guard (M1/G3, docs/ROUTE_B_GPU_PHASE.md §3.5).
 // Before the executor hides MoE-chain intermediates (results in our private
 // arena, main-graph dst left uncomputed) we must prove no node OUTSIDE the
@@ -22,6 +24,14 @@ namespace stream_moe {
 // (privatised) chain intermediates (named ffn_moe_* minus gating/output), and
 // the output end (ffn_moe_out - written to the main dst, not hidden).
 bool moe_chain_node_is_privatizable(const ggml_tensor * node);
+
+// Explicit collection (docs/ROUTE_B_GPU_PHASE.md §3.5): right after build_graph
+// and BEFORE the scheduler splits, pin every privatizable chain COMPUTE node to
+// our backend via ggml_backend_sched_set_tensor_backend (sched pass1 respects
+// user assignments) so the whole chain lands as one split in our graph_compute.
+// View/layout nodes are skipped - pass4 follows view_src automatically.
+bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sched,
+                              ggml_backend_t our_backend);
 
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
