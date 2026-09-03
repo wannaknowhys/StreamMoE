@@ -9,28 +9,28 @@
         {"--moe-ram-pool"}, "MB",
         "StreamMoE: expert residency budget in MB (0 = auto 75% free RAM)",
         [](common_params & params, int value) {
-            params.moe_ram_pool_mb = value;
+            params.moe_expert_pools.push_back("RAM:" + std::to_string(value));
         }
     ));
     add_opt(common_arg(
         {"--moe-vram-pool"}, "MB",
         "StreamMoE: VRAM budget for the expert pool (GPU pool phase)",
         [](common_params & params, int value) {
-            params.moe_vram_pool_mb = value;
+            params.moe_expert_pools.push_back("Vulkan0:" + std::to_string(value));
         }
     ));
     add_opt(common_arg(
         {"--moe-draft-ram-pool"}, "MB",
         "StreamMoE: DRAFT model expert residency budget in MB (0 = full resident, no eviction)",
         [](common_params & params, int value) {
-            params.moe_draft_ram_pool_mb = value;
+            params.moe_draft_expert_pools.push_back("RAM:" + std::to_string(value));
         }
     ));
     add_opt(common_arg(
         {"--moe-draft-vram-pool"}, "MB",
         "StreamMoE: VRAM budget for the DRAFT expert pool (GPU pool phase)",
         [](common_params & params, int value) {
-            params.moe_draft_vram_pool_mb = value;
+            params.moe_draft_expert_pools.push_back("Vulkan0:" + std::to_string(value));
         }
     ));
     add_opt(common_arg(
@@ -67,6 +67,37 @@
                 size_t comma = value.find(',', start);
                 std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
                 if (!tok.empty()) params.kv_placement.push_back(tok);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+    ));
+
+    add_opt(common_arg(
+        {"--moe-expert-pools"}, "DEV:MB,...",
+        "StreamMoE: MAIN model expert pools as <device>:<MB> comma list, e.g. RAM:8192,Vulkan0:5120",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_pools.clear();
+            size_t start = 0;
+            while (start <= value.size()) {
+                size_t comma = value.find(',', start);
+                std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!tok.empty()) params.moe_expert_pools.push_back(tok);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-draft-expert-pools"}, "DEV:MB,...",
+        "StreamMoE: DRAFT model expert pools as <device>:<MB> comma list",
+        [](common_params & params, const std::string & value) {
+            params.moe_draft_expert_pools.clear();
+            size_t start = 0;
+            while (start <= value.size()) {
+                size_t comma = value.find(',', start);
+                std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!tok.empty()) params.moe_draft_expert_pools.push_back(tok);
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }

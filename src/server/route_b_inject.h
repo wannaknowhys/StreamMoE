@@ -26,11 +26,16 @@ namespace stream_moe {
 llama_model_tensor_buft_override* route_b_setup(
     const char* model_path,
     const std::vector<std::string>& extra_files,
-    size_t ram_pool_mb, int threads, bool pool_full_when_zero);
+    const std::vector<std::string>& pools,
+    int threads, bool pool_full_when_zero);
 
 // v2-chunk: fill a dense tensor from its strip-file segments (called by the
 // llama.cpp loader where it would otherwise skip the override read). Expert
 // tensors / unknown names are a no-op. Returns true if the tensor was filled.
 bool route_b_fill_dense(const char* tensor_name, void* data);
+
+// Perform queued VRAM pool allocations once devices (vulkan) are available.
+// Called from the first graph_compute.
+void route_b_lazy_alloc_pools();
 
 } // namespace stream_moe

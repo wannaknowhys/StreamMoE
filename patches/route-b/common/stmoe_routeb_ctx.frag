@@ -8,7 +8,7 @@
         // (llama_params_fit scratch). Our override must sit at the FRONT - the
         // loader reads from index 0 and stops at the first null pattern.
         params.tensor_buft_overrides.clear();
-        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.expert_model_files, params.moe_ram_pool_mb, params.cpuparams.n_threads, false);
+        auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(), params.expert_model_files, params.moe_expert_pools, params.cpuparams.n_threads, false);
         if (ovr) {
             for (auto * p = ovr; p->pattern != nullptr; ++p) {
                 params.tensor_buft_overrides.push_back(*p);

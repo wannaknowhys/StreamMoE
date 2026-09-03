@@ -30,7 +30,7 @@ index 36f1e0cd5..cc7d745fb 100644
 +    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_posix.cpp)
 +endif()
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4eef2212e..c9c7a31f7 100644
+index 4eef2212e..f910c7e0e 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -12,6 +12,8 @@
@@ -118,7 +118,7 @@ index 4eef2212e..c9c7a31f7 100644
 +        // same _exps pattern must not route the draft's experts to the main
 +        // pool). ram_pool_mb==0 -> full residency (no eviction).
 +        if (params.expert_backend) {
-+            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), {}, params.moe_draft_ram_pool_mb, params.cpuparams.n_threads, true);
++            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), {}, params.moe_draft_expert_pools, params.cpuparams.n_threads, true);
 +            if (ovr) {
 +                mparams.tensor_buft_overrides = ovr; // draft pool's own (terminated) array
 +            }

@@ -34,6 +34,10 @@ struct model_pool_t {
     ggml_backend_buffer_type_t            dense_buft = nullptr; // v2-chunk dense buft
     std::unordered_map<std::string, std::vector<src_seg_t>> dense_srcs; // name -> strip segments (v2 chunk)
     llama_model_tensor_buft_override      overrides[3] = {};    // expert + dense + terminator
+    // Device pools beyond the CPU-RAM scheduler (M1+: allocate, reserve for use).
+    std::vector<std::pair<std::string, size_t>> vram_pending;   // dev, MB - allocated lazily (vulkan registers late)
+    std::vector<ggml_backend_t>                 vram_backends;  // one ggml backend per VRAM pool
+    std::vector<ggml_backend_buffer_t>          vram_buffers;   // its allocated buffer
 };
 
 std::vector<std::unique_ptr<model_pool_t>> g_pools;
@@ -44,7 +48,8 @@ std::shared_ptr<async_dio_engine> g_shared_dio;   // one IOCP engine for all poo
 llama_model_tensor_buft_override* route_b_setup(
     const char* model_path,
     const std::vector<std::string>& extra_files,
-    size_t ram_pool_mb, int threads, bool pool_full_when_zero) {
+    const std::vector<std::string>& pools,
+    int threads, bool pool_full_when_zero) {
     sm_tmr::timer _t("route_b_setup");
     for (const auto& p : g_pools) {
         if (p->model_path == model_path) {
@@ -92,13 +97,33 @@ llama_model_tensor_buft_override* route_b_setup(
             pool->shards.push_back(f);
         }
 
-        size_t pool_bytes;
-        if (ram_pool_mb > 0) {
-            pool_bytes = ram_pool_mb * 1024ull * 1024ull;
-        } else if (pool_full_when_zero) {
-            pool_bytes = pool->topo->expert_total_bytes;
-        } else {
-            pool_bytes = get_available_ram_bytes() * 3 / 4;
+        // Parse "<device>:<MB>" pool specs. RAM -> scheduler bytes; any other
+        // device (Vulkan0, ...) -> allocate the buffer now (reserved; expert
+        // residency on the device comes later). No RAM entry keeps the default
+        // (75% free RAM, or full residency when pool_full_when_zero).
+        size_t pool_bytes = 0;
+        for (const auto& spec : pools) {
+            const size_t colon = spec.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string dev = spec.substr(0, colon);
+            const size_t mb = (size_t) std::strtoull(spec.c_str() + colon + 1, nullptr, 10);
+            if (dev == "RAM" || dev == "CPU") {
+                pool_bytes = mb * 1024ull * 1024ull;
+                continue;
+            }
+            // reserve a device pool: defer the real backend allocation - vulkan
+            // (and other device backends) register after model load, while
+            // route_b_setup runs before it. route_b_lazy_alloc_pools() (called
+            // from the first graph_compute) performs the actual allocation.
+            pool->vram_pending.push_back({dev, mb});
+            std::fprintf(stderr, "route B: device pool queued %zu MB on '%s' (lazy alloc)\n", mb, dev.c_str());
+        }
+        if (pool_bytes == 0) {
+            if (pool_full_when_zero) {
+                pool_bytes = pool->topo->expert_total_bytes;
+            } else {
+                pool_bytes = get_available_ram_bytes() * 3 / 4;
+            }
         }
 
         pool->sched = std::make_unique<expert_scheduler>();
@@ -168,6 +193,42 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
         return ok;
     }
     return false;
+}
+
+// Device (VRAM) pools are queued at route_b_setup (vulkan registers only after
+// model load). Perform the real allocations once the devices are available -
+// called from the first graph_compute.
+void route_b_lazy_alloc_pools() {
+    for (auto& pool : g_pools) {
+        for (const auto& req : pool->vram_pending) {
+            const std::string& dev = req.first;
+            const size_t mb = req.second;
+            ggml_backend_dev_t vdev = ggml_backend_dev_by_name(dev.c_str());
+            if (!vdev) {
+                std::fprintf(stderr, "route B: lazy alloc: unknown device '%s'. Available:",
+                             dev.c_str());
+                for (int di = 0; di < ggml_backend_dev_count(); ++di) {
+                    ggml_backend_dev_t dd = ggml_backend_dev_get(di);
+                    if (dd) std::fprintf(stderr, " %s", ggml_backend_dev_name(dd));
+                }
+                std::fprintf(stderr, "\n");
+                continue;
+            }
+            ggml_backend_t vbe = ggml_backend_dev_init(vdev, nullptr);
+            if (!vbe) { std::fprintf(stderr, "route B: lazy alloc: cannot init '%s'\n", dev.c_str()); continue; }
+            ggml_backend_buffer_t vbuf = ggml_backend_buft_alloc_buffer(
+                ggml_backend_get_default_buffer_type(vbe), mb * 1024ull * 1024ull);
+            if (!vbuf) {
+                std::fprintf(stderr, "route B: lazy alloc: cannot allocate %zu MB on '%s'\n", mb, dev.c_str());
+                ggml_backend_free(vbe);
+                continue;
+            }
+            pool->vram_backends.push_back(vbe);
+            pool->vram_buffers.push_back(vbuf);
+            std::fprintf(stderr, "route B: device pool allocated %zu MB on '%s' (reserved)\n", mb, dev.c_str());
+        }
+        pool->vram_pending.clear();
+    }
 }
 
 } // namespace stream_moe
