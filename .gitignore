@@ -29,3 +29,9 @@ memwatch_*.log
 
 # Runtime data
 temp/
+
+# baseline regression artifacts (large binaries - local only, like model disk)
+baseline_regression/baseline/*.bin
+baseline_regression/baseline/*.json
+baseline_regression/tools/*.exe
+baseline_regression/temp/
