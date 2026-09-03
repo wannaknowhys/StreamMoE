@@ -30,6 +30,16 @@
 
 namespace stream_moe {
 
+// A device (non-RAM) expert region added on top of the CPU-RAM pool: one
+// contiguous run of slot-aligned whole-expert blocks, host-mapped so the
+// scheduler can load/move expert bytes straight into it.
+struct vram_region_t {
+    uint32_t  pool   = 1;   // device pool index (0 = CPU RAM is not a region)
+    uint32_t  group  = 0;   // expert group this region serves
+    uint8_t*  base   = nullptr;   // host-mapped base (nullptr -> region skipped)
+    uint32_t  n_slots = 0;
+};
+
 struct expert_handle_t {
     int32_t  slot       = -1;
     uint32_t generation = 0;
@@ -69,9 +79,14 @@ public:
     expert_scheduler& operator=(const expert_scheduler&) = delete;
 
     // Allocate the fixed pool and open the DIO engine/files. `pool_bytes` is the
-    // hard cap on expert residency (e.g. 70GB). Call before start().
+    // hard cap on CPU-RAM expert residency (e.g. 70GB). `vregions` adds
+    // host-mapped device (VRAM) regions as extra slot runs on top of the RAM
+    // sub-pools - each region is one contiguous run of slot-aligned whole-expert
+    // blocks serving one expert group (pool index 1, 2, ...). Call before
+    // start(). RAM behaviour is unchanged when `vregions` is empty.
     bool init(const moe_model_topology_t& topo, async_dio_engine& dio,
-              const std::vector<dio_file_t*>& files, size_t pool_bytes);
+              const std::vector<dio_file_t*>& files, size_t pool_bytes,
+              const std::vector<vram_region_t>& vregions = {});
 
     // A single process-wide scheduler thread drives all pools (multi-model:
     // main + draft). start() registers this pool with it; stop() unregisters.
@@ -103,9 +118,12 @@ public:
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
 
-    // Sub-pool layout (docs/MULTI_SUBPOOL.md): one contiguous pool carved into
-    // per-expert-group regions. Slot indices are global (across all groups).
+    // Sub-pool layout (docs/MULTI_SUBPOOL.md): the slot space is carved into
+    // per-(group, pool) regions. Slot indices are global across all regions.
+    // A group's CPU-RAM region comes first; device (VRAM) regions follow.
     struct subpool_t {
+        uint32_t pool       = 0;   // 0 = CPU RAM, 1 = first device, ...
+        uint32_t group      = 0;
         uint32_t slot_begin = 0;
         uint32_t n_slots    = 0;
         size_t   expert_size = 0;
@@ -113,7 +131,11 @@ public:
     };
     // Group index owning `layer`, or (uint32_t)-1.
     uint32_t group_of(uint32_t layer) const;
-    const subpool_t& subpool(uint32_t gidx) const { return subpools_[gidx]; }
+    // CPU-RAM sub-pool of `group` (the executor host path), or nullptr when the
+    // group has no RAM region. Device regions of the group are later in the
+    // sub-pool list.
+    const subpool_t* ram_subpool(uint32_t group) const;
+    const subpool_t* subpool_at(size_t idx) const { return &subpools_[idx]; }
     size_t subpools_count() const { return subpools_.size(); }
 
     // Raw slot memory for a pinned/resident slot (compute side).

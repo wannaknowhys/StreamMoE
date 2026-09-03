@@ -22,7 +22,8 @@ expert_scheduler::~expert_scheduler() {
 }
 
 bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& dio,
-                            const std::vector<dio_file_t*>& files, size_t pool_bytes) {
+                            const std::vector<dio_file_t*>& files, size_t pool_bytes,
+                            const std::vector<vram_region_t>& vregions) {
     topo_ = &topo;
     dio_  = &dio;
     files_ = files;
@@ -58,7 +59,8 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     const size_t spare = pool_bytes - sum_floor;
 
     num_slots_ = 0;
-    for (size_t i = 0; i < topo.groups.size(); ++i) {
+    const size_t n_groups = topo.groups.size();
+    for (size_t i = 0; i < n_groups; ++i) {
         const auto& g = topo.groups[i];
         // floor + byte-fraction share of the spare (double to avoid 64-bit overflow)
         size_t budget = floor_bytes[i] + static_cast<size_t>(
@@ -67,12 +69,35 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
         const uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * per_layer;
         if (ns < per_layer) ns = per_layer;             // never below one full layer
         if (ns > g_experts_total) ns = g_experts_total; // never more than the group's real experts
-        subpools_.push_back({ num_slots_, ns, g.expert_size, nullptr });
+        subpools_.push_back({ 0, static_cast<uint32_t>(i), num_slots_, ns, g.expert_size, nullptr });
         num_slots_ += ns;
     }
 
+    // Device (VRAM) regions: appended slot runs on top of the RAM sub-pools.
+    // A region must be whole-expert-slot aligned on its group's slot size and
+    // carry a usable host-mapped base; anything else is skipped with a warning
+    // (the pool still runs on CPU RAM alone).
+    uint32_t max_pool = 0;
+    for (const auto& reg : vregions) {
+        if (reg.base == nullptr || reg.group >= n_groups || reg.n_slots == 0) {
+            LOG_WARN("expert_scheduler: skipping vram region pool=" << reg.pool
+                     << " group=" << reg.group << " (base=" << (void*)reg.base
+                     << " n_slots=" << reg.n_slots << ")");
+            continue;
+        }
+        const size_t es = topo.groups[reg.group].expert_size;
+        subpools_.push_back({ reg.pool, reg.group, num_slots_, reg.n_slots, es, reg.base });
+        num_slots_ += reg.n_slots;
+        if (reg.pool > max_pool) max_pool = reg.pool;
+    }
+    n_pools_ = max_pool + 1;
+
+    // RAM commit = the sum of the CPU-RAM regions only (device regions live in
+    // their own host-mapped buffers, not in the RAM pool allocation).
     size_t total_commit = 0;
-    for (const auto& sp : subpools_) total_commit += static_cast<size_t>(sp.n_slots) * sp.expert_size;
+    for (const auto& sp : subpools_) {
+        if (sp.pool == 0) total_commit += static_cast<size_t>(sp.n_slots) * sp.expert_size;
+    }
     pool_bytes_ = total_commit;
 
     pool_base_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(pool_bytes_));
@@ -81,7 +106,11 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
         return false;
     }
     uint8_t* b = pool_base_;
-    for (auto& sp : subpools_) { sp.base = b; b += static_cast<size_t>(sp.n_slots) * sp.expert_size; }
+    for (auto& sp : subpools_) {
+        if (sp.pool != 0) continue;   // device bases come from the caller's buffers
+        sp.base = b;
+        b += static_cast<size_t>(sp.n_slots) * sp.expert_size;
+    }
 
     slots_ = std::make_unique<slot_meta[]>(num_slots_);
     owner_.resize(num_slots_, {0, 0});
@@ -128,11 +157,13 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     load_in_use_.assign(max_in_flight_, 0);
     stats_.init("", topo.n_layer, topo.n_expert, 8192);
 
-    LOG_INFO("Expert pool: " << num_slots_ << " slots across " << subpools_.size()
-             << " groups = " << (pool_bytes_ / (1024 * 1024)) << " MB committed (hard cap on expert residency)");
+    LOG_INFO("Expert pool: " << num_slots_ << " slots across " << n_groups
+             << " expert groups (RAM " << (pool_bytes_ / (1024 * 1024))
+             << " MB committed; " << (subpools_.size() - n_groups) << " device region(s))");
     for (const auto& sp : subpools_) {
-        LOG_INFO("  subpool: slots [" << sp.slot_begin << ", " << (sp.slot_begin + sp.n_slots)
-                 << ") x " << (sp.expert_size / 1024) << "KB");
+        LOG_INFO("  subpool: pool=" << sp.pool << " group=" << sp.group
+                 << " slots [" << sp.slot_begin << ", " << (sp.slot_begin + sp.n_slots)
+                 << ") x " << (sp.expert_size / 1024) << "KB @ " << (void*) sp.base);
     }
     return true;
 }
@@ -145,6 +176,13 @@ uint32_t expert_scheduler::group_of(uint32_t layer) const {
         }
     }
     return static_cast<uint32_t>(-1);
+}
+
+const expert_scheduler::subpool_t* expert_scheduler::ram_subpool(uint32_t group) const {
+    for (const auto& sp : subpools_) {
+        if (sp.pool == 0 && sp.group == group) return &sp;
+    }
+    return nullptr;
 }
 
 void expert_scheduler::start() {
@@ -168,8 +206,9 @@ void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
 int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert) {
     uint32_t gidx = group_of(layer);
     if (gidx == static_cast<uint32_t>(-1)) return -1;
-    const subpool_t& sp = subpools_[gidx];
-    const uint32_t lo = sp.slot_begin, hi = sp.slot_begin + sp.n_slots;
+    const subpool_t* sp = ram_subpool(gidx);
+    if (!sp) return -1;
+    const uint32_t lo = sp->slot_begin, hi = sp->slot_begin + sp->n_slots;
 
     // 1. free slot (within this group's sub-pool)
     for (uint32_t i = lo; i < hi; ++i) {

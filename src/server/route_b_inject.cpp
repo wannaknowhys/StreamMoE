@@ -17,6 +17,9 @@
 #include <vector>
 #include <unordered_map>
 
+// ggml-vulkan route-B extension: host mapping of a host-visible buffer.
+void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
+
 namespace stream_moe {
 
 namespace {
@@ -248,8 +251,28 @@ llama_model_tensor_buft_override* route_b_setup(
                          plan_bytes / (1024 * 1024), ginfo.empty() ? "" : (" groups:" + ginfo).c_str());
         }
 
+        // Hand the host-mapped device regions to the scheduler so its slot space
+        // covers the VRAM blocks too (device pool 1, 2, ... in the order the
+        // backends were initialised above). A region whose backend exposes no
+        // host mapping is skipped by the scheduler.
+        std::vector<vram_region_t> vregions;
+        for (size_t si = 0; si < pool->vram_segs.size(); ++si) {
+            const auto& seg = pool->vram_segs[si];
+            int dev_idx = -1;
+            for (size_t bi = 0; bi < pool->vram_backends.size(); ++bi) {
+                if (pool->vram_backends[bi] == seg.be) { dev_idx = static_cast<int>(bi); break; }
+            }
+            if (dev_idx < 0) continue;
+            vram_region_t r;
+            r.pool = static_cast<uint32_t>(dev_idx) + 1;
+            r.group = seg.group;
+            r.base = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(seg.buf));
+            r.n_slots = static_cast<uint32_t>(seg.n_slots);
+            vregions.push_back(r);
+        }
+
         pool->sched = std::make_unique<expert_scheduler>();
-        if (!pool->sched->init(*pool->topo, *pool->dio, pool->shards, pool_bytes)) {
+        if (!pool->sched->init(*pool->topo, *pool->dio, pool->shards, pool_bytes, vregions)) {
             std::fprintf(stderr, "route B: scheduler init failed\n");
             return nullptr;
         }

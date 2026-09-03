@@ -270,7 +270,12 @@ enum ggml_status moe_exec_mul_mat_id(
             LOG_ERROR("stream_moe: no subpool group for layer " << pn.layer);
             ok = false; break;
         }
-        const auto& sp = sched.subpool(gidx);
+        const auto* rsp = sched.ram_subpool(gidx);   // executor host path (CPU RAM)
+        if (!rsp) {
+            LOG_ERROR("stream_moe: no CPU-RAM subpool for layer " << pn.layer);
+            ok = false; break;
+        }
+        const auto& sp = *rsp;
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
         ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
         w3d->ne[2] = g_n_slots;
