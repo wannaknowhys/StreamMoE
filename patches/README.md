@@ -81,3 +81,12 @@ git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_ti
 `src/`（backend/io/loader/pool/profile/server）随主仓库 commit，经 2a 的
 `common/CMakeLists.txt`（STREAM_MOE_SRC）编进 llama-common。这是 StreamMoE 引擎本体，
 **不属 vendored patch**——单独 git 管理。
+
+## 补丁铁律（添加 2026-09：消灭 phase2a/2b patch 的长线目标）
+
+＞ 长线目标：**消灭 phase2a/2b 的 patch 文件**（route-b-inject.patch / prefill-export-llama.patch 最终消失）——vendored 改动全经 **phase1 打桩（include 锚点）** + 主仓库内容（frag / 独立 cpp）表达，只留 streammoe-macros.patch。现在不立刻整理（部分已走 frag/独立 cpp，逐步迁移）。
+
+**vendored 需改动时的处理：**
+1. 小插入（钩子/几行调用）→ 不直接 patch vendored：R phase1 → phase1 加 include 锚点→ apply phase1 → 写 frag 内容（主仓库 patches/<phase>/）
+2. 大块逻辑 → 倾向主仓库独立 cpp（src/ 下，CMake STREAM_MOE_SRC 编入，像 route_b_chain.cpp），vendored 只锚点调用；或大块也 frag（include 大 frag 可行）
+3. **不得不直接改 vendored 时 → 先问用户**（不要自作主张积累欠账）
