@@ -243,13 +243,37 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     }
     if (victim < 0) return -1; // all slots pinned/in-flight
 
-    // 3. evict: READY -> EVICTING, clear this pool's directory entry, drain
-    //    refcount, reuse
+    // 3. evict: READY -> EVICTING, block new pins, drain refcount.
     if (!slots_[victim].begin_evict()) return -1;
-    dir_->clear(owner_[victim].first, owner_[victim].second, sp->pool);
+    const uint32_t v_layer = owner_[victim].first;
+    const uint32_t v_expert = owner_[victim].second;
+    dir_->clear(v_layer, v_expert, sp->pool);
     while (slot_word_refcount(slots_[victim].load()) != 0) {
         std::this_thread::yield();
     }
+
+    // 4. Demote, don't drop, device-region victims: move the content into the
+    //    group's CPU-RAM region (which itself drops its coldest expert to make
+    //    room). CPU-RAM victims are dropped (the disk is the next level). The
+    //    content copy happens after the refcount drain, so no reader is pinned
+    //    on the source slot; the destination slot is IO_INFLIGHT (reserved by
+    //    alloc_or_evict above) and gets mark_ready() without any DIO.
+    if (sp->pool != 0) {
+        const subpool_t* rsp = ram_subpool(sp->group);
+        if (rsp && rsp->expert_size == sp->expert_size) {
+            int32_t dst = alloc_or_evict(v_layer, v_expert, 0);   // RAM: make room
+            if (dst >= 0) {
+                std::memcpy(slot_mem(dst), slot_mem(victim), sp->expert_size);
+                slots_[dst].mark_ready();
+                dir_->set(v_layer, v_expert, 0, static_cast<uint32_t>(dst));
+                LOG_DEBUG("expert_scheduler: demoted L" << v_layer << " E" << v_expert
+                          << " device slot " << victim << " -> RAM slot " << dst);
+            }
+            // RAM full/pinned: fall through to dropping the device copy (the
+            // content stays readable from disk).
+        }
+    }
+
     slots_[victim].begin_reload();
     owner_[victim] = {layer, expert};
     return victim;
