@@ -94,3 +94,16 @@
 - [x] J5 **device 驱逐 demote 回 RAM（77b0bbe）**：vram victim（READY+ref0）内容 memcpy 进 group 的 RAM 区（RAM 先丢最冷腾位），目录迁移 pool；RAM victim 仍丢弃（盘为下一层）。Vulkan0:1024（139 槽 group0）129-token 触发 **1987 次 demote 仍 IDENTICAL**——move 数据路径正确
 - [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
 
+### K. M2 设备执行器（2026-09，设计已落 docs/M2_DEVICE_EXECUTOR.md EN+zh）
+> 按专家列跨真实设备执行 + profile 通道。设计要点：列链段（mm→silu/geglu→down 不出 device）、
+> 真并行（vulkan async + CPU worker——`graph_compute_async` 只是 iface 直通无通用异步层，CPU
+> 后端同步无队列）、每 device 奇偶乒乓（verify 预算分摊；in-place 普遍不可行，2 区理论最小）、
+> 出口 scatter 通用化（写外部消费方所在 buffer，dense 位置参数化）、profile 双 ring（alloc ring
+> + 独立 profile ring）+ ctx 聚合（层出口每设备一次事件），total_tokens/rdtsc 供未来 lag 预取
+> 策略（策略后置）。
+
+- [ ] M2-1 全 vram 单 device 真 vulkan 列链执行（vram 内 device arena/乒乓 + mini-leaf 提交 vulkan）→ IDENTICAL
+- [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+- [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+- [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
+

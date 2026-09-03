@@ -8,7 +8,9 @@
 > Verified facts carried over: Vulkan and CUDA natively support `MUL_MAT_ID`
 > with the pool-slot 3D layout; RX 590 exposes a real 8 GiB
 > `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap; GGML_VULKAN=ON builds clean.
-> Related: `docs/MULTI_MODEL_POOL.md`, `docs/MULTI_SUBPOOL.md`, `docs/Backend.md`.
+> Related: `docs/MULTI_MODEL_POOL.md`, `docs/MULTI_SUBPOOL.md`, `docs/Backend.md`,
+> `docs/M2_DEVICE_EXECUTOR.md` (M2 executor: per-device expert-column chains,
+> output scatter generalisation, profile channel).
 
 ## 1. Goal and mainline
 
