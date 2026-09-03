@@ -201,18 +201,12 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
         fprintf(stderr, "[moe_db] graph_compute called: nodes=%d\n", cgraph ? cgraph->n_nodes : -1);
         auto* bctx = static_cast<moe_backend_ctx*>(b->context);
-        // If this sub-graph has no MoE (MUL_MAT_ID) compute - pure view/layout or
-        // other nodes (data is already computed by their src) - there is nothing
-        // for the expert pool to do: succeed without touching anything.
-        bool has_moe = false;
-        for (int i = 0; i < cgraph->n_nodes && !has_moe; ++i) {
-            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) has_moe = true;
-        }
-        if (!has_moe) {
-            return GGML_STATUS_SUCCESS;
-        }
-        // resolve the owning scheduler by the weight buft of this graph's nodes
-        // (each model pool has its own expert buft - see MULTI_MODEL_POOL.md)
+        // This backend now receives whole privatised MoE splits: splits with
+        // routed MUL_MAT_ID nodes AND weightless chain-compute splits (no mm -
+        // the mm split ran first, srcs are already materialised). No early-out.
+        // resolve the owning scheduler: by the weight buft of this graph's nodes
+        // (each model pool has its own expert buft - see MULTI_MODEL_POOL.md),
+        // falling back to the sole binding when this split carries no weights.
         expert_scheduler* sched = nullptr;
         for (int i = 0; i < cgraph->n_nodes && !sched; ++i) {
             const ggml_tensor* nd = cgraph->nodes[i];
@@ -221,6 +215,9 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
             for (const auto& bnd : g_bindings) {
                 if (bnd.buft == buft) { sched = bnd.sched; break; }
             }
+        }
+        if (!sched && g_bindings.size() == 1) {
+            sched = g_bindings[0].sched;   // single-pool: weightless chain split
         }
         if (!sched) {
             LOG_ERROR("stream_moe: graph_compute without a scheduler (expert backend not wired)");
