@@ -51,7 +51,8 @@ rem build), not passed via CMAKE_CXX_FLAGS.
 rem   main                  -> route_b          (route-B full inference, production)
 rem   upstream_dump         -> prefill_export   (prefill export, no vulkan baseline)
 rem   upstream_vulkan_dump  -> prefill_export   (prefill export + vulkan, for Vulkan0 comparison)
-rem   StreamMoE_dump        -> route_b,prefill_export (full StreamMoE export, vs upstream_dump)
+rem   StreamMoE_dump        -> route_b,prefill_export + vulkan (full StreamMoE export,
+rem                            with the Vulkan0 device-pool path; vs upstream_dump)
 set STREAM_MOE_FEATURES=
 if "%TAG%"=="main"                 set STREAM_MOE_FEATURES=route_b
 if "%TAG%"=="upstream_dump"        set STREAM_MOE_FEATURES=prefill_export
@@ -62,11 +63,16 @@ rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
 rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
 rem         to znver3 (5950X) for now.
 rem   upstream_dump: prefill export, no vulkan (clean upstream baseline).
-rem   upstream_vulkan_dump / StreamMoE_dump: vulkan backend for Vulkan0 comparison.
+rem   upstream_vulkan_dump: vulkan backend for Vulkan0 comparison.
+rem   StreamMoE_dump: vulkan backend too - the route-B Vulkan0 device-pool path
+rem         (M1+) needs the device registered; runs still default to CPU unless
+rem         -ngl is given, so numerics land on the same CPU kernels.
 set STREAM_MOE_CPU_FLAGS=-march=znver3
 set GGML_VULKAN_DEFAULT=OFF
 if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
-rem StreamMoE_dump (route-B moe) is CPU-only - vulkan is for upstream comparison only.
+if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
+rem env GGML_VULKAN=OFF still overrides (e.g. to rebuild a CPU-only StreamMoE_dump
+rem for an IDENTICAL baseline regression - see baseline_regression/README.md).
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
 if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
 if "%GGML_HIP%"==""   set GGML_HIP=OFF

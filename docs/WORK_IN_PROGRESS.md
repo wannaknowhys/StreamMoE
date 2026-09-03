@@ -80,4 +80,5 @@
 - [x] I3 Vulkan0 真分配：2048MB 成功；3G/4G/5G/6G/7G 全 OOM。两层限制：① RX590 驱动 maxBufferSize 偏低（ggml-vulkan.cpp:6377，需 `GGML_VK_FORCE_MAX_BUFFER_SIZE` env 绕过）② 绕过后 vkAllocateMemory 真 OOM——8GB 卡实际空闲 ~2.5GB（-ngl 2 dense + vulkan 运行时 + 系统占用）。M2+ 分段分配规避，不依赖单 buffer
 - [x] I4 **新发现待查**：GGML_VULKAN=ON 编入 StreamMoE_dump 后，纯 CPU decode（-ngl 0）结果也分歧（embd token#0 cos 0.985）——vulkan backend 存在改变图执行路径（即使无 offload）。**别用 vulkan 版 StreamMoE_dump 跑回归**（回归 binary = CPU 版）
 - [x] I5 div_match 工具整合（63824cb）：`baseline_regression/tools/div_match.js` = 专家翻转 token 集 vs 高散 token 集匹配度。实测 vulkan 版分歧：34 个高散 token 34/34（100%）有专家翻转、0 无翻转——分歧完全由 gemma-4 专家翻转（gate 边界噪声）解释，非 bug；层 29（末层）翻转最频繁（放大最直接）。run_baseline.bat 加 [6/6] div_match 步——DIVERGED 时自动归因（unexplained>0 = bug 信号），IDENTICAL 时一行确认
+- [x] I6 build.bat：`StreamMoE_dump` tag **默认 GGML_VULKAN=ON**（route-B Vulkan0 device-pool 路径需设备注册；运行默认仍 CPU 除非 -ngl，数值落同一 CPU 内核）。`upstream_dump`/`main` 默认 OFF 保持 baseline/生产语义；env `GGML_VULKAN=OFF` 覆盖（重建 CPU-only StreamMoE_dump 供 IDENTICAL 回归）。**注意**：默认 vulkan 后 run_baseline.bat 的 moe 对照会走 expert 翻转分歧（div_match 归因），需 IDENTICAL PASS 时用 GGML_VULKAN=OFF 编 CPU 版或生成 vulkan 版新 baseline
 
