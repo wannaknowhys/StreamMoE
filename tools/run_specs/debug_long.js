@@ -5,7 +5,7 @@ const bin = 'build/upstream_dump/llama-build/bin/llama-server.exe';
 const line = fs.readFileSync('benchmark/prompts/long_horizon_prompts_zh.jsonl', 'utf8').split('\n')[0];
 const prompt = JSON.parse(line).prompt;
 console.log('prompt chars=' + prompt.length + ' (~131 tokens, build.bat upstream_dump VULKAN=ON)');
-const args = ['-m', 'N:/AI_LLM/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf', '--fit', 'off', '--no-warmup', '-c', '4096', '-t', '8',
+const args = ['-m', 'N:/AI_LLM/gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf', '--fit', 'off', '--no-warmup', '-c', '4096', '-t', '8',
   '--n-gpu-layers', '0', '--host', '127.0.0.1', '--port', '8999', '--no-webui', '--temp', '1', '--top-p', '0.95',
   '--export-dir', 'O:/1/dbg_export'];
 const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });

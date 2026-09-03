@@ -20,7 +20,7 @@ rem  source order) then EXPERT section (_exps, source order), every tensor
 rem  4K-aligned, stream_moe.* KV. Upstream llama.cpp can load it directly.
 rem
 rem  example:
-rem    scripts\convert_v1.bat -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -o out\gemma_v1.gguf
+rem    scripts\convert_v1.bat -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf -o out\gemma_v1.gguf
 rem =====================================================================
 node tools\stream_moe_convert.js %*
 popd

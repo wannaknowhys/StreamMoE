@@ -40,7 +40,10 @@ if "%OUT%"=="" set "OUT=%BR%\temp"
 if not exist "%OUT%\moe"  mkdir "%OUT%\moe"
 if not exist "%OUT%\up"   mkdir "%OUT%\up"
 
-set MODEL=N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+rem  moe runs the v2 chunk build (experts pre-isolated for direct DIO); upstream
+rem  only understands the v1 layout and stays the CPU upstream reference.
+set MODEL_MOE=N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf
+set MODEL_UP=N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
 set TOK=%BR%\baseline\upstream_129\tokens_id.bin
 set MOE_BIN=%ROOT%\build\StreamMoE_dump\llama-build\bin\llama-server.exe
 set UP_BIN=%ROOT%\build\upstream_dump\llama-build\bin\llama-server.exe
@@ -64,12 +67,12 @@ set PASS=1
 echo.
 echo =====================================================================
 echo [1/5] moe prefill-from (route-B, 8GB pool) ...
-"%MOE_BIN%" -m %MODEL% --prefill-from %TOK% --export-dir %OUT%\moe -c 2048 -t 16 ^
+"%MOE_BIN%" -m %MODEL_MOE% --prefill-from %TOK% --export-dir %OUT%\moe -c 2048 -t 16 ^
     --expert-backend --moe-ram-pool 8192 --fit off --no-warmup > %OUT%\moe\run.log 2>&1
 if errorlevel 1 ( echo [-] moe run failed & exit /b 1 )
 echo.
 echo [2/5] upstream prefill-from ...
-"%UP_BIN%" -m %MODEL% --prefill-from %TOK% --export-dir %OUT%\up -c 2048 -t 16 > %OUT%\up\run.log 2>&1
+"%UP_BIN%" -m %MODEL_UP% --prefill-from %TOK% --export-dir %OUT%\up -c 2048 -t 16 > %OUT%\up\run.log 2>&1
 if errorlevel 1 ( echo [-] upstream run failed & exit /b 1 )
 
 echo.
@@ -92,7 +95,7 @@ rem  A *_vk baseline (GGML_VULKAN=ON flavor) diverges more from the CPU
 rem  upstream reference than a CPU baseline does, so loosen the threshold.
 set "KLTHRESH=1.0"
 echo %BL% | findstr /C:"_vk" >nul && set "KLTHRESH=4.5"
-"%KL%" %MODEL% %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin --thresh %KLTHRESH%
+"%KL%" %MODEL_UP% %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin --thresh %KLTHRESH%
 
 echo.
 echo [5/5] kv_cos (baseline moe vs new moe, expect ~1.0) ...

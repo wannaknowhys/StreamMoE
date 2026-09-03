@@ -48,7 +48,7 @@ run_baseline.bat [baseline_moe_dir] [verify_dir]
 
 ```bat
 rem 用当时验证过的 build 跑两遍 prefill-from 产物拷入
-build\StreamMoE_dump\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <tmp_moe> -c 2048 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup
+build\StreamMoE_dump\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <tmp_moe> -c 2048 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup
 build\upstream_dump\llama-build\bin\llama-server.exe -m ... --prefill-from ... --export-dir <tmp_up> -c 2048 -t 16
 rem 拷 prefill_export_main.bin / expert_history_main.bin / prefill_meta.json / tokens_id.bin 到
 rem   baseline\<moe_129_8192 | moe_129_8192_vk | upstream_129>\  —— *_vk 目录只能由 GGML_VULKAN=ON 构建产物填

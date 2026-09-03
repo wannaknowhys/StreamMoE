@@ -172,7 +172,7 @@ F:\Dev\LLVM\bin\clang-cl.exe /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT 
     F:/Dev/StreamMoE/build/main/llama-build/ggml/src/ggml-base.lib ^
     F:/Dev/LLVM/lib/libomp.lib ws2_32.lib /Fe:temp/stream_moe_convertd.exe
 rem 测试 open（读 GGUF metadata -> JSON）：
-node tools\convertd_call.js '{"cmd":"open","in":["N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"]}'
+node tools\convertd_call.js '{"cmd":"open","in":["N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf"]}'
 ```
 
 ### wrapper 命令

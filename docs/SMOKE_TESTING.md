@@ -6,14 +6,14 @@
 
 | 用途 | 模型 | 说明 |
 |---|---|---|
-| **MoE** | `N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` | Gemma 4 26B **A4B**（每 token 激活 4 个专家），验证 MoE 前向路径/路由 |
+| **MoE** | `N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf` | Gemma 4 26B **A4B**（每 token 激活 4 个专家），验证 MoE 前向路径/路由 |
 | **Dense** | `F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf` | 2B dense，快速验证基本链路（文本）；模型在快盘 |
 
 ## 验证命令（原版 llama-server，M1 起可用）
 
 ```bat
 rem MoE（gemma-4-26B-A4B）；--no-warmup 跳过空跑预热（MoE 下避免启动时冷盘专家装载）
-build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --fit off --no-warmup --no-webui
+build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --fit off --no-warmup --no-webui
 
 rem Dense（Qwen3-VL-2B）
 build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --no-warmup --no-webui
