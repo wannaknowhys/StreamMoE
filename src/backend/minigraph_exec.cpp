@@ -1,5 +1,6 @@
 #include "backend/minigraph_exec.h"
 #include "backend/route_b_chain.h"
+#include "backend/moe_backend.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
 
@@ -8,6 +9,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// ggml-vulkan route-B extensions.
+void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
+void* stmoe_vk_buffer_host_offset(ggml_backend_buffer_t buffer, size_t off);
 
 namespace stream_moe {
 
@@ -391,6 +396,92 @@ static void refresh_aliases(int32_t layer, const ggml_tensor * prod) {
     }
 }
 
+// Vulkan mm execution (C2b4): the MUL_MAT_ID runs on the device backend inside
+// VRAM. Weight shell points at the pool buffer slot; cur and the translated
+// ids are uploaded to a host-visible staging buffer; the result is computed
+// into the device arena and copied back to the hidden host dst (the weightless
+// chain below still runs on the host until it moves into the arena too).
+// `slotbuf` carries the global slot per (k,t); `sp` is the single resident
+// region (single-region active set).
+static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
+                       device_exec_ctx_t & dv, ggml_tensor * nd,
+                       const parsed_node_t & pn,
+                       const std::vector<int32_t> & slotbuf,
+                       const expert_scheduler::subpool_t & sp, size_t branch_off) {
+    ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+    ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
+    const ggml_tensor * w  = nd->src[0];
+    const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+    const size_t mm_bytes = ggml_nbytes(nd);
+    const size_t cur_bytes = ggml_nbytes(cur);
+    const size_t ids_bytes = n_ids * sizeof(int32_t);
+
+    if (!stream_moe_backend_device_ensure(sp.pool, mm_bytes + 4u * 1024 * 1024,
+                                           ids_bytes + cur_bytes + 4u * 1024 * 1024)) {
+        LOG_ERROR("stream_moe: device arena/stage ensure failed (pool " << sp.pool << ")");
+        return false;
+    }
+    if (!dv.stage_map || !dv.arena_map) {
+        LOG_ERROR("stream_moe: device arena/stage host maps unavailable (pool " << sp.pool << ")");
+        return false;
+    }
+
+    // Contiguous check for the activation upload.
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (cur->nb[d] != cur->nb[d - 1] * cur->ne[d - 1]) {
+            LOG_ERROR("stream_moe: vk mm activation is not contiguous (" << ggml_op_name(nd->op) << ")");
+            return false;
+        }
+    }
+
+    // Upload translated ids (region-local slots) and cur into the staging buffer.
+    const size_t ids_off = 0;
+    const size_t cur_off = (ids_bytes + 63u) & ~size_t(63u);
+    {
+        auto * slot32 = reinterpret_cast<int32_t*>(dv.stage_map + ids_off);
+        for (size_t i = 0; i < n_ids; ++i) {
+            slot32[i] = slotbuf[i] - static_cast<int32_t>(sp.slot_begin);
+        }
+        std::memcpy(dv.stage_map + cur_off, cur->data, cur_bytes);
+    }
+
+    ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
+    const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+
+    // w3d shell over the device pool buffer (slot stride = expert_size).
+    ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+    w3d->ne[2] = g_n_slots;
+    w3d->nb[2] = sp.expert_size;
+    w3d->nb[3] = sp.expert_size * g_n_slots;
+    w3d->buffer = wbuf;
+    w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, branch_off));
+
+    // ids leaf in the staging buffer.
+    ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    ids_leaf->buffer = dv.stage;
+    ids_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.stage, ids_off));
+
+    // activation leaf in the staging buffer (contiguous upload, standard nb).
+    ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+    b_leaf->buffer = dv.stage;
+    b_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.stage, cur_off));
+
+    // mm node: dst at arena offset 0.
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_leaf);
+    mm->buffer = dv.arena;
+    mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv.arena, 0));
+    ggml_build_forward_expand(gf, mm);
+
+    if (ggml_backend_graph_compute(dv.be, gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: vulkan mm compute failed for " << (w->name ? w->name : "?"));
+        return false;
+    }
+    // Copy the result back to the hidden host dst (weightless chain is on host).
+    std::memcpy(nd->data, dv.arena_map, mm_bytes);
+    return true;
+}
+
 // Slot of a pinned (layer, expert), or -1.
 static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer, uint32_t expert) {
     for (const auto & h : pins) {
@@ -454,6 +545,18 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
         }
         if (!use_sp) return true;   // no active experts
         const expert_scheduler::subpool_t& sp = *use_sp;
+
+        // Device-resident active set: compute the mm on the device backend in
+        // VRAM (weight shell + uploaded cur/ids), copy the result back to the
+        // hidden host dst for the host-side weightless chain.
+        if (sp.pool != 0) {
+            device_exec_ctx_t* dv = stream_moe_backend_device_exec(sp.pool);
+            if (!dv || !dv->be) {
+                LOG_ERROR("stream_moe: no device exec context for pool " << sp.pool);
+                return false;
+            }
+            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, off);
+        }
 
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
         ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);

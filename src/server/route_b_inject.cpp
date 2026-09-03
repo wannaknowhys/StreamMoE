@@ -230,11 +230,11 @@ llama_model_tensor_buft_override* route_b_setup(
             }
             pool->vram_backends.push_back(vbe);
             ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(vbe);
-            // M2 device-exec resources: register this device pool's exec backend
-            // (arena = device compute buft, staging = host-visible host buft).
-            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(vdev);
+            // M2 device-exec resources: arena + staging both use the default
+            // (DEVICE_LOCAL|HOST_VISIBLE) buft - the dedicated Vulkan_Host buft
+            // does not expose a host map on this driver.
             stream_moe_backend_bind_device_exec(
-                static_cast<uint32_t>(pool->vram_backends.size()), vbe, vbuft, host_buft);
+                static_cast<uint32_t>(pool->vram_backends.size()), vbe, vbuft, vbuft);
             const size_t budget = vs.mb * 1024ull * 1024ull;
             std::vector<size_t> plan;
             plan_device_slots(*pool->topo, budget, remaining, plan);
