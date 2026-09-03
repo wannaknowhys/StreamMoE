@@ -154,29 +154,6 @@ static enum ggml_status exec_split_legacy_impl(
 {
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 
-    // Chain-topology audit (STREAM_MOE_DUMP_CHAIN=1): log every privatised
-    // node once per graph_compute. Dev tool for the M2 executor work.
-    if (std::getenv("STREAM_MOE_DUMP_CHAIN")) {
-        fprintf(stderr, "[chain] split n_nodes=%d\n", n_nodes);
-        for (int i = 0; i < n_nodes; ++i) {
-            const ggml_tensor* nd = nodes[i];
-            fprintf(stderr, "  [%3d] op=%-14s name=%-46s ne=%lldx%lldx%lldx%lld nb=%zu view_off=%zu data=%p",
-                    i, ggml_op_name(nd->op), nd->name ? nd->name : "?",
-                    (long long) nd->ne[0], (long long) nd->ne[1],
-                    (long long) nd->ne[2], (long long) nd->ne[3],
-                    ggml_nbytes(nd), nd->view_offs, (void*) nd->data);
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                if (nd->src[s]) {
-                    fprintf(stderr, " |s%d=%s(%s)", s,
-                            nd->src[s]->name ? nd->src[s]->name : "?",
-                            ggml_op_name(nd->src[s]->op));
-                }
-            }
-            fprintf(stderr, "\n");
-        }
-        fflush(stderr);
-    }
-
     const moe_model_topology_t& topo = sched.topology();
 
     // ---- phase 1: parse + pin (non-down) / wait (down) ----
@@ -611,13 +588,6 @@ enum ggml_status moe_exec_mul_mat_id(
 {
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 
-    if (std::getenv("STREAM_MOE_DUMP_CHAIN")) {
-        fprintf(stderr, "[chain] graph_compute first=%s(%s)\n",
-                nodes[0]->name ? nodes[0]->name : "?",
-                ggml_op_name(nodes[0]->op));
-        fflush(stderr);
-    }
-
     const ggml_tensor * first = nodes[0];
     const int32_t layer = moe_chain_layer_of_node(first);
     if (layer < 0) {
@@ -626,19 +596,10 @@ enum ggml_status moe_exec_mul_mat_id(
     }
     const int32_t idx = moe_chain_layer_index(layer, first);
     static thread_local int32_t g_bl = -1;
-    if (std::getenv("STREAM_MOE_BURST_DBG")) {
-        fprintf(stderr, "[exec] %s(%s) layer=%d idx=%d g_bl=%d\n",
-                first->name ? first->name : "?", ggml_op_name(first->op),
-                (int) layer, (int) idx, g_bl);
-        fflush(stderr);
-    }
     if (idx > 0 && g_bl == layer) {
         return GGML_STATUS_SUCCESS;   // already produced by this pass's burst
     }
     const enum ggml_status st = exec_layer_burst(layer, ctx, cpu_backend, sched, n_threads);
-    if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[exec] BURST L%d FAILED\n", (int) layer);
-    }
     g_bl = layer;
     return st;
 }
