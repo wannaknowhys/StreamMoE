@@ -63,9 +63,11 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         tot_bytes += ggml_nbytes(nd);
         n++;
     }
+#ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_verify] chain intermediates: %d nodes, total %zu MB (%.1f MB/layer)\n",
             n, tot_bytes / (1024 * 1024), (double) tot_bytes / (1024.0 * 1024.0 * 30.0));
     fprintf(stderr, "[route_b_verify] chain backend assigned: %d compute nodes -> stream_moe\n", n);
+#endif
     return true;
 }
 
@@ -296,7 +298,9 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
             break;
         }
     }
+#ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_cap] external_violations=%d\n", violations);
+#endif
 
     if (violations > 0) {
         fprintf(stderr,
