@@ -28,7 +28,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
   - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 专属：llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）——**无 frag new-file**
   - **`gguf-alignment.patch`**（独立）：ggml gguf.h/cpp（convertd 工具用）
 - **应用顺序**：macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama（临时 worktree 逐字节一致验证过，21 文件）。
-- **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；运行默认仍 CPU，除非 `-ngl`）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖（重建 CPU-only StreamMoE_dump 供 IDENTICAL baseline 回归，见 baseline_regression/README.md）。
+- **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；`--expert-backend` **隐含 no-op-offload**，见下）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖。
+- **op_offload 与数值形态**：llama 默认 `op_offload=true`（把 host 计算自动 offload 到 device，-ngl 0 也占 Vulkan0 compute buffer ~1.3G）。`--expert-backend` 在 frag 里隐含 `--no-op-offload`（route B 拥有专家放置权，3932d33）——Vulkan0 splits=0 实测。但 **GGML_VULKAN=ON 编译本身改变数值**（CPU buft 换 Vulkan0 host buft 等 host 内存形态，gate 边界 expert-flip 级噪声）——回归按构建形态选基线：CPU-only 编对 `baseline_regression\baseline\moe_129_8192`，默认 vulkan 编对 `moe_129_8192_vk`（run_baseline.bat 首参，见该 README）。
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
