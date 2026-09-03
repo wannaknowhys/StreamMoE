@@ -33,6 +33,13 @@ bool moe_chain_node_is_privatizable(const ggml_tensor * node);
 bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sched,
                               ggml_backend_t our_backend);
 
+// Ping-pong private intermediate buffer (M1 privatisation). Two persistent
+// aligned buffers (parity 0/1) shared across graph_compute calls - the whole
+// MoE chain writes its hidden intermediates here instead of the main-graph dst
+// (odd/even compute nodes alternate buffers, so a write never clobbers an
+// input still being read one step away). Grows on demand; process-lifetime.
+void * moe_chain_pingpong_buffer(int parity, size_t need_bytes);
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).

@@ -1,5 +1,6 @@
 #include "backend/route_b_chain.h"
 
+#include "backend/alloc.h"
 #include "ggml-impl.h"
 
 #include <cstdio>
@@ -9,6 +10,18 @@
 #include <vector>
 
 namespace stream_moe {
+
+void * moe_chain_pingpong_buffer(int parity, size_t need_bytes) {
+    static void * buf[2] = {nullptr, nullptr};
+    static size_t sz[2] = {0, 0};
+    const int p = parity & 1;
+    if (need_bytes > sz[p]) {
+        aligned_free_ptr(buf[p]);
+        buf[p] = aligned_alloc_ptr(need_bytes, 64);
+        sz[p] = buf[p] ? need_bytes : 0;
+    }
+    return buf[p];
+}
 
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
     if (!gf || !sched || !our_backend) return false;

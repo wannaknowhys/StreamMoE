@@ -1,4 +1,5 @@
 ﻿#include "backend/minigraph_exec.h"
+#include "backend/route_b_chain.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
 
@@ -67,6 +68,21 @@ expert_handle_t pin_state_find(const pin_state_t& st, uint32_t layer, uint32_t e
 }
 
 } // namespace
+
+// Privatisation: alternate hidden compute-node outputs between the two ping-pong
+// buffers (odd/even), so a write never clobbers an input one step away. Moe_out
+// (the chain end) is NOT hidden - it writes the main-graph dst for the dense
+// side. Process-lifetime counter; alternation is what matters, not the absolute
+// parity (a decode may start on either buffer - neighbours always differ).
+static int s_hide_flip = 0;
+
+static bool hide_output(ggml_tensor * nd) {
+    void * pb = moe_chain_pingpong_buffer(s_hide_flip & 1, ggml_nbytes(nd));
+    if (!pb) return false;
+    nd->data = pb;
+    s_hide_flip++;
+    return true;
+}
 
 // Route B delegation: the compact slot pool is one contiguous block with a uniform stride
 // (slot e at pool_base + e*slot_size). So each original MUL_MAT_ID node can be executed by
@@ -175,6 +191,9 @@ enum ggml_status moe_exec_mul_mat_id(
                 }
             }
             if (!ok) break;
+            if (!(nd->name && strstr(nd->name, "ffn_moe_out"))) {
+                if (!hide_output(const_cast<ggml_tensor*>(nd))) { ok = false; break; }
+            }
             ggml_cgraph* gf = ggml_new_graph(ctx);
             gf->nodes[0] = const_cast<ggml_tensor*>(nd);
             gf->n_nodes  = 1;
@@ -190,6 +209,10 @@ enum ggml_status moe_exec_mul_mat_id(
         const ggml_tensor* ids = nd->src[2];
         const ggml_tensor* dst = nd;
         parsed_node_t pn = parse_weight_name(w->name);
+
+        // hide: reroute this MUL_MAT_ID's output into the ping-pong buffer
+        // (dst == nd; mini-graph writes nd->data, which now points at the buffer)
+        if (!hide_output(const_cast<ggml_tensor*>(nd))) { ok = false; break; }
 
         // branch layout (compact slot offset, uniform across experts)
         size_t off = 0, bytes = 0;
