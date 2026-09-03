@@ -16,6 +16,8 @@
 struct ggml_cgraph;
 struct ggml_tensor;
 
+#include <vector>
+
 namespace stream_moe {
 
 // Single chain-node predicate, shared by supports_op (collection), verify and
@@ -54,5 +56,24 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes);
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).
 bool moe_chain_verify_graph(struct ggml_cgraph * gf);
+
+// ---- whole-layer burst capture (M2 executor) ----------------------------
+// Per-layer privatised compute-node sequence, captured at build time (the
+// graph is delivered one node per graph_compute, so the executor needs the
+// whole-layer order up front). Each entry is the main-graph compute node
+// (stable while llama reuses the built graph across decodes; capture is
+// refreshed on every rebuild). Includes the anonymous per-topk convergence
+// adds and the moe_out end.
+struct moe_layer_exec_t {
+    int32_t layer = -1;
+    std::vector<ggml_tensor*> compute;   // main-graph compute nodes, exec order
+};
+// Layer of the privatised exec sequence containing `node` (pointer match), or
+// -1 when `node` is not a captured privatised compute node.
+int32_t moe_chain_layer_of_node(const ggml_tensor * node);
+// Whole exec sequence of `layer`, or nullptr.
+const moe_layer_exec_t * moe_chain_layer_exec(int32_t layer);
+// Index of `node` inside its layer's exec sequence, or -1.
+int32_t moe_chain_layer_index(int32_t layer, const ggml_tensor * node);
 
 } // namespace stream_moe

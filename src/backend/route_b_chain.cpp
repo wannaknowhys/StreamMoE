@@ -15,6 +15,10 @@ namespace {
 bool g_pingpong_ok = true;
 void * g_fullalloc_buf = nullptr;
 size_t g_fullalloc_cap = 0;
+
+// Whole-layer burst capture: per-layer privatised compute sequence from the
+// last graph build (see moe_chain_assign_backend).
+std::map<int, moe_layer_exec_t> g_layer_exec;
 }
 
 bool moe_chain_pingpong_ok() { return g_pingpong_ok; }
@@ -60,26 +64,69 @@ void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
 
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
     if (!gf || !sched || !our_backend) return false;
-    // Assign the NAMED privatised nodes (routed mm + ffn_moe_* hidden/output).
-    // The anonymous per-topk convergence adds are intentionally NOT privatised
-    // yet: executed per-node on CPU they read a hidden weighted output whose
-    // ping-pong region gets clobbered by the add tree (interval > 1 step).
-    // They join the privatised set together with the whole-layer burst executor
-    // (docs/M2_DEVICE_EXECUTOR.md 2.1/2.2).
+    // Privatise the WHOLE chain closure (BFS from routed mm anchors, shared
+    // with verify): routed mm + named hidden intermediates + output end + the
+    // anonymous per-topk convergence adds. View/layout nodes are left to the
+    // scheduler (pass4 follows view_src). The same traversal fills the
+    // whole-layer burst capture (exec order per layer).
+    std::vector<char> chain;
+    std::vector<int> layer;
+    int n_anchors = 0;
+    collect_chain(gf, chain, layer, n_anchors);
+    g_layer_exec.clear();
     int n = 0;
     size_t tot_bytes = 0;
     for (int i = 0; i < gf->n_nodes; ++i) {
+        if (!chain[i]) continue;
         ggml_tensor * nd = gf->nodes[i];
-        if (!moe_chain_node_is_privatizable(nd)) continue;
         if (is_view_op(nd)) continue;
+        const int L = layer[i];
+        if (L >= 0) {
+            moe_layer_exec_t & ex = g_layer_exec[L];
+            if (ex.compute.empty()) ex.layer = L;
+            ex.compute.push_back(nd);
+        }
+        // set_tensor_backend stays on the NAMED predicate until the whole-layer
+        // burst executor lands: assigning the anonymous convergence adds now
+        // (per-node splits, ping-pong hide) clobbers the weighted output they
+        // read at >1-step distance. The capture above already includes them.
+        if (!moe_chain_node_is_privatizable(nd)) continue;
         ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
         tot_bytes += ggml_nbytes(nd);
         n++;
     }
 #ifdef STREAM_MOE_CHAIN_DEBUG
-    fprintf(stderr, "[route_b_verify] chain backend assigned: %d compute nodes -> stream_moe\n", n);
+    fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",
+            n_anchors, n, tot_bytes / (1024 * 1024));
+    for (const auto & kv : g_layer_exec) {
+        fprintf(stderr, "  L%d: %zu compute nodes\n", kv.first, kv.second.compute.size());
+    }
 #endif
     return true;
+}
+
+int32_t moe_chain_layer_of_node(const ggml_tensor * node) {
+    if (!node) return -1;
+    for (const auto & kv : g_layer_exec) {
+        for (const auto * cn : kv.second.compute) {
+            if (cn == node) return kv.first;
+        }
+    }
+    return -1;
+}
+
+const moe_layer_exec_t * moe_chain_layer_exec(int32_t layer) {
+    auto it = g_layer_exec.find(layer);
+    return it == g_layer_exec.end() ? nullptr : &it->second;
+}
+
+int32_t moe_chain_layer_index(int32_t layer, const ggml_tensor * node) {
+    const auto * ex = moe_chain_layer_exec(layer);
+    if (!ex || !node) return -1;
+    for (size_t k = 0; k < ex->compute.size(); ++k) {
+        if (ex->compute[k] == node) return static_cast<int32_t>(k);
+    }
+    return -1;
 }
 
 namespace {
