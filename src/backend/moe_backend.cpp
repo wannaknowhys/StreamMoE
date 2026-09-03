@@ -3,7 +3,6 @@
 #include "backend/minigraph_exec.h"
 #include "backend/scheduler.h"
 #include "common/logger.h"
-#include "server/route_b_inject.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -200,7 +199,6 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
     };
     backend->iface.synchronize = [](ggml_backend_t) {};
     backend->iface.graph_compute = [](ggml_backend_t b, ggml_cgraph* cgraph) -> enum ggml_status {
-        stream_moe::route_b_lazy_alloc_pools();   // first compute: devices are registered now
         auto* bctx = static_cast<moe_backend_ctx*>(b->context);
         // This backend now receives whole privatised MoE splits: splits with
         // routed MUL_MAT_ID nodes AND weightless chain-compute splits (no mm -

@@ -34,8 +34,4 @@ llama_model_tensor_buft_override* route_b_setup(
 // tensors / unknown names are a no-op. Returns true if the tensor was filled.
 bool route_b_fill_dense(const char* tensor_name, void* data);
 
-// Perform queued VRAM pool allocations once devices (vulkan) are available.
-// Called from the first graph_compute.
-void route_b_lazy_alloc_pools();
-
 } // namespace stream_moe

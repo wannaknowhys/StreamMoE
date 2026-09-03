@@ -10,6 +10,7 @@
 #include "loader/model_builder.h"
 #include "loader/topo_builder.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -34,11 +35,94 @@ struct model_pool_t {
     ggml_backend_buffer_type_t            dense_buft = nullptr; // v2-chunk dense buft
     std::unordered_map<std::string, std::vector<src_seg_t>> dense_srcs; // name -> strip segments (v2 chunk)
     llama_model_tensor_buft_override      overrides[3] = {};    // expert + dense + terminator
-    // Device pools beyond the CPU-RAM scheduler (M1+: allocate, reserve for use).
-    std::vector<std::pair<std::string, size_t>> vram_pending;   // dev, MB - allocated lazily (vulkan registers late)
-    std::vector<ggml_backend_t>                 vram_backends;  // one ggml backend per VRAM pool
-    std::vector<ggml_backend_buffer_t>          vram_buffers;   // its allocated buffer
+    // Device pools beyond the CPU-RAM scheduler (M1+): allocated up front in
+    // route_b_setup, same point as the RAM scheduler. Every block is a whole
+    // group of slot-aligned expert runs (an expert weight is never split); a
+    // block that fails halves down to a single slot. vram_segs records each
+    // buffer's {dev, group, slot span} so a future executor can address the
+    // device pools directly.
+    struct vram_seg_t {
+        ggml_backend_t         be = nullptr;
+        std::string            dev;
+        uint32_t               group = 0;
+        ggml_backend_buffer_t  buf = nullptr;
+        size_t                 slot_size = 0;
+        size_t                 n_slots = 0;
+    };
+    std::vector<ggml_backend_t>        vram_backends;  // keep device backends alive
+    std::vector<ggml_backend_buffer_t> vram_buffers;   // every allocated buffer
+    std::vector<vram_seg_t>            vram_segs;
 };
+
+// vram device spec parsed from --moe-expert-pools.
+struct vram_spec_t { std::string dev; size_t mb; };
+
+// Plan the group slots one device should host for a byte budget. Floors first
+// (one full layer per group, biggest expert groups first - a device that can
+// not host every group should host whole layers of the big ones), then the
+// spare budget fills by the remaining model-wide byte need. plan[] is capped
+// by remaining[]; remaining[] is only decremented by the caller after the real
+// allocation lands (allocation can fall short of the plan).
+void plan_device_slots(const moe_model_topology_t& topo, size_t budget_bytes,
+                       const std::vector<size_t>& remaining, std::vector<size_t>& plan) {
+    const size_t G = topo.groups.size();
+    const uint32_t per_layer = topo.n_expert;
+    plan.assign(G, 0);
+    std::vector<size_t> order(G);
+    for (size_t i = 0; i < G; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return topo.groups[a].expert_size > topo.groups[b].expert_size;
+    });
+    for (size_t gi : order) {
+        if (budget_bytes < topo.groups[gi].expert_size) continue;   // below one slot
+        const size_t want = remaining[gi] < per_layer ? remaining[gi] : per_layer;
+        const size_t need = want * topo.groups[gi].expert_size;
+        if (need <= budget_bytes) { plan[gi] += want; budget_bytes -= need; }
+    }
+    std::vector<size_t> rem_bytes(G);
+    size_t total_rem = 0;
+    for (size_t i = 0; i < G; ++i) {
+        const size_t left = remaining[i] - plan[i];
+        rem_bytes[i] = left * topo.groups[i].expert_size;
+        total_rem += rem_bytes[i];
+    }
+    if (total_rem && budget_bytes) {
+        for (size_t i = 0; i < G; ++i) {
+            if (!rem_bytes[i]) continue;
+            const size_t share = static_cast<size_t>(budget_bytes * (double) rem_bytes[i] / (double) total_rem);
+            const size_t can = remaining[i] - plan[i];
+            plan[i] += share / topo.groups[i].expert_size > can ? can : share / topo.groups[i].expert_size;
+        }
+    }
+}
+
+// Allocate one group's planned bytes on a device as slot-aligned blocks. On a
+// failed request, halve (always to a whole-slot multiple) and retry; a
+// successful block never shrinks the next attempt, so the loop keeps probing
+// the device heap until it is full or a single slot fails.
+size_t vram_alloc_group(model_pool_t* pool, const std::string& dev, ggml_backend_t be,
+                        ggml_backend_buffer_type_t buft, uint32_t group,
+                        size_t want_bytes, size_t slot_size) {
+    size_t got = 0;
+    size_t chunk = want_bytes;
+    while (got < want_bytes) {
+        const size_t ask = chunk < want_bytes - got ? chunk : want_bytes - got;
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, ask);
+        if (buf) {
+            pool->vram_buffers.push_back(buf);
+            model_pool_t::vram_seg_t seg;
+            seg.be = be; seg.dev = dev; seg.group = group;
+            seg.buf = buf; seg.slot_size = slot_size; seg.n_slots = ask / slot_size;
+            pool->vram_segs.push_back(seg);
+            got += ask;
+        } else {
+            const size_t half = (ask / 2 / slot_size) * slot_size;  // whole slots only
+            if (half < slot_size) break;                            // single slot failed too
+            chunk = half;
+        }
+    }
+    return got;
+}
 
 std::vector<std::unique_ptr<model_pool_t>> g_pools;
 std::shared_ptr<async_dio_engine> g_shared_dio;   // one IOCP engine for all pools
@@ -97,11 +181,18 @@ llama_model_tensor_buft_override* route_b_setup(
             pool->shards.push_back(f);
         }
 
-        // Parse "<device>:<MB>" pool specs. RAM -> scheduler bytes; any other
-        // device (Vulkan0, ...) -> allocate the buffer now (reserved; expert
-        // residency on the device comes later). No RAM entry keeps the default
-        // (75% free RAM, or full residency when pool_full_when_zero).
+        // Parse "<device>:<MB>" pool specs. RAM -> scheduler bytes (bounded
+        // residency, evict-managed). Every other device (Vulkan0, ...) gets a
+        // reserved pool of slot-aligned whole-expert blocks, allocated HERE at
+        // the same point as the RAM scheduler (never lazily at first compute).
+        const uint32_t per_layer = pool->topo->n_expert;
+        const size_t G = pool->topo->groups.size();
+        std::vector<size_t> remaining(G);
+        for (size_t i = 0; i < G; ++i) {
+            remaining[i] = static_cast<size_t>(pool->topo->groups[i].layers.size()) * per_layer;
+        }
         size_t pool_bytes = 0;
+        std::vector<vram_spec_t> vspecs;
         for (const auto& spec : pools) {
             const size_t colon = spec.find(':');
             if (colon == std::string::npos) continue;
@@ -111,12 +202,7 @@ llama_model_tensor_buft_override* route_b_setup(
                 pool_bytes = mb * 1024ull * 1024ull;
                 continue;
             }
-            // reserve a device pool: defer the real backend allocation - vulkan
-            // (and other device backends) register after model load, while
-            // route_b_setup runs before it. route_b_lazy_alloc_pools() (called
-            // from the first graph_compute) performs the actual allocation.
-            pool->vram_pending.push_back({dev, mb});
-            std::fprintf(stderr, "route B: device pool queued %zu MB on '%s' (lazy alloc)\n", mb, dev.c_str());
+            vspecs.push_back({dev, mb});
         }
         if (pool_bytes == 0) {
             if (pool_full_when_zero) {
@@ -124,6 +210,42 @@ llama_model_tensor_buft_override* route_b_setup(
             } else {
                 pool_bytes = get_available_ram_bytes() * 3 / 4;
             }
+        }
+
+        // Real device allocations: one group plan per spec. Failures are logged
+        // and the model still runs (RAM backs whatever a device cannot hold).
+        for (const auto& vs : vspecs) {
+            ggml_backend_dev_t vdev = ggml_backend_dev_by_name(vs.dev.c_str());
+            if (!vdev) {
+                std::fprintf(stderr, "route B: unknown pool device '%s' - ignoring (RAM backs this model)\n", vs.dev.c_str());
+                continue;
+            }
+            ggml_backend_t vbe = ggml_backend_dev_init(vdev, nullptr);
+            if (!vbe) {
+                std::fprintf(stderr, "route B: cannot init backend '%s'\n", vs.dev.c_str());
+                continue;
+            }
+            pool->vram_backends.push_back(vbe);
+            ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(vbe);
+            const size_t budget = vs.mb * 1024ull * 1024ull;
+            std::vector<size_t> plan;
+            plan_device_slots(*pool->topo, budget, remaining, plan);
+            size_t plan_bytes = 0, got_bytes = 0;
+            std::string ginfo;
+            for (size_t gi = 0; gi < G; ++gi) {
+                if (!plan[gi]) continue;
+                const size_t es = pool->topo->groups[gi].expert_size;
+                plan_bytes += plan[gi] * es;
+                const size_t got = vram_alloc_group(pool.get(), vs.dev, vbe, vbuft,
+                                                    static_cast<uint32_t>(gi), plan[gi] * es, es);
+                got_bytes += got;
+                const size_t ns = got / es;
+                remaining[gi] = ns >= plan[gi] ? 0 : remaining[gi] - ns;
+                ginfo += (gi ? "," : "") + std::to_string(gi) + ":" + std::to_string(ns) + "/" + std::to_string(plan[gi]);
+            }
+            std::fprintf(stderr, "route B: device pool '%s' got %zu/%zu MB (planned %zu MB)%s\n",
+                         vs.dev.c_str(), got_bytes / (1024 * 1024), vs.mb,
+                         plan_bytes / (1024 * 1024), ginfo.empty() ? "" : (" groups:" + ginfo).c_str());
         }
 
         pool->sched = std::make_unique<expert_scheduler>();
@@ -193,42 +315,6 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
         return ok;
     }
     return false;
-}
-
-// Device (VRAM) pools are queued at route_b_setup (vulkan registers only after
-// model load). Perform the real allocations once the devices are available -
-// called from the first graph_compute.
-void route_b_lazy_alloc_pools() {
-    for (auto& pool : g_pools) {
-        for (const auto& req : pool->vram_pending) {
-            const std::string& dev = req.first;
-            const size_t mb = req.second;
-            ggml_backend_dev_t vdev = ggml_backend_dev_by_name(dev.c_str());
-            if (!vdev) {
-                std::fprintf(stderr, "route B: lazy alloc: unknown device '%s'. Available:",
-                             dev.c_str());
-                for (int di = 0; di < ggml_backend_dev_count(); ++di) {
-                    ggml_backend_dev_t dd = ggml_backend_dev_get(di);
-                    if (dd) std::fprintf(stderr, " %s", ggml_backend_dev_name(dd));
-                }
-                std::fprintf(stderr, "\n");
-                continue;
-            }
-            ggml_backend_t vbe = ggml_backend_dev_init(vdev, nullptr);
-            if (!vbe) { std::fprintf(stderr, "route B: lazy alloc: cannot init '%s'\n", dev.c_str()); continue; }
-            ggml_backend_buffer_t vbuf = ggml_backend_buft_alloc_buffer(
-                ggml_backend_get_default_buffer_type(vbe), mb * 1024ull * 1024ull);
-            if (!vbuf) {
-                std::fprintf(stderr, "route B: lazy alloc: cannot allocate %zu MB on '%s'\n", mb, dev.c_str());
-                ggml_backend_free(vbe);
-                continue;
-            }
-            pool->vram_backends.push_back(vbe);
-            pool->vram_buffers.push_back(vbuf);
-            std::fprintf(stderr, "route B: device pool allocated %zu MB on '%s' (reserved)\n", mb, dev.c_str());
-        }
-        pool->vram_pending.clear();
-    }
 }
 
 } // namespace stream_moe
