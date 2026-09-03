@@ -1,8 +1,8 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 36f1e0cd5..7ead0ee54 100644
+index 36f1e0cd5..cc7d745fb 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -179,3 +179,25 @@ if (LLAMA_LLGUIDANCE)
+@@ -179,3 +179,26 @@ if (LLAMA_LLGUIDANCE)
  endif()
  
  target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
@@ -16,6 +16,7 @@ index 36f1e0cd5..7ead0ee54 100644
 +    ${STREAM_MOE_SRC}/backend/moe_backend.cpp
 +    ${STREAM_MOE_SRC}/backend/minigraph_exec.cpp
 +    ${STREAM_MOE_SRC}/backend/scheduler.cpp
++    ${STREAM_MOE_SRC}/backend/route_b_chain.cpp
 +    ${STREAM_MOE_SRC}/io/staging_reader.cpp
 +    ${STREAM_MOE_SRC}/loader/moe_loader.cpp
 +    ${STREAM_MOE_SRC}/loader/model_builder.cpp
