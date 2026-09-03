@@ -218,3 +218,20 @@ index 0402044da..d06dcdf23 100644
  
              struct ggml_context * ctx_compute_opt;
              {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c1d86aaac..0cfba9029 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -18872,6 +18872,12 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
+     }
+ }
+ 
++// StreamMoE route-B extensions (host map + fake-base offset exports).
++// Bodies live in the parent repo frag (patches/route-b/common).
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_vk_hostmap.frag"
++#endif
++
+ // Extension availability
+ static bool ggml_vk_instance_layer_settings_available() {
+ #ifdef GGML_VULKAN_VALIDATE

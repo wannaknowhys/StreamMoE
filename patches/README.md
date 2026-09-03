@@ -7,9 +7,10 @@
 
 ## 总览（2026-09-03 重构后）
 
-- **vendored HEAD = 纯上游 `f280b2698`**；工作区 = 5 patch 全 apply 态。
+- **vendored HEAD = 纯上游 `f280b2698`**；工作区 = 4 patch 全 apply 态。
 - **frag（内容片段）全部在主仓库** `patches/<phase>/...`（单一来源，普通文件随主仓库 commit）：
-  - `patches/route-b/common/`：route-b 的 common 层 5 frag + server-context spec 打印 2 frag
+  - `patches/route-b/common/`：route-b 的 common 层 frag（含 `stmoe_routeb_vk_hostmap.frag`——
+    ggml-vulkan host map 导出函数体）+ server-context spec 打印 2 frag
   - `patches/prefill-export/common/`：prefill 的 common 层 4 frag
   - `patches/prefill-export/include/`：prefill 的 llama.h 层 3 frag
 - **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b /
@@ -29,6 +30,9 @@
   - `common/common.cpp` / `common/common.h`（route-b/prefill 锚点）
   - `include/llama.h`（prefill 3 锚点：includes/params/apis——frag 在 `patches/prefill-export/include/`）
   - `tools/server/server-context.cpp`（**3 锚点**：route-b spec slot/dtore + prefill nout）
+  - `ggml/src/ggml-vulkan/ggml-vulkan.cpp`（**1 锚点**：`STREAM_MOE_ROUTE_B` 保护 include
+    `stmoe_routeb_vk_hostmap.frag`——函数体在 `patches/route-b/common/`；2026-09 由原
+    直插 patch `streammoe-vk-hostmap.patch` 改造，随 macros 走 features 全局 include 路径）
 - `tsc_timer.patch`：`src/tsc_timer.h`（[TMR] `sm_tmr::timer`，析构打印经 `STREAM_MOE_TMR` env 门控）
 
 ### Phase 2a（可选）route-b-inject.patch
@@ -56,7 +60,8 @@ git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_ti
 ```
 
 - Phase 1 必选（顺序可互换）；2a/2b 可选组合；gguf-alignment 独立。
-- 验证（A4 做过）：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（21 文件 hash）。
+- 验证（A4 做过）：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（22 文件 hash；
+  2026-09 hostmap 并入 macros 后 +1 文件 = ggml-vulkan.cpp）。
 - 叠加纪律（README 旧版铁律沿用）：在已有 patch 基础上改代码前先 commit 父仓库 + 快照
   `git -C third_party/llama.cpp diff > temp/patch_backup_<date>/working-tree-full.patch`。
 - 每次 vendored 改动收尾：重生成受影响 patch → 临时 worktree apply 验证逐字节一致 → commit。

@@ -24,7 +24,7 @@
 最终设计"device_pool[] / 多池目录 / 池本地驱逐"里**数据物理层**已先行（执行仍 CPU 单池路径），
 见 `docs/WORK_IN_PROGRESS.md` J 节：
 - device_pool 的**物理区** = scheduler `subpool_t` 的 (group,pool) 区（pool 0=RAM, 1+=device host map），槽全局编号
-- 已实现：vram 分配 seg 登记、host map 通道（patch `streammoe-vk-hostmap`）、read 优先装 vram、
+- 已实现：vram 分配 seg 登记、host map 通道（ggml-vulkan.cpp phase1 锚点 include `stmoe_routeb_vk_hostmap.frag`）、read 优先装 vram、
   DIO/staging 写 vram slot、CPU 从 vram map 读权重执行（IDENTICAL）、device 驱逐 **demote 回 RAM**
 - **仍是 mock**：M1 执行 resolve 单区（同层激活集须同池——跨池分区执行 J6 未做，结构同 GPU per-device）；
   M2 计算 backend 仍固定 CPU（vulkan 执行未接）；M3 私有 arena 仍单 scratch（device 侧固定执行区未建）

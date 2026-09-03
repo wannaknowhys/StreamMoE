@@ -34,7 +34,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
 ### VRAM 数据层（2026-09，路线 A：数据层先行）
-- **vram 池真驻留 + CPU 从 vram 读权重执行**（`--moe-expert-pools RAM:N,Vulkan0:N`）：分配（slot 对齐降档，seg 登记）→ host map 通道（patch `streammoe-vk-hostmap`：ggml vulkan `get_base` 是假 base `0x1000`，改**导出** `stmoe_vk_buffer_host_ptr` 返回真 vkMapMemory ptr）→ scheduler 槽空间并入 vram 区（subpool 变 per-(group,pool)）→ 请求优先装 vram → CPU 执行从 vram map 读权重（"reads pool 1"，IDENTICAL）→ **vram 驱逐 demote 回 RAM**（Vulkan0:1024 触发 1987 demote 仍 IDENTICAL）。
+- **vram 池真驻留 + CPU 从 vram 读权重执行**（`--moe-expert-pools RAM:N,Vulkan0:N`）：分配（slot 对齐降档，seg 登记）→ host map 通道（ggml-vulkan.cpp 在 **phase1 macros.patch 的 `STREAM_MOE_ROUTE_B` 锚点** include `stmoe_routeb_vk_hostmap.frag`（函数体在主仓库）导出 `stmoe_vk_buffer_host_ptr` 返回真 vkMapMemory ptr；`get_base` 仍是假 base `0x1000` 不改）→ scheduler 槽空间并入 vram 区（subpool 变 per-(group,pool)）→ 请求优先装 vram → CPU 执行从 vram map 读权重（"reads pool 1"，IDENTICAL）→ **vram 驱逐 demote 回 RAM**（Vulkan0:1024 触发 1987 demote 仍 IDENTICAL）。
 - 开发模型 = **v2 chunk**（专家独立化 direct，moe(v2) 与 v1 基线 IDENTICAL）；upstream 对照仍 v1（不认识 v2）。
 - 已知限制：执行器**单区**（同层激活集须同池）；mixed 分区执行（WIP J6）与 GPU 每-device 分区同构，GPU 阶段前铺。
 - 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J 节。

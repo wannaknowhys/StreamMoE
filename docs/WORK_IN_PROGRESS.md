@@ -87,7 +87,7 @@
 ### J. VRAM 数据层 - 池真驻留 + CPU 读 vram 执行（2026-09）
 > 路线 A 落地（数据层先行，执行仍 CPU；为 GPU 阶段铺数据硬前置）。主仓代码直接 commit；唯一 vendored 改动 = ggml-vulkan host map 导出（patch）。
 
-- [x] J1 **host map 通道（patch streammoe-vk-hostmap, 511cc7a）**：ggml-vulkan `get_base` 固定返回假 `vk_ptr_base=(void*)0x1000`（:2407）——vulkan 内部靠 `tensor->data - vk_ptr_base` 算偏移（:2411），**不能改**。加后端导出 `stmoe_vk_buffer_host_ptr(buffer)` 返回真 `vkMapMemory` ptr（HOST_VISIBLE buffer，:3548-3550）。RX590 分配即 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（rebar/BAR1，create_buffer_device :3597-3606）。实测 4MB pattern RW-OK
+- [x] J1 **host map 通道（ggml-vulkan.cpp phase1 锚点 → `stmoe_routeb_vk_hostmap.frag`，511cc7a 起）**：ggml-vulkan `get_base` 固定返回假 `vk_ptr_base=(void*)0x1000`（:2407）——vulkan 内部靠 `tensor->data - vk_ptr_base` 算偏移（:2411），**不能改**。经 frag 导出 `stmoe_vk_buffer_host_ptr(buffer)` 返回真 `vkMapMemory` ptr（HOST_VISIBLE buffer，:3548-3550）。RX590 分配即 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（rebar/BAR1，create_buffer_device :3597-3606）。实测 4MB pattern RW-OK。2026-09 由独立 patch 改造成 macros 锚点 + frag（见 patches/README）。
 - [x] J2 **v2 模型开发路径（5265d0a）**：gemma v2 chunk（专家独立化 direct）——moe(v2) 与 moe_129_8192_vk(v1) 基线 **IDENTICAL**（chunk 重排数值无损）；run_baseline 拆 MODEL_MOE(v2)/MODEL_UP(v1，upstream 不认识 v2)
 - [x] J3 **vram 区并入槽空间（7f33b00）**：`subpool_t` → per-(group,pool) 区（pool 0=RAM，1+=device）；`init` 收 `vram_region_t{pool,group,base(n=host map),n_slots}`；槽号全局连续、`slot_mem` 覆盖 vram map；RAM carve/驱逐不变；`ram_subpool`/`subpool_of_slot` API。RAM-only 与 RAM+Vulkan0 均 IDENTICAL
 - [x] J4 **read_to_vram + CPU 从 vram 读权重执行（b691c90）**：`alloc_or_evict` pool 感知；`accept_requests` 优先该 group 的 device 区（RAM fallback）；DIO（v2 direct）/staging 写进 vram slot（slot_mem = vram map）；目录记 pool 1；minigraph_exec **激活集动态单区**（w3d/ids 区局部化；mixed RAM/VRAM active set 报错 = J6）。实测全 vram "reads pool 1" + IDENTICAL
@@ -112,7 +112,16 @@
   5. mm v2：dst 即 hide_dev 的 arena off（不再 readback host）；手工 mm 图 leaf 同 v1；
   6. moe_out：记录原主 dst host 指针 → arena off 计算 → memcpy(arena_map+off → 主 dst)；
   7. 域内 view alias 衔接走 arena（mm 输出 view = arena+off，buffer=arena）；CPU 域路径不动。
-- [x] **v2 尝试结论（64d77c2，device chain 已禁用）**：arena 中途 realloc 会废掉已 hide 输出（需层首一次性 reserve 全量）；mm 的 cur 分 device-resident/上传两路（cur_on_dev）。**致命问题**：直接改主图 tensor 的 buffer 后，llama sched 对 burst 之后该 tensor 的 buffer 归属/copy 处理崩（moe_out 后崩）。**下一方向 = arena-clone 执行器：不动主图任何 tensor，为每链节点在 arena 建独立 clone（leaf+op node），链中间在 clone 张量间引用，仅 moe_out 结果 memcpy 回主 dst**——exec_device_chain 保留为骨架参考。
+- [x] **v2 尝试结论（64d77c2，device chain 已禁用）**：arena 中途 realloc 会废掉已 hide 输出（需层首一次性 reserve 全量）；mm 的 cur 分 device-resident/上传两路（cur_on_dev）。**致命问题**：直接改主图 tensor 的 buffer 后，llama sched 对 burst 之后该 tensor 的 buffer 归属/copy 处理崩（moe_out 后崩）。exec_device_chain 保留为骨架参考。
+- [x] **b4-3 定案（2026-09）**：整层闭包（含匿名收敛 add 与 moe_out）全在 GPU 执行，否则 per-expert contribution readback 代价太大跑不起来。
+  - **不动主图 tensor**。arena-clone：为 `ex->compute` 每节点在 device arena 建独立 clone（leaf+op node），链内 clone 自持，整层单 vulkan cgraph 一次提交，仅 moe_out 出口 memcpy 回主 dst host 指针（不碰 buffer）。
+  - **布局 = 全分配（先）**：出参位置数组 `out_off` 按 full-alloc bump 填（每节点独立区，层首 reserve 全量，杜绝中途 realloc）。
+  - **结构 = 拓扑解析与字节布局分离**（moe_node_plan，见 docs/M2_DEVICE_EXECUTOR.md §4.1）：
+    - 入参存**引用**（`prod` 序号 + view 链 `off`），不存绝对偏移——builder 用 `plan[prod].out_off + off` 现算叶子 data；复用分析将来只改 `out_off` 数组，builder 不动。
+    - mm / moe_out 是特例：mm 的 src[0] 权重壳（池 dev_buf+branch_off，非 arena）+ ids 区域本地化，builder 按 op 特判；moe_out 有出参区 + 出口 readback 标记。
+    - **将来**：verify 里 live-range/interval 复用分析填同一 `out_off` 数组（乒乓两区 = interval 图特例）→ 同一 builder 直接消费，零结构变更。
+  - 风险：闭包 weightless op（REPEAT/GET_ROWS/ADD/GLU）也走 vulkan kernel，需数值门验证 GPU==CPU 逐字节（v1 mm 已证 Q4_K 一致，float 单 op 以实测为准）。
+  - **测试池用小 vram 专家池**（怕全分配 arena 太大）；实际 lsum 值趁真跑时记录。
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）

@@ -102,6 +102,47 @@ Execution model (final):
   merge can read contribution columns straight from the mapping while dense is
   on CPU.
 
+## 4.1 Node plan: topology resolution decoupled from byte layout (2026-09)
+
+The whole-layer closure (anonymous convergence adds AND moe_out included) executes
+entirely on the device - reading per-expert contributions back to the host for the
+merge is too expensive to run. Main-graph tensors are never mutated (a b4-2 crash:
+llama's scheduler keeps bookkeeping the mutated buffers after the burst).
+
+The builder is fed a **per-layer node plan** that separates *what the graph is*
+from *where bytes go*:
+
+```cpp
+enum class moe_in_kind { k_chain, k_external };
+struct moe_resolved_in {
+    moe_in_kind   kind = moe_in_kind::k_external;
+    int32_t       prod = -1;   // k_chain: producer index (compute order)
+    int64_t       off  = 0;    // k_chain: cumulative view-chain byte offset
+    ggml_tensor * src  = nullptr; // actual tensor for shape/type/nb
+};
+struct moe_node_plan {
+    ggml_tensor * node = nullptr;
+    size_t        out_off   = 0;  // arena region (allocator fills)
+    size_t        out_bytes = 0;
+    bool          is_out    = false;  // moe_out: exit readback to main dst
+    moe_resolved_in in[GGML_MAX_SRC];
+};
+```
+
+- Chain inputs are stored as **references** (`prod` + view offset), never absolute
+  arena offsets - the builder derives `plan[prod].out_off + off` when it creates
+  the arena leaf for an input, so a reuse analysis only ever rewrites the `out_off`
+  array and the builder does not change.
+- mm / moe_out are special-cased by op in the builder: mm src[0] is the weight
+  shell (pool device buffer + branch offset, not the arena) and ids need slot
+  localisation; moe_out owns an arena region plus the exit-readback flag.
+- **Now**: `out_off` is a fixed full-alloc bump over the compute sequence (each
+  node its own region; the layer's whole arena+stage is reserved once up front -
+  growing the arena mid-layer frees already-hidden outputs, b4-2 lesson).
+- **Future**: verify runs a live-range / interval reuse analysis and fills the
+  same `out_off` array (per-device ping-pong pairs are a special case of the
+  interval layout). Builder consumes it unchanged.
+
 ## 5. Exit merge and scatter (generalised)
 
 - The exit (cross-expert add into moe_out) reads every device's contribution
