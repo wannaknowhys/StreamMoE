@@ -201,12 +201,52 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
         g.total_bytes = static_cast<uint64_t>(g.layers.size()) * topo.n_expert * g.expert_size;
     }
 
+    // SoA columns per group (docs/MULTI_SUBPOOL.md §1a): each expert tensor that
+    // the group's layers share becomes one column (stride = its perExpert).
+    // All experts of a layer have identical sub_tensor layout, so inspect the
+    // first expert of the group's first layer. Columns are (tag,type,perExpert)
+    // merged across the group's layers where the layout matches.
+    for (auto& g : topo.groups) {
+        if (g.layers.empty()) continue;
+        const expert_info_t& probe = topo.experts[(size_t) g.layers[0] * topo.n_expert];
+        auto& cols = g.columns;
+        cols.clear();
+        for (const auto& st : probe.sub_tensors) {
+            const std::string tag = [&]() -> std::string {
+                if (st.name.find("gate_up") != std::string::npos) return "gate_up";
+                if (st.name.find("ffn_gate_exps") != std::string::npos) return "gate";
+                if (st.name.find("ffn_up_exps") != std::string::npos) return "up";
+                if (st.name.find("down_exps") != std::string::npos) return "down";
+                return "?";
+            }();
+            // merge with an existing column when the slice layout matches
+            auto it = std::find_if(cols.begin(), cols.end(), [&](const auto& c) {
+                return c.tag == tag && c.ggml_type == st.ggml_type && c.per_expert == st.byte_size;
+            });
+            if (it != cols.end()) continue;
+            moe_model_topology_t::expert_group_t::column_t c;
+            c.col_index = static_cast<uint32_t>(cols.size());
+            c.name = st.name;
+            c.tag = tag;
+            c.ggml_type = st.ggml_type;
+            for (int d = 0; d < 4; ++d) c.ne[d] = st.ne[d];
+            c.per_expert = st.byte_size;
+            cols.push_back(c);
+        }
+    }
+
     LOG_INFO("Expert groups: " << topo.groups.size() << " ("
              << topo.moe_layers.size() << " MoE layers, " << topo.n_expert << " experts/layer)");
     for (const auto& g : topo.groups) {
         LOG_INFO("  group " << g.idx << ": layers=" << g.layers.size()
                  << " expert_size=" << (g.expert_size / 1024) << "KB total="
-                 << (g.total_bytes / (1024ull * 1024ull)) << "MB");
+                 << (g.total_bytes / (1024ull * 1024ull)) << "MB"
+                 << " columns=" << g.columns.size());
+        for (const auto& c : g.columns) {
+            LOG_INFO("    col " << c.col_index << " " << c.tag << " type=" << c.ggml_type
+                     << " perExpert=" << (c.per_expert / 1024) << "KB"
+                     << (c.per_expert_4k() ? " [direct]" : " [staging]"));
+        }
     }
 
     return topo;

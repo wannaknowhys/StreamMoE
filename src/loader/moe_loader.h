@@ -76,6 +76,23 @@ struct moe_model_topology_t {
         std::vector<uint32_t> layers;         // layers covered by this group
         size_t                expert_size = 0;  // bytes per expert (uniform within group)
         uint64_t              total_bytes  = 0; // layers.size()*n_expert*expert_size
+
+        // SoA column layout (struct-of-array, 2026-09, docs/MULTI_SUBPOOL.md §1a).
+        // A sub-pool is no longer one AoS block per whole expert; it is one
+        // COLUMN per expert tensor. A slot (a resident expert) spans one slice
+        // in EVERY column at the same slot index; slice e of column c sits at
+        // column_base[c] + e * column stride. A column groups all layers of the
+        // group that share the same (tag, type, perExpert) layout.
+        struct column_t {
+            uint32_t    col_index = 0;   // index within the group's column list
+            std::string name;            // full tensor name of a representative layer
+            std::string tag;             // gate_up / gate / up / down
+            int32_t     ggml_type = 0;
+            int64_t     ne[4] = { 1, 1, 1, 1 };
+            size_t      per_expert = 0;  // compact slice bytes = SoA stride
+            bool        per_expert_4k() const { return per_expert % 4096 == 0; }  // direct-DIO capable
+        };
+        std::vector<column_t> columns;   // per-tensor SoA columns, ORDER-sorted
     };
     std::vector<expert_group_t> groups;
 
