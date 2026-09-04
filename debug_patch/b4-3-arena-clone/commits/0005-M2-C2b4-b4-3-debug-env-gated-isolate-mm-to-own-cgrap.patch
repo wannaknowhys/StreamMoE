@@ -1,0 +1,256 @@
+From 2a123c802e46199cfa2a395d062bc49889311618 Mon Sep 17 00:00:00 2001
+From: wannaknowhys <heyusu@gmail.com>
+Date: Thu, 3 Sep 2026 21:52:56 -0500
+Subject: [PATCH 5/6] M2-C2b4 b4-3 debug (env-gated): isolate mm to own cgraph
+ (still NaN@2348 -> not multi-node-graph); dump infra for cur/w3d/vmm. KEY
+ FINDING: gate_up mm cur (norm reshaped [2816,1,129]) is all-QNaN in BOTH
+ arena and v1 exec_mm_vk paths - contradicts v1 vulkan mm being correct; v1's
+ 'all-vram vulkan mm == baseline' may have been a CPU-path artifact
+ (exec_mm_vk fires 60x but cur is NaN). Next: re-verify whether v1 vulkan mm
+ ever really ran correct on device, and why norm->data is QNaN (norm
+ privatization/binding/order). RAM IDENTICAL.
+
+---
+ docs/WORK_IN_PROGRESS.md       |   1 +
+ src/backend/minigraph_exec.cpp | 120 +++++++++++++++++++++++++--------
+ 2 files changed, 93 insertions(+), 28 deletions(-)
+
+diff --git a/docs/WORK_IN_PROGRESS.md b/docs/WORK_IN_PROGRESS.md
+index 47b1c6c..2bd5059 100644
+--- a/docs/WORK_IN_PROGRESS.md
++++ b/docs/WORK_IN_PROGRESS.md
+@@ -143,6 +143,7 @@
+     ② w3d：Q4_K block 对齐/branch_off（v1 同 off 但 arena 可能 n_slots/expert_size 字段差）。
+     ③ ids 翻译 local slot（GET_ROWS identical 提示 ids 内容对，但 mm 的 ids_leaf nb/区可能不同）。
+     - 诊断工具已留：ACDBG node/cont/mmcur 打印、layerdump、cmp_layer_dump.js 全 env 门控。
++  - **重大矛盾发现（2026-09，待 fresh 重验）**：逐节点隔离后 arena mm 仍 NaN@2348（排除多节点图）。**关键证据**：arena 首层 gate_up mm 的 cur（norm reshaped `STREAMMOE#ffn_norm_2-0`，3D [2816,1,129]）源 data **全 QNaN**（文件字节 `00e0eaff` 重复）。**v1 路径同 cur 也全 QNaN**——但 v1（exec_mm_vk vulkan mm）声称数值对。矛盾：cur 全 NaN 不可能 mm 对。**待查：v1 vulkan mm 是否从未真正算对（此前"v1 全 vram vulkan mm = 基线一致"可能是 CPU 路径假象——[vmm] 显示 exec_mm_vk 被调 60 次但 cur 全 NaN）**；以及 norm 为何 data=QNaN（norm 是否被意外私有化/分配给我们 backend，结算时机/来源）。dump 工具：STREAM_MOE_CURDUMP（temp_cur_arena/v1.bin）+ STREAM_MOE_WDUMP（temp_w3d.bin）+ STREAM_MOE_VMM。
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+diff --git a/src/backend/minigraph_exec.cpp b/src/backend/minigraph_exec.cpp
+index 5a5e12b..032658c 100644
+--- a/src/backend/minigraph_exec.cpp
++++ b/src/backend/minigraph_exec.cpp
+@@ -366,6 +366,15 @@ static enum ggml_status exec_split_legacy_impl(
+     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+ }
+ 
++#ifdef STREAM_MOE_ARENA_CLONE
++// exec_mm_vk lives after the arena block (v1 path); arena-clone reuses it for
++// the isolated mm experiment (STREAM_MOE_MM_ISOLATE).
++static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
++                       device_exec_ctx_t & dv, ggml_tensor * nd,
++                       const parsed_node_t & pn,
++                       const std::vector<int32_t> & slotbuf,
++                       const expert_scheduler::subpool_t & sp, size_t branch_off,
++                       size_t dst_off, size_t & stage_off, bool readback);
+ // ===================== arena-clone whole-layer device executor ==============
+ // (docs/M2_DEVICE_EXECUTOR.md 4.1, b4-3) The whole privatised layer closure
+ // (mm + weightless + anonymous convergence + moe_out) executes on ONE device
+@@ -562,15 +571,20 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+         const moe_node_plan & p = plan[ci];
+         ggml_tensor * nd = p.node;
+         if (getenv("STREAM_MOE_ACDBG")) {
+-            fprintf(stderr, "[ac] node ci=%zu op=%s name=%s\n", ci, ggml_op_name(nd->op),
+-                    nd->name ? nd->name : "?");
++            fprintf(stderr, "[ac] node ci=%zu op=%s name=%s ne=%lldx%lldx%lldx%lld nb=%zu,%zu,%zu,%zu type=%d\n",
++                    ci, ggml_op_name(nd->op), nd->name ? nd->name : "?",
++                    (long long) nd->ne[0], (long long) nd->ne[1],
++                    (long long) nd->ne[2], (long long) nd->ne[3],
++                    nd->nb[0], nd->nb[1], nd->nb[2], nd->nb[3], (int) nd->type);
+             for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                 if (!nd->src[s]) continue;
+                 const ggml_tensor * t = nd->src[s];
+                 const char * bt = t->buffer && t->buffer->buft && t->buffer->buft->iface.get_name
+                     ? t->buffer->buft->iface.get_name(t->buffer->buft) : "?";
+-                fprintf(stderr, "[ac]   src%d %s op=%s buft=%s data=%p nbytes=%zu kind=%d prod=%d off=%lld\n",
+-                        s, t->name ? t->name : "?", ggml_op_name(t->op), bt, t->data, ggml_nbytes(t),
++                fprintf(stderr, "[ac]   src%d %s op=%s buft=%s ne=%lldx%lldx%lld data=%p nbytes=%zu kind=%d prod=%d off=%lld\n",
++                        s, t->name ? t->name : "?", ggml_op_name(t->op), bt,
++                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
++                        t->data, ggml_nbytes(t),
+                         (int) p.in[s].kind, p.in[s].prod, (long long) p.in[s].off);
+             }
+             fflush(stderr);
+@@ -634,7 +648,7 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+                 // src may be a reshaped tensor whose nb is the base stride
+                 // (exec_mm_vk deliberately ignores cur->nb for external cur).
+                 const size_t cur_bytes = ggml_nbytes(cur);
+-                stage_off = align_up(stage_off, 4096);
++                stage_off = align_up(stage_off, 4096);   // vulkan buffer-offset alignment
+                 if (stage_off + cur_bytes > dv->stage_cap) {
+                     LOG_ERROR("stream_moe: arena-clone stage overflow (mm cur)");
+                     return actx_guard(false);
+@@ -650,6 +664,14 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+                 cur_leaf = ggml_new_tensor_3d(actx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
+                 cur_leaf->buffer = dv->stage;
+                 cur_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, stage_off));
++                if (getenv("STREAM_MOE_CURDUMP")) {
++                    FILE * cf = fopen("temp_cur_arena.bin", "wb");
++                    if (cf) { fwrite(cur->data, 1, cur_bytes, cf); fclose(cf); }
++                    fprintf(stderr, "[ac] curdump %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
++                            cur->name ? cur->name : "?", (long long) cur->ne[0],
++                            (long long) cur->ne[1], (long long) cur->ne[2], cur_bytes, cur->data);
++                    fflush(stderr);
++                }
+                 stage_off += cur_bytes;
+             }
+ 
+@@ -661,6 +683,21 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+             w3d->buffer = wbuf;
+             w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, boff));
+ 
++            if (getenv("STREAM_MOE_WDUMP")) {
++                // Dump the first expert's gate_up weight bytes straight from the
++                // vram host map, for comparison against the CPU-path slot.
++                uint8_t * base = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(wbuf));
++                if (base) {
++                    FILE * wf = fopen("temp_w3d.bin", "wb");
++                    if (wf) { fwrite(base + boff, 1, 8192, wf); fclose(wf); }
++                    fprintf(stderr, "[ac] w3d %s n_slots=%d expert_size=%zu boff=%zu ne=%lldx%lld type=%d\n",
++                            nd->src[0]->name ? nd->src[0]->name : "?", g_n_slots,
++                            sp.expert_size, boff, (long long) nd->src[0]->ne[0],
++                            (long long) nd->src[0]->ne[1], (int) nd->src[0]->type);
++                    fflush(stderr);
++                }
++            }
++
+             ggml_tensor * mm = ggml_mul_mat_id(actx, w3d, cur_leaf, ids_leaf);
+             mm->buffer = dv->arena;
+             mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->arena, p.out_off));
+@@ -733,23 +770,35 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+         gf_nodes.push_back(c);
+     }
+ 
+-    // ---- one vulkan graph_compute over the whole layer closure -------------
+-    // Build via ggml_build_forward_expand (NOT by filling nodes[] by hand):
+-    // vulkan's graph_compute relies on ggml's internal graph structure
+-    // (nodes/leafs/hash/visited). Each clone op is expanded from its own dst;
+-    // ggml dedups already-visited tensors, so the union covers the DAG exactly
+-    // once in dependency order. Leaves (op == NONE, arena/stage/weight shells)
+-    // never enter nodes[] - they are plain inputs the kernels read directly.
+-    ggml_cgraph * gf = ggml_new_graph(actx);
+-    if ((size_t) gf->size < gf_nodes.size()) {
++    // ---- vulkan graph_compute: mm nodes first, then the rest --------------
++    // DEBUG-ISOLATION: submit the MUL_MAT_ID clones as their own cgraph (v1
++    // exec_mm_vk semantics) before the weightless graph. If the mm output turns
++    // correct under this split, the NaN lives in the combined whole-layer graph;
++    // if it stays NaN, the mm itself (vram weight read / packaging) is at fault.
++    ggml_cgraph * gf_mm = ggml_new_graph(actx);
++    ggml_cgraph * gf_rest = ggml_new_graph(actx);
++    if ((size_t) gf_mm->size < gf_nodes.size() || (size_t) gf_rest->size < gf_nodes.size()) {
+         LOG_ERROR("stream_moe: arena-clone graph overflow");
+         return actx_guard(false);
+     }
++    for (size_t ci = 0; ci < plan.size(); ++ci) {
++        if (plan[ci].node->op == GGML_OP_MUL_MAT_ID) {
++            ggml_build_forward_expand(gf_mm, clone[ci]);
++        } else {
++            ggml_build_forward_expand(gf_rest, clone[ci]);
++        }
++    }
++    // cont / dup auxiliaries used by weightless nodes must be in gf_rest too
+     for (ggml_tensor * nd : gf_nodes) {
+-        ggml_build_forward_expand(gf, nd);
++        if (nd->op == GGML_OP_MUL_MAT_ID) continue;
++        if (nd->op == GGML_OP_DUP) ggml_build_forward_expand(gf_rest, nd);
+     }
+ 
+-    if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
++    if (ggml_backend_graph_compute(dv->be, gf_mm) != GGML_STATUS_SUCCESS) {
++        LOG_ERROR("stream_moe: arena-clone mm compute failed (layer " << layer << ")");
++        return actx_guard(false);
++    }
++    if (ggml_backend_graph_compute(dv->be, gf_rest) != GGML_STATUS_SUCCESS) {
+         LOG_ERROR("stream_moe: arena-clone layer compute failed (layer " << layer << ")");
+         return actx_guard(false);
+     }
+@@ -772,6 +821,7 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+     }
+     return actx_guard(true);
+ }
++#endif // STREAM_MOE_ARENA_CLONE
+ 
+ 
+ // M2 executor (docs/M2_DEVICE_EXECUTOR.md 2.2): llama delivers the privatised
+@@ -865,9 +915,22 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
+             slot32[i] = slotbuf[i] - static_cast<int32_t>(sp.slot_begin);
+         }
+         std::memcpy(dv.stage_map + cur_off, cur->data, cur_bytes);
++        if (getenv("STREAM_MOE_CURDUMP") && cur_bytes <= 1600000) {
++            FILE * cf = fopen("temp_cur_v1.bin", "wb");
++            if (cf) { fwrite(cur->data, 1, cur_bytes, cf); fclose(cf); }
++            fprintf(stderr, "[v1cur] %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
++                    cur->name ? cur->name : "?", (long long) cur->ne[0],
++                    (long long) cur->ne[1], (long long) cur->ne[2], cur_bytes, cur->data);
++            fflush(stderr);
++        }
+     }
+     stage_off = cur_off + cur_bytes;
+ 
++    if (getenv("STREAM_MOE_VMM")) {
++        fprintf(stderr, "[vmm] %s pool=%u cur_on_dev=%d dst_off=%zu\n",
++                w->name ? w->name : "?", sp.pool, cur_on_dev, dst_off);
++        fflush(stderr);
++    }
+     ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
+     const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+ 
+@@ -1104,41 +1167,42 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
+     }
+ 
+     bool ok = true;
+-    // Arena-clone whole-layer device execution (b4-3): gated by STREAM_MOE_ARENA
+-    // env while the stage_put handling of pool-resident weight sub-tensors is
+-    // being validated. Default (no env): CPU path below (v1 semantics) stays
+-    // green.
+-    bool want_device = getenv("STREAM_MOE_ARENA") != nullptr;
++#ifdef STREAM_MOE_ARENA_CLONE
++    // Arena-clone whole-layer device execution (b4-3): only compiled when the
++    // STREAM_MOE_ARENA_CLONE macro is defined (build.bat / CXX flag). A layer
++    // whose whole active set sits on one device pool runs on the device; the
++    // macro-off build below stays the plain CPU burst (v1 semantics).
+     uint32_t dom = 0; bool dom_ok = true;
+     for (const auto & h : pins) {
+         if (dom == 0) dom = h.pool; else if (h.pool != dom) { dom_ok = false; break; }
+     }
+-    if (want_device && dom_ok && dom != 0) {
++    if (dom_ok && dom != 0) {
+         const std::vector<moe_node_plan> * plan = moe_chain_layer_plan(layer);
+         if (!plan) {
+             LOG_ERROR("stream_moe: layer " << layer << " has no node plan");
+             ok = false;
+         } else {
+-            if (getenv("STREAM_MOE_ARENA")) {
+-                fprintf(stderr, "[arena-exec] L%d device pool %u plan nodes %zu pins %zu\n",
+-                        layer, dom, plan->size(), pins.size());
+-                fflush(stderr);
+-            }
+             ok = exec_arena_clone(layer, ctx, sched, topo, *plan, dom, pins);
+         }
+-    } else {
++    } else
++#endif
++    {
+         moe_chain_set_full_alloc(lsum);
+         reset_layer(layer);
++#ifdef STREAM_MOE_ARENA_CLONE
+         int ci = 0;
++#endif
+         for (const auto * cn : ex->compute) {
+             if (!ok) break;
+             ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
+             ok = exec_one_burst(ctx, cpu, sched, topo, nd, layer, pins);
++#ifdef STREAM_MOE_ARENA_CLONE
+             if (getenv("STREAM_MOE_DUMP_DIR") && getenv("STREAM_MOE_DUMP_LAYER")) {
+                 layer_dump_out("cpu", layer, ci, ggml_op_name(nd->op),
+                                nd->name, nd->data, ggml_nbytes(nd));
+             }
+             ci++;
++#endif
+         }
+     }
+     for (const auto & h : pins) sched.unpin(h);
+-- 
+2.55.0.windows.3
+

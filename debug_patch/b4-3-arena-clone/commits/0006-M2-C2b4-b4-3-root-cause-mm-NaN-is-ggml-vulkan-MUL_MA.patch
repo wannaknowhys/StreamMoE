@@ -1,0 +1,268 @@
+From c70119b149ff60a9ee16c2f58072eb2b70dfb878 Mon Sep 17 00:00:00 2001
+From: wannaknowhys <heyusu@gmail.com>
+Date: Thu, 3 Sep 2026 22:40:06 -0500
+Subject: [PATCH 6/6] M2-C2b4 b4-3 root cause: mm NaN is ggml-vulkan MUL_MAT_ID
+ vs route-B w3d shell, NOT arena/data/graph. Evidence (env-gated tools kept):
+ (1) L0 incremental-fill dump (STREAM_MOE_L0INC) - c00 NaN@2348 from prefix1
+ alone, byte-stable across all 14 prefixes (rules out graph-order/clobber);
+ (2) per-layer CURDUMP - L0 cur is NaN-free (earlier all-QNaN was L29 file
+ overwrite artifact; L1+ NaN = L0 mm NaN propagation); (3) LOADDBG at
+ mark_ready - vram slot bytes == RAM slot bytes for same (L0,E79) (load/DIO
+ correct); (4) VMMDUMP of v1 exec_mm_vk single-node vulkan mm readback =
+ byte-identical to arena's wrong output (both NaN 457437, all words differ
+ from CPU) - proves v1 'all-vram vulkan mm correct' was a CPU-path artifact,
+ vulkan mul_mat_id never computed this shell correctly. CPU runs same w3d
+ shell + same data -> correct (cpu_ref IDENTICAL). Next: fix vulkan mul_mat_id
+ indexing for ne[2]=n_slots/nb[2]=expert_size virtual 3D weight, or re-layout
+ weights to vulkan-native expert-major before upload. RAM IDENTICAL.
+
+---
+ docs/WORK_IN_PROGRESS.md       |   8 ++
+ src/backend/minigraph_exec.cpp | 142 ++++++++++++++++++++++++++++++---
+ src/backend/scheduler.cpp      |  10 +++
+ 3 files changed, 149 insertions(+), 11 deletions(-)
+
+diff --git a/docs/WORK_IN_PROGRESS.md b/docs/WORK_IN_PROGRESS.md
+index 2bd5059..f649acf 100644
+--- a/docs/WORK_IN_PROGRESS.md
++++ b/docs/WORK_IN_PROGRESS.md
+@@ -144,6 +144,14 @@
+     ③ ids 翻译 local slot（GET_ROWS identical 提示 ids 内容对，但 mm 的 ids_leaf nb/区可能不同）。
+     - 诊断工具已留：ACDBG node/cont/mmcur 打印、layerdump、cmp_layer_dump.js 全 env 门控。
+   - **重大矛盾发现（2026-09，待 fresh 重验）**：逐节点隔离后 arena mm 仍 NaN@2348（排除多节点图）。**关键证据**：arena 首层 gate_up mm 的 cur（norm reshaped `STREAMMOE#ffn_norm_2-0`，3D [2816,1,129]）源 data **全 QNaN**（文件字节 `00e0eaff` 重复）。**v1 路径同 cur 也全 QNaN**——但 v1（exec_mm_vk vulkan mm）声称数值对。矛盾：cur 全 NaN 不可能 mm 对。**待查：v1 vulkan mm 是否从未真正算对（此前"v1 全 vram vulkan mm = 基线一致"可能是 CPU 路径假象——[vmm] 显示 exec_mm_vk 被调 60 次但 cur 全 NaN）**；以及 norm 为何 data=QNaN（norm 是否被意外私有化/分配给我们 backend，结算时机/来源）。dump 工具：STREAM_MOE_CURDUMP（temp_cur_arena/v1.bin）+ STREAM_MOE_WDUMP（temp_w3d.bin）+ STREAM_MOE_VMM。
++  - **根因已收敛（2026-09，L0 增量提交 + 逐输入对证钉死）**：mm NaN 不是 arena/图序/覆盖/数据问题，而是 **ggml-vulkan 的 MUL_MAT_ID kernel 不兼容 route-B 的手工 w3d 壳**。证据链：
++    ① **cur（norm）输入正常**——之前"L0 cur 全 QNaN"是 dump 文件被 30 层覆盖成 L29 的假象；按层分文件后 **L0 cur nan=0**（L1+ 全 NaN 是 L0 mm NaN 写回主图的必然传播）。
++    ② **L0 增量提交（prefix1..14）**：c00 从只算 mm 自己的 prefix1 就 NaN@2348，且 14 个前缀完全逐字节不变 → 排除"后续节点覆盖/图序/DUP 干扰"。
++    ③ **vram 权重 = RAM 权重**：LOADDBG 在 mark_ready 后读 slot 首字节，vram run 与 RAM-only run 的同一 (L0,E79) 槽逐字节相同 → 装载/DIO/字节数据全对（此前"vram garbage"是拿不同 run 的不同槽对比的错判）。
++    ④ **v1 exec_mm_vk 与 arena 完全同错**：VMMDUMP 直接 dump v1 单节点 vulkan mm readback 输出 = NaN 457437、与 cpu_ref 逐字全 diff（同 arena）。**证实 v1 全 vram vulkan mm 从未真正算对，此前验证是 CPU 路径假象**（当时 v1 在 vram 池的调度多半仍落 RAM 走 CPU mm）。
++    ⑤ CPU 用同一 w3d 壳 + 同数据 mm 算对（cpu_ref L0 c00 无 NaN、与基线 IDENTICAL）。
++    - **下一步方向**：不在 arena 侧找（数据/构造全对），改查 ggml-vulkan MUL_MAT_ID 对 `ne[2]=n_slots/nb[2]=expert_size` 3D 虚拟权重的索引约定（可能要求 src0 的 nb[2]/ne[2] 反映"每 expert 矩阵连续 + 槽 stride"，或 kernel 对 ids 取槽的偏移公式与 route-B 槽池不同）；或绕道：vram 权重在 arena 里按 vulkan 原生 mul_mat_id 期望的 `expert 在 ne[1]` 布局重排后上传。调试工具已留：L0INC 增量 dump、LOADDBG、VMMDUMP、CURDUMP 按层分文件、WDUMP 带指针诊断。
++  - **L0INC 增量调试器（env STREAM_MOE_L0INC + DUMP_DIR，layer0 专用）**：构建完 clone 后进入——先 dump 每 clone 的 stage/wbuf 外部输入（arena 链输入未算前的垃圾不 dump），再 for k=1..plan.size() 每前缀新建 cgraph 提交 compute、dump 前缀内全部节点输出，完成后 exit(0)。产出 `l0in_cXX_sN_*.bin` + `l0preNNN_cXX_*.bin`（temp/l0inc/，113 文件）。CPU 侧用 `STREAM_MOE_DUMP_DIR+DUMP_LAYER=0`（temp/cpu_ref/）同层参考。
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+diff --git a/src/backend/minigraph_exec.cpp b/src/backend/minigraph_exec.cpp
+index 032658c..b18506b 100644
+--- a/src/backend/minigraph_exec.cpp
++++ b/src/backend/minigraph_exec.cpp
+@@ -330,6 +330,16 @@ static enum ggml_status exec_split_legacy_impl(
+         w3d->nb[3] = sp.expert_size * g_n_slots;
+         w3d->data  = sp.base + off;
+ 
++        if (getenv("STREAM_MOE_WDUMP") && sp.pool == 0) {
++            // dump the same slot-region head that the arena/vram path dumps
++            // (l0in_c00_s0_wbuf.bin) for a direct RAM-vs-vram weight compare.
++            FILE * wf = fopen("temp_w_ram_c00.bin", "wb");
++            if (wf) { fwrite(static_cast<const uint8_t*>(sp.base) + off, 1, 8192, wf); fclose(wf); }
++            fprintf(stderr, "[wcpu] %s pool=%u slot_begin=%u off=%zu\n",
++                    w->name ? w->name : "?", sp.pool, sp.slot_begin, off);
++            fflush(stderr);
++        }
++
+         // ids_slot: translate expert ids -> region-local slot indices
+         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+         auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+@@ -665,10 +675,12 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+                 cur_leaf->buffer = dv->stage;
+                 cur_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, stage_off));
+                 if (getenv("STREAM_MOE_CURDUMP")) {
+-                    FILE * cf = fopen("temp_cur_arena.bin", "wb");
++                    char fn[96];
++                    snprintf(fn, sizeof fn, "temp_cur_arena_L%u.bin", (unsigned) pn.layer);
++                    FILE * cf = fopen(fn, "wb");
+                     if (cf) { fwrite(cur->data, 1, cur_bytes, cf); fclose(cf); }
+-                    fprintf(stderr, "[ac] curdump %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
+-                            cur->name ? cur->name : "?", (long long) cur->ne[0],
++                    fprintf(stderr, "[ac] curdump L%u %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
++                            (unsigned) pn.layer, cur->name ? cur->name : "?", (long long) cur->ne[0],
+                             (long long) cur->ne[1], (long long) cur->ne[2], cur_bytes, cur->data);
+                     fflush(stderr);
+                 }
+@@ -687,15 +699,16 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+                 // Dump the first expert's gate_up weight bytes straight from the
+                 // vram host map, for comparison against the CPU-path slot.
+                 uint8_t * base = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(wbuf));
++                fprintf(stderr, "[ac] w3d %s pool=%u sp.base=%p hostptr=%p boff=%zu expert_size=%zu slot_begin=%u n_slots=%d type=%d\n",
++                        nd->src[0]->name ? nd->src[0]->name : "?", sp.pool,
++                        (void*) sp.base, (void*) base, boff, sp.expert_size, sp.slot_begin, g_n_slots,
++                        (int) nd->src[0]->type);
+                 if (base) {
+                     FILE * wf = fopen("temp_w3d.bin", "wb");
+                     if (wf) { fwrite(base + boff, 1, 8192, wf); fclose(wf); }
+-                    fprintf(stderr, "[ac] w3d %s n_slots=%d expert_size=%zu boff=%zu ne=%lldx%lld type=%d\n",
+-                            nd->src[0]->name ? nd->src[0]->name : "?", g_n_slots,
+-                            sp.expert_size, boff, (long long) nd->src[0]->ne[0],
+-                            (long long) nd->src[0]->ne[1], (int) nd->src[0]->type);
+-                    fflush(stderr);
++                    fprintf(stderr, "[ac] w3d written\n");
+                 }
++                fflush(stderr);
+             }
+ 
+             ggml_tensor * mm = ggml_mul_mat_id(actx, w3d, cur_leaf, ids_leaf);
+@@ -770,6 +783,93 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+         gf_nodes.push_back(c);
+     }
+ 
++    // ---- L0 incremental-fill debug (env STREAM_MOE_L0INC + DUMP_DIR) -------
++    // Whole-layer GPU numerics are NaN from L0 on. To find whether the fault is
++    // in the mm itself or in later nodes corrupting earlier arena regions, run
++    // the clone chain one prefix at a time (cgraph grows by one node per round,
++    // re-computing from scratch every round) and dump every prefix's inputs +
++    // outputs. Layer 0 only, then exits. Inputs: stage/wbuf leaves are ready
++    // before any compute (external cur/ids, weights); arena leaves (chain =
++    // producer outputs) are garbage pre-compute and are covered by output dumps.
++    const bool l0inc = (layer == 0) && getenv("STREAM_MOE_L0INC") && getenv("STREAM_MOE_DUMP_DIR");
++    if (l0inc) {
++        const char * dir = getenv("STREAM_MOE_DUMP_DIR");
++        const auto * osp0 = pins.empty() ? nullptr : sched.subpool_of_slot(pins[0].slot);
++        ggml_backend_buffer_t wbuf = osp0 ? reinterpret_cast<ggml_backend_buffer_t>(osp0->dev_buf) : nullptr;
++        const char * fakebase = static_cast<const char*>(stmoe_vk_buffer_host_offset(dv->stage, 0)); // vk_ptr_base
++
++        // ---- input dump: every clone's stage/wbuf (external) src leaves -----
++        for (size_t ci = 0; ci < plan.size(); ++ci) {
++            const ggml_tensor * c = clone[ci];
++            if (!c) continue;
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * t = c->src[s];
++                if (!t) continue;
++                const uint8_t * base = nullptr;
++                const char * kind = "?";
++                if (t->buffer == dv->stage) { base = dv->stage_map; kind = "stage"; }
++                else if (t->buffer == wbuf) { base = static_cast<const uint8_t*>(stmoe_vk_buffer_host_ptr(wbuf)); kind = "wbuf"; }
++                else continue;                    // arena (chain): not ready yet
++                if (!base) continue;
++                const size_t off = static_cast<size_t>((const char*)t->data - fakebase);
++                // Length: non-quantized leaves are contiguous element bytes; the
++                // Q4_K weight shell gets a bounded head dump (full shell would be
++                // the whole slot pool). b_leaf type Q4_K -> ggml_nelements is not
++                // row bytes, so use a plain head cap there.
++                const bool quant = ggml_is_quantized(t->type);
++                const size_t nbytes = quant ? 8192u
++                                            : ggml_nelements(t) * ggml_element_size(t);
++                char path[512];
++                snprintf(path, sizeof path, "%s/l0in_c%02zu_s%d_%s_%s.bin", dir, ci, s, kind,
++                         t->name ? t->name : "?");
++                FILE * f = fopen(path, "wb");
++                if (f) { fwrite(base + off, 1, nbytes, f); fclose(f); }
++                fprintf(stderr, "[l0inc] in c%02zu s%d kind=%s off=%zu len=%zu name=%s\n",
++                        ci, s, kind, off, nbytes, t->name ? t->name : "?");
++                fflush(stderr);
++            }
++        }
++
++        // ---- incremental compute + per-prefix output dump -------------------
++        for (size_t k = 1; k <= plan.size(); ++k) {
++            ggml_cgraph * g = ggml_new_graph_custom(actx, (unsigned)(gf_nodes.size() + 16), false);
++            if ((size_t) g->size < gf_nodes.size() + 16) {
++                LOG_ERROR("stream_moe: l0inc graph overflow");
++                return actx_guard(false);
++            }
++            for (size_t ci = 0; ci < k; ++ci) {
++                ggml_build_forward_expand(g, clone[ci]);   // recursive: pulls DUP/chain deps
++            }
++            ggml_backend_t cbe = dv->be;
++            ggml_backend_t tmp_cpu = nullptr;
++            if (getenv("STREAM_MOE_L0CPU")) {   // re-run the SAME arena-clone graph on CPU
++                tmp_cpu = ggml_backend_init_by_name("CPU", nullptr);
++                if (tmp_cpu) cbe = tmp_cpu;
++            }
++            if (ggml_backend_graph_compute(cbe, g) != GGML_STATUS_SUCCESS) {
++                if (tmp_cpu) ggml_backend_free(tmp_cpu);
++                LOG_ERROR("stream_moe: l0inc prefix " << k << " compute failed");
++                return actx_guard(false);
++            }
++            if (tmp_cpu) ggml_backend_free(tmp_cpu);
++            for (size_t ci = 0; ci < k; ++ci) {
++                const ggml_tensor * nd = plan[ci].node;
++                char path[512];
++                snprintf(path, sizeof path, "%s/l0pre%03zu_c%02zu_%s.bin", dir, k, ci,
++                         nd->name ? nd->name : "?");
++                FILE * f = fopen(path, "wb");
++                if (f) {
++                    fwrite(dv->arena_map + plan[ci].out_off, 1, plan[ci].out_bytes, f);
++                    fclose(f);
++                }
++            }
++            fprintf(stderr, "[l0inc] prefix %zu/%zu computed\n", k, plan.size());
++            fflush(stderr);
++        }
++        fprintf(stderr, "[l0inc] L0 incremental dump done - exiting\n");
++        fflush(stderr);
++        exit(0);
++    }
+     // ---- vulkan graph_compute: mm nodes first, then the rest --------------
+     // DEBUG-ISOLATION: submit the MUL_MAT_ID clones as their own cgraph (v1
+     // exec_mm_vk semantics) before the weightless graph. If the mm output turns
+@@ -916,10 +1016,12 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
+         }
+         std::memcpy(dv.stage_map + cur_off, cur->data, cur_bytes);
+         if (getenv("STREAM_MOE_CURDUMP") && cur_bytes <= 1600000) {
+-            FILE * cf = fopen("temp_cur_v1.bin", "wb");
++            char fn[96];
++            snprintf(fn, sizeof fn, "temp_cur_v1_L%u.bin", (unsigned) pn.layer);
++            FILE * cf = fopen(fn, "wb");
+             if (cf) { fwrite(cur->data, 1, cur_bytes, cf); fclose(cf); }
+-            fprintf(stderr, "[v1cur] %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
+-                    cur->name ? cur->name : "?", (long long) cur->ne[0],
++            fprintf(stderr, "[v1cur] L%u %s ne=%lldx%lldx%lld bytes=%zu srcdata=%p\n",
++                    (unsigned) pn.layer, cur->name ? cur->name : "?", (long long) cur->ne[0],
+                     (long long) cur->ne[1], (long long) cur->ne[2], cur_bytes, cur->data);
+             fflush(stderr);
+         }
+@@ -969,6 +1071,16 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
+     }
+     if (readback) {
+         std::memcpy(nd->data, dv.arena_map + dst_off, mm_bytes);
++        if (getenv("STREAM_MOE_VMMDUMP") && pn.layer == 0) {
++            char fn[96];
++            snprintf(fn, sizeof fn, "temp_v1mm_L0_%s.bin", pn.down ? "down" : "gate");
++            FILE * f = fopen(fn, "wb");
++            if (f) { fwrite(nd->data, 1, mm_bytes, f); fclose(f); }
++            fprintf(stderr, "[v1mm] L0 %s bytes=%zu ne=%lldx%lld\n",
++                    pn.down ? "down" : "gate", mm_bytes,
++                    (long long) nd->ne[0], (long long) nd->ne[1]);
++            fflush(stderr);
++        }
+     }
+     return true;
+ }
+@@ -1057,6 +1169,14 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
+         w3d->nb[3] = sp.expert_size * g_n_slots;
+         w3d->data  = sp.base + off;
+ 
++        if (getenv("STREAM_MOE_WDUMP") && sp.pool == 0) {
++            FILE * wf = fopen("temp_w_ram_c00.bin", "wb");
++            if (wf) { fwrite(static_cast<const uint8_t*>(sp.base) + off, 1, 8192, wf); fclose(wf); }
++            fprintf(stderr, "[wcpu] %s pool=%u slot_begin=%u off=%zu\n",
++                    w->name ? w->name : "?", sp.pool, sp.slot_begin, off);
++            fflush(stderr);
++        }
++
+         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+         auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
+         for (size_t i = 0; i < n_ids; ++i) {
+diff --git a/src/backend/scheduler.cpp b/src/backend/scheduler.cpp
+index 0b451bc..d8c5a41 100644
+--- a/src/backend/scheduler.cpp
++++ b/src/backend/scheduler.cpp
+@@ -362,6 +362,16 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
+                 slots_[t->slot].mark_ready();
+                 dir_->set(t->layer, t->expert, t->pool, t->slot);
+                 n_misses_.fetch_add(1, std::memory_order_relaxed);
++                if (getenv("STREAM_MOE_LOADDBG")) {
++                    const auto * lsp = subpool_of_slot((int32_t) t->slot);
++                    if (lsp) {
++                        const uint8_t * p = static_cast<const uint8_t*>(slot_mem((int32_t) t->slot));
++                        fprintf(stderr, "[load] L%u E%u slot=%u pool=%u first16=%02x%02x%02x%02x...%02x%02x%02x%02x\n",
++                                t->layer, t->expert, t->slot, lsp->pool, p[0], p[1], p[2], p[3],
++                                p[12], p[13], p[14], p[15]);
++                        fflush(stderr);
++                    }
++                }
+             } else {
+                 slots_[t->slot].mark_failed();
+                 LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,286 @@
+From 4ac4bec8ad18718fe260217168d3bb1d5e0e1cec Mon Sep 17 00:00:00 2001
+From: wannaknowhys <heyusu@gmail.com>
+Date: Thu, 3 Sep 2026 19:56:52 -0500
+Subject: [PATCH 2/6] M2-C2b4 b4-3 arena-clone: reach rc=0 on device domain
+ (env STREAM_MOE_ARENA gated, default CPU green). Root causes fixed: (1)
+ whole-layer clone DAG overflows llama graph ctx -> dedicated no_alloc scratch
+ ggml_context (16MB, RAII free); (2) plan-time ri.src data goes stale when
+ llama re-wraps inputs between build and sched compute -> resolve external
+ input data from EXECUTION-time main-graph nd->src[s], plan keeps structure
+ only. 30 layers run arena-clone vulkan whole-layer cgraph without crash but
+ numerics still wrong (embd cos 0.217) - recorded isolation checklist for next
+ session (moe_out readback target, VIEW-strided weighted-slice srcs on GPU,
+ down-mm arena-cur, anonymous-add dependency order). RAM IDENTICAL
+
+---
+ docs/WORK_IN_PROGRESS.md       |   9 ++-
+ src/backend/minigraph_exec.cpp | 118 ++++++++++++++++++++++++---------
+ 2 files changed, 93 insertions(+), 34 deletions(-)
+
+diff --git a/docs/WORK_IN_PROGRESS.md b/docs/WORK_IN_PROGRESS.md
+index 854d735..27cf0a7 100644
+--- a/docs/WORK_IN_PROGRESS.md
++++ b/docs/WORK_IN_PROGRESS.md
+@@ -124,8 +124,13 @@
+   - **测试池用小 vram 专家池**（怕全分配 arena 太大）；实际 lsum 值趁真跑时记录。
+   - **实测（129-token prefill, env STREAM_MOE_LSUM）**：每层 full-alloc = 50.0 MB（含 moe_out 51.3 MB，14 compute nodes/层，各层同尺寸；∝ ubatch token 数不随 ctx 变）。小池 Vulkan0:1024 全跑通 rc=0（v1 CPU 路径）。→ 单层 arena reserve ≈ 51.3 MB + stage 在 vram 池之外另分配，RX590 8G 无压力。
+ - [x] **b4-3 arena-clone 框架落地（本批，device 域已禁用）**：`exec_arena_clone` 已写好并编译（不动主图 tensor：per-node plan 对齐 clone 建 arena 张量、k_chain 输入指 producer 的 arena region、k_external 走 stage_put 上传、mm clone 用 w3d 壳 + cur/ids stage、整层**单 vulkan cgraph 一次提交**、moe_out 出口 arena→host 主 dst memcpy）。
+-  - **崩点结论（跑 Vulkan0:2048 实测）**：external 里混着 **per-expert 权重子张量**（scale / weights_norm，expert buft，leaf data 是 dummy base）——stage_put 直接 `memcpy(ggml_nbytes, leaf->data)` 读到假指针崩（stage_need 还被算成 477MB）。它们必须像 mm 权重壳那样**经 pool slot 区解析**（branch_layout off + slot base 每槽 stride），不是 host 叶子。
+-  - **下一轮**：plan 的 k_external 增加"驻 expert 池的权重子张量"类别 → stage 前从 slot 区 gather（按激活专家）或按 REPEAT/GET_ROWS 的语义直接指 slot；处理完解除 exec_layer_burst 的禁用并跑数值门（小 vram 池全闭包 GPU vs CPU 逐字节）。CPU 路径 + RAM IDENTICAL 不受影响（本批已验证）。
++  - **崩点结论修正（2026-09，实测钉死）**：不是"外部引用私有区"，也不是"scale 是 dummy base"。scale 主图 src0 在执行期 data 是**高地址有效 host 内存**（buft=STREAMMOE_HOST）；stage_put 却拿到低地址 0x1A2E9C1C——因为 plan 在 **assign(build) 时拍下 ri.src 叶子快照**，执行发生在 **llama 每 decode 重建图之后**，node->src 的包装 view/leaf 已变 → plan 存的旧 data 指针失效。CPU 路径无此问题：它在 burst 开头用 `input_layouts` **执行时现场刷新** data，不吃 build 快照。
++  - **正确修法**：plan 只存"拓扑引用 + 形状（kind/prod/off/ne/nb）"，**data 一律执行时现取**（k_external 用当前 nd->src[s]->data 上传；k_chain 用 producer clone 的 arena region 现算，本就不存 data）。删除 arena-clone 里对 `ri.src->data` 的构建期依赖。
++- [x] **b4-3 arena-clone 跑通（env 门控 `STREAM_MOE_ARENA=1`，默认 CPU 保绿）**：
++  - **第二个崩点修复**：单层 clone DAG 一次建太多 tensor 撑爆 llama graph ctx（`ggml_new_object` OOM，needed 54MB vs available 51MB）→ arena-clone 用**独立临时 ggml_context（`ggml_init` 16MB + `no_alloc=true`，data 全手动指 arena/stage）**，函数内 `actx_guard` RAII 释放。tensor 元数据量极小。
++  - **修 data 陈旧**：weightless clone 的输入一律取**执行期主图 `nd->src[s]`**（llama 在 build→sched 间会重包输入，plan 里的 `ri.src` 快照 data 已 stale——ci=3 REPEAT 的 scale 崩即此因）。
++  - **现状**：`STREAM_MOE_ARENA=1` + RAM:8192,Vulkan0:2048 → 30 层全走 device 域、**rc=0 无崩溃**，但**数值全错**（embd cos≈0.217 vs 基线）。默认（无 env）RAM-only 2048 **IDENTICAL**（未破坏主线）。
++  - **下一轮（数值二分清单）**：① moe_out readback 目标/时机（node->data 是否 llama 已分配、memcpy 是否真执行）；② GPU weightless 对 **VIEW-src 大步长切片**（weighted per-expert 列 view，stride=nb 继承 base）的语义；③ down mm 的 cur 走 geglu clone arena leaf（cur_on_dev）寻址；④ 匿名收敛 ADD 树在单 cgraph 的读依赖。建议逐类隔离：先只 GPU 化 mm（已知对）+ weightless CPU，再切 weightless 单类 op 对照。
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+diff --git a/src/backend/minigraph_exec.cpp b/src/backend/minigraph_exec.cpp
+index 3655c22..0b56fad 100644
+--- a/src/backend/minigraph_exec.cpp
++++ b/src/backend/minigraph_exec.cpp
+@@ -410,17 +410,32 @@ static ggml_tensor* clone_op(ggml_context * ctx, const ggml_tensor * tpl,
+ // Whole-layer device (arena-clone) executor. `plan` is the layer's node plan
+ // (route_b_chain), aligned with ex->compute; pins are the layer's full active
+ // set on one device pool.
+-static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler & sched,
++static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_scheduler & sched,
+                              const moe_model_topology_t & topo,
+                              const std::vector<moe_node_plan> & plan,
+                              uint32_t pool, const std::vector<expert_handle_t> & pins) {
+     if (plan.empty()) return true;
+     device_exec_ctx_t * dv = stream_moe_backend_device_exec(pool);
+     if (!dv || !dv->be) {
+-        LOG_ERROR("stream_moe: arena-clone device exec ctx unavailable (pool " << pool << ")");
++        LOG_ERROR("stream_moe: arena-clone device exec actx unavailable (pool " << pool << ")");
+         return false;
+     }
+ 
++    // Dedicated scratch context for the whole-layer clone DAG. Must NOT build
++    // clones in llama's graph actx - a whole layer's clones + leaves + cgraph
++    // overflow its pool (b4-3 crash: ggml_new_object out of memory). no_alloc:
++    // tensor data pointers are set by hand (arena/stage fake offsets); only the
++    // object metadata lives here.
++    ggml_init_params iparams = { /*.mem_size   =*/ 16u * 1024u * 1024u,
++                                 /*.mem_buffer =*/ nullptr,
++                                 /*.no_alloc   =*/ true };
++    ggml_context * actx = ggml_init(iparams);
++    if (!actx) { LOG_ERROR("stream_moe: arena-clone scratch ctx alloc failed"); return false; }
++    auto actx_guard = [&](bool okv) {
++        ggml_free(actx);
++        return okv;
++    };
++
+     // ---- whole-layer budgets ----------------------------------------------
+     size_t arena_need = 0;
+     for (const auto & p : plan) arena_need = std::max(arena_need, p.out_off + p.out_bytes);
+@@ -455,12 +470,12 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+     }
+     if (!stream_moe_backend_device_ensure(pool, arena_need + 4096, stage_need)) {
+         LOG_ERROR("stream_moe: arena-clone layer reserve failed (pool " << pool << ")");
+-        return false;
++        return actx_guard(false);
+     }
+     dv = stream_moe_backend_device_exec(pool);
+     if (!dv->arena_map || !dv->stage_map) {
+         LOG_ERROR("stream_moe: arena-clone host maps unavailable (pool " << pool << ")");
+-        return false;
++        return actx_guard(false);
+     }
+ 
+     // ---- build clones (plan order) ----------------------------------------
+@@ -481,10 +496,15 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+         if (it != stage_leaf.end()) return it->second;
+         if (!src->data) return nullptr;
+         const size_t need = ggml_nbytes(src);
++        if (getenv("STREAM_MOE_ACDBG")) {
++            fprintf(stderr, "[ac] sp0 %s nb=%zu data=%p\n", src->name ? src->name : "?", need, src->data);
++            fflush(stderr);
++        }
+         stage_off = align_up(stage_off, 4096);
+         if (stage_off + need > dv->stage_cap) { LOG_ERROR("stream_moe: stage overflow"); return nullptr; }
+         std::memcpy(dv->stage_map + stage_off, src->data, need);
+-        ggml_tensor * leaf = arena_leaf(ctx, src, dv->stage, stage_off);
++        if (getenv("STREAM_MOE_ACDBG")) { fprintf(stderr, "[ac] sp1 copied\n"); fflush(stderr); }
++        ggml_tensor * leaf = arena_leaf(actx, src, dv->stage, stage_off);
+         stage_off += need;
+         stage_leaf[src] = leaf;
+         return leaf;
+@@ -493,6 +513,20 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+     for (size_t ci = 0; ci < plan.size(); ++ci) {
+         const moe_node_plan & p = plan[ci];
+         ggml_tensor * nd = p.node;
++        if (getenv("STREAM_MOE_ACDBG")) {
++            fprintf(stderr, "[ac] node ci=%zu op=%s name=%s\n", ci, ggml_op_name(nd->op),
++                    nd->name ? nd->name : "?");
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (!nd->src[s]) continue;
++                const ggml_tensor * t = nd->src[s];
++                const char * bt = t->buffer && t->buffer->buft && t->buffer->buft->iface.get_name
++                    ? t->buffer->buft->iface.get_name(t->buffer->buft) : "?";
++                fprintf(stderr, "[ac]   src%d %s op=%s buft=%s data=%p nbytes=%zu kind=%d prod=%d off=%lld\n",
++                        s, t->name ? t->name : "?", ggml_op_name(t->op), bt, t->data, ggml_nbytes(t),
++                        (int) p.in[s].kind, p.in[s].prod, (long long) p.in[s].off);
++            }
++            fflush(stderr);
++        }
+         if (nd->op == GGML_OP_MUL_MAT_ID) {
+             // ---- mm clone: weight shell + cur (arena or staged) + ids -----
+             parsed_node_t pn = parse_weight_name(nd->src[0]->name);
+@@ -527,11 +561,11 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+                     }
+                     if (local < 0) {
+                         LOG_ERROR("stream_moe: arena-clone mm expert not in region slot");
+-                        return false;
++                        return actx_guard(false);
+                     }
+                     slot32[i] = local;
+                 }
+-                ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
++                ids_leaf = ggml_new_tensor_2d(actx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+                 ids_leaf->buffer = dv->stage;
+                 ids_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, stage_off));
+                 stage_off += n_ids * 4;
+@@ -544,7 +578,7 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+                 const ggml_tensor * prod = plan[cri.prod].node;
+                 ggml_tensor * base = clone[cri.prod];
+                 if (!base) return false;
+-                cur_leaf = arena_leaf(ctx, prod, dv->arena,
++                cur_leaf = arena_leaf(actx, prod, dv->arena,
+                                       plan[cri.prod].out_off + (size_t) cri.off);
+             } else {
+                 cur_leaf = stage_put(cur);
+@@ -552,14 +586,14 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+             }
+ 
+             ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
+-            ggml_tensor * w3d = ggml_new_tensor_3d(ctx, nd->src[0]->type, nd->src[0]->ne[0], nd->src[0]->ne[1], 1);
++            ggml_tensor * w3d = ggml_new_tensor_3d(actx, nd->src[0]->type, nd->src[0]->ne[0], nd->src[0]->ne[1], 1);
+             w3d->ne[2] = g_n_slots;
+             w3d->nb[2] = sp.expert_size;
+             w3d->nb[3] = sp.expert_size * (size_t) g_n_slots;
+             w3d->buffer = wbuf;
+             w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, boff));
+ 
+-            ggml_tensor * mm = ggml_mul_mat_id(ctx, w3d, cur_leaf, ids_leaf);
++            ggml_tensor * mm = ggml_mul_mat_id(actx, w3d, cur_leaf, ids_leaf);
+             mm->buffer = dv->arena;
+             mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->arena, p.out_off));
+             clone[ci] = mm;
+@@ -568,8 +602,12 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+         }
+ 
+         // ---- weightless compute clone --------------------------------------
+-        // copy shape/op from the main node, srcs resolved to clones/stage
+-        ggml_tensor * c = clone_op(ctx, nd, dv->arena, p.out_off);
++        // copy shape/op from the main node, srcs resolved to clones/stage.
++        // NOTE: shapes/data always come from the EXECUTION-time main-graph src
++        // (nd->src[s]); the plan only carries structure (kind/prod/off/out_off).
++        // Plan-time ri.src is a build snapshot whose data goes stale once llama
++        // re-wraps inputs between build and sched compute (b4-3 crash).
++        ggml_tensor * c = clone_op(actx, nd, dv->arena, p.out_off);
+         for (int s = 0; s < GGML_MAX_SRC; ++s) {
+             if (!nd->src[s]) continue;
+             const moe_resolved_in & ri = p.in[s];
+@@ -577,14 +615,14 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+             if (ri.kind == moe_in_kind::k_chain) {
+                 ggml_tensor * base = clone[ri.prod];
+                 if (!base) { LOG_ERROR("stream_moe: arena-clone missing producer " << ci << " src" << s); return false; }
+-                if ((size_t) ri.off == 0 && ri.src == plan[ri.prod].node) {
++                if ((size_t) ri.off == 0) {
+                     in_t = base;                       // whole producer output
+                 } else {
+-                    in_t = arena_leaf(ctx, ri.src, dv->arena,
++                    in_t = arena_leaf(actx, nd->src[s], dv->arena,
+                                       plan[ri.prod].out_off + (size_t) ri.off);
+                 }
+             } else {
+-                in_t = stage_put(ri.src);
++                in_t = stage_put(nd->src[s]);
+                 if (!in_t) return false;
+             }
+             c->src[s] = in_t;
+@@ -594,17 +632,17 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+     }
+ 
+     // ---- one vulkan graph_compute over the whole layer closure -------------
+-    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_cgraph * gf = ggml_new_graph(actx);
+     if ((size_t) gf->size < gf_nodes.size()) {
+         LOG_ERROR("stream_moe: arena-clone graph overflow");
+-        return false;
++        return actx_guard(false);
+     }
+     for (size_t i = 0; i < gf_nodes.size(); ++i) gf->nodes[i] = gf_nodes[i];
+     gf->n_nodes = (int) gf_nodes.size();
+ 
+     if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
+         LOG_ERROR("stream_moe: arena-clone layer compute failed (layer " << layer << ")");
+-        return false;
++        return actx_guard(false);
+     }
+ 
+     // ---- moe_out readback to the main dst (host pointer) -------------------
+@@ -615,7 +653,7 @@ static bool exec_arena_clone(int32_t layer, ggml_context * ctx, expert_scheduler
+             std::memcpy(nd->data, dv->arena_map + plan[ci].out_off, plan[ci].out_bytes);
+         }
+     }
+-    return true;
++    return actx_guard(true);
+ }
+ 
+ 
+@@ -949,19 +987,35 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
+     }
+ 
+     bool ok = true;
+-    // Arena-clone whole-layer device execution (b4-3) is DISABLED for now: the
+-    // device domain reaches external per-expert weight sub-tensors (scale /
+-    // weights_norm) as expert-buft leaves whose data is a dummy base - a stage
+-    // memcpy of leaf->data is invalid; they must resolve through the pool slot
+-    // region (like the mm weight shell), not the leaf pointer. Until then every
+-    // layer runs the CPU path below (v1 semantics: per-mm vulkan compute + host
+-    // readback for device pools, host weightless chain), which stays green.
+-    (void) exec_arena_clone;   // keep the disabled skeleton referenced
+-    moe_chain_set_full_alloc(lsum);
+-    reset_layer(layer);
+-    for (const auto * cn : ex->compute) {
+-        if (!ok) break;
+-        ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
++    // Arena-clone whole-layer device execution (b4-3): gated by STREAM_MOE_ARENA
++    // env while the stage_put handling of pool-resident weight sub-tensors is
++    // being validated. Default (no env): CPU path below (v1 semantics) stays
++    // green.
++    bool want_device = getenv("STREAM_MOE_ARENA") != nullptr;
++    uint32_t dom = 0; bool dom_ok = true;
++    for (const auto & h : pins) {
++        if (dom == 0) dom = h.pool; else if (h.pool != dom) { dom_ok = false; break; }
++    }
++    if (want_device && dom_ok && dom != 0) {
++        const std::vector<moe_node_plan> * plan = moe_chain_layer_plan(layer);
++        if (!plan) {
++            LOG_ERROR("stream_moe: layer " << layer << " has no node plan");
++            ok = false;
++        } else {
++            if (getenv("STREAM_MOE_ARENA")) {
++                fprintf(stderr, "[arena-exec] L%d device pool %u plan nodes %zu pins %zu\n",
++                        layer, dom, plan->size(), pins.size());
++                fflush(stderr);
++            }
++            ok = exec_arena_clone(layer, ctx, sched, topo, *plan, dom, pins);
++        }
++    } else {
++        moe_chain_set_full_alloc(lsum);
++        reset_layer(layer);
++        for (const auto * cn : ex->compute) {
++            if (!ok) break;
++            ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
++        }
+     }
+     for (const auto & h : pins) sched.unpin(h);
+     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+-- 
+2.55.0.windows.3
+

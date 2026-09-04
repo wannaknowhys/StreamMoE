@@ -1,0 +1,262 @@
+From efc9d4d51d890c8ee100602e02aa1e8246b5fb3f Mon Sep 17 00:00:00 2001
+From: wannaknowhys <heyusu@gmail.com>
+Date: Thu, 3 Sep 2026 20:40:10 -0500
+Subject: [PATCH 3/6] M2-C2b4 b4-3 arena-clone numerics debug (env-gated,
+ default CPU green): add per-node output dump (STREAM_MOE_DUMP_DIR/LAYER +
+ temp/cmp_layer_dump.js) for CPU-vs-GPU comparison. Fixed: build cgraph via
+ ggml_build_forward_expand (hand-filled nodes[] made vulkan compute no-op -
+ whole layer wrote zeros); strided k_chain view inputs (weighted per-expert
+ cols, nb=4/90112) now get a GGML_OP_DUP cont copy to a dedicated arena region
+ (vulkan elementwise kernels index linearly); external mm cur uses a
+ contiguous-nb leaf (src may be reshaped with base stride). REPEAT/GET_ROWS
+ now byte-identical, GLU/MUL/mm close (ulp); remaining: gate_up mm NaN from
+ element 2348 (per-expert/fused layout) - candidates recorded in WIP (cur 3D
+ nb, w3d Q4_K offset, ids leaf) for fresh-session field-by-field diff vs
+ exec_mm_vk. RAM IDENTICAL.
+
+---
+ docs/WORK_IN_PROGRESS.md       |  14 +++-
+ src/backend/minigraph_exec.cpp | 144 ++++++++++++++++++++++++++++++---
+ 2 files changed, 144 insertions(+), 14 deletions(-)
+
+diff --git a/docs/WORK_IN_PROGRESS.md b/docs/WORK_IN_PROGRESS.md
+index 27cf0a7..3ceec61 100644
+--- a/docs/WORK_IN_PROGRESS.md
++++ b/docs/WORK_IN_PROGRESS.md
+@@ -127,10 +127,16 @@
+   - **崩点结论修正（2026-09，实测钉死）**：不是"外部引用私有区"，也不是"scale 是 dummy base"。scale 主图 src0 在执行期 data 是**高地址有效 host 内存**（buft=STREAMMOE_HOST）；stage_put 却拿到低地址 0x1A2E9C1C——因为 plan 在 **assign(build) 时拍下 ri.src 叶子快照**，执行发生在 **llama 每 decode 重建图之后**，node->src 的包装 view/leaf 已变 → plan 存的旧 data 指针失效。CPU 路径无此问题：它在 burst 开头用 `input_layouts` **执行时现场刷新** data，不吃 build 快照。
+   - **正确修法**：plan 只存"拓扑引用 + 形状（kind/prod/off/ne/nb）"，**data 一律执行时现取**（k_external 用当前 nd->src[s]->data 上传；k_chain 用 producer clone 的 arena region 现算，本就不存 data）。删除 arena-clone 里对 `ri.src->data` 的构建期依赖。
+ - [x] **b4-3 arena-clone 跑通（env 门控 `STREAM_MOE_ARENA=1`，默认 CPU 保绿）**：
+-  - **第二个崩点修复**：单层 clone DAG 一次建太多 tensor 撑爆 llama graph ctx（`ggml_new_object` OOM，needed 54MB vs available 51MB）→ arena-clone 用**独立临时 ggml_context（`ggml_init` 16MB + `no_alloc=true`，data 全手动指 arena/stage）**，函数内 `actx_guard` RAII 释放。tensor 元数据量极小。
+-  - **修 data 陈旧**：weightless clone 的输入一律取**执行期主图 `nd->src[s]`**（llama 在 build→sched 间会重包输入，plan 里的 `ri.src` 快照 data 已 stale——ci=3 REPEAT 的 scale 崩即此因）。
+-  - **现状**：`STREAM_MOE_ARENA=1` + RAM:8192,Vulkan0:2048 → 30 层全走 device 域、**rc=0 无崩溃**，但**数值全错**（embd cos≈0.217 vs 基线）。默认（无 env）RAM-only 2048 **IDENTICAL**（未破坏主线）。
+-  - **下一轮（数值二分清单）**：① moe_out readback 目标/时机（node->data 是否 llama 已分配、memcpy 是否真执行）；② GPU weightless 对 **VIEW-src 大步长切片**（weighted per-expert 列 view，stride=nb 继承 base）的语义；③ down mm 的 cur 走 geglu clone arena leaf（cur_on_dev）寻址；④ 匿名收敛 ADD 树在单 cgraph 的读依赖。建议逐类隔离：先只 GPU 化 mm（已知对）+ weightless CPU，再切 weightless 单类 op 对照。
++  - **逐节点 dump 定位（env STREAM_MOE_DUMP_DIR/LAYER + temp/cmp_layer_dump.js）**：
++    - 全 0 根因 = 手工塞 cgraph nodes 数组（vulkan 靠 ggml 图结构）→ 改 **ggml_build_forward_expand** 逐个 expand（visited 去重）→ vulkan 真执行。
++    - **c03 REPEAT / c04 GET_ROWS 逐字节 IDENTICAL**（clone 图机制 + stage 上传 + view 切片全对）；c00/c01/c02/c05/c06 接近 CPU（ulp 级）；**c07+ 收敛 ADD NaN**。
++    - NaN 第一因 = **strided view 输入**（weighted per-expert 列 view: ne=2816x129 nb=4/90112，非连续；vulkan elementwise 线性索引读 garbage）。**已修**：非连续 k_chain view 输入插 **GGML_OP_DUP（cont 区，独立 arena 尾，预算含 cont_need）**，vulkan cpy pipeline 支持 strided 源。
++    - 残留：**c00 gate_up mm 从元素 2348 起 NaN**（c02/c06 从 2816、c01 从 940 都是 c00 NaN 传播）。已修 external cur 用连续 nb leaf（v1 语义），无效。
++  - **mm NaN@2348 候选（下一轮 fresh 逐字段对照 v1 exec_mm_vk vs arena mm clone）**：
++    ① gate mm cur=norm reshaped **3D [2816,1,129]**（nb 4/11264/…, ggml_nbytes=1453056）；b_leaf 需与 v1 完全一致（含 3D nb）。
++    ② w3d：Q4_K block 对齐/branch_off（v1 同 off 但 arena 可能 n_slots/expert_size 字段差）。
++    ③ ids 翻译 local slot（GET_ROWS identical 提示 ids 内容对，但 mm 的 ids_leaf nb/区可能不同）。
++    - 诊断工具已留：ACDBG node/cont/mmcur 打印、layerdump、cmp_layer_dump.js 全 env 门控。
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+ - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+diff --git a/src/backend/minigraph_exec.cpp b/src/backend/minigraph_exec.cpp
+index 0b56fad..5a5e12b 100644
+--- a/src/backend/minigraph_exec.cpp
++++ b/src/backend/minigraph_exec.cpp
+@@ -407,6 +407,29 @@ static ggml_tensor* clone_op(ggml_context * ctx, const ggml_tensor * tpl,
+     return c;
+ }
+ 
++// Per-node output dump for the CPU-vs-GPU whole-layer comparison (env
++// STREAM_MOE_DUMP_DIR + STREAM_MOE_DUMP_LAYER gate). Writes one binary file per
++// (layer, compute-index) holding the node's output bytes exactly as the CPU /
++// arena-clone path produced them, plus a sidecar line for mapping. Single
++// debug feature - zero cost when the env is unset.
++static void layer_dump_out(const char * side, int32_t layer, int ci,
++                           const char * op, const char * name,
++                           const void * data, size_t nbytes) {
++    const char * dir = getenv("STREAM_MOE_DUMP_DIR");
++    if (!dir) return;
++    const char * lstr = getenv("STREAM_MOE_DUMP_LAYER");
++    if (!lstr || atoi(lstr) != (int) layer) return;
++    char path[512];
++    snprintf(path, sizeof(path), "%s/%s_L%02d_c%02d.bin", dir, side, layer, ci);
++    FILE * f = fopen(path, "wb");
++    if (!f) return;
++    fwrite(data, 1, nbytes, f);
++    fclose(f);
++    fprintf(stderr, "[layerdump] %s L%d c%d op=%s name=%s bytes=%zu\n",
++            side, layer, ci, op ? op : "?", name ? name : "?", nbytes);
++    fflush(stderr);
++}
++
+ // Whole-layer device (arena-clone) executor. `plan` is the layer's node plan
+ // (route_b_chain), aligned with ex->compute; pins are the layer's full active
+ // set on one device pool.
+@@ -437,8 +460,29 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+     };
+ 
+     // ---- whole-layer budgets ----------------------------------------------
++    size_t arena_plan_end = 0;
++    for (const auto & p : plan) arena_plan_end = std::max(arena_plan_end, p.out_off + p.out_bytes);
+     size_t arena_need = 0;
+-    for (const auto & p : plan) arena_need = std::max(arena_need, p.out_off + p.out_bytes);
++    // Strided k_chain view inputs (weighted per-expert slices feeding the
++    // anonymous adds) get a CONT copy to a contiguous arena region: vulkan
++    // elementwise kernels index linearly, a strided leaf would read garbage.
++    // Budget one contiguous copy per non-contiguous chain-view src.
++    {
++        size_t cont_need = 0;
++        for (const auto & p : plan) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src = p.node->src[s];
++                if (!src) continue;
++                if (p.in[s].kind != moe_in_kind::k_chain) continue;
++                if (p.in[s].prod < 0 || p.in[s].prod >= (int) plan.size()) continue;
++                if (src == plan[p.in[s].prod].node) continue;   // direct edge: reuse clone
++                if (ggml_is_contiguous(src)) continue;
++                cont_need += align_up(ggml_nelements(src) * ggml_element_size(src), 4096);
++            }
++        }
++        arena_plan_end = align_up(arena_plan_end, 4096);
++        arena_need = arena_plan_end + cont_need + 4096;
++    }
+     arena_need = align_up(arena_need, 4096);
+     // stage: external host inputs, deduped by (src pointer + consumed bytes).
+     // mm ids/cur count as external too (ids translated per mm).
+@@ -485,6 +529,10 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+     // staged external leaves, deduped by src pointer
+     std::unordered_map<const ggml_tensor*, ggml_tensor*> stage_leaf;
+     size_t stage_off = 0;
++    // contiguous-copy arena region (appended after the plan regions): strided
++    // chain-view slices are cont'd here so vulkan elementwise ops read them
++    // linearly.
++    size_t cont_off = align_up(arena_plan_end, 4096);
+     const int32_t g_n_slots = [&]() -> int32_t {
+         if (pins.empty()) return 0;
+         const auto * sp = sched.subpool_of_slot(pins[0].slot);
+@@ -581,8 +629,28 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+                 cur_leaf = arena_leaf(actx, prod, dv->arena,
+                                       plan[cri.prod].out_off + (size_t) cri.off);
+             } else {
+-                cur_leaf = stage_put(cur);
+-                if (!cur_leaf) return false;
++                // External cur (norm output). Uploaded contiguously into the
++                // stage; the mm activation leaf must carry a CONTIGUOUS nb - the
++                // src may be a reshaped tensor whose nb is the base stride
++                // (exec_mm_vk deliberately ignores cur->nb for external cur).
++                const size_t cur_bytes = ggml_nbytes(cur);
++                stage_off = align_up(stage_off, 4096);
++                if (stage_off + cur_bytes > dv->stage_cap) {
++                    LOG_ERROR("stream_moe: arena-clone stage overflow (mm cur)");
++                    return actx_guard(false);
++                }
++                std::memcpy(dv->stage_map + stage_off, cur->data, cur_bytes);
++                if (getenv("STREAM_MOE_ACDBG")) {
++                    fprintf(stderr, "[ac] mmcur ci=%zu %s ne=%lldx%lld nb=%zu,%zu bytes=%zu contig=%d\n",
++                            ci, cur->name ? cur->name : "?", (long long) cur->ne[0],
++                            (long long) cur->ne[1], cur->nb[0], cur->nb[1], cur_bytes,
++                            ggml_is_contiguous(cur));
++                    fflush(stderr);
++                }
++                cur_leaf = ggml_new_tensor_3d(actx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]);
++                cur_leaf->buffer = dv->stage;
++                cur_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, stage_off));
++                stage_off += cur_bytes;
+             }
+ 
+             ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
+@@ -615,11 +683,45 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+             if (ri.kind == moe_in_kind::k_chain) {
+                 ggml_tensor * base = clone[ri.prod];
+                 if (!base) { LOG_ERROR("stream_moe: arena-clone missing producer " << ci << " src" << s); return false; }
+-                if ((size_t) ri.off == 0) {
+-                    in_t = base;                       // whole producer output
++                if (nd->src[s] == plan[ri.prod].node) {
++                    in_t = base;                       // whole producer output (direct edge)
+                 } else {
+-                    in_t = arena_leaf(actx, nd->src[s], dv->arena,
+-                                      plan[ri.prod].out_off + (size_t) ri.off);
++                    // a view/reshape slice of the producer (off may be 0 but the
++                    // shape differs - e.g. the gate/up halves of a fused mm out)
++                    ggml_tensor * vleaf = arena_leaf(actx, nd->src[s], dv->arena,
++                                                     plan[ri.prod].out_off + (size_t) ri.off);
++                    if (ggml_is_contiguous(nd->src[s])) {
++                        in_t = vleaf;                  // contiguous slice: read in place
++                    } else {
++                        // strided slice (weighted per-expert views feeding the
++                        // anonymous adds): vulkan elementwise kernels index
++                        // linearly -> materialize a contiguous copy in the
++                        // cont region first (cpy pipeline handles strided src).
++                        // Hand-built DUP op: ggml_dup() may return the src when
++                        // it considers the copy redundant, which we must avoid.
++                        ggml_tensor * cc = ggml_new_tensor(actx, vleaf->type,
++                                                           ggml_n_dims(vleaf), vleaf->ne);
++                        cc->op = GGML_OP_DUP;
++                        cc->src[0] = vleaf;   // strided view leaf (contiguous dst by default nb)
++                        const size_t cneed = ggml_nbytes(cc);
++                        cont_off = align_up(cont_off, 4096);
++                        if (cont_off + cneed > dv->arena_cap) {
++                            LOG_ERROR("stream_moe: arena-clone cont region overflow");
++                            return actx_guard(false);
++                        }
++                        cc->buffer = dv->arena;
++                        cc->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->arena, cont_off));
++                        cont_off += cneed;
++                        gf_nodes.push_back(cc);   // registered for expand; consumed via in_t
++                        if (getenv("STREAM_MOE_ACDBG")) {
++                            fprintf(stderr, "[ac] cont ci=%zu src%d %s ne=%lldx%lld off=%zu->%zu nneed=%zu\n",
++                                    ci, s, nd->src[s]->name ? nd->src[s]->name : "?",
++                                    (long long) vleaf->ne[0], (long long) vleaf->ne[1],
++                                    (size_t) ri.off, cont_off - cneed, cneed);
++                            fflush(stderr);
++                        }
++                        in_t = cc;
++                    }
+                 }
+             } else {
+                 in_t = stage_put(nd->src[s]);
+@@ -632,13 +734,20 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+     }
+ 
+     // ---- one vulkan graph_compute over the whole layer closure -------------
++    // Build via ggml_build_forward_expand (NOT by filling nodes[] by hand):
++    // vulkan's graph_compute relies on ggml's internal graph structure
++    // (nodes/leafs/hash/visited). Each clone op is expanded from its own dst;
++    // ggml dedups already-visited tensors, so the union covers the DAG exactly
++    // once in dependency order. Leaves (op == NONE, arena/stage/weight shells)
++    // never enter nodes[] - they are plain inputs the kernels read directly.
+     ggml_cgraph * gf = ggml_new_graph(actx);
+     if ((size_t) gf->size < gf_nodes.size()) {
+         LOG_ERROR("stream_moe: arena-clone graph overflow");
+         return actx_guard(false);
+     }
+-    for (size_t i = 0; i < gf_nodes.size(); ++i) gf->nodes[i] = gf_nodes[i];
+-    gf->n_nodes = (int) gf_nodes.size();
++    for (ggml_tensor * nd : gf_nodes) {
++        ggml_build_forward_expand(gf, nd);
++    }
+ 
+     if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
+         LOG_ERROR("stream_moe: arena-clone layer compute failed (layer " << layer << ")");
+@@ -653,6 +762,14 @@ static bool exec_arena_clone(int32_t layer, ggml_context * /*ctx*/, expert_sched
+             std::memcpy(nd->data, dv->arena_map + plan[ci].out_off, plan[ci].out_bytes);
+         }
+     }
++    // ---- per-node output dump (CPU-vs-GPU comparison) ----------------------
++    if (getenv("STREAM_MOE_DUMP_DIR") && getenv("STREAM_MOE_DUMP_LAYER")) {
++        for (size_t ci = 0; ci < plan.size(); ++ci) {
++            const ggml_tensor * nd = plan[ci].node;
++            layer_dump_out("gpu", layer, (int) ci, ggml_op_name(nd->op),
++                           nd->name, dv->arena_map + plan[ci].out_off, plan[ci].out_bytes);
++        }
++    }
+     return actx_guard(true);
+ }
+ 
+@@ -1012,9 +1129,16 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
+     } else {
+         moe_chain_set_full_alloc(lsum);
+         reset_layer(layer);
++        int ci = 0;
+         for (const auto * cn : ex->compute) {
+             if (!ok) break;
+-            ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
++            ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
++            ok = exec_one_burst(ctx, cpu, sched, topo, nd, layer, pins);
++            if (getenv("STREAM_MOE_DUMP_DIR") && getenv("STREAM_MOE_DUMP_LAYER")) {
++                layer_dump_out("cpu", layer, ci, ggml_op_name(nd->op),
++                               nd->name, nd->data, ggml_nbytes(nd));
++            }
++            ci++;
+         }
+     }
+     for (const auto & h : pins) sched.unpin(h);
+-- 
+2.55.0.windows.3
+

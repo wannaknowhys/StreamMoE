@@ -2,3 +2,6 @@
 patches/*.patch text eol=lf
 # cmd.exe misbehaves with LF-only batch files (goto/label parsing).
 *.bat text eol=crlf
+
+debug_patch/**/*.patch text eol=lf
+debug_patch/**/README.txt text eol=lf

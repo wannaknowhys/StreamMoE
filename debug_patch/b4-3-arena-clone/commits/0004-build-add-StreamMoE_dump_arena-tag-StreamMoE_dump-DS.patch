@@ -1,0 +1,88 @@
+From e110d2c1ed8d23504e4374b7646f4b2ca7ea2fe2 Mon Sep 17 00:00:00 2001
+From: wannaknowhys <heyusu@gmail.com>
+Date: Thu, 3 Sep 2026 21:17:15 -0500
+Subject: [PATCH 4/6] build: add StreamMoE_dump_arena tag - StreamMoE_dump +
+ -DSTREAM_MOE_ARENA_CLONE (whole-layer arena-clone executor #ifdef'd out of
+ all other tags). Arena-clone debug code now compiles only under the arena
+ tag; plain StreamMoE_dump/main/upstream builds stay clean (verified binary
+ has no arena-clone string). Env macro switch retired in favor of the tag.
+ Arena device-domain trigger is scheduling-dependent (layer active set must
+ land on the vram pool) - use Vulkan0:4096 to reproduce.
+
+---
+ build.bat                | 15 ++++++++++++++-
+ docs/WORK_IN_PROGRESS.md |  6 ++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/build.bat b/build.bat
+index 4483d75..641c3ae 100644
+--- a/build.bat
++++ b/build.bat
+@@ -53,11 +53,22 @@ rem   upstream_dump         -> prefill_export   (prefill export, no vulkan basel
+ rem   upstream_vulkan_dump  -> prefill_export   (prefill export + vulkan, for Vulkan0 comparison)
+ rem   StreamMoE_dump        -> route_b,prefill_export + vulkan (full StreamMoE export,
+ rem                            with the Vulkan0 device-pool path; vs upstream_dump)
++rem   StreamMoE_dump_arena  -> StreamMoE_dump + STREAM_MOE_ARENA_CLONE (in-progress
++rem                            arena-clone device executor; debug builds only)
+ set STREAM_MOE_FEATURES=
+ if "%TAG%"=="main"                 set STREAM_MOE_FEATURES=route_b
+ if "%TAG%"=="upstream_dump"        set STREAM_MOE_FEATURES=prefill_export
+ if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_FEATURES=prefill_export
+ if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_FEATURES=route_b,prefill_export
++if "%TAG%"=="StreamMoE_dump_arena" set STREAM_MOE_FEATURES=route_b,prefill_export
++rem ---- in-progress compile-time feature switches (default OFF) ------------
++rem   StreamMoE_dump_arena (tag) = StreamMoE_dump + whole-layer arena-clone
++rem   device executor (docs/M2_DEVICE_EXECUTOR.md 4.1, b4-3; still NaN @ gate_up
++rem   mm). The arena-clone code is #ifdef STREAM_MOE_ARENA_CLONE; this tag adds
++rem   the macro so it compiles. All other tags build without it (production
++rem   green, plain CPU burst).
++set STREAM_MOE_ARENA_CLONE_FLAG=
++if "%TAG%"=="StreamMoE_dump_arena" set STREAM_MOE_ARENA_CLONE_FLAG=-DSTREAM_MOE_ARENA_CLONE
+ rem ---- CPU arch + backend by tag ----
+ rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
+ rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
+@@ -71,6 +82,7 @@ set STREAM_MOE_CPU_FLAGS=-march=znver3
+ set GGML_VULKAN_DEFAULT=OFF
+ if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
+ if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
++if "%TAG%"=="StreamMoE_dump_arena" set GGML_VULKAN_DEFAULT=ON
+ rem env GGML_VULKAN=OFF still overrides (e.g. to rebuild a CPU-only StreamMoE_dump
+ rem for an IDENTICAL baseline regression - see baseline_regression/README.md).
+ if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
+@@ -103,7 +115,7 @@ if "%GGML_VULKAN%"=="ON" (
+     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
+     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
+     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
+-    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS%" ^
++    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS% %STREAM_MOE_ARENA_CLONE_FLAG%" ^
+     -DSTREAM_MOE_FEATURES="%STREAM_MOE_FEATURES%" ^
+     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
+     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
+@@ -231,6 +243,7 @@ echo Optional [tag] sub-path for llamalibs/build (default: main).
+ echo   llamalibs main           - route-B llama-server (build\main)
+ echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
+ echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
++echo   llamalibs StreamMoE_dump_arena - StreamMoE_dump + arena-clone debug macro
+ echo   build.bat convertd       - build converter TCP service (build\convertd)
+ echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
+ echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
+diff --git a/docs/WORK_IN_PROGRESS.md b/docs/WORK_IN_PROGRESS.md
+index 3ceec61..47b1c6c 100644
+--- a/docs/WORK_IN_PROGRESS.md
++++ b/docs/WORK_IN_PROGRESS.md
+@@ -4,6 +4,12 @@
+ > **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
+ > **本轮：Linux async DIO 真异步化（评估待做）仍在。** 另完成：E3 死锁修复验证、verify_prefill.js 修复、backend 分歧分析（docs/BACKEND_DIVERGENCE_ANALYSIS.md）。
+ 
++## 编译宏开关（in-progress 特性，默认 OFF）
++
++| tag / env | 内容 | 启用 | 状态 |
++|---|---|---|---|
++| `StreamMoE_dump_arena`（build.bat llamalibs）| `StreamMoE_dump` + `-DSTREAM_MOE_ARENA_CLONE`（整层 arena-clone device 执行器 b4-3，含 per-node dump + cont/DUP + 调试 env）→ `build\StreamMoE_dump_arena`| `build.bat llamalibs StreamMoE_dump_arena`；arena-clone 代码 `#ifdef STREAM_MOE_ARENA_CLONE`，其余 tag 编译期裁掉（纯 CPU burst，生产绿）| 数值未过（mm NaN@2348），见 K 节 |
++
+ ## 背景状态（已落地，commit 403a5d2）
+ - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
+ - frag 全主仓库：route-b/common、prefill-export/common、prefill-export/include（vendored include/ 已清空）
+-- 
+2.55.0.windows.3
+
