@@ -31,12 +31,21 @@ static moe_model_topology_t build_topo() {
     topo.expert_slot_size = SLOT_SIZE;
     topo.experts.resize(static_cast<size_t>(N_LAYERS) * N_EXPERTS);
 
-    // One homogeneous expert group covering both layers (uniform stride slots).
+    // One homogeneous expert group covering both layers (SoA: one column whose
+    // stride = EXPERT_BYTES; slot bytes per expert = the column stride).
     moe_model_topology_t::expert_group_t g;
     g.idx = 0;
     g.layers = {0, 1};
-    g.expert_size = SLOT_SIZE;
+    g.expert_size = EXPERT_BYTES;   // per expert = column stride (compact)
     g.total_bytes = static_cast<uint64_t>(g.layers.size()) * N_EXPERTS * g.expert_size;
+    moe_model_topology_t::expert_group_t::column_t col;
+    col.col_index = 0;
+    col.name = "blk.0.ffn_gate_exps.weight";
+    col.tag = "gate";
+    col.ggml_type = 0;
+    col.ne[0] = 8; col.ne[1] = 8; col.ne[2] = 1; col.ne[3] = 1;
+    col.per_expert = EXPERT_BYTES;
+    g.columns.push_back(col);
     topo.groups.push_back(g);
 
     for (uint32_t l = 0; l < N_LAYERS; ++l) {
@@ -58,7 +67,8 @@ static moe_model_topology_t build_topo() {
             req.shard_idx = st.shard_idx;
             req.file_offset = st.abs_file_offset;
             req.byte_size = st.byte_size;
-            req.slot_offset = 0;
+            req.column = 0;       // single SoA column
+            req.col_off = 0;
             info.read_plan = build_expert_read_plan(&req, 1);
         }
     }
@@ -91,33 +101,39 @@ static bool test_scheduler_load_and_pin() {
 
     moe_model_topology_t topo = build_topo();
     expert_scheduler sched;
-    TEST_ASSERT(sched.init(topo, *dio, {f}, 3 * SLOT_SIZE), "scheduler init (3 slots)");
-    TEST_ASSERT(sched.num_slots() == 3, "3 slots (pool < expert count forces eviction)");
+    TEST_ASSERT(sched.init(topo, *dio, {f}, 8 * EXPERT_BYTES), "scheduler init");
+    TEST_ASSERT(sched.num_slots() == 8, "8 slots = whole group resident");
     sched.start();
 
-    // pin all 4 experts of layer 0 -> 3 slots force eviction of earlier ones
-    for (uint32_t e = 0; e < N_EXPERTS; ++e) {
-        expert_handle_t h = sched.pin_expert(0, e);
-        TEST_ASSERT(h.pinned && h.slot >= 0, "pin succeeded");
-        const uint8_t* slot_ptr = nullptr;
-        // content check via the scheduler's pool base (exposed through slot index)
-        // we can't read private pool; instead verify via a second pin round-trip
-        // and telemetry. Content correctness is covered by read_expert_sync UT.
-        sched.unpin(h);
+    // pin all 4 experts of layer 0 in one batch
+    {
+        uint64_t need[BITMAP_WORDS] = { 0 };
+        batch_await_t aw;
+        for (uint32_t e = 0; e < N_EXPERTS; ++e) expert_scheduler::bit_set(need, e);
+        std::vector<expert_handle_t> pins(N_EXPERTS);
+        const int32_t np = sched.pin_layer(0, need, aw, pins.data(), N_EXPERTS);
+        TEST_ASSERT(np == static_cast<int32_t>(N_EXPERTS), "all 4 pinned");
+        for (const auto& h : pins) TEST_ASSERT(h.pinned && h.slot >= 0, "pin succeeded");
+        for (const auto& h : pins) sched.unpin(h);
     }
 
-    // telemetry: 4 lookups, 4 misses (first-touch, small pool), hits=0
+    // telemetry: 4 lookups, 4 misses (first-touch), hits=0
     TEST_ASSERT(sched.total_lookups() == 4, "4 lookups");
     TEST_ASSERT(sched.disk_misses() == 4, "4 first-touch misses");
     TEST_ASSERT(sched.ram_hits() == 0, "0 hits on cold pool");
 
-    // second touch: the last-pinned expert survived LRU eviction -> must hit
+    // second touch: all resident now -> 4 hits, no new misses
     {
-        expert_handle_t h = sched.pin_expert(0, 3);
-        sched.unpin(h);
+        uint64_t need[BITMAP_WORDS] = { 0 };
+        batch_await_t aw;
+        for (uint32_t e = 0; e < N_EXPERTS; ++e) expert_scheduler::bit_set(need, e);
+        std::vector<expert_handle_t> pins(N_EXPERTS);
+        const int32_t np = sched.pin_layer(0, need, aw, pins.data(), N_EXPERTS);
+        TEST_ASSERT(np == static_cast<int32_t>(N_EXPERTS), "re-pin ok");
+        for (const auto& h : pins) sched.unpin(h);
     }
-    TEST_ASSERT(sched.total_lookups() == 5, "5 total lookups");
-    TEST_ASSERT(sched.ram_hits() >= 1, "survivor expert is a hit");
+    TEST_ASSERT(sched.total_lookups() == 8, "8 total lookups");
+    TEST_ASSERT(sched.ram_hits() >= 4, "all 4 resident are hits");
     TEST_ASSERT(sched.disk_misses() == 4, "4 first-touch misses only");
 
     sched.stop();
@@ -132,19 +148,19 @@ static bool test_scheduler_content() {
     dio_file_t* f = dio->open_file(TMP_FILE);
     moe_model_topology_t topo = build_topo();
     expert_scheduler sched;
-    sched.init(topo, *dio, {f}, 3 * SLOT_SIZE);
+    sched.init(topo, *dio, {f}, 8 * EXPERT_BYTES);
     sched.start();
 
-    // verify slot memory content: read via a raw DIO read of the slot region is
-    // not exposed; instead assert correctness indirectly by re-reading the file
-    // through the scheduler twice - content equality covered by staging_reader
-    // unit test. Here we just exercise the full lifecycle without crash.
+    // exercise the full per-layer batch lifecycle across both layers
     for (uint32_t l = 0; l < N_LAYERS; ++l) {
-        for (uint32_t e = 0; e < N_EXPERTS; ++e) {
-            expert_handle_t h = sched.pin_expert(l, e);
-            sched.wait_ready(l, e); // down-role path
-            sched.unpin(h);
-        }
+        uint64_t need[BITMAP_WORDS] = { 0 };
+        batch_await_t aw;
+        for (uint32_t e = 0; e < N_EXPERTS; ++e) expert_scheduler::bit_set(need, e);
+        std::vector<expert_handle_t> pins(N_EXPERTS);
+        const int32_t np = sched.pin_layer(l, need, aw, pins.data(), N_EXPERTS);
+        TEST_ASSERT(np == static_cast<int32_t>(N_EXPERTS), "layer batch pinned");
+        for (const auto& h : pins) TEST_ASSERT(h.pinned, "all handles pinned");
+        for (const auto& h : pins) sched.unpin(h);
     }
     TEST_ASSERT(sched.total_lookups() == 8, "8 lookups across layers");
 

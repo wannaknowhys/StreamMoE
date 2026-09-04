@@ -2,6 +2,7 @@
 // Model-agnostic, cross-platform (no llama.cpp dependency).
 #include "backend/slot.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <thread>
 #include <chrono>
@@ -116,11 +117,50 @@ static bool test_expert_directory() {
 
 static bool test_mpsc_queue() {
     mpsc_alloc_queue q(8);
-    for (uint32_t i = 0; i < 8; ++i) q.push({1, i, i});
+    for (uint32_t i = 0; i < 8; ++i) {
+        slot_request_t r;
+        r.layer = 1;
+        r.seq = i + 1;
+        r.needed[0] = 1ull << i;   // expert i
+        q.push(r);
+    }
     slot_request_t r;
     uint32_t n = 0;
-    while (q.pop(r)) { TEST_ASSERT(r.expert == n, "pop order preserved"); ++n; }
+    while (q.pop(r)) {
+        TEST_ASSERT(r.layer == 1, "layer preserved");
+        TEST_ASSERT((r.needed[0] >> n) & 1ull, "pop order preserved");
+        ++n;
+    }
     TEST_ASSERT(n == 8, "all 8 popped");
+
+    // multi-producer: 4 threads push distinct expert bits, single consumer pops
+    mpsc_alloc_queue q2(64);
+    std::atomic<int> producers_done{0};
+    auto producer = [&](uint32_t base) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            slot_request_t r;
+            r.layer = 2;
+            r.needed[0] = 1ull << (base + i);
+            q2.push(r);
+        }
+        producers_done.fetch_add(1, std::memory_order_relaxed);
+    };
+    std::thread t0(producer, 0), t1(producer, 16), t2(producer, 32), t3(producer, 48);
+    std::vector<uint64_t> seen;
+    while (producers_done.load(std::memory_order_relaxed) < 4 || seen.size() < 64) {
+        slot_request_t x;
+        while (q2.pop(x)) seen.push_back(x.needed[0]);
+        if (seen.size() < 64) std::this_thread::yield();
+    }
+    t0.join(); t1.join(); t2.join(); t3.join();
+    // drain any remaining
+    slot_request_t x;
+    while (q2.pop(x)) seen.push_back(x.needed[0]);
+    TEST_ASSERT(seen.size() == 64, "64 messages from 4 producers");
+    std::sort(seen.begin(), seen.end());
+    for (uint32_t i = 0; i < 64; ++i) {
+        TEST_ASSERT(seen[static_cast<size_t>(i)] == (1ull << i), "no loss/dup");
+    }
 
     std::printf("[+] test_mpsc_queue PASSED\n"); std::fflush(stdout);
     return true;

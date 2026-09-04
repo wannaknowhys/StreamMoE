@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -253,46 +254,114 @@ private:
 };
 
 // ---- bounded MPSC alloc-request queue -------------------------------------
-// Compute threads push (layer, expert); scheduler thread pops. Producers block
-// when full (wait-on-space), consumers block when empty (wait-on-item).
+// Compute threads push a WHOLE-LAYER request (bitmap of needed experts);
+// scheduler thread pops. A request is a fixed POD:
+//   header   layer u32 + total_tokens u32 + start_rdtsc u64   (16B)
+//   wake     seq (target count) u32 + batch_ready ptr u64      (16B)
+//   bitmap   needed[8]                                        (64B)
+//            == 96B total (the batch_ready pointer is the wake-once carrier;
+//            without it exec would sleep per-expert version word).
+// Producer sets seq = number of experts it expects the scheduler to load and
+// passes a pointer to its own counter; scheduler bumps + wakes it once per
+// completed expert; exec sleeps once until count == seq.
+// Ring elements are PLAIN PODs guarded by a per-slot publish generation +
+// release/acquire on head/tail - NOT std::atomic<T> (12B was already
+// non-lock-free -> hidden lock; 96B would be worse). Multi-producer safe.
+static constexpr uint32_t MAX_EXPERTS_PER_LAYER = 512;
+static constexpr uint32_t BITMAP_WORDS = MAX_EXPERTS_PER_LAYER / 64;
+
 struct slot_request_t {
-    uint32_t layer = 0;
-    uint32_t expert = 0;
-    uint32_t seq = 0;
+    uint32_t layer        = 0;   // layer index this request covers
+    uint32_t total_tokens = 0;   // [profile] batch tokens (ids->ne[1])
+    uint64_t start_rdtsc  = 0;   // [profile] batch submit time (raw TSC)
+    // seq repurposed (2026-09): number of experts this request expects the
+    // scheduler to process. Compute waits on *batch_ready until it reaches seq.
+    uint32_t seq          = 0;
+    // wake-once counter (compute-side batch_await_t::done). A raw pointer keeps
+    // slot_request_t trivially copyable for the plain ring.
+    std::atomic<uint32_t>* batch_ready = nullptr;
+    uint64_t needed[BITMAP_WORDS] = { 0 };         // bit e -> expert e needed
+};
+static_assert(sizeof(slot_request_t) == 96, "slot_request_t layout drifted");
+
+// Convenience for the exec side: the wake-once counter + expected count.
+struct batch_await_t {
+    std::atomic<uint32_t> done{0};   // scheduler fetch_add per completed expert
+    uint32_t target = 0;             // == slot_request_t::seq
+    // Wait until `done` reaches `target` (wake-once; scheduler wakes this word).
+    void wait() {
+        uint32_t cur = done.load(std::memory_order_acquire);
+        while (cur < target) {
+            slot_wait_addr(&done, &cur, sizeof(cur));
+            cur = done.load(std::memory_order_acquire);
+        }
+    }
+    void reset() { done.store(0, std::memory_order_relaxed); target = 0; }
 };
 
 class mpsc_alloc_queue {
 public:
-    explicit mpsc_alloc_queue(uint32_t capacity) : cap_(capacity), ring_(capacity) {}
+    explicit mpsc_alloc_queue(uint32_t capacity) : cap_(capacity), ring_(capacity) {
+        seqs_.reset(new std::atomic<uint32_t>[capacity]);
+        for (uint32_t i = 0; i < capacity; ++i) seqs_[i].store(0, std::memory_order_relaxed);
+    }
 
     void push(slot_request_t r) {
-        uint32_t tail = tail_.load(std::memory_order_relaxed);
-        while (true) {
-            uint32_t head = head_.load(std::memory_order_acquire);
-            if (tail - head < cap_) break;
-            // full: wait for space
-            std::this_thread::yield();
+        // reserve a slot by claiming the tail counter (MPSC: fetch_add gives
+        // each producer a unique slot index and the reservation's generation)
+        uint32_t tail;
+        for (;;) {
+            const uint32_t head = head_.load(std::memory_order_acquire);
+            tail = tail_.load(std::memory_order_relaxed);
+            if (tail - head >= cap_) {   // full
+                std::this_thread::yield();
+                continue;
+            }
+            uint32_t expected = tail;
+            if (tail_.compare_exchange_weak(expected, tail + 1,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+                break;   // claimed tail
+            }
         }
-        ring_[tail % cap_].store(r, std::memory_order_release);
-        tail_.fetch_add(1, std::memory_order_release);
+        const uint32_t slot = tail % cap_;
+        ring_[slot] = r;   // plain write payload
+        // publish: the slot's generation = this reservation (head+1 base).
+        // Consumers wait until seq matches before reading (no ABA across wrap).
+        seqs_[slot].store(tail + 1, std::memory_order_release);
     }
 
     bool pop(slot_request_t& out) {
-        uint32_t head = head_.load(std::memory_order_relaxed);
-        while (true) {
-            uint32_t tail = tail_.load(std::memory_order_acquire);
-            if (head == tail) return false;
-            if (head_.compare_exchange_weak(head, head + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                out = ring_[head % cap_].load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t head = head_.load(std::memory_order_relaxed);
+            const uint32_t tail = tail_.load(std::memory_order_acquire);
+            if (head == tail) return false;   // empty
+            const uint32_t slot = head % cap_;
+            // wait for this slot's producer to publish (generation == head+1)
+            if (seqs_[slot].load(std::memory_order_acquire) != head + 1) {
+                std::this_thread::yield();
+                continue;
+            }
+            out = ring_[slot];   // plain read, ordered after the acquire above
+            // release the slot (only the consumer owns head)
+            uint32_t expected = head;
+            if (head_.compare_exchange_weak(expected, head + 1,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+                // no need to clear seqs_[slot]; the next producer for this
+                // physical slot writes a fresh generation (head+1+cap) and the
+                // consumer only proceeds when it matches that generation.
                 return true;
             }
+            // lost head CAS (another consumer); retry with fresh head
         }
     }
 
 private:
     uint32_t cap_;
     std::atomic<uint32_t> head_{0}, tail_{0};
-    std::vector<std::atomic<slot_request_t>> ring_;
+    std::vector<slot_request_t>         ring_;    // plain PODs
+    std::unique_ptr<std::atomic<uint32_t>[]> seqs_;   // publish generation per slot
 };
 
 } // namespace stream_moe

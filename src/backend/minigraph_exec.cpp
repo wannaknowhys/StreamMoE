@@ -193,7 +193,25 @@ static enum ggml_status exec_split_legacy_impl(
     }
 
     if (has_down) {
-        for (const auto& k : down_keys) sched.wait_ready(k.layer, k.expert);
+        // Down role: gate/up splits of this layer already pinned the experts
+        // (held in pin_state across graph_compute calls). They are READY by
+        // construction (a pin only succeeds on a READY slot and refcount>0
+        // blocks eviction). Just confirm every down key is pinned; a missing one
+        // (edge: down split before any gate/up pin) is batch-pinned here.
+        std::vector<keyed_expert_t> missing;
+        for (const auto & k : down_keys) {
+            if (!pin_state_has(pin_state(), k.layer, k.expert)) missing.push_back(k);
+        }
+        if (!missing.empty()) {
+            uint64_t need[BITMAP_WORDS] = { 0 };
+            batch_await_t aw;
+            for (const auto & k : missing) expert_scheduler::bit_set(need, k.expert);
+            std::vector<expert_handle_t> hp(missing.size());
+            const int32_t np = sched.pin_layer(missing[0].layer, need, aw,
+                                               hp.data(), static_cast<uint32_t>(hp.size()));
+            if (np < 0) return GGML_STATUS_FAILED;
+            for (int i = 0; i < np; ++i) pin_state().pins.push_back(hp[static_cast<size_t>(i)]);
+        }
     } else {
         uint32_t layer = pin_keys.empty() ? 0 : pin_keys[0].layer;
         if (pin_state().layer != static_cast<int32_t>(layer)) {
@@ -201,10 +219,23 @@ static enum ggml_status exec_split_legacy_impl(
             pin_state().layer = static_cast<int32_t>(layer);
             pin_state().pins.clear();
         }
-        for (const auto& k : pin_keys) {
-            if (!pin_state_has(pin_state(), k.layer, k.expert)) {
-                pin_state().pins.push_back(sched.pin_expert(k.layer, k.expert));
+        // pin the keys not yet held (one batch request for this split's set)
+        std::vector<keyed_expert_t> missing;
+        for (const auto & k : pin_keys) {
+            if (!pin_state_has(pin_state(), k.layer, k.expert)) missing.push_back(k);
+        }
+        if (!missing.empty()) {
+            uint64_t need[BITMAP_WORDS] = { 0 };
+            batch_await_t aw;
+            for (const auto & k : missing) expert_scheduler::bit_set(need, k.expert);
+            std::vector<expert_handle_t> hp(missing.size());
+            const int32_t np = sched.pin_layer(layer, need, aw, hp.data(),
+                                               static_cast<uint32_t>(hp.size()));
+            if (np < 0) {
+                for (const auto& h : pin_state().pins) sched.unpin(h);
+                return GGML_STATUS_FAILED;
             }
+            for (int i = 0; i < np; ++i) pin_state().pins.push_back(hp[static_cast<size_t>(i)]);
         }
     }
     // ---- phase 2: one official mul_mat_id per node, in a leaf-only mini-graph ----
@@ -808,6 +839,8 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     }
 
     // Pin the layer's whole active expert set (all mm nodes share the ids).
+    // Batch semantics (2026-09): ONE request carrying the whole layer's expert
+    // bitmap; missing experts load concurrently (IOCP n-way), exec wakes once.
     std::vector<keyed_expert_t> keys;
     auto add_key = [&](uint32_t l, uint32_t e) {
         for (const auto & x : keys) if (x.layer == l && x.expert == e) return;
@@ -825,17 +858,24 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                 if (e >= 0 && e < static_cast<int32_t>(topo.n_expert)) add_key(pn.layer, static_cast<uint32_t>(e));
             }
     }
-    std::vector<expert_handle_t> pins;
-    pins.reserve(keys.size());
-    for (const auto & k : keys) {
-        expert_handle_t h = sched.pin_expert(k.layer, k.expert);
-        if (!h.pinned) {
-            LOG_ERROR("stream_moe: burst pin failed L" << k.layer << " E" << k.expert);
-            for (const auto & hh : pins) sched.unpin(hh);
-            return GGML_STATUS_FAILED;
-        }
-        pins.push_back(h);
+    // All keys belong to `layer` (burst is per-layer); build the needed bitmap.
+    if (!keys.empty() && keys[0].layer != static_cast<uint32_t>(layer)) {
+        LOG_ERROR("stream_moe: burst keys layer mismatch (" << keys[0].layer << " vs " << layer << ")");
+        return GGML_STATUS_FAILED;
     }
+    uint64_t needed[BITMAP_WORDS] = { 0 };
+    for (const auto & k : keys) expert_scheduler::bit_set(needed, k.expert);
+    batch_await_t await;
+    std::vector<expert_handle_t> pins(keys.size());
+    const int32_t np = sched.pin_layer(static_cast<uint32_t>(layer), needed, await,
+                                       pins.data(), static_cast<uint32_t>(pins.size()));
+    if (np < 0 || static_cast<size_t>(np) != keys.size()) {
+        LOG_ERROR("stream_moe: burst pin_layer failed (wanted " << keys.size() << ", got " << np << ")");
+        return GGML_STATUS_FAILED;
+    }
+    // pin_layer fills handles in ascending-expert order; exec_one_burst's
+    // pin_slot(pins, layer, expert) scans by (layer,expert) so any order works.
+    (void)0;
 
     bool ok = true;
     // Device-resident whole-layer execution (b4-2) is disabled for now: it

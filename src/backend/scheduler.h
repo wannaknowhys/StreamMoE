@@ -64,6 +64,9 @@ struct async_load_t {
     bool failed = false;
     bool direct = false;      // v2: reqs read straight into the slot
     uint8_t* staging = nullptr;
+    // wake-once (2026-09): this load belongs to a layer batch; on completion
+    // (mark_ready) we fetch_add the owner's counter and wake it.
+    std::atomic<uint32_t>* batch_ready = nullptr;
     uint64_t req_tsc = 0;     // [TMR] raw TSC: async load requested
     uint64_t dio_tsc = 0;     // [TMR] raw TSC: all DIO reads completed
     uint64_t done_tsc = 0;    // [TMR] raw TSC: drain settled the slot
@@ -108,16 +111,28 @@ public:
     // each pool's engine and dispatches completions by owner (async_load_t::sched).
     async_dio_engine* dio_engine() const { return dio_; }
 
-    // Compute-side API (called from graph_compute).
-    // Block until (layer, expert) is resident, then pin it (refcount++).
-    expert_handle_t pin_expert(uint32_t layer, uint32_t expert);
-
-    // For the down-role split: the expert was pinned by the gate/up split and
-    // eviction is blocked; just wait until READY (no refcount change).
-    void wait_ready(uint32_t layer, uint32_t expert);
+    // Compute-side API (called from graph_compute). Batch semantics (2026-09):
+    // one call = one whole layer's active expert set. `needed` is a bitmap over
+    // experts of `layer` (bit e set => expert e is needed); `await` is the
+    // exec-side wake-once counter. Blocks until EVERY needed expert is READY
+    // (requesting the missing subset as ONE batch message), then pins each and
+    // fills `out` with one expert_handle_t per SET bit (indexed in ascending
+    // expert order). Returns the number of needed experts, or -1 on failure.
+    int32_t pin_layer(uint32_t layer, const uint64_t* needed, batch_await_t& await,
+                      expert_handle_t* out, uint32_t out_cap);
 
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
+
+    // Bitmap helpers (bit e of a layer's expert bitmap).
+    static bool bit_test(const uint64_t* bm, uint32_t e) { return (bm[e >> 6] >> (e & 63)) & 1ull; }
+    static void bit_set(uint64_t* bm, uint32_t e) { bm[e >> 6] |= (1ull << (e & 63)); }
+    static void bit_clear(uint64_t* bm, uint32_t e) { bm[e >> 6] &= ~(1ull << (e & 63)); }
+    static uint32_t bit_count(const uint64_t* bm, uint32_t n_experts) {
+        uint32_t c = 0;
+        for (uint32_t e = 0; e < n_experts; ++e) c += bit_test(bm, e);
+        return c;
+    }
 
     // Sub-pool layout (docs/MULTI_SUBPOOL.md §1a): the pool is struct-of-array.
     // One COLUMN per expert tensor (gate_up / down / ...); a slot (a resident
@@ -272,7 +287,6 @@ private:
 
     mpsc_alloc_queue        requests_{4096};
     std::atomic<bool>       running_{false};
-    std::atomic<uint64_t>   seq_{0};
 
     std::atomic<uint64_t>   n_lookups_{0};
     std::atomic<uint64_t>   n_hits_{0};

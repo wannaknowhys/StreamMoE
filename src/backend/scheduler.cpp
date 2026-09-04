@@ -28,6 +28,16 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     dio_  = &dio;
     files_ = files;
 
+    // Batch bitmap capacity check (2026-09): requests encode a layer's expert
+    // set as a fixed-size bitmap. Fail fast here (load-time) instead of at a
+    // random compute step when an expert index overflows the bitmap.
+    if (topo.n_expert > MAX_EXPERTS_PER_LAYER) {
+        LOG_ERROR("expert_scheduler: model has " << topo.n_expert
+                  << " experts/layer, batch bitmap supports " << MAX_EXPERTS_PER_LAYER
+                  << " - increase MAX_EXPERTS_PER_LAYER in slot.h");
+        return false;
+    }
+
     // Carve per-expert-group sub-pools. Hard floor per group: enough slots to
     // hold one full layer's expert set (per_layer x expert_size). A single
     // decode may pin any subset of one layer, and eviction cannot reclaim slots
@@ -407,6 +417,14 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 slots_[t->slot].mark_failed();
                 LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
             }
+            // wake-once: every settle (success OR failure) advances the batch
+            // counter so exec never spins forever; exec rescans and pins what
+            // is actually READY, retrying failures.
+            if (t->batch_ready) {
+                std::atomic<uint32_t>* c = t->batch_ready;
+                c->fetch_add(1, std::memory_order_acq_rel);
+                slot_wake_all(c);
+            }
             t->done_tsc = tsc_now();   // [TMR] slot settled (ready or failed)
             const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
             const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
@@ -421,25 +439,50 @@ bool expert_scheduler::accept_requests() {
     slot_request_t req;
     while (requests_.pop(req)) {
         any = true;
-        uint32_t pool = 0;
-        if (dir_->scan(req.layer, req.expert, &pool) != SLOT_UNASSIGNED) continue;
+        // One request = one whole layer's missing expert set (bitmap). Each set
+        // bit counts once toward the batch's completion word: already-resident
+        // bits (raced) bump immediately, others bump when their async load
+        // settles (drain_completions). Placement: device region first (keeps the
+        // active set on one region while the executor has no per-region split
+        // yet), RAM fallback.
         if (load_free_.empty()) { requests_.push(req); break; }
-        // Placement: spread loads across the group's pools by capacity ratio
-        // (the pool with the lowest occupancy fraction wins), instead of
-        // cramming everything into the device region. Deterministic baseline -
-        // the future prefetch policy skews this. Fall back to the next-best
-        // pool when the preferred one cannot make room.
-        uint32_t gidx = group_of(req.layer);
-        int32_t slot = -1;
-        // Device region first (keeps the active set on one region so a layer
-        // stays single-region while the executor has no per-region split yet).
-        // The future prefetch policy replaces this with a capacity-aware skew.
-        const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
-        if (dsp) slot = alloc_or_evict(req.layer, req.expert, dsp->pool);
-        if (slot < 0) slot = alloc_or_evict(req.layer, req.expert, 0);
-        if (slot < 0) { requests_.push(req); break; }
-        async_load_t* t = start_async_load(slot, req.layer, req.expert);
-        if (!t) { requests_.push(req); break; }
+        const uint32_t n_experts = topo_->n_expert;
+        uint64_t leftover[BITMAP_WORDS] = { 0 };
+        uint32_t n_left = 0;
+        auto bump = [&]() {   // one processed bit -> one toward the batch target
+            if (req.batch_ready) {
+                req.batch_ready->fetch_add(1, std::memory_order_acq_rel);
+                slot_wake_all(req.batch_ready);
+            }
+        };
+        for (uint32_t e = 0; e < n_experts; ++e) {
+            if (!bit_test(req.needed, e)) continue;
+            if (load_free_.empty()) { bit_set(leftover, e); ++n_left; continue; }
+            uint32_t pool = 0;
+            if (dir_->scan(req.layer, e, &pool) != SLOT_UNASSIGNED) {
+                bump();   // raced with another submit: resident already
+                continue;
+            }
+            uint32_t gidx = group_of(req.layer);
+            int32_t slot = -1;
+            const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
+            if (dsp) slot = alloc_or_evict(req.layer, e, dsp->pool);
+            if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
+            if (slot < 0) { bit_set(leftover, e); ++n_left; continue; }
+            async_load_t* t = start_async_load(slot, req.layer, e);
+            if (!t) { bit_set(leftover, e); ++n_left; continue; }
+            t->batch_ready = req.batch_ready;   // drain bumps when this settles
+        }
+        // requeue whatever could not be placed this pass (ring full / no victim)
+        if (n_left) {
+            slot_request_t rq = {};
+            rq.layer = req.layer;
+            rq.seq = req.seq;                    // keep the SAME completion target
+            rq.batch_ready = req.batch_ready;
+            for (uint32_t w = 0; w < BITMAP_WORDS; ++w) rq.needed[w] = leftover[w];
+            requests_.push(rq);
+            break;   // backpressure: don't starve other queues in this tick
+        }
     }
     return any;
 }
@@ -461,52 +504,112 @@ void expert_scheduler::update_alpha() {
     }
 }
 
-expert_handle_t expert_scheduler::pin_expert(uint32_t layer, uint32_t expert) {
-    n_lookups_.fetch_add(1, std::memory_order_relaxed);
-    bool waited_for_load = false;
-    for (int retries = 0; retries < 100000; ++retries) {
+int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batch_await_t& await,
+                                    expert_handle_t* out, uint32_t out_cap) {
+    if (!topo_ || layer >= topo_->n_layer) return -1;
+    const uint32_t n_experts = topo_->n_expert;
+    const uint32_t want = bit_count(needed, n_experts);
+    if (want == 0) return 0;
+    if (want > out_cap) {
+        LOG_ERROR("expert_scheduler: pin_layer out_cap " << out_cap << " < needed " << want);
+        return -1;
+    }
+
+    // Two-pass: split the set into already-resident (pin now) and missing
+    // (one batch request). Because the directory is read-only for compute and
+    // only the scheduler mutates residency, do the split here by scanning.
+    uint64_t missing[BITMAP_WORDS] = { 0 };
+    uint32_t n_missing = 0, n_hit = 0;
+    uint32_t o = 0;
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        if (!bit_test(needed, e)) continue;
         uint32_t pool = 0;
-        uint32_t s = dir_->scan(layer, expert, &pool);
+        uint32_t s = dir_->scan(layer, e, &pool);
         if (s == SLOT_UNASSIGNED) {
-            waited_for_load = true;
-            uint32_t v = dir_->version(layer, expert);
-            requests_.push({layer, expert, static_cast<uint32_t>(seq_.fetch_add(1, std::memory_order_relaxed))});
-            dir_->wait_version(layer, expert, v);
+            bit_set(missing, e);
+            ++n_missing;
             continue;
         }
-        uint32_t st = slot_word_state(slots_[s].load());
-        if (st == SLOT_FAILED) {
-            LOG_ERROR("expert_scheduler: pin_expert FAILED for L" << layer << " E" << expert);
-            return {-1, 0, layer, expert, pool, false};
+        if (slot_word_state(slots_[s].load()) != SLOT_READY) {
+            // in-flight/evicting: not pin-able yet; request it too (idempotent -
+            // the scheduler skips already-resident bits).
+            bit_set(missing, e);
+            ++n_missing;
+            continue;
         }
         int64_t gen = slots_[s].try_pin();
         if (gen >= 0) {
-            if (!waited_for_load) {
-                n_hits_.fetch_add(1, std::memory_order_relaxed);
-            }
+            out[o++] = { static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, e, pool, true };
+            ++n_hit;
             const uint64_t t = token_.fetch_add(1, std::memory_order_relaxed) + 1;
-            dir_->touch_last_used(layer, expert, t);
-            return {static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, expert, pool, true};
+            dir_->touch_last_used(layer, e, t);
+        } else {
+            bit_set(missing, e);   // transient (another pin racing); request it
+            ++n_missing;
         }
-        std::this_thread::yield(); // transient (evicting); retry
     }
-    LOG_ERROR("expert_scheduler: pin_expert retry limit hit for L" << layer << " E" << expert);
-    return {-1, 0, layer, expert, 0, false};
-}
 
-void expert_scheduler::wait_ready(uint32_t layer, uint32_t expert) {
-    for (;;) {
-        uint32_t pool = 0;
-        uint32_t s = dir_->scan(layer, expert, &pool);
-        if (s == SLOT_UNASSIGNED) {
-            uint32_t v = dir_->version(layer, expert);
-            requests_.push({layer, expert, static_cast<uint32_t>(seq_.fetch_add(1, std::memory_order_relaxed))});
-            dir_->wait_version(layer, expert, v);
-            continue;
-        }
-        if (slot_word_state(slots_[s].load()) == SLOT_READY) return;
-        std::this_thread::yield();
+    if (n_missing == 0) {
+        n_lookups_.fetch_add(want, std::memory_order_relaxed);
+        n_hits_.fetch_add(n_hit, std::memory_order_relaxed);
+        return static_cast<int32_t>(want);
     }
+
+    // Submit ONE batch request for the missing subset. `await` counts down per
+    // completed expert; exec sleeps once until seq (== n_missing) is reached.
+    slot_request_t req;
+    req.layer = layer;
+    req.seq = n_missing;
+    for (uint32_t w = 0; w < BITMAP_WORDS; ++w) req.needed[w] = missing[w];
+    await.reset();
+    await.target = n_missing;
+    req.batch_ready = &await.done;
+
+    // Wait for the batch to settle (wake-once). Re-scan on completion: some
+    // bits may have been raced/resident meanwhile; pin whatever is ready.
+    n_lookups_.fetch_add(want, std::memory_order_relaxed);
+    n_hits_.fetch_add(n_hit, std::memory_order_relaxed);
+
+    for (uint32_t round = 0; round < 2; ++round) {
+        requests_.push(req);                 // MPSC batch submit (blocking if full)
+        await.wait();                        // single wake: done == target
+        // pin the bits that are now resident
+        uint32_t still_missing = 0;
+        for (uint32_t e = 0; e < n_experts; ++e) {
+            if (!bit_test(missing, e)) continue;
+            uint32_t pool = 0;
+            uint32_t s = dir_->scan(layer, e, &pool);
+            if (s == SLOT_UNASSIGNED || slot_word_state(slots_[s].load()) != SLOT_READY) {
+                ++still_missing;
+                continue;
+            }
+            int64_t gen = slots_[s].try_pin();
+            if (gen >= 0) {
+                out[o++] = { static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, e, pool, true };
+                const uint64_t t = token_.fetch_add(1, std::memory_order_relaxed) + 1;
+                dir_->touch_last_used(layer, e, t);
+                bit_clear(missing, e);      // pinned
+            } else {
+                ++still_missing;
+            }
+        }
+        if (still_missing == 0) return static_cast<int32_t>(want);
+        if (round == 0) {
+            // transient failure / extra load needed: rebuild a fresh request and
+            // retry once. Guarded against infinite spin.
+            req.seq = still_missing;
+            for (uint32_t w = 0; w < BITMAP_WORDS; ++w) req.needed[w] = 0;
+            for (uint32_t e = 0; e < n_experts; ++e) if (bit_test(missing, e)) bit_set(req.needed, e);
+            await.reset();
+            await.target = still_missing;
+            req.batch_ready = &await.done;
+        } else {
+            LOG_ERROR("expert_scheduler: pin_layer retry limit for L" << layer
+                      << " (still missing " << still_missing << ")");
+            return -1;
+        }
+    }
+    return -1;
 }
 
 void expert_scheduler::unpin(const expert_handle_t& h) {

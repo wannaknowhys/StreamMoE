@@ -134,6 +134,47 @@
   - [ ] **全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）**——**被既有 demote 风暴阻塞**：Vulkan0:2048 + RAM:1024~8192 下 129/15-token prefill 触发 ~1300/277 次 device→RAM demote（每层新活跃集驱逐上层的 J 节既有行为，旧 v2 文件同样卡超时，非 SoA 回归），激活集未稳定驻留 vram → exec 走 CPU、未触发 exec_mm_vk。待办：独立验证 device 触发路径（如大 vram 池容纳整模型 / 缩小到单层活跃集 / 修正 accept 放置），确认 vulkan 吃 SoA 列后数值正确
 - [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
 
+### L. 批量 pin：bitmap 层请求 + MPSC 就绪位（2026-09 定案）
+> **动机**：逐专家阻塞 pin（exec 每个 miss → push 单条 → `wait_version` 死等该专家 → 下一个才入队）
+> 使 DIO 全串行 + exec/scheduler 乒乓（scheduler 装完一个队列空、sleep 1ms）。vram 路径跑不起来
+> （demote 风暴 + 从不触发 GPU mm）。同时 M2_DEVICE_EXECUTOR §6 的 `total_tokens`+`start_rdtsc`
+> profile 字段一直没载体。
+>
+> **定案（用户 2026-09）**：
+> 1. **请求 = 整层一条**：`slot_request_t` 从 `{layer,expert,seq}`（12B）改 **80B 定长 POD**：
+>    `{layer u32, total_tokens u32, start_rdtsc u64, bitmap u64[8]}`（512bit，覆盖 gemma 128 / deepseek 256 / 上限 512）。
+>    **seq 删掉**——它从没被读；等待不靠它（靠 dir 的 per-expert version + wait_version）。
+> 2. **MPSC 队列就绪位化**：ring 元素普通 POD（80B 不可能进 `std::atomic`，12B 已非 lock-free 退化成锁），
+>    每槽加 ready flag（producer 写槽 → release 置 ready；consumer acquire 看 ready → 读槽 → 复位），
+>    **多生产者安全**（main/draft / 未来多 batch 并发 push）。容量不会被打爆（一层一条，4096 深）。
+> 3. **批量 API**：`pin_layer(layer, bitmap, n)` 取代 `pin_expert`/`wait_ready` 单专家 API——
+>    exec 把整层活跃集一次 push；scheduler pop 后对 bitmap 差集**集体** `alloc_or_evict` +
+>    并发 `submit_batch`（IOCP n 路 in-flight）；exec **只醒一次**。
+> 4. **wake-once**：exec 提交 bitmap 后聚合等待（不在逐专家 version 上逐个睡）。待定实现：
+>    A. 复用现有 per-expert version 逐个 wait（装载已并发，等待只是收尾）；B. 层级 batch-ready 字
+>    （seq 字段重定义为"本批待装载数"作 wake 计数目标）。倾向 B（exec 只醒一次，等待逻辑最简，
+>    且给 profile 一个 per-batch 完成点）。
+> 5. **pin 生命周期不变**（整专家 = 全列切片 READY 才可用）：async_load_t 本就"整专家 pending 聚合 0
+>    才 mark_ready"；批量后 bitmap 位 = 该专家全列载入完成。exec 只在专家 READY 后 pin，层尾全 unpin。
+> 6. **total_tokens** = exec 层 `ids->ne[1]`（batch token 数，burst 收 keys 时可得）；`start_rdtsc` =
+>    批量请求发起时刻。draft 与 main 同路径。
+> 7. **上限校验**：`scheduler::init`（或 build_topology）读每层专家数 `n_expert ≤ 512`，超了 fail-fast。
+>    bitmap 容量取 2 的幂只是覆盖主流，非对模型形态假设（非 2 幂只要 ≤ 容量即可）。
+> 8. **多生产者实现**：ring 元素 = 普通 POD + 每槽 ready 位 + head/tail 原子 release/acquire；
+>    不用 `std::atomic<80B>`（必退化锁）。
+>
+> **不做**：mixed RAM/VRAM 同层分区执行（J6/M2-3 独立大工程）；vulkan 后端 dll；real-time profile
+> 消费端（M2-4，仅补字段载体）。
+>
+> **任务**
+> - [ ] L1 slot.h：slot_request_t 80B 定长（layer/total_tokens/start_rdtsc/bitmap[8]），删 seq；mpsc 队列 ready-flag 化
+> - [ ] L2 scheduler.h：MAX_EXPERTS_PER_LAYER=512；删 pin_expert/wait_ready 单专家 API；加 pin_layer(layer, bitmap, n) 批量 API（wake-once 语义 B）
+> - [ ] L3 scheduler.cpp：init n_expert≤512 fail-fast；accept_requests 集体装载；batch-ready 完成点
+> - [ ] L4 minigraph_exec：burst + legacy 改整层 bitmap 一次 push + 聚合等 + 批量 pin；down 只等不 pin
+> - [ ] L5 测试：test_scheduler/test_slot 适配新 API + mpsc 多生产者
+> - [ ] L6 编译 + prefill-from 回归 IDENTICAL（纯 RAM CPU）；再探 vram GPU 触发（K6 阻塞）
+> - [ ] L7 文档同步（本文件 + CHECKPOINT）
+
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
