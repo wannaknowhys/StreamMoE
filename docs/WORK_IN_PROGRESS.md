@@ -94,35 +94,21 @@
 - [x] J5 **device 驱逐 demote 回 RAM（77b0bbe）**：vram victim（READY+ref0）内容 memcpy 进 group 的 RAM 区（RAM 先丢最冷腾位），目录迁移 pool；RAM victim 仍丢弃（盘为下一层）。Vulkan0:1024（139 槽 group0）129-token 触发 **1987 次 demote 仍 IDENTICAL**——move 数据路径正确
 - [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
 
-### K. M2 设备执行器（2026-09，设计已落 docs/M2_DEVICE_EXECUTOR.md EN+zh）
-> 按专家列跨真实设备执行 + profile 通道。设计要点：列链段（mm→silu/geglu→down 不出 device）、
-> 真并行（vulkan async + CPU worker——`graph_compute_async` 只是 iface 直通无通用异步层，CPU
-> 后端同步无队列）、每 device 奇偶乒乓（verify 预算分摊；in-place 普遍不可行，2 区理论最小）、
-> 出口 scatter 通用化（写外部消费方所在 buffer，dense 位置参数化）、profile 双 ring（alloc ring
-> + 独立 profile ring）+ ctx 聚合（层出口每设备一次事件），total_tokens/rdtsc 供未来 lag 预取
-> 策略（策略后置）。
+### K. M2 设备执行器（2026-09 改版：b4-3 死路已归档，转 v1 + 张量池布局）
+> 2026-09 根因钉死：**ggml-vulkan MUL_MAT_ID 的专家步长硬编码 = `ne0*ne1`（单张量紧凑大小），
+> 完全忽略 `nb[2]`**（mul_mm.comp:253 用 host 传的 batch_stride_a=ne00*ne01；ggml-vulkan.cpp:10385）。
+> CPU mul_mat_id 读 `nb02`（ggml-cpu.c:1654）正确。所以任何"槽 stride = expert_size、w3d 壳
+> 伪 3D（ne[2]=slots/nb[2]=expert_size）"的布局对 vulkan 数学上不可能工作——b4-3 arena-clone
+> 整层实验线因此是死路，已整体归档（见 debug_patch/b4-3-arena-clone/，可 git am 恢复），
+> HEAD 回退 860f9f4 干净基线，v1 单节点 vulkan mm + CPU burst 完整保留（RAM IDENTICAL）。
 
-- [ ] M2-1 全 vram 单 device 真 vulkan 列链执行（vram 内 device arena/乒乓 + mini-leaf 提交 vulkan）→ IDENTICAL
-- [x] M2-1 **v1（31286fa）**：vram 激活集的 MUL_MAT_ID 已走 vulkan（w3d 壳指 pool buffer + cur/ids 上传默认 buft（Vulkan_Host buft 本驱动无 host map，改用 default）→ arena 计算 → 拷贝 host 隐藏 dst）。全 vram run embd/hidden/KV-used 与基线一致
-- [ ] M2-1 **v2（b4-2 备忘，整层 device 原地执行）**：
-  1. device 域判定（层激活单 pool>0）在 exec_layer_burst pin 后；
-  2. hide_dev：arena bump（dv.arena ensure 层 lsum），设主图节点 nd->buffer=dv.arena、nd->data=host_offset(arena,off)；**refresh_aliases 需同步 va.view->buffer=prod->buffer**；
-  3. 非私有 src（dense 输出 cur/ids/scale/weights_norm 等 host tensor）逐节点前 **stage 上传**：memcpy 到 dv.stage + 临时设其 buffer=dv.stage、data=offset（这些 tensor 每 step 重建，llama 不再读）；
-  4. weightless 单节点图直接用主图节点提交 dv.be（buffer 已设）——无需 arena 克隆；
-  5. mm v2：dst 即 hide_dev 的 arena off（不再 readback host）；手工 mm 图 leaf 同 v1；
-  6. moe_out：记录原主 dst host 指针 → arena off 计算 → memcpy(arena_map+off → 主 dst)；
-  7. 域内 view alias 衔接走 arena（mm 输出 view = arena+off，buffer=arena）；CPU 域路径不动。
-- [x] **v2 尝试结论（64d77c2，device chain 已禁用）**：arena 中途 realloc 会废掉已 hide 输出（需层首一次性 reserve 全量）；mm 的 cur 分 device-resident/上传两路（cur_on_dev）。**致命问题**：直接改主图 tensor 的 buffer 后，llama sched 对 burst 之后该 tensor 的 buffer 归属/copy 处理崩（moe_out 后崩）。exec_device_chain 保留为骨架参考。
-- [x] **b4-3 定案（2026-09）**：整层闭包（含匿名收敛 add 与 moe_out）全在 GPU 执行，否则 per-expert contribution readback 代价太大跑不起来。
-  - **不动主图 tensor**。arena-clone：为 `ex->compute` 每节点在 device arena 建独立 clone（leaf+op node），链内 clone 自持，整层单 vulkan cgraph 一次提交，仅 moe_out 出口 memcpy 回主 dst host 指针（不碰 buffer）。
-  - **布局 = 全分配（先）**：出参位置数组 `out_off` 按 full-alloc bump 填（每节点独立区，层首 reserve 全量，杜绝中途 realloc）。
-  - **结构 = 拓扑解析与字节布局分离**（moe_node_plan，见 docs/M2_DEVICE_EXECUTOR.md §4.1）：
-    - 入参存**引用**（`prod` 序号 + view 链 `off`），不存绝对偏移——builder 用 `plan[prod].out_off + off` 现算叶子 data；复用分析将来只改 `out_off` 数组，builder 不动。
-    - mm / moe_out 是特例：mm 的 src[0] 权重壳（池 dev_buf+branch_off，非 arena）+ ids 区域本地化，builder 按 op 特判；moe_out 有出参区 + 出口 readback 标记。
-    - **将来**：verify 里 live-range/interval 复用分析填同一 `out_off` 数组（乒乓两区 = interval 图特例）→ 同一 builder 直接消费，零结构变更。
-  - 风险：闭包 weightless op（REPEAT/GET_ROWS/ADD/GLU）也走 vulkan kernel，需数值门验证 GPU==CPU 逐字节（v1 mm 已证 Q4_K 一致，float 单 op 以实测为准）。
-  - **测试池用小 vram 专家池**（怕全分配 arena 太大）；实际 lsum 值趁真跑时记录。
-- [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
+- [x] M2-1 **v1（31286fa）**：vram 激活集的 MUL_MAT_ID 已走 vulkan（w3d 壳指 pool buffer + cur/ids 上传默认 buft（Vulkan_Host buft 本驱动无 host map，改用 default）→ arena 计算 → 拷贝 host 隐藏 dst）。**注意：v1 在真 vram 池下数值并不对**（同 b4-3 根因——vulkan 不认槽壳），此前"全 vram IDENTICAL"是激活集落 RAM 走 CPU mm 的假象（VMMDUMP 证实 v1 与 arena 逐字节同错）。v1 保留为 CPU/RAM 域执行器基线。
+- [ ] **M2-1 布局改造（用户决策 2026-09，替代 b4-3）**：**vulkan 只认专家连续紧凑 src0**（每张量一个连续区、区内专家 stride=该张量大小、无空洞）。落地：
+  1. **GGUF 文件格式回归 v1（"sections-v1"）**：专家子张量按张量边界分散、每张量一段连续、GGUF 原生可读（弃 v2 expert-blocks 整专家紧凑块——那是导致槽池 expert_size 布局的源头）。
+  2. **pool 改为张量连续**：每专家 N 个子张量各归一个连续池（gate_up 池、down 池……池内同张量专家连续排布、无跨张量空洞），槽大小 = 单张量大小 = vulkan 期望的专家 stride。**N 与各张量 type/尺寸加载时枚举**（gemma: gate_up Q4_K + down Q5_1 前29层/Q8_0 末层——down 池需按 type 分段；通用 MoE 可能是 gate/up/down 3 张量）。
+  3. **读一个专家 = N 次 DIO**（每张量一次，落在该张量池自己的槽），异步装载/驱逐/按需 pin 调度机制保留，就绪/驱逐跨池一致性按 b4-3 前的 scheduler 语义扩展。
+  4. 数值门：改后 w3d 壳 data 直指张量连续区、专家 stride=单张量大小 → CPU/vulkan 同读同构造逐字节验证。
+  - 待办：确认 convertd v1 输出 + loader/scheduler 改张量池 + exec w3d 改紧凑指向（原 b4-3 的 route_b_chain plan 结构不迁入）。
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
