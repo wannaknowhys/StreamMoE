@@ -65,3 +65,11 @@
   - 对比标准 GGUF 与 4KB 扇区对齐 GGUF 的直读性能（`stream_moe_convert` 规划）。
 - [ ] **4.6 多 Agent 并发多会话槽位共享压力测试 (Multi-Slot Concurrency)**
   - 4~16 个并发对话流复用专家池时的局部性放大效应。
+
+## 阶段 7：dense 位置管理（2026-09，route B 独占专家放置后的下一项）
+
+- [ ] **7.1 dense 层 offload 位置管理**（当前已隐含 `-ngl 0` 作为临时默认）
+  - 背景：`--expert-backend` 已隐含 `no_op_offload`（防 llama 自动 offload host 计算），但 **`n_gpu_layers` 默认 -1（auto = 全量 offload）**，RAM-only 遍仍分配 ~2.5GB GPU buffer。
+  - 临时方案：frag 隐含 `params.n_gpu_layers = 0`（显式 `-ngl N` 在后覆盖）——实测 GPU 占用 2508MB → 5MB，纯 RAM 遍数值不变。
+  - 目标：route B 拥有 expert 放置权后，**dense 位置也应成为可管理项**——按预算/层把 dense 层放 GPU（`-ngl N` 语义）、KV cache 介质等统一决策，而非靠用户显式传参或全禁。
+- [ ] **7.2 默认 offload 语义澄清**：`-ngl` 默认 -1（auto）与 route B "纯 CPU 遍应零 GPU" 的矛盾，将来在参数文档/CHECKPOINT 中明确"expert-backend 下 dense offload 需显式 -ngl"。

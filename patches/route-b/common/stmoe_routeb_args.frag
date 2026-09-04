@@ -22,6 +22,12 @@
             // it steals VRAM for device compute buffers and pulls CPU-numeric
             // runs through device kernels even at -ngl 0.
             params.no_op_offload = true;
+            // n_gpu_layers defaults to -1 (auto = offload every layer), which
+            // makes a RAM-only run still allocate ~2.5 GB of GPU buffers.
+            // route B decides expert placement itself and dense placement is a
+            // future concern (docs/TODO.md) - default to no layer offload; an
+            // explicit later --gpu-layers N overrides this in arg order.
+            params.n_gpu_layers = 0;
         }
     ));
     add_opt(common_arg(
