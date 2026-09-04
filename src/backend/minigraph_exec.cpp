@@ -11,6 +11,14 @@
 #include <string>
 #include <vector>
 
+#ifdef STREAM_MOE_TEMP
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+#endif
+
 // ggml-vulkan route-B extensions.
 void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
 void* stmoe_vk_buffer_host_offset(ggml_backend_buffer_t buffer, size_t off);
@@ -534,6 +542,201 @@ static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer
     return -1;
 }
 
+#ifdef STREAM_MOE_TEMP
+// ---- L0 binary dump harness (temporary diagnostics, STREAM_MOE_TEMP only) --
+// Dumps full raw bytes of per-layer entry/exit data so a pure-CPU run and a
+// mixed-RAM/VRAM run can be compared node-by-node and expert-by-expert.
+// Controlled by env:
+//   STREAM_MOE_TMP_DUMP      =1 enable
+//   STREAM_MOE_TMP_DUMP_DIR   dump directory (created on demand)
+//   STREAM_MOE_TMP_DUMP_LAYER layer to dump (default 0)
+//   STREAM_MOE_TMP_DUMP_OUT_ONLY =1 only ffn_moe_out (exit) nodes (mixed run)
+// Layout of one node's files under <dir>/L<layer>/i<seq>_<op>_<tag>:
+//   .bin                 full output bytes (after execution)
+//   .cur.bin             mm activation input src[1] (mm only)
+//   .ids.bin             routing ids src[2] (mm only)
+//   .w_e<N>.bin          resident weight column slice of expert N (mm only)
+struct tmp_dump_cfg_t {
+    bool   on = false, out_only = false;
+    std::string dir;
+    int32_t layer = 0;
+};
+const tmp_dump_cfg_t & tmp_dump_cfg() {
+    static tmp_dump_cfg_t c = [] {
+        tmp_dump_cfg_t r;
+        const char * en = std::getenv("STREAM_MOE_TMP_DUMP");
+        if (en && std::string(en) == "1") {
+            r.on = true;
+            const char * d  = std::getenv("STREAM_MOE_TMP_DUMP_DIR");
+            r.dir = d && *d ? d : "temp/tmp_l0_dump";
+            const char * l  = std::getenv("STREAM_MOE_TMP_DUMP_LAYER");
+            if (l && *l) r.layer = atoi(l);
+            const char * o  = std::getenv("STREAM_MOE_TMP_DUMP_OUT_ONLY");
+            if (o && std::string(o) == "1") r.out_only = true;
+        }
+        return r;
+    } ();
+    return c;
+}
+static void tmp_mkdirs(const std::string & path) {
+    // create every missing level (Windows fopen fails on a missing dir); the
+    // cumulative prefix is kept so later segments nest under the earlier ones.
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] == '/' || path[i] == '\\') {
+#ifdef _WIN32
+            _mkdir(cur.c_str());
+#else
+            ::mkdir(cur.c_str(), 0755);
+#endif
+        }
+    }
+    if (!cur.empty()) {
+#ifdef _WIN32
+        _mkdir(cur.c_str());
+#else
+        ::mkdir(cur.c_str(), 0755);
+#endif
+    }
+}
+static void tmp_dump_write(const std::string & dir, const std::string & fname,
+                           const void * data, size_t bytes) {
+    tmp_mkdirs(dir);
+    if (!data || bytes == 0) return;
+    const std::string path = dir + "/" + fname;
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) { LOG_ERROR("stream_moe: [tmp] dump open failed " << path); return; }
+    const size_t wr = fwrite(data, 1, bytes, f);
+    fclose(f);
+    if (wr != bytes) LOG_ERROR("stream_moe: [tmp] dump short write " << path << " (" << wr << "/" << bytes << ")");
+}
+// Sidecar metadata JSON for an accompanying raw .bin: the tensor's own
+// ne/nb/type/op/name so an OFFLINE tool can re-slice the raw bytes into
+// per-expert columns without any contiguity assumption. .bin stays pure raw.
+static void tmp_dump_meta(const std::string & dir, const std::string & fname,
+                          const ggml_tensor * t) {
+    if (!t) return;
+    char j[512];
+    const char * ty = ggml_type_name(t->type);
+    snprintf(j, sizeof(j),
+             "{\"ne\":[%lld,%lld,%lld,%lld],\"nb\":[%zu,%zu,%zu,%zu],"
+             "\"type\":\"%s\",\"nbytes\":%zu,\"op\":\"%s\",\"name\":\"%s\"}\n",
+             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+             t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+             ty ? ty : "?", ggml_nbytes(t), ggml_op_name(t->op),
+             t->name ? t->name : "");
+    tmp_dump_write(dir, fname + ".json", j, strlen(j));
+}
+// Write a tensor's raw bytes + its metadata sidecar under one base name.
+static void tmp_dump_tensor(const std::string & dir, const std::string & fname,
+                            const ggml_tensor * t, const void * data, size_t bytes) {
+    tmp_dump_write(dir, fname, data, bytes);
+    tmp_dump_meta(dir, fname, t);
+}
+static std::string tmp_sanitize(const char * s) {
+    if (!s || !*s) return "anon";
+    std::string r;
+    for (const char * p = s; *p; ++p) {
+        const char ch = *p;
+        r += (ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' ||
+              ch == '"' || ch == '<' || ch == '>' || ch == '|') ? '_' : ch;
+    }
+    return r;
+}
+// Dump a captured node after execution. Entry side (cur/ids/weight slices) is
+// dumped for mm nodes in full mode; exit data = the node's own output bytes.
+static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t & topo,
+                          const std::vector<expert_handle_t> & pins, int32_t layer,
+                          size_t seq, ggml_tensor * nd) {
+    const tmp_dump_cfg_t & cfg = tmp_dump_cfg();
+    if (!cfg.on || layer != cfg.layer) return;
+    const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+    if (cfg.out_only && !is_out) return;
+    char sub[64];
+    snprintf(sub, sizeof(sub), "L%d", layer);
+    const std::string dir = cfg.dir + "/" + sub;
+    // Owner pool prefix (offline alignment key): the pool this data lives on /
+    // was produced by. `cpu_` (pool 0) vs `gpu_` (any device pool). For an mm
+    // the prefix follows the region its active set executed on (rescanned here
+    // from the pinned slots - exec already ran, so use_sp is unambiguous);
+    // weight slices use their own slot's pool (a mixed layer then produces
+    // per-expert files under both prefixes, which is the whole point).
+    uint32_t mm_pool = 0;
+    const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
+    if (is_mm) {
+        const ggml_tensor * ids = nd->src[2];
+        if (ids && ids->data) {
+            for (int t = 0; t < ids->ne[1]; ++t) {
+                for (int k = 0; k < ids->ne[0]; ++k) {
+                    const int32_t e = MOE_ID_AT(ids, t, k);
+                    if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) continue;
+                    const int32_t slot = pin_slot(pins, (uint32_t)layer, (uint32_t)e);
+                    if (slot < 0) continue;
+                    const expert_scheduler::subpool_t * osp = sched.subpool_of_slot(slot);
+                    if (osp && osp->pool != 0) { mm_pool = osp->pool; break; }
+                }
+                if (mm_pool != 0) break;
+            }
+        }
+    }
+    const char * mm_pre = mm_pool != 0 ? "gpu" : "cpu";
+    const char * node_pre = (is_mm && mm_pool != 0) ? "gpu" : "cpu";
+    char base[256];
+    snprintf(base, sizeof(base), "i%03zu_%s_%s", seq, ggml_op_name(nd->op),
+             tmp_sanitize(nd->name ? nd->name : "").c_str());
+    if (is_mm && !cfg.out_only) {
+        // entry: activation input + routing ids + resident weight column slices
+        const ggml_tensor * cur = nd->src[1];
+        const ggml_tensor * ids = nd->src[2];
+        if (cur && cur->data) {
+            tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".cur.bin", cur, cur->data, ggml_nbytes(cur));
+        }
+        if (ids && ids->data) {
+            tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".ids.bin", ids, ids->data, ggml_nbytes(ids));
+        }
+        // weight slice per active expert (SoA column slice at its slot); the
+        // filename carries the expert's OWN pool prefix (mm_pre is the layer
+        // burst owner; individual experts may still live elsewhere).
+        const ggml_tensor * w = nd->src[0];
+        if (w && w->name && ids && ids->data && topo.n_expert > 0) {
+            std::vector<bool> done(topo.n_expert, false);
+            for (int t = 0; t < ids->ne[1]; ++t) {
+                for (int k = 0; k < ids->ne[0]; ++k) {
+                    const int32_t e = MOE_ID_AT(ids, t, k);
+                    if (e < 0 || e >= static_cast<int32_t>(topo.n_expert) || done[e]) continue;
+                    done[e] = true;
+                    const int32_t slot = pin_slot(pins, (uint32_t)layer, (uint32_t)e);
+                    if (slot < 0) continue;
+                    const expert_scheduler::subpool_t * sp = sched.subpool_of_slot(slot);
+                    if (!sp) continue;
+                    size_t col_off = 0, col_stride = 0; uint32_t ci = 0;
+                    if (!sched.column_layout(*sp, w->name, col_off, col_stride, ci)) continue;
+                    const uint8_t * p = sp->base + col_off +
+                        static_cast<size_t>(slot - static_cast<int32_t>(sp->slot_begin)) * col_stride;
+                    const char * pre = sp->pool != 0 ? "gpu" : "cpu";
+                    char wf[256];
+                    snprintf(wf, sizeof(wf), "%s_%s.w_e%d.bin", pre, base, e);
+                    // A weight slice is one expert's compact column (stride
+                    // bytes) of the full tensor - not the whole tensor. Emit
+                    // the slice's own minimal meta (no ne/nb: offline use is
+                    // per-expert byte comparison, not column re-slicing).
+                    tmp_dump_write(dir, wf, p, col_stride);
+                    char j[256];
+                    snprintf(j, sizeof(j),
+                             "{\"type\":\"%s\",\"nbytes\":%zu,\"expert\":%d,\"slice_of\":\"%s\"}\n",
+                             ggml_type_name(w->type), col_stride, e, w->name ? w->name : "");
+                    tmp_dump_write(dir, std::string(wf) + ".json", j, strlen(j));
+                }
+            }
+        }
+    }
+    // exit: the node's own output bytes (full run only; out_only already filtered)
+    if (nd->data) {
+        tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".bin", nd, nd->data, ggml_nbytes(nd));
+    }
+}
+#endif // STREAM_MOE_TEMP
 
 // Execute one captured compute node (view aliases already refreshed by the
 // producers). mm / weightless compute both run as single-node CPU graphs.
@@ -603,7 +806,15 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
                 return false;
             }
             size_t stage_off = 0;
-            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, col_off, col_stride, 0, stage_off, true);
+            const bool vk_ok = exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, col_off, col_stride, 0, stage_off, true);
+            // Mirror the CPU mm branch: refresh every chain view of this
+            // producer so the next (host weightless) node reads the hidden dst
+            // the device result was read back into, not the stale main-graph
+            // address. exec_mm_vk writes nd->data (hide_burst'd), the views
+            // need the same pointer. (Bug surfaced by the pure-VRAM L0 dump:
+            // GLU output was all zeros downstream of the GPU gate_up.)
+            if (vk_ok) refresh_aliases(layer, nd);
+            return vk_ok;
         }
 
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
@@ -898,9 +1109,16 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                  << " pool0=" << n_pool0 << " pool1=" << n_pool1);
     }
 #endif
+    size_t seq = 0;
     for (const auto * cn : ex->compute) {
         if (!ok) break;
         ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
+#ifdef STREAM_MOE_TEMP
+        if (ok) {
+            tmp_dump_node(sched, topo, pins, layer, seq, const_cast<ggml_tensor*>(cn));
+        }
+#endif
+        ++seq;
     }
     for (const auto & h : pins) sched.unpin(h);
     return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
