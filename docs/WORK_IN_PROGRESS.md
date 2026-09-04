@@ -1,8 +1,7 @@
 ﻿# Work In Progress - patch 体系手术 + 收尾
 
-> 会话任务清单，边做边更新（多 commit，每步成功即提交）。
 > **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
-> **本轮（2026-09-04）**：v2 块内张量对齐 + SoA pool 布局改造定案。转换器（K1/K2）已完成并验证；引擎 SoA 改动点（K3-K6）细化。v1 sections-v1 否决。
+> **本轮（2026-09-04）**：v2 块内张量对齐 + SoA pool 布局改造定案并落地（K1-K5）；批量 pin（L1-L6，纯 RAM 0.11s IDENTICAL）；**M 节设计定稿**（驱逐 + move 管线，docs/EXPERT_MOVE_PIPELINE.md）。v1 sections-v1 否决。
 
 ## 背景状态（已落地，commit 403a5d2）
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
@@ -171,6 +170,45 @@
 > - [x] L6 编译 + 回归：gemma v2align prefill-from vs moe_129_8192_vk **IDENTICAL**；**wall time 几十秒 → 0.11s**（DIO 并发化 + 消乒乓）——0518153
 > - [ ] **L6b vram GPU 触发（K6 阻塞延续）**：批量 pin 后纯 RAM 无 demote、极快；但 vram 池场景仍触发 ~918 次 device→RAM demote 且 129-token 超时（1-token 0 demote 但无 MoE 前向不触发 GPU；15-token 277 demote）。demote 风暴是 J 节既有容量/放置语义（vram 428 槽 < 逐层累积驻留），非批量 pin 引入。需独立处理：放置策略（当前层优先驻留 vram / 防跨层驱逐）或足够大 vram。1-token 单层解码可能是不触发 GPU 的正确复现入口（需确认 prefill 首 token 是否真过 MoE）。
 > - [ ] L7 文档同步（WIP L 节已写；补 CHECKPOINT 一行引用）
+
+### M. Expert Move Pipeline + (L,E)-Keyed Eviction（2026-09 设计定稿）
+> **完整设计见 `docs/EXPERT_MOVE_PIPELINE.md`（EN）/ `.zh-CN.md`** —— 一次工作会话
+> 敲定的下一轮 scheduler 重构，建在已落地 L 节批量 pin 之上。本文档含 open questions
+> 与构建顺序，改动面大，动码前以它为唯一设计依据。
+>
+> **动机**：批量 pin 消除了 DIO 串行，暴露 demote 同步 memcpy 成新瓶颈——vram 池
+> 场景 ~900+ 次 device→RAM demote 全在调度线程同步做（递归为 RAM 腾位），exec
+> 卡在批等待、从未触发 `exec_mm_vk`（L6b）。
+>
+> **定案要点**：
+> 1. **Directory 加宽为 (L,E)×pool 生命周期状态表**（A1：state_+slot_ 两个并行原子）：
+>    ABSENT/LOADING/READY/MOVING_OUT/MOVING_IN/FAILED——半途状态对 exec 可见，
+>    消灭"正在装/在搬"与"缺失"不可分的重复装载窗口。完整 move 描述住任务对象，
+>    不进 directory。
+> 2. **装载顺序不变量**：先发布 `dir=LOADING(slot)` 再 `begin_reload`（可见点在前）。
+> 3. **删 owner_**：8 处编译错误全在 alloc_or_evict（登记×2/打分×2/victim 反查×2），
+>    无外部依赖。驱逐改 (L,E) 键后槽侧不再需要"槽里是谁"。
+> 4. **驱逐 = (L,E) 键 + 层距偏好**：为 layer-L 批腾 K 槽，从 L-1 往前逐层，最近层
+>    先逐（top K/2/层，score 低先逐；score 线估算后置）。枚举用逐层查 entries_
+>    （O(256)/层，只扫近层），将来可换 per-(pool,layer) 驻留列表。
+> 5. **Move 管线（v2r+r2v 统一异步）**：1 个 copy worker（数量参数化），move_task
+>    提交队列 + 完成队列（仿 DIO），worker 只 memcpy、控制面收尾回调度线程；
+>    源槽保持 EVICTING 到 cq（不 drop——drop 因状态混乱被否）；排他用槽状态
+>    （源 EVICTING/目标 IO_INFLIGHT）**不用 refcount**（refcount 是计算读者语义，
+>    驱逐 drain 会自锁）。
+> 6. **v2r 不做 GPU/vulkan DMA**：独显 host-visible heap 仍是显存，系统 RAM 不在 GPU
+>    地址空间，copy engine 写不到（UMA/APU 才有）。只能 CPU memcpy，故异步 worker。
+> 7. **批进度记账移调度线程**：scheduler 维护 remaining=seq，归零 wake 一次；exec
+>    保留 pins[] handle 数组（resolve/unpin 用，独立记账）。
+>
+> **任务（详细 build order 见设计文档 §9）**
+> - [ ] M1 directory 加宽（A1 state_+slot_）；owner_ 留到 M3 编译通过
+> - [ ] M2 装载路径：先发 LOADING 再 begin_reload；accept 加 in-flight skip（消重复装载窗口）
+> - [ ] M3 驱逐改 (L,E) 层距（alloc_or_evict 内）；删 owner_（8 处用已枚举）
+> - [ ] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进 device victim 驱逐
+> - [ ] M5 批进度记账移调度线程（只醒一次）
+> - [ ] M6 验证：纯 RAM IDENTICAL；VRAM 单设备到达 exec_mm_vk（解 L6b）；新 UT
+> - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛）
 
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
