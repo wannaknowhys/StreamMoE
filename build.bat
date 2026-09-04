@@ -58,19 +58,29 @@ if "%TAG%"=="main"                 set STREAM_MOE_FEATURES=route_b
 if "%TAG%"=="upstream_dump"        set STREAM_MOE_FEATURES=prefill_export
 if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_FEATURES=prefill_export
 if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_FEATURES=route_b,prefill_export
+if "%TAG%"=="StreamMoE_dump_dbg"   set STREAM_MOE_FEATURES=route_b,prefill_export
+rem ---- in-progress compile-time feature switches (default OFF) ------------
+rem   StreamMoE_dump_dbg (tag) = StreamMoE_dump + STREAM_MOE_TEMP (temporary
+rem   diagnostic code compiled in; see PROJECT_STRUCTURE.md §10). All other tags
+rem   build without the macro (production green). Diagnostics are #ifdef
+rem   STREAM_MOE_TEMP and must stay gated - the dbg tag is the only way they build.
+set STREAM_MOE_TEMP_FLAG=
+if "%TAG%"=="StreamMoE_dump_dbg"   set STREAM_MOE_TEMP_FLAG=-DSTREAM_MOE_TEMP
 rem ---- CPU arch + backend by tag ----
 rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
 rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
 rem         to znver3 (5950X) for now.
 rem   upstream_dump: prefill export, no vulkan (clean upstream baseline).
 rem   upstream_vulkan_dump: vulkan backend for Vulkan0 comparison.
-rem   StreamMoE_dump: vulkan backend too - the route-B Vulkan0 device-pool path
-rem         (M1+) needs the device registered; runs still default to CPU unless
-rem         -ngl is given, so numerics land on the same CPU kernels.
+rem   StreamMoE_dump / StreamMoE_dump_dbg: vulkan backend too - the route-B
+rem         Vulkan0 device-pool path (M1+) needs the device registered; runs still
+rem         default to CPU unless -ngl is given, so numerics land on the same CPU
+rem         kernels.
 set STREAM_MOE_CPU_FLAGS=-march=znver3
 set GGML_VULKAN_DEFAULT=OFF
 if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="StreamMoE_dump_dbg"   set GGML_VULKAN_DEFAULT=ON
 rem env GGML_VULKAN=OFF still overrides (e.g. to rebuild a CPU-only StreamMoE_dump
 rem for an IDENTICAL baseline regression - see baseline_regression/README.md).
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
@@ -103,7 +113,7 @@ if "%GGML_VULKAN%"=="ON" (
     -DLLAMA_CURL=OFF -DGGML_OPENMP=ON -DGGML_NATIVE=ON ^
     -DGGML_VULKAN=%GGML_VULKAN% -DGGML_CUDA=%GGML_CUDA% -DGGML_HIP=%GGML_HIP% ^
     -DGGML_METAL=%GGML_METAL% -DGGML_SYCL=%GGML_SYCL% ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS%" ^
+    -DCMAKE_C_FLAGS="-Wno-cast-qual %STREAM_MOE_CPU_FLAGS%" -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc %STREAM_MOE_CPU_FLAGS% %STREAM_MOE_TEMP_FLAG%" ^
     -DSTREAM_MOE_FEATURES="%STREAM_MOE_FEATURES%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
@@ -231,6 +241,8 @@ echo Optional [tag] sub-path for llamalibs/build (default: main).
 echo   llamalibs main           - route-B llama-server (build\main)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
 echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
+echo   llamalibs StreamMoE_dump_dbg - StreamMoE_dump + STREAM_MOE_TEMP diagnostic
+echo                                code (build\StreamMoE_dump_dbg; debug only)
 echo   build.bat convertd       - build converter TCP service (build\convertd)
 echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.

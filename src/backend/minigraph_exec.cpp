@@ -886,6 +886,18 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // replaces exec_device_chain.
     moe_chain_set_full_alloc(lsum);
     reset_layer(layer);
+#ifdef STREAM_MOE_TEMP
+    {
+        // TEMP M-diagnostic: where does this layer's pinned active set live?
+        uint32_t n_pool0 = 0, n_pool1 = 0;
+        for (const auto & h : pins) {
+            const auto * osp = sched.subpool_of_slot(h.slot);
+            if (osp && osp->pool == 0) ++n_pool0; else if (osp) ++n_pool1;
+        }
+        LOG_INFO("stream_moe: [tmp] burst L" << layer << " pins=" << pins.size()
+                 << " pool0=" << n_pool0 << " pool1=" << n_pool1);
+    }
+#endif
     for (const auto * cn : ex->compute) {
         if (!ok) break;
         ok = exec_one_burst(ctx, cpu, sched, topo, const_cast<ggml_tensor*>(cn), layer, pins);
