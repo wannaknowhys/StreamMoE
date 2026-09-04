@@ -1,7 +1,8 @@
 # 多子池设计：按专家种类分组 (MULTI_SUBPOOL.md)
 
-> 状态：**定案（2026-08-27）**。替代 `heterogeneous_layers` 排除方案（异构层也进池）。
-> 相关：`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7（第三路径：官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽）。
+> 状态：**定案（2026-08-27），2026-09 修订**（SoA 张量列区）。替代 `heterogeneous_layers` 排除方案（异构层也进池）。
+> 相关：`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7（第三路径：官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽）、
+> `docs/STREAMMOE_GGUF_FORMAT.md` §2.6（块内张量切片 4K 对齐变体）。
 
 ## 1. 问题
 
@@ -12,6 +13,24 @@ route B 第三路径要求**每专家等大**（均匀 stride 槽：`nb[2]=slot_
 - layer 29（1 层）：`gate_up Q4_K + down Q8_0`，每专家 **4336640 B**
 
 同质假设下异构层无法进池（旧方案：排除走 mmap）。
+
+## 1a. SoA 张量列区修订（2026-09）
+
+> 为了 ggml-vulkan 步长兼容（专家步长硬编码 = 单张量紧凑大小），槽布局从"整专家块 AoS"
+> 改为**每张量一列（struct-of-array）**。组（expert_group）仍是"per-expert 字节布局相同的层集合"
+> 的分组单位，但组内不再是一个"槽 = 整专家块"的连续块，而是**每张量一个列区**：
+
+```text
+组内（同质：每专家同 quant 同 ne）:
+  gate_up 列: [e0 gate_up | e1 gate_up | ...]  stride = gate_up perExpert 紧凑
+  down    列: [e0 down    | e1 down    | ...]  stride = down perExpert 紧凑
+  槽 e 的物理内容 = 各列中第 e 个切片（跨列同索引），不再是单块连续内存
+```
+
+- 组识别不变（每专家总字节相同 → 同组），组内每列 stride = 该张量 perExpert。
+- exec 以单张量为单位：w3d 壳 data = 列基址 + e×stride、nb[2] = perExpert。
+- 装载：专家 e 的每张量切片独立 DIO（文件侧块内切片 4K 对齐，见 GGUF_FORMAT §2.6）；
+  perExpert 4K 倍数 → 直写；非 4K → staging move。
 
 ## 2. 设计：按专家种类分子池
 

@@ -94,21 +94,39 @@
 - [x] J5 **device 驱逐 demote 回 RAM（77b0bbe）**：vram victim（READY+ref0）内容 memcpy 进 group 的 RAM 区（RAM 先丢最冷腾位），目录迁移 pool；RAM victim 仍丢弃（盘为下一层）。Vulkan0:1024（139 槽 group0）129-token 触发 **1987 次 demote 仍 IDENTICAL**——move 数据路径正确
 - [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
 
-### K. M2 设备执行器（2026-09 改版：b4-3 死路已归档，转 v1 + 张量池布局）
-> 2026-09 根因钉死：**ggml-vulkan MUL_MAT_ID 的专家步长硬编码 = `ne0*ne1`（单张量紧凑大小），
-> 完全忽略 `nb[2]`**（mul_mm.comp:253 用 host 传的 batch_stride_a=ne00*ne01；ggml-vulkan.cpp:10385）。
-> CPU mul_mat_id 读 `nb02`（ggml-cpu.c:1654）正确。所以任何"槽 stride = expert_size、w3d 壳
-> 伪 3D（ne[2]=slots/nb[2]=expert_size）"的布局对 vulkan 数学上不可能工作——b4-3 arena-clone
-> 整层实验线因此是死路，已整体归档（见 debug_patch/b4-3-arena-clone/，可 git am 恢复），
-> HEAD 回退 860f9f4 干净基线，v1 单节点 vulkan mm + CPU burst 完整保留（RAM IDENTICAL）。
+### K. v2 块内张量对齐 + SoA pool 布局改造（2026-09 定案，替代 b4-3/v1 路线）
+> 根因钉死：**ggml-vulkan MUL_MAT_ID 专家步长硬编码 = `ne0*ne1`（单张量紧凑大小），忽略 `nb[2]`**
+> （mul_mm.comp:253 batch_stride_a=ne00*ne01；ggml-vulkan.cpp:10385）。CPU mul_mat_id 读 `nb02`
+> （ggml-cpu.c:1654）正确。b4-3 arena-clone 已归档（debug_patch/b4-3-arena-clone/）。
+> **v1 sections-v1 已否决（2026-09）**：GGUF tensor offset 必须紧凑单调（gguf reader 校验
+> `ti.offset==累计 padded size`，gguf.cpp:774-794），无法在张量内做 4K 切片 stride；writeV1 的
+> per-expert reflow 产出非法 GGUF（llama 加载报 offset 不匹配）。实测 gemma perExpert：
+> gate_up Q4_K 2230272=4096×544.5（非 4K）/ down Q5_1 1486848（4K）/ 末层 Q8_0 2106368（非 4K）；
+> deepseek+dspark Q8_0 4456448 全 4K。
 
-- [x] M2-1 **v1（31286fa）**：vram 激活集的 MUL_MAT_ID 已走 vulkan（w3d 壳指 pool buffer + cur/ids 上传默认 buft（Vulkan_Host buft 本驱动无 host map，改用 default）→ arena 计算 → 拷贝 host 隐藏 dst）。**注意：v1 在真 vram 池下数值并不对**（同 b4-3 根因——vulkan 不认槽壳），此前"全 vram IDENTICAL"是激活集落 RAM 走 CPU mm 的假象（VMMDUMP 证实 v1 与 arena 逐字节同错）。v1 保留为 CPU/RAM 域执行器基线。
-- [ ] **M2-1 布局改造（用户决策 2026-09，替代 b4-3）**：**vulkan 只认专家连续紧凑 src0**（每张量一个连续区、区内专家 stride=该张量大小、无空洞）。落地：
-  1. **GGUF 文件格式回归 v1（"sections-v1"）**：专家子张量按张量边界分散、每张量一段连续、GGUF 原生可读（弃 v2 expert-blocks 整专家紧凑块——那是导致槽池 expert_size 布局的源头）。
-  2. **pool 改为张量连续**：每专家 N 个子张量各归一个连续池（gate_up 池、down 池……池内同张量专家连续排布、无跨张量空洞），槽大小 = 单张量大小 = vulkan 期望的专家 stride。**N 与各张量 type/尺寸加载时枚举**（gemma: gate_up Q4_K + down Q5_1 前29层/Q8_0 末层——down 池需按 type 分段；通用 MoE 可能是 gate/up/down 3 张量）。
-  3. **读一个专家 = N 次 DIO**（每张量一次，落在该张量池自己的槽），异步装载/驱逐/按需 pin 调度机制保留，就绪/驱逐跨池一致性按 b4-3 前的 scheduler 语义扩展。
-  4. 数值门：改后 w3d 壳 data 直指张量连续区、专家 stride=单张量大小 → CPU/vulkan 同读同构造逐字节验证。
-  - 待办：确认 convertd v1 输出 + loader/scheduler 改张量池 + exec w3d 改紧凑指向（原 b4-3 的 route_b_chain plan 结构不迁入）。
+**定案（用户 2026-09，两步 + 装载分流）**
+- **文件侧（B，保留 expert-blocks 架构）**：v2 块内**每个张量切片独立 4K 对齐**（gate_up 段、
+  down 段各自起点 4K；原紧凑拼接 down 起点因 gate_up 2230272 半块错开非 4K）。块内 offset 计算
+  每分支起点 align_up(累计,4096)；pad 由 fill 补（块内空洞）。**DIO 源对齐成立**（每个专家每个
+  张量切片都可从 4K 对齐位置发起 DIO）。
+- **pool 侧（SoA / struct-of-array）**：subpool 内按张量分列——gate_up 列、down 列……每列 = 该
+  张量全部专家切片连续，stride = 单张量紧凑 perExpert（无跨张量空洞）。槽语义从"整专家块 AoS"
+  变"列内专家切片"。executor 以单张量为权重单位：w3d 壳 data = 列基址 + e×stride、nb[2]=perExpert
+  → vulkan 步长天然命中，无需伪 3D。
+- **装载（DIO 分流）**：专家 e 的每张量切片各一次 DIO（读 gate_up 切片 → gate_up 列）：
+  - perExpert 是 4K 倍数 → 源(4K)+目标槽(4K) 对齐 → **DIO 直写槽**（deepseek/dspark 全命中、gemma down 前29层）
+  - perExpert 非 4K → DIO 读 4K 窗口 → **staging move**（gemma gate_up 2230272、末层 down）
+  - 异步 ring buffer / pending 聚合 / staging 基础设施已有（async_load_t reqs[pending]）
+
+**任务**
+- [ ] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）
+- [ ] K2 跑转换 gemma original→新 v2，验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（转换矩阵）
+- [ ] K3 loader/topo：sub_tensor.slot_offset 语义从"专家块内拼接"改"张量列区内的槽/列描述"；read plan 携带 per-expert DIO 对齐性（direct vs staging）
+- [ ] K4 scheduler：subpool 槽空间从 AoS（base + slot×expert_size）改 SoA 分列（每列 base + stride）；async_load 目标偏移按列算
+- [ ] K5 minigraph_exec：w3d 壳改单张量指向（data=列基址+off、nb[2]=perExpert、ne[2]=n_slots）；CPU/vulkan 同构造
+- [ ] K6 数值门：v2 回归（moe_129_8192_vk 基线 IDENTICAL）+ 全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）
+- [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
+
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）

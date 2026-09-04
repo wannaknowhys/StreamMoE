@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-03（b4-3 实验线归档 + v1/张量池布局决策）。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-04（v2 块内张量对齐 + SoA pool 布局改造定案；v1 否决）。维护者每阶段收尾更新"当前状态"与"下一步"。
 
 ---
 
@@ -36,7 +36,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ### VRAM 数据层（2026-09，路线 A：数据层先行）
 - **vram 池真驻留 + CPU 从 vram 读权重执行**（`--moe-expert-pools RAM:N,Vulkan0:N`）：分配（slot 对齐降档，seg 登记）→ host map 通道（ggml-vulkan.cpp 在 **phase1 macros.patch 的 `STREAM_MOE_ROUTE_B` 锚点** include `stmoe_routeb_vk_hostmap.frag`（函数体在主仓库）导出 `stmoe_vk_buffer_host_ptr` 返回真 vkMapMemory ptr；`get_base` 仍是假 base `0x1000` 不改）→ scheduler 槽空间并入 vram 区（subpool 变 per-(group,pool)）→ 请求优先装 vram → CPU 执行从 vram map 读权重（"reads pool 1"，IDENTICAL）→ **vram 驱逐 demote 回 RAM**（Vulkan0:1024 触发 1987 demote 仍 IDENTICAL）。
 - 开发模型 = **v2 chunk**（专家独立化 direct，moe(v2) 与 v1 基线 IDENTICAL）；upstream 对照仍 v1（不认识 v2）。
-- **布局决策反转（2026-09，见 §4 下一步）**：v2 expert-blocks 整专家紧凑块是 vulkan 不兼容槽布局（专家 stride=expert_size）的源头；**回归 v1 sections-v1（张量分散）+ pool 改张量连续**，vulkan 才能原生执行 mm。v2 loader/转换先保留未动。
+- **v2 布局改造定案（2026-09，见 §4 下一步）**：v2 expert-blocks 整专家紧凑块是 vulkan 不兼容槽布局（专家 stride=expert_size）的源头。解法 = **v2 文件块内每个张量切片独立 4K 对齐** + **pool 改张量列区（struct-of-array）**。文件侧 DIO 源对齐，pool 侧槽 stride=单张量紧凑大小（vulkan 硬编码步长）。v1 sections-v1（张量分散 GGUF 原生可读）已否决——GGUF tensor offset 须紧凑单调，无法在张量内做 4K 切片 stride，writeV1 的 per-expert reflow 产出非法 GGUF（llama 加载 offset 校验失败）。
 - 已知限制：执行器**单区**（同层激活集须同池）；mixed 分区执行（WIP J6）与 GPU 每-device 分区同构，GPU 阶段前铺。
 - 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J 节。
 
@@ -101,9 +101,13 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 ## 4. 下一步（TODO）
 
-**主线方向（2026-09 决策：vulkan 兼容布局改造）**
-0. **b4-3 实验线已归档**（HEAD 回退 860f9f4，存档 debug_patch/b4-3-arena-clone/）——arena-clone 整层 GPU 执行是死路：ggml-vulkan MUL_MAT_ID 专家步长硬编码 `ne0*ne1`、忽略 `nb[2]`，任何槽 stride=expert_size 的伪 3D 壳 vulkan 都不认（CPU 读 nb02 才正确）。v1 单节点 vulkan mm 在真 vram 池数值也不对（此前"全 vram IDENTICAL"是激活集落 RAM 走 CPU 的假象）。
-1. **布局改造（核心，替代 b4-3）**：vulkan 只认"每张量一个连续区、区内专家 stride=单张量大小"。三步：① **GGUF 文件格式回归 v1（sections-v1，张量分散、GGUF 原生可读）**，弃 v2 expert-blocks 整专家紧凑块；② **pool 改张量连续**（gate_up 池、down 池……每专家 N 个子张量各归一个连续池，槽=单张量，N/type/尺寸加载时枚举；gemma 实测：gate_up Q4_K×30层 + down Q5_1 前29层/末层 Q8_0，down 池按 type 分段）；③ **读一个专家 = N 次 DIO**（每张量各落自己池槽，异步/驱逐/pin 调度保留）。数值门：CPU/vulkan 同读同构造逐字节。详见 docs/WORK_IN_PROGRESS.md K 节。
+**主线方向（2026-09 决策：vulkan 兼容布局改造 = v2 块内张量对齐 + SoA pool）**
+0. **b4-3 实验线已归档**（HEAD 回退 860f9f4，存档 debug_patch/b4-3-arena-clone/）——arena-clone 整层 GPU 执行是死路：ggml-vulkan MUL_MAT_ID 专家步长硬编码 `ne0*ne1`、忽略 `nb[2]`，任何槽 stride=expert_size 的伪 3D 壳 vulkan 都不认（CPU 读 nb02 才正确）。
+1. **v2 文件布局改造（核心，替代 b4-3）**：vulkan 只认"每张量一个连续区、区内专家 stride=单张量紧凑大小"。两步：
+   - **文件侧（v2 转换器）**：保留 expert-blocks 块架构，但**块内每张量切片独立 4K 对齐**（gate_up 段、down 段各自起点 4K；原紧凑拼接 down 起点非 4K）。块内 offset 计算对齐到 4096；pad 空洞由 fill 补。所有专家切片源 offset 均 4K 对齐 → DIO 源对齐成立。
+   - **pool 侧（SoA）**：subpool 内按张量分成列（gate_up 列、down 列……每列是某张量的专家切片序列，stride = 单张量紧凑 perExpert）。槽 = (列, 专家切片)。vulkan mm 以单张量为权重单位（列基址 + e×stride，nb[2]=perExpert）→ 天然匹配。
+   - **装载**：专家 e 的 gate_up 切片 = 文件 gate_up 段 offset 一次 DIO → 池 gate_up 列。perExpert 是 4K 倍数 → DIO 直写；非 4K → DIO 读 4K 窗口 + staging move。每专家 N 次 DIO（每张量一次）。
+   - 数值门：改后 w3d 壳 stride=perExpert → CPU/vulkan 同读同构造逐字节验证。
 2. deepseek `--prefill-from` KV 预构建实测（gemma 非 dsv4 无 KV；deepseek 才有，验证 KV 导出 + 预构建价值）。
 3. **vulkan 作为 backend dll**（`GGML_BACKEND_DL` + `BUILD_SHARED_LIBS=ON`）——**需与 moe 适配商议**。
 

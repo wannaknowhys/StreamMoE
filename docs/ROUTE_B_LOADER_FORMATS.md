@@ -7,6 +7,19 @@
 > (loader, read direction). The converter evolved after the loader; this doc
 > records the divergence and the target async loading design.
 
+> **2026-09 revision (supersedes v1-as-superset and whole-block-DIO below)**:
+> ggml-vulkan hardcodes the per-expert stride to the single-tensor compact size
+> (`ne0*ne1`), so route B is moving to **struct-of-array pools (one column per
+> tensor)** and v2 blocks with **each branch tensor slice 4K-aligned inside the
+> block** (see `STREAMMOE_GGUF_FORMAT.md` §2.6). Consequences for the loader:
+> v1 sections-v1 is dead (GGUF tensor offsets must be compact/monotonic - the
+> writeV1 per-expert reflow produced GGUF that llama refuses to load). For v2,
+> loading becomes **one DIO per (expert, tensor-slice)** instead of one DIO per
+> whole block: a slice whose perExpert is a 4K multiple loads straight into its
+> tensor column (aligned source + aligned slot); otherwise DIO reads a 4K window
+> into staging then moves into the column. The column layout is decided in
+> `src/loader` + `src/backend/scheduler` (SoA), independent of the file format.
+
 ## 1. Input formats
 
 | format | `stream_moe.layout` | `incomplete` | expert layout | alignment | read plan |

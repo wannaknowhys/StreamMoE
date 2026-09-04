@@ -6,6 +6,12 @@
 > **关键结论**：GGUF 张量没有 stride/切片语义（`gguf_tensor_info_t` 只有 name/ne/type/offset，数据必须连续）——"专家物理连续"与"原版可读"**不可兼得**。因此两个版本：
 > - **v1 = GGUF 超集（兼容，原版可读）**：每分支张量连续，dense/expert 分区。
 > - **v2 = expert-blocks（自有格式，原版不可读）**：每专家一个紧凑块，一次 DIO 装载。
+>
+> **2026-09 修正**：v1（sections-v1）因 GGUF tensor offset 必须紧凑单调（gguf reader 校验
+> `ti.offset == 累计 padded size`，ggml gguf.cpp:774-794）而否决——无法在单张量内做 4K 专家切片
+> stride（writeV1 的 per-expert reflow 产出非法 GGUF，llama 加载报 offset 不匹配）。**v2 为唯一
+> 布局**；v2 块内进一步改为"每张量切片独立 4K 对齐"（供推理引擎按张量 DIO + SoA 槽执行，见
+> §2.6），此变体原版同样不可读。
 
 ---
 
@@ -87,6 +93,27 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 - dense：同 v1（整段读）。
 - expert：scheduler 按 `expert_sections[i].offset` **一次 DIO 读整个块** → 槽（gate_up/up/down/scale 区域按块内布局）。
 - 无 `stream_moe.*` → 现有路径。
+
+### 2.6 块内张量切片独立 4K 对齐变体（2026-09，推理引擎 SoA 槽执行用）
+> 背景：ggml-vulkan MUL_MAT_ID 专家步长硬编码 = 单张量紧凑大小（`ne0*ne1`），忽略 `nb[2]`。
+> 推理引擎槽布局改为"每张量一列（struct-of-array）"，槽 = 某张量的单个专家切片，stride = 该张量
+> 紧凑 perExpert。为让每个专家切片的 **DIO 源 offset 4K 对齐**，v2 块内不再是"分支紧凑拼接"
+> （gate_up 2230272 半块会把 down 起点错开 2048B 非 4K），而是**每个分支起点独立 align_up 4K**：
+>
+> ```text
+> block e 内部（相对块起点，块起点本身 4K 对齐）:
+>   gate_up 切片起点 0            （4K 对齐）
+>   down   切片起点 align_up(gate_up perExpert, 4096)   （4K 对齐）
+>   块内各分支之间 pad 空洞（converter fill 补 0）
+> ```
+>
+> - **文件不变量**：块内每个分支切片源 offset（块基址 + 分支起点）都是 4K 对齐 → 装载任一专家
+>   任一张量切片都可用 DIO 直读。
+> - **DIO 分流**：perExpert 为 4K 倍数 → 源(4K)+目标槽(4K) → DIO 直写槽；perExpert 非 4K → DIO 读
+>   4K 窗口 → staging move。每个专家切片**独立一次 DIO**（不再是整块一次读）。
+> - 数值上块 = 原紧凑块 + 分支间 pad（约 +2048B/块, gemma；deepseek perExpert 全 4K 无 pad）。
+> - 兼容：tensor_info 占位、expert_sections 表、chunk 机制不变；仅"块内分支布局"变。loader 需按
+>   `stream_moe.branch_align` 区分新旧（无/0 = 旧紧凑拼接，1 = 新分支 4K 对齐）。
 
 ---
 
