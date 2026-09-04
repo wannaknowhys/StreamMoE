@@ -624,6 +624,9 @@ static bool exec_round_cpu(ggml_context * ctx, ggml_backend_t cpu,
                            const ggml_tensor * nd,
                            std::vector<float>& out) {
     const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+    // Leaves' DATA point at our heap buffers (not the ctx pool) - the exec ctx
+    // is a fixed-size arena sized from the graph nodes; a 129-token mixed round
+    // would otherwise exhaust it allocating b_leaf/ids_leaf per sub-mm.
     ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
     w3d->ne[2] = g_n_slots;
     w3d->nb[2] = col_stride;
@@ -631,11 +634,10 @@ static bool exec_round_cpu(ggml_context * ctx, ggml_backend_t cpu,
     w3d->data  = sp.base + col_off;
 
     ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, n_active);
-    std::memcpy(ids_leaf->data, ids_sub.data(), ids_sub.size() * sizeof(int32_t));
+    ids_leaf->data = const_cast<int32_t*>(ids_sub.data());
 
-    // cur leaf: rebuilt [d_in, width, n_active] contiguous f32 (see build_cur_sub)
     ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (int64_t)d_in, width, n_active);
-    std::memcpy(b_leaf->data, cur_sub.data(), cur_sub.size() * sizeof(float));
+    b_leaf->data = const_cast<float*>(cur_sub.data());
 
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_leaf);
@@ -811,6 +813,7 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
 //   .w_e<N>.bin          resident weight column slice of expert N (mm only)
 struct tmp_dump_cfg_t {
     bool   on = false, out_only = false;
+    bool   mm_only = false;   // keep only mm outputs + moe_out (small offline gate)
     std::string dir;
     int32_t layer = 0;
 };
@@ -826,6 +829,8 @@ const tmp_dump_cfg_t & tmp_dump_cfg() {
             if (l && *l) r.layer = atoi(l);
             const char * o  = std::getenv("STREAM_MOE_TMP_DUMP_OUT_ONLY");
             if (o && std::string(o) == "1") r.out_only = true;
+            const char * m  = std::getenv("STREAM_MOE_TMP_DUMP_MM_ONLY");
+            if (m && std::string(m) == "1") r.mm_only = true;
         }
         return r;
     } ();
@@ -906,6 +911,8 @@ static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t &
     if (!cfg.on || layer != cfg.layer) return;
     const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
     if (cfg.out_only && !is_out) return;
+    const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
+    if (cfg.mm_only && !is_mm && !is_out) return;   // mm_only: skip intermediate nodes
     char sub[64];
     snprintf(sub, sizeof(sub), "L%d", layer);
     const std::string dir = cfg.dir + "/" + sub;
@@ -916,7 +923,6 @@ static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t &
     // weight slices use their own slot's pool (a mixed layer then produces
     // per-expert files under both prefixes, which is the whole point).
     uint32_t mm_pool = 0;
-    const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
     if (is_mm) {
         const ggml_tensor * ids = nd->src[2];
         if (ids && ids->data) {
@@ -939,14 +945,17 @@ static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t &
     snprintf(base, sizeof(base), "i%03zu_%s_%s", seq, ggml_op_name(nd->op),
              tmp_sanitize(nd->name ? nd->name : "").c_str());
     if (is_mm && !cfg.out_only) {
-        // entry: activation input + routing ids + resident weight column slices
-        const ggml_tensor * cur = nd->src[1];
+        // routing ids always (column->expert map; the offline gate reads it);
+        // activation + per-expert weight slices only in full mode.
         const ggml_tensor * ids = nd->src[2];
-        if (cur && cur->data) {
-            tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".cur.bin", cur, cur->data, ggml_nbytes(cur));
-        }
         if (ids && ids->data) {
             tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".ids.bin", ids, ids->data, ggml_nbytes(ids));
+        }
+        if (!cfg.mm_only) {
+        // entry: activation input + routing ids + resident weight column slices
+        const ggml_tensor * cur = nd->src[1];
+        if (cur && cur->data) {
+            tmp_dump_tensor(dir, std::string(node_pre) + "_" + base + ".cur.bin", cur, cur->data, ggml_nbytes(cur));
         }
         // weight slice per active expert (SoA column slice at its slot); the
         // filename carries the expert's OWN pool prefix (mm_pre is the layer
@@ -983,6 +992,7 @@ static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t &
                 }
             }
         }
+        }   // !cfg.mm_only
     }
     // exit: the node's own output bytes (full run only; out_only already filtered)
     if (nd->data) {

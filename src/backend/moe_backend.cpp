@@ -157,6 +157,17 @@ static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
         need += ggml_nbytes(nd);          // result written into dst
         need += 4 * ggml_tensor_overhead() * 8;
         need += 1 * 1024 * 1024;
+        // Mixed-region split (J6): per-pool peel rounds each rebuild their own
+        // ids_leaf + cur leaf ([d_in, width, n_active]) inside THIS graph_compute
+        // call, on top of the single-mm budget above. Those leaves are NOT graph
+        // nodes, so reserve per-token scratch: cur = d_in x n_t x 4 (worst case
+        // a round is one token deep); ids = n_t x n_k x 4. Use src[2] (ids) ne
+        // for the token count when available.
+        const ggml_tensor* ids = nd->src[2];
+        const int64_t n_tok = ids ? ids->ne[1] : 1024;
+        need += static_cast<size_t>(w->ne[0]) * static_cast<size_t>(n_tok) * 4; // cur rebuild
+        need += static_cast<size_t>(n_tok) * static_cast<size_t>(ids ? ids->ne[0] : 16) * 4; // ids rebuild
+        need += 16 * 1024 * 1024;          // round graphs + mm result staging margin
     }
     return need * 2;
 }

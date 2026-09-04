@@ -77,6 +77,7 @@
 | B30 | PARTIAL | cache hit rate 基于 fake routing | src/main.cpp | ✅ fake 指标随 mock 路径移除；真实命中率待 route B 提供路由观测 |
 | B31 | PARTIAL | 测试断言过弱 | tests/* | ✅ 端到端真实输出验证已建立；单元级黄金用例待补 |
 | B32 | FIXED | prompt_tokens 分母不可信 | src/main.cpp:130 | ✅ libllama tokenizer 计数 |
+| B33 | OPEN | `build.bat llamalibs main` 链接失败：route_b 源码无条件引用 `stmoe_vk_buffer_host_ptr/host_offset`（ggml-vulkan host-map 符号），但 main tag `GGML_VULKAN=OFF` 不编 vulkan → undefined symbol | src/backend/minigraph_exec.cpp + vendored route-b | ⏳ 既有（非 mixed 引入）；route_b 需在无 vulkan 时条件编译或提供 stub；StreamMoE_dump/dbg（VULKAN=ON）不受影响 |
 
 ## P3 保留资产
 
