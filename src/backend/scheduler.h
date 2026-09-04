@@ -69,6 +69,14 @@ struct move_task_t {
         const uint8_t* src = nullptr;   // column slice source (resolved)
         uint8_t*       dst = nullptr;   // column slice destination (resolved)
         size_t         bytes = 0;
+        // v2r DMA: when the source lives on a device (vram) region, copying by
+        // host memcpy reads the rebar map at ~0.02 GB/s (unusable). Instead the
+        // worker issues a transfer-queue DMA (stmoe_vk_dma_read) into the dst.
+        // `dev_buf` = the source region's device buffer (null => RAM src, plain
+        // memcpy); `dev_off` = byte offset inside that buffer (= src - region
+        // base, since a vram region's host map starts at buffer offset 0).
+        void*  dev_buf = nullptr;
+        size_t dev_off = 0;
     };
     std::vector<copy_t> cols;  // one per tensor column
     expert_scheduler* owner = nullptr;  // scheduler owning both pools

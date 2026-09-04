@@ -7,6 +7,11 @@
 #include <algorithm>
 #include <chrono>
 
+// Transfer-queue DMA download of a VRAM buffer slice to a host pointer
+// (defined in the route-B vk_dma frag, vendored ggml-vulkan.cpp). 0.02 GB/s
+// rebar host reads vs ~14 GB/s via the device transfer queue.
+void stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
+
 namespace stream_moe {
 
 expert_scheduler::~expert_scheduler() {
@@ -248,6 +253,11 @@ bool expert_scheduler::submit_move(uint32_t layer, uint32_t expert,
         cp.dst = col_slice_ptr(*dsp, dc, static_cast<int32_t>(dst_slot));
         cp.bytes = sc.stride;
         if (!cp.src || !cp.dst) return false;
+        // v2r: DMA the device source instead of reading the slow rebar host map.
+        if (ssp->pool != 0 && ssp->dev_buf) {
+            cp.dev_buf = ssp->dev_buf;
+            cp.dev_off = static_cast<size_t>(cp.src - ssp->base);
+        }
         t.cols.push_back(cp);
     }
     {
@@ -271,15 +281,26 @@ void expert_scheduler::move_worker_main() {
             t = std::move(move_submit_.front());
             move_submit_.pop_front();
         }
-        // pure per-column memcpy - never touches the scheduler control plane
+        // per-column copy. Device (vram) sources go through the transfer-queue
+        // DMA download (stmoe_vk_dma_read); RAM sources are a plain memcpy.
+        // Never touches the scheduler control plane.
         const uint64_t cp0 = tsc_now();
+        uint64_t dma_ns = 0, mc_ns = 0;
         for (const auto& cp : t.cols) {
-            std::memcpy(cp.dst, cp.src, cp.bytes);
+            if (cp.dev_buf) {
+                const uint64_t d0 = tsc_now();
+                stmoe_vk_dma_read(cp.dev_buf, cp.dev_off, cp.dst, cp.bytes);
+                dma_ns += tsc_now() - d0;
+            } else {
+                const uint64_t d0 = tsc_now();
+                std::memcpy(cp.dst, cp.src, cp.bytes);
+                mc_ns += tsc_now() - d0;
+            }
         }
-        const int64_t memcpy_ns = tsc_delta_ns(tsc_now() - cp0);
         t.done_tsc = tsc_now();
         LOG_DEBUG("sched: move L" << t.layer << " E" << t.expert
-                  << " memcpy=" << (memcpy_ns / 1000) << "us"
+                  << (dma_ns ? " dma=" + std::to_string(tsc_delta_ns(dma_ns) / 1000) + "us" : "")
+                  << " mc=" << (tsc_delta_ns(mc_ns) / 1000) << "us"
                   << " (queued=" << (tsc_delta_ns(t.done_tsc - t.req_tsc) / 1000) << "us)");
         {
             std::lock_guard<std::mutex> lk(move_mtx_);

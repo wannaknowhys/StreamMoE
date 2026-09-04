@@ -17,11 +17,15 @@
 // into the ordinary host buffer `dst` (a RAM expert slot). Synchronous: returns
 // after the copy is complete and dst holds the bytes. Uses the transfer queue +
 // cached staging internally.
-void stmoe_vk_dma_read(ggml_backend_buffer_t buffer, size_t off, void * dst, size_t bytes) {
-    if (buffer == nullptr || buffer->context == nullptr || dst == nullptr || bytes == 0) {
+void stmoe_vk_dma_read(void * buffer, size_t off, void * dst, size_t bytes) {
+    if (buffer == nullptr || dst == nullptr || bytes == 0) {
         return;
     }
-    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
+    auto * buf = static_cast<ggml_backend_buffer_t>(buffer);
+    if (buf->context == nullptr) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buf->context);
     if (ctx->dev_buffer == nullptr) {
         return;
     }
