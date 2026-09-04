@@ -503,14 +503,27 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
         r = aio_req_t{};
         r.file = files_[sl.shard_idx];
         r.file_offset = sl.file_read_start;
-        if (sl.direct) {
-            // source aligned + len 4K multiple: DIO straight into the column slot
+        // Direct DIO into the column slot needs a 4K-aligned DESTINATION, not
+        // just an aligned source/length. The plan's `direct` only checks the
+        // file side; the slot address (column base + slot index * stride) can
+        // drift out of alignment when a preceding column's per-expert stride is
+        // not 4K and the region slot count moves the column start (e.g. a
+        // device region with 69 slots puts the down column at mod 4096 = 2048).
+        // Fall back to the staging path when the target is misaligned (every
+        // slice keeps its staging bytes reserved either way).
+        bool use_direct = sl.direct;
+        if (use_direct) {
             const uint8_t* dst = slot_col_mem(slot, sl.column);
             if (!dst) { t->failed = true; break; }
+            if (!is_aligned(dst + sl.copy_dst_offset)) use_direct = false;
+        }
+        if (use_direct) {
+            const uint8_t* dst = slot_col_mem(slot, sl.column);
             r.aligned_buf = const_cast<uint8_t*>(dst) + sl.copy_dst_offset;
             t->direct = true;
         } else {
             r.aligned_buf = t->staging + sl.staging_offset;
+            t->staging_mask |= static_cast<uint8_t>(1u << s);
         }
         r.aligned_len = sl.file_read_len;
         r.user_data = t;
@@ -536,7 +549,9 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
         const int slice = static_cast<int>(done[i] - t->reqs);
         if (done[i]->error_code != 0) {
             t->failed = true;
-        } else if (!t->failed && !t->plan.slices[slice].direct) {
+        } else if (!t->failed && (t->staging_mask & (uint8_t)(1u << slice))) {
+            // plan.direct but the runtime destination was not 4K aligned: the
+            // read went to staging, so copy payload to the column slot now.
             const auto& sl = t->plan.slices[slice];
             const uint8_t* dst = slot_col_mem(static_cast<int32_t>(t->slot), sl.column);
             if (dst) {

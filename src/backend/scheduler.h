@@ -87,6 +87,9 @@ struct async_load_t {
     int pending = 0;
     bool failed = false;
     bool direct = false;      // v2: reqs read straight into the slot
+    uint8_t staging_mask = 0; // per-slice (bit s) 1 = this slice went to staging
+                               // (plan.direct but the destination was not 4K
+                               // aligned -> runtime fallback; drain memcpys it)
     uint8_t* staging = nullptr;
     // wake-once (2026-09): this load belongs to a layer batch; on completion
     // (mark_ready) we fetch_add the owner's counter and wake it.
