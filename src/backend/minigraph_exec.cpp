@@ -1,4 +1,5 @@
 #include "backend/minigraph_exec.h"
+#include "backend/mix_split.h"
 #include "backend/route_b_chain.h"
 #include "backend/moe_backend.h"
 #include "common/logger.h"
@@ -542,6 +543,258 @@ static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// Mixed-region MUL_MAT_ID execution (J6).
+//
+// Kernel facts (ggml_cpu mul_mat_id, ggml-cpu.c):
+//   ids      [n_k, n_t]; entry (k,t) = expert id
+//   src0     weight [d_in, d_out, n_slot]; expert slice at ids[k][t]
+//   src1     cur [d_in, ne11, ne1(ids) tokens]; column chosen as
+//            (id % ne11, token): gate_up cur ne11=1 => one column shared by all
+//            experts; down cur ne11=n_k => one column per (topk slot, token).
+//   dst      [d_out, n_k, n_t]; column (k,t) at dst[k*nb1 + t*nb2]
+//
+// So a mul_mat_id is a per-column (topk-slot, token) op: expert weights from
+// ids, activation from cur, result to the matching dst column. Splitting by
+// pool = running one sub-mm whose ids/cur/dst are the pool's OWN slice of
+// (topk-slot, token) columns, then scattering the compact sub-dst columns back
+// to the real main-dst columns.
+//
+// mix_split (backend/mix_split.cpp) produces, per pool, peel rounds. Each
+// round is a full rectangle [width, n_active]: ids_sub stores pool-local slot
+// numbers (row-major token-major, ggml ids layout), scatter[idx] records the
+// original (t,k) of round idx = a*width+s. We rebuild cur_sub so sub-mm
+// column (s,a) reads source cur column (scatter_k % cur_ne11, scatter_t).
+// ---------------------------------------------------------------------------
+
+// Build the sub-mm's rebuilt activation from the source cur columns the round
+// references. Shared cur (ne11==1): width identical columns per token, so we
+// store [d_in, width, n_active] with all width columns equal (kernel then reads
+// s%width==s). Per-expert cur (ne11>1): column s carries source column
+// (scatter_k % ne11, t). Returns false on a mis-sized source.
+static bool build_cur_sub(const ggml_tensor * cur,
+                          const std::vector<mix_scatter_t>& scatter,
+                          uint32_t width, uint32_t n_active,
+                          std::vector<float>& cur_sub, size_t& d_in_out) {
+    const size_t d_in = static_cast<size_t>(cur->ne[0]);
+    if (cur->type != GGML_TYPE_F32) { LOG_ERROR("stream_moe: mixed cur not f32"); return false; }
+    d_in_out = d_in;
+    const int64_t cur_ne11 = cur->ne[1];
+    cur_sub.assign(static_cast<size_t>(width) * n_active * d_in, 0.0f);
+    for (uint32_t a = 0; a < n_active; ++a) {
+        for (uint32_t s = 0; s < width; ++s) {
+            const mix_scatter_t & sc = scatter[static_cast<size_t>(a) * width + s];
+            const int64_t kk = sc.k % cur_ne11;
+            const int64_t tt = sc.t;
+            const float * src = (const float *) ((const char *) cur->data + kk*cur->nb[1] + tt*cur->nb[2]);
+            float * dst = &cur_sub[(static_cast<size_t>(a) * width + s) * d_in];
+            std::memcpy(dst, src, d_in * sizeof(float));
+        }
+    }
+    return true;
+}
+
+// Scatter a compact sub-dst [d_out, width, n_active] back into the main dst
+// columns. Main dst is contiguous [d_out, n_k, n_t] (hide_burst'd host buffer);
+// sub column idx=(a*width+s) -> main column (scatter_k + n_k*scatter_t)*d_out.
+static void scatter_sub_dst(uint8_t * main_dst, size_t main_dst_nk,
+                            const std::vector<mix_scatter_t>& scatter,
+                            uint32_t width, uint32_t n_active,
+                            const void * sub_dst, size_t d_out, size_t esize) {
+    for (uint32_t a = 0; a < n_active; ++a) {
+        for (uint32_t s = 0; s < width; ++s) {
+            const mix_scatter_t & sc = scatter[static_cast<size_t>(a) * width + s];
+            const size_t idx = static_cast<size_t>(a) * width + s;
+            const size_t sub_off = idx * d_out * esize;
+            const size_t main_off = (static_cast<size_t>(sc.k) + main_dst_nk * sc.t) * d_out * esize;
+            std::memcpy(main_dst + main_off, (const char*)sub_dst + sub_off, d_out * esize);
+        }
+    }
+}
+
+// One pool's sub-mm round, CPU backend (pool 0). Writes the compact sub-dst
+// [d_out, width, n_active] into `out` (f32, sized by the caller).
+static bool exec_round_cpu(ggml_context * ctx, ggml_backend_t cpu,
+                           const ggml_tensor * w,
+                           const expert_scheduler::subpool_t & sp,
+                           size_t col_off, size_t col_stride,
+                           const std::vector<int32_t>& ids_sub, uint32_t width,
+                           uint32_t n_active,
+                           const std::vector<float>& cur_sub, size_t d_in,
+                           const ggml_tensor * nd,
+                           std::vector<float>& out) {
+    const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+    ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+    w3d->ne[2] = g_n_slots;
+    w3d->nb[2] = col_stride;
+    w3d->nb[3] = col_stride * g_n_slots;
+    w3d->data  = sp.base + col_off;
+
+    ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, n_active);
+    std::memcpy(ids_leaf->data, ids_sub.data(), ids_sub.size() * sizeof(int32_t));
+
+    // cur leaf: rebuilt [d_in, width, n_active] contiguous f32 (see build_cur_sub)
+    ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (int64_t)d_in, width, n_active);
+    std::memcpy(b_leaf->data, cur_sub.data(), cur_sub.size() * sizeof(float));
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_leaf);
+    out.resize(ggml_nbytes(mm) / sizeof(float), 0.0f);
+    mm->data = out.data();
+    ggml_build_forward_expand(gf, mm);
+    if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: mixed cpu round compute failed for " << (w->name ? w->name : "?"));
+        return false;
+    }
+    (void)nd;
+    return true;
+}
+
+// One pool's sub-mm round, device backend (pool != 0): upload ids/cur to the
+// staging buffer, compute in the arena, read the compact sub-dst back to `out`.
+static bool exec_round_vk(ggml_context * ctx, const ggml_tensor * w,
+                          const expert_scheduler::subpool_t & sp,
+                          size_t col_off, size_t col_stride,
+                          const std::vector<int32_t>& ids_sub, uint32_t width,
+                          uint32_t n_active,
+                          const std::vector<float>& cur_sub, size_t d_in,
+                          std::vector<float>& out) {
+    device_exec_ctx_t* dv = stream_moe_backend_device_exec(sp.pool);
+    if (!dv || !dv->be) {
+        LOG_ERROR("stream_moe: mixed no device exec context for pool " << sp.pool);
+        return false;
+    }
+    const size_t ids_bytes = ids_sub.size() * sizeof(int32_t);
+    const size_t cur_bytes = cur_sub.size() * sizeof(float);
+    const size_t d_out = static_cast<size_t>(w->ne[1]);
+    const size_t out_bytes = d_out * static_cast<size_t>(width) * n_active * sizeof(float);
+    // arena for the round's dst; staging holds ids + cur (ids first)
+    if (!stream_moe_backend_device_ensure(sp.pool, out_bytes + 4u * 1024 * 1024,
+                                           ids_bytes + cur_bytes + 4u * 1024 * 1024)) {
+        LOG_ERROR("stream_moe: mixed round arena/stage ensure failed (pool " << sp.pool << ")");
+        return false;
+    }
+    if (!dv->stage_map || !dv->arena_map) {
+        LOG_ERROR("stream_moe: mixed round arena/stage host maps unavailable (pool " << sp.pool << ")");
+        return false;
+    }
+    const size_t cur_off = (ids_bytes + 63u) & ~size_t(63u);
+    std::memcpy(dv->stage_map, ids_sub.data(), ids_bytes);
+    std::memcpy(dv->stage_map + cur_off, cur_sub.data(), cur_bytes);
+
+    ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp.dev_buf);
+    const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
+
+    ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+    w3d->ne[2] = g_n_slots;
+    w3d->nb[2] = col_stride;
+    w3d->nb[3] = col_stride * g_n_slots;
+    w3d->buffer = wbuf;
+    w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, col_off));
+
+    ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, n_active);
+    ids_leaf->buffer = dv->stage;
+    ids_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, 0));
+
+    ggml_tensor* b_leaf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (int64_t)d_in, width, n_active);
+    b_leaf->buffer = dv->stage;
+    b_leaf->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->stage, cur_off));
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* mm = ggml_mul_mat_id(ctx, w3d, b_leaf, ids_leaf);
+    out.resize(out_bytes / sizeof(float), 0.0f);
+    mm->buffer = dv->arena;
+    mm->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(dv->arena, 0));
+    ggml_build_forward_expand(gf, mm);
+    if (ggml_backend_graph_compute(dv->be, gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: mixed vk round compute failed for " << (w->name ? w->name : "?"));
+        return false;
+    }
+    std::memcpy(out.data(), dv->arena_map, out_bytes);
+    return true;
+}
+
+// Execute one mixed MUL_MAT_ID node: run each pool's peel rounds on that pool's
+// backend, scatter each round's compact output into the (hide_burst'd) main dst.
+// `ids_compact` = llama-layout expert ids [n_k, n_t] (k fastest) compacted from
+// the sparse routing tensor; `expert_pool` maps expert -> owning pool. Main dst
+// is nd->data (already hide_burst'd by the caller).
+static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
+                          expert_scheduler & sched, const moe_model_topology_t & topo,
+                          ggml_tensor * nd, int32_t layer,
+                          const std::vector<expert_handle_t>& pins,
+                          const std::vector<int32_t>& ids_compact,
+                          const std::vector<int32_t>& expert_pool) {
+    ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+    ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+    ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
+    const uint32_t n_k = static_cast<uint32_t>(ids->ne[0]);
+    const uint32_t n_t = static_cast<uint32_t>(ids->ne[1]);
+    if (cur->type != GGML_TYPE_F32) {
+        LOG_ERROR("stream_moe: mixed mm cur not f32 for " << (w->name ? w->name : "?"));
+        return false;
+    }
+    const size_t d_out = static_cast<size_t>(nd->ne[0]);
+    if (nd->type != GGML_TYPE_F32) {
+        LOG_ERROR("stream_moe: mixed mm dst not f32 for " << (w->name ? w->name : "?"));
+        return false;
+    }
+
+    mix_plan_t plan = build_mix_plan(ids_compact.data(), n_k, n_t,
+                                     expert_pool.data(), topo.n_expert, sched.n_pools());
+    if (plan.rounds.empty()) return true;
+
+    uint8_t * main_dst = static_cast<uint8_t*>(nd->data);
+    const size_t esize = sizeof(float);
+
+    for (const auto & r : plan.rounds) {
+        if (r.ids.empty()) continue;
+        // subpool owning this round's experts (first slot decides)
+        const mix_scatter_t & sc0 = r.scatter[0];
+        const int32_t e0 = ids_compact[static_cast<size_t>(sc0.t) * n_k + sc0.k];
+        const int32_t slot0 = pin_slot(pins, static_cast<uint32_t>(layer), static_cast<uint32_t>(e0));
+        const expert_scheduler::subpool_t * sp = slot0 < 0 ? nullptr : sched.subpool_of_slot(slot0);
+        if (!sp) {
+            LOG_ERROR("stream_moe: mixed round has no subpool (pool " << r.pool << ")");
+            return false;
+        }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_DUMP")) {
+            LOG_INFO("stream_moe: [tmp] mixed round pool=" << r.pool << " width=" << r.width
+                     << " active=" << r.n_active << " first_e=" << e0 << " sp_pool=" << sp->pool);
+        }
+#endif
+        size_t col_off = 0, col_stride = 0;
+        uint32_t col_index = 0;
+        if (!sched.column_layout(*sp, w->name, col_off, col_stride, col_index)) {
+            LOG_ERROR("stream_moe: mixed no column for " << w->name << " in pool " << sp->pool);
+            return false;
+        }
+        // pool-local slot ids for this round
+        std::vector<int32_t> ids_sub(r.ids.size());
+        for (size_t idx = 0; idx < r.ids.size(); ++idx) {
+            const mix_scatter_t & sc = r.scatter[idx];
+            const int32_t e = ids_compact[static_cast<size_t>(sc.t) * n_k + sc.k];
+            const int32_t slot = pin_slot(pins, static_cast<uint32_t>(layer), static_cast<uint32_t>(e));
+            if (slot < 0) { LOG_ERROR("stream_moe: mixed round expert not pinned"); return false; }
+            ids_sub[idx] = slot - static_cast<int32_t>(sp->slot_begin);
+        }
+        // rebuilt activation columns
+        std::vector<float> cur_sub;
+        size_t d_in = 0;
+        if (!build_cur_sub(cur, r.scatter, r.width, r.n_active, cur_sub, d_in)) return false;
+
+        std::vector<float> out;
+        const bool ok = sp->pool == 0
+            ? exec_round_cpu(ctx, cpu, w, *sp, col_off, col_stride, ids_sub, r.width, r.n_active, cur_sub, d_in, nd, out)
+            : exec_round_vk(ctx, w, *sp, col_off, col_stride, ids_sub, r.width, r.n_active, cur_sub, d_in, out);
+        if (!ok) return false;
+        scatter_sub_dst(main_dst, n_k, r.scatter, r.width, r.n_active, out.data(), d_out, esize);
+    }
+    return true;
+}
+
+
 #ifdef STREAM_MOE_TEMP
 // ---- L0 binary dump harness (temporary diagnostics, STREAM_MOE_TEMP only) --
 // Dumps full raw bytes of per-layer entry/exit data so a pure-CPU run and a
@@ -766,7 +1019,13 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
         if (gidx == static_cast<uint32_t>(-1)) return false;
         const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
         std::vector<int32_t> slotbuf(n_ids, -1);
+        // Mixed-region resolve: collect the pool each (k,t) expert lives on.
+        // Single pool keeps the historical fast path; >1 pool runs per-pool
+        // sub-mms (exec_mixed_mm). expert_pool[e] is set from the pinned slot.
         const expert_scheduler::subpool_t* use_sp = nullptr;
+        bool mixed = false;
+        std::vector<int32_t> expert_pool(topo.n_expert, -1);
+        std::vector<int32_t> ids_compact(n_ids, -1);
         for (int t = 0; t < ids->ne[1]; ++t) {
             for (int k = 0; k < ids->ne[0]; ++k) {
                 const int32_t e = MOE_ID_AT(ids, t, k);
@@ -775,16 +1034,20 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
                 if (slot < 0) return false;
                 const expert_scheduler::subpool_t* osp = sched.subpool_of_slot(slot);
                 if (!osp) return false;
-                if (use_sp && use_sp != osp) {
-                    LOG_ERROR("stream_moe: mixed-region active set for " << w->name
-                              << " (pool " << use_sp->pool << " + pool " << osp->pool << ") - device split pending");
-                    return false;
-                }
-                if (!use_sp) use_sp = osp;
+                ids_compact[static_cast<size_t>(t) * ids->ne[0] + k] = e;
+                expert_pool[e] = static_cast<int32_t>(osp->pool);
+                if (!use_sp) { use_sp = osp; }
+                else if (use_sp->pool != osp->pool) { mixed = true; }
                 slotbuf[static_cast<size_t>(t) * ids->ne[0] + k] = slot;
             }
         }
         if (!use_sp) return true;   // no active experts
+        if (mixed) {
+            const bool ok_m = exec_mixed_mm(ctx, cpu, sched, topo, nd, layer, pins,
+                                            ids_compact, expert_pool);
+            if (ok_m) refresh_aliases(layer, nd);
+            return ok_m;
+        }
         const expert_scheduler::subpool_t& sp = *use_sp;
 
         // SoA column geometry for this branch's tensor (col_off region-relative,

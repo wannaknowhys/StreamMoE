@@ -279,6 +279,7 @@ public:
 
     size_t   pool_bytes() const { return pool_bytes_; }
     uint32_t num_slots() const { return num_slots_; }
+    uint32_t n_pools()   const { return n_pools_; }
 
 private:
     int32_t alloc_or_evict(uint32_t layer, uint32_t expert, uint32_t pool);
