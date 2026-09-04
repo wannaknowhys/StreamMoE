@@ -272,10 +272,15 @@ void expert_scheduler::move_worker_main() {
             move_submit_.pop_front();
         }
         // pure per-column memcpy - never touches the scheduler control plane
+        const uint64_t cp0 = tsc_now();
         for (const auto& cp : t.cols) {
             std::memcpy(cp.dst, cp.src, cp.bytes);
         }
+        const int64_t memcpy_ns = tsc_delta_ns(tsc_now() - cp0);
         t.done_tsc = tsc_now();
+        LOG_DEBUG("sched: move L" << t.layer << " E" << t.expert
+                  << " memcpy=" << (memcpy_ns / 1000) << "us"
+                  << " (queued=" << (tsc_delta_ns(t.done_tsc - t.req_tsc) / 1000) << "us)");
         {
             std::lock_guard<std::mutex> lk(move_mtx_);
             move_done_.push_back(std::move(t));
@@ -371,6 +376,8 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
             return static_cast<int32_t>(i);
         }
     }
+    LOG_DEBUG("sched: alloc L" << layer << " E" << expert << " pool " << pool
+              << " no free slot in [" << lo << "," << hi << ") - must evict");
 
     // 2. Evict victim, keyed on (L,E) with layer-distance preference (M3, design
     //    §6). We need a free slot for (layer, expert) in this pool; choose a
@@ -419,7 +426,13 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
             // no evictable expert in this layer; widen to the next-older layer.
         }
     }
-    if (victim < 0) return -1; // all slots pinned/in-flight
+    if (victim < 0) {
+        LOG_DEBUG("sched: alloc L" << layer << " E" << expert << " pool " << pool
+                  << " NO evictable victim (all pinned/fresh)");
+        return -1; // all slots pinned/in-flight
+    }
+    LOG_DEBUG("sched: evict L" << v_layer << " E" << v_expert << " (slot " << victim
+              << ") to make room for L" << layer << " E" << expert << " in pool " << pool);
 
     // 3. evict: READY -> EVICTING, block new pins, drain refcount.
     if (!slots_[victim].begin_evict()) return -1;
@@ -566,6 +579,10 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 slots_[t->slot].mark_ready();
                 dir_->set(t->layer, t->expert, t->pool, t->slot);
                 n_misses_.fetch_add(1, std::memory_order_relaxed);
+                LOG_DEBUG("sched: loaded L" << t->layer << " E" << t->expert
+                          << " -> pool " << t->pool << " slot " << t->slot
+                          << " (staging_mask=" << (unsigned)t->staging_mask << ")"
+                          << " dio=" << (t->dio_tsc > t->req_tsc ? tsc_delta_ns(t->dio_tsc - t->req_tsc) / 1000 : 0) << "us");
             } else {
                 slots_[t->slot].mark_failed();
                 // Revert LOADING -> ABSENT so a later retry can reload the
@@ -596,6 +613,8 @@ bool expert_scheduler::accept_requests() {
     slot_request_t req;
     while (requests_.pop(req)) {
         any = true;
+        LOG_DEBUG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
+                  << " target=" << req.n_load_target << " load_free=" << load_free_.size());
         // One request = one whole layer's missing expert set (bitmap). Each set
         // bit counts once toward the batch's completion word: already-resident
         // bits (raced) bump immediately, others bump when their async load
@@ -636,7 +655,10 @@ bool expert_scheduler::accept_requests() {
             const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
             if (dsp) slot = alloc_or_evict(req.layer, e, dsp->pool);
             if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
-            if (slot < 0) { bit_set(leftover, e); ++n_left; continue; }
+            if (slot < 0) {
+                LOG_DEBUG("sched: L" << req.layer << " E" << e << " no slot in vram or ram (leftover)");
+                bit_set(leftover, e); ++n_left; continue;
+            }
             async_load_t* t = start_async_load(slot, req.layer, e);
             if (!t) {
                 // No async-load ring slot: revert LOADING -> ABSENT so a later
@@ -645,6 +667,7 @@ bool expert_scheduler::accept_requests() {
                 // ring-full case is transient; next alloc picks an EMPTY one).
                 dir_->transition(req.layer, e, subpool_of_slot(slot) ? subpool_of_slot(slot)->pool : 0,
                                  EXPERT_ABSENT, SLOT_UNASSIGNED);
+                LOG_DEBUG("sched: L" << req.layer << " E" << e << " ring-full (slot " << slot << "), reverted to ABSENT");
                 bit_set(leftover, e); ++n_left; continue;
             }
             t->batch_ready = req.batch_ready;   // drain bumps when this settles
@@ -734,6 +757,8 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
     // Submit ONE batch request for the missing subset. `await` counts down per
     // completed expert; exec sleeps once until n_load_target (== n_missing) is
     // reached.
+    LOG_DEBUG("exec->sched: pin_layer L" << layer << " want=" << want
+              << " hit=" << n_hit << " miss=" << n_missing);
     slot_request_t req;
     req.layer = layer;
     req.n_load_target = n_missing;
@@ -770,6 +795,9 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
                 ++still_missing;
             }
         }
+        LOG_DEBUG("exec<-sched: pin_layer L" << layer << " round " << round
+                  << " pinned=" << (want - still_missing) << "/" << want
+                  << " still_missing=" << still_missing);
         if (still_missing == 0) return static_cast<int32_t>(want);
         if (round == 0) {
             // transient failure / extra load needed: rebuild a fresh request and
