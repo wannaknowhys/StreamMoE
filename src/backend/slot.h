@@ -169,37 +169,64 @@ struct slot_meta {
 };
 
 // ---- expert directory -----------------------------------------------------
-// Maps (layer, expert) -> slot index (per pool) or UNASSIGNED. Two-dimensional:
-// outer (layer, expert), inner pool (CPU RAM / GPU VRAM ...). The whole expert
-// store is viewed as a read-only multi-level cache: a directory is kept per
-// (layer, expert) per pool, plus one cross-pool last_used_token (recency for
-// eviction scoring). Compute threads read-only; scheduler thread writes.
-// version[e] bumps on every mapping change (any pool) so waiters can wake and
-// re-scan without a lock.
+// Maps (layer, expert) x pool -> expert lifecycle state + slot. The whole
+// expert store is a read-only multi-level cache: an expert may hold one copy
+// per pool (RAM + VRAM). Two-dimensional: outer (layer, expert), inner pool.
+//
+// 2026-09 (M1): the directory widens from a residency-only table (slot or
+// UNASSIGNED, set only at READY) to a (L,E) x pool lifecycle STATE table, so
+// half-way states (LOADING / MOVING_*) are visible to compute scans - an expert
+// mid-load otherwise looks identical to an absent one (duplicate-load window).
+// Layout A1: two parallel atomics per (L,E,pool): state_[] (u32) + slot_[] (u32).
+// version[e] bumps on every transition (any pool) so waiters wake and rescan.
 static constexpr uint32_t SLOT_UNASSIGNED = 0xFFFFFFFFu;
+
+enum expert_state : uint32_t {
+    EXPERT_ABSENT      = 0,   // not in this pool
+    EXPERT_LOADING     = 1,   // reserved, DIO in flight (slot IO_INFLIGHT), not ready
+    EXPERT_READY       = 2,   // pin-able
+    EXPERT_MOVING_OUT  = 3,   // copy being moved away (v2r/r2v source), not pin-able
+    EXPERT_MOVING_IN   = 4,   // copy being moved in (target), not pin-able
+    EXPERT_FAILED      = 5,   // load/move failed
+};
 
 class expert_directory {
 public:
     expert_directory(uint32_t n_layers, uint32_t n_experts, uint32_t n_pools, uint32_t n_slots)
         : n_layers_(n_layers), n_experts_(n_experts), n_pools_(n_pools), n_slots_(n_slots),
-          entries_(static_cast<size_t>(n_layers) * n_experts * n_pools),
+          states_(static_cast<size_t>(n_layers) * n_experts * n_pools),
+          slots_(static_cast<size_t>(n_layers) * n_experts * n_pools),
           versions_(static_cast<size_t>(n_layers) * n_experts),
           last_used_(static_cast<size_t>(n_layers) * n_experts) {
-        for (auto& e : entries_) e.store(SLOT_UNASSIGNED, std::memory_order_relaxed);
+        for (auto& st : states_) st.store(EXPERT_ABSENT, std::memory_order_relaxed);
+        for (auto& sl : slots_)  sl.store(SLOT_UNASSIGNED, std::memory_order_relaxed);
     }
 
     uint32_t n_pools() const { return n_pools_; }
 
-    // (layer, expert) -> slot in a specific pool, or SLOT_UNASSIGNED.
-    uint32_t find(uint32_t layer, uint32_t expert, uint32_t pool) const {
-        return entries_[idx(layer, expert, pool)].load(std::memory_order_acquire);
+    // Current state of (layer, expert) in a specific pool.
+    expert_state state(uint32_t layer, uint32_t expert, uint32_t pool) const {
+        return static_cast<expert_state>(states_[idx(layer, expert, pool)].load(std::memory_order_acquire));
+    }
+    // Slot id for (layer, expert) in a specific pool (any state), or UNASSIGNED.
+    uint32_t slot(uint32_t layer, uint32_t expert, uint32_t pool) const {
+        return slots_[idx(layer, expert, pool)].load(std::memory_order_acquire);
     }
 
-    // Scan all pools for (layer, expert). Returns slot (global) and writes the
-    // owning pool to *out_pool, or SLOT_UNASSIGNED if resident nowhere.
+    // READY-only lookup: (layer, expert) -> READY slot in a specific pool,
+    // or SLOT_UNASSIGNED (not resident / not ready here). Back-compat with the
+    // old find().
+    uint32_t find(uint32_t layer, uint32_t expert, uint32_t pool) const {
+        const size_t i = idx(layer, expert, pool);
+        if (states_[i].load(std::memory_order_acquire) != EXPERT_READY) return SLOT_UNASSIGNED;
+        return slots_[i].load(std::memory_order_acquire);
+    }
+
+    // Scan all pools for (layer, expert) READY copy. Returns slot (global) and
+    // writes the owning pool to *out_pool, or SLOT_UNASSIGNED if READY nowhere.
     uint32_t scan(uint32_t layer, uint32_t expert, uint32_t* out_pool) const {
         for (uint32_t p = 0; p < n_pools_; ++p) {
-            uint32_t s = entries_[idx(layer, expert, p)].load(std::memory_order_acquire);
+            const uint32_t s = find(layer, expert, p);
             if (s != SLOT_UNASSIGNED) {
                 if (out_pool) *out_pool = p;
                 return s;
@@ -208,14 +235,27 @@ public:
         return SLOT_UNASSIGNED;
     }
 
-    void set(uint32_t layer, uint32_t expert, uint32_t pool, uint32_t slot) {
-        entries_[idx(layer, expert, pool)].store(slot, std::memory_order_release);
+    // Transition (layer, expert) in `pool` to `st` with `slot` (slot may be
+    // UNASSIGNED for ABSENT/FAILED). Single-writer: scheduler thread only.
+    // Ordering invariant (§3.4): publish the state+slot (seq-cst visibility
+    // point) BEFORE touching the physical slot on load/move start; on
+    // completion the physical slot is made READY FIRST, then the dir state is
+    // flipped to READY.
+    void transition(uint32_t layer, uint32_t expert, uint32_t pool,
+                    expert_state st, uint32_t slot) {
+        const size_t i = idx(layer, expert, pool);
+        slots_[i].store(slot, std::memory_order_relaxed);
+        states_[i].store(st, std::memory_order_release);
         versions_[idx(layer, expert)].fetch_add(1, std::memory_order_acq_rel);
         slot_wake_all(&versions_[idx(layer, expert)]);
     }
 
+    // Back-compat helpers (semantics preserved from the pre-M1 directory).
+    void set(uint32_t layer, uint32_t expert, uint32_t pool, uint32_t slot) {
+        transition(layer, expert, pool, EXPERT_READY, slot);
+    }
     void clear(uint32_t layer, uint32_t expert, uint32_t pool) {
-        set(layer, expert, pool, SLOT_UNASSIGNED);
+        transition(layer, expert, pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
     }
 
     uint32_t version(uint32_t layer, uint32_t expert) const {
@@ -248,7 +288,8 @@ private:
         return (static_cast<size_t>(layer) * n_experts_ + expert) * n_pools_ + pool;
     }
     uint32_t n_layers_, n_experts_, n_pools_, n_slots_;
-    std::vector<std::atomic<uint32_t>> entries_;
+    std::vector<std::atomic<uint32_t>> states_;
+    std::vector<std::atomic<uint32_t>> slots_;
     std::vector<std::atomic<uint32_t>> versions_;
     std::vector<std::atomic<uint64_t>> last_used_;
 };
