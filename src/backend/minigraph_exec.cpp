@@ -270,22 +270,6 @@ static enum ggml_status exec_split_legacy_impl(
         // (dst == nd; mini-graph writes nd->data, which now points at the buffer)
         if (!hide_output(const_cast<ggml_tensor*>(nd), pn.layer)) { ok = false; break; }
 
-        // branch layout (compact slot offset, uniform across experts)
-        size_t off = 0, bytes = 0;
-        if (!sched.branch_layout(pn.layer, 0, w->name, off, bytes)) {
-            LOG_ERROR("stream_moe: no slot layout for " << w->name);
-            ok = false; break;
-        }
-
-        // Resolve the resident region(s) of this MUL_MAT_ID's active experts.
-        // All active experts must share ONE region (single-region execution);
-        // a mixed RAM/VRAM active set needs per-region sub-computes, which only
-        // appear once device moves land (phase B).
-        uint32_t gidx = sched.group_of(pn.layer);
-        if (gidx == static_cast<uint32_t>(-1)) {
-            LOG_ERROR("stream_moe: no subpool group for layer " << pn.layer);
-            ok = false; break;
-        }
         const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
         std::vector<int32_t> slotbuf(n_ids, -1);
         const expert_scheduler::subpool_t* use_sp = nullptr;
@@ -322,12 +306,21 @@ static enum ggml_status exec_split_legacy_impl(
             LOG_INFO("stream_moe: expert execution reads pool " << sp.pool
                      << " (device region, host-mapped VRAM)");
         }
+        // SoA column: the branch's tensor slices live in one column at
+        // `col_off` with stride `col_stride` (= compact per-expert bytes =
+        // the stride vulkan hardcodes for MUL_MAT_ID).
+        size_t col_off = 0, col_stride = 0;
+        uint32_t col_index = 0;
+        if (!sched.column_layout(sp, w->name, col_off, col_stride, col_index)) {
+            LOG_ERROR("stream_moe: no column for " << w->name);
+            ok = false; break;
+        }
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
         ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
         w3d->ne[2] = g_n_slots;
-        w3d->nb[2] = sp.expert_size;
-        w3d->nb[3] = sp.expert_size * g_n_slots;
-        w3d->data  = sp.base + off;
+        w3d->nb[2] = col_stride;
+        w3d->nb[3] = col_stride * g_n_slots;
+        w3d->data  = sp.base + col_off;
 
         // ids_slot: translate expert ids -> region-local slot indices
         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
@@ -414,8 +407,8 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
                        device_exec_ctx_t & dv, ggml_tensor * nd,
                        const parsed_node_t & pn,
                        const std::vector<int32_t> & slotbuf,
-                       const expert_scheduler::subpool_t & sp, size_t branch_off,
-                       size_t dst_off, size_t & stage_off, bool readback) {
+                       const expert_scheduler::subpool_t & sp, size_t col_off,
+                       size_t col_stride, size_t dst_off, size_t & stage_off, bool readback) {
     ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
     ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
     const ggml_tensor * w  = nd->src[0];
@@ -465,10 +458,10 @@ static bool exec_mm_vk(ggml_context * ctx, expert_scheduler & sched,
 
     ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
     w3d->ne[2] = g_n_slots;
-    w3d->nb[2] = sp.expert_size;
-    w3d->nb[3] = sp.expert_size * g_n_slots;
+    w3d->nb[2] = col_stride;
+    w3d->nb[3] = col_stride * g_n_slots;
     w3d->buffer = wbuf;
-    w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, branch_off));
+    w3d->data   = static_cast<char*>(stmoe_vk_buffer_host_offset(wbuf, col_off));
 
     ggml_tensor* ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
     ids_leaf->buffer = dv.stage;
@@ -535,12 +528,6 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
         parsed_node_t pn = parse_weight_name(w->name);
         if (!pn.ok) { LOG_ERROR("stream_moe: cannot parse weight name " << w->name); return false; }
 
-        size_t off = 0, bytes = 0;
-        if (!sched.branch_layout(pn.layer, 0, w->name, off, bytes)) {
-            LOG_ERROR("stream_moe: no slot layout for " << w->name);
-            return false;
-        }
-
         uint32_t gidx = sched.group_of(pn.layer);
         if (gidx == static_cast<uint32_t>(-1)) return false;
         const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
@@ -566,6 +553,15 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
         if (!use_sp) return true;   // no active experts
         const expert_scheduler::subpool_t& sp = *use_sp;
 
+        // SoA column geometry for this branch's tensor (col_off region-relative,
+        // stride = compact perExpert = vulkan's hardcoded MUL_MAT_ID stride).
+        size_t col_off = 0, col_stride = 0;
+        uint32_t col_index = 0;
+        if (!sched.column_layout(sp, w->name, col_off, col_stride, col_index)) {
+            LOG_ERROR("stream_moe: no column for " << w->name);
+            return false;
+        }
+
         // Device-resident active set: compute the mm on the device backend in
         // VRAM (weight shell + uploaded cur/ids), copy the result back to the
         // hidden host dst for the host-side weightless chain.
@@ -576,15 +572,15 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
                 return false;
             }
             size_t stage_off = 0;
-            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, off, 0, stage_off, true);
+            return exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, sp, col_off, col_stride, 0, stage_off, true);
         }
 
         const int32_t g_n_slots = static_cast<int32_t>(sp.n_slots);
         ggml_tensor* w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
         w3d->ne[2] = g_n_slots;
-        w3d->nb[2] = sp.expert_size;
-        w3d->nb[3] = sp.expert_size * g_n_slots;
-        w3d->data  = sp.base + off;
+        w3d->nb[2] = col_stride;
+        w3d->nb[3] = col_stride * g_n_slots;
+        w3d->data  = sp.base + col_off;
 
         ggml_tensor* ids_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
         auto* ids_slot_data = static_cast<int32_t*>(ids_slot->data);
@@ -704,8 +700,6 @@ static ggml_tensor * dev_stage_leaf(ggml_context * ctx, ggml_tensor * src,
         if (nd->op == GGML_OP_MUL_MAT_ID) {
             parsed_node_t pn = parse_weight_name(nd->src[0]->name);
             if (!pn.ok) { ok = false; break; }
-            size_t off = 0, bytes = 0;
-            if (!sched.branch_layout(pn.layer, 0, nd->src[0]->name, off, bytes)) { ok = false; break; }
             if (sched.group_of(pn.layer) == static_cast<uint32_t>(-1)) { ok = false; break; }
             const ggml_tensor * ids = nd->src[2];
             if (!ids->data) { ok = false; break; }
@@ -730,9 +724,12 @@ static ggml_tensor * dev_stage_leaf(ggml_context * ctx, ggml_tensor * src,
             }
             if (!ok) break;
             if (!use_sp || use_sp->pool != pool) { ok = false; break; }
+            size_t col_off = 0, col_stride = 0;
+            uint32_t col_index = 0;
+            if (!sched.column_layout(*use_sp, nd->src[0]->name, col_off, col_stride, col_index)) { ok = false; break; }
             size_t dst_off = 0;
             if (!dev_arena_hide(nd, pool, arena_bump, dst_off)) { ok = false; break; }
-            if (!exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, *use_sp, off, dst_off, stage_bump, false)) {
+            if (!exec_mm_vk(ctx, sched, *dv, nd, pn, slotbuf, *use_sp, col_off, col_stride, dst_off, stage_bump, false)) {
                 ok = false; break;
             }
             refresh_aliases(layer, nd);

@@ -11,17 +11,20 @@ struct sub_tensor_req_t {
     uint32_t shard_idx;   // Shard file index
     uint64_t file_offset; // Absolute file offset within that shard
     uint64_t byte_size;   // Byte length of this tensor slice
-    uint64_t slot_offset; // Offset in compact slot memory
+    uint32_t column;      // SoA column index this slice belongs to (2026-09)
+    uint64_t col_off;     // offset of this slice's payload inside the column slot
 };
 
 struct tensor_slice_read_t {
     uint32_t shard_idx;       // Shard file index
     uint64_t file_read_start; // 4KB sector aligned start in file
     uint32_t file_read_len;   // 4KB sector aligned length in file
+    uint32_t column;          // SoA column index (dst = that column's slot slice)
     size_t   staging_offset;  // Offset in temporary staging buffer
     size_t   copy_src_offset; // Offset in staging buffer where valid payload starts
-    size_t   copy_dst_offset; // Offset in compact slot
+    size_t   copy_dst_offset; // Offset inside the column slot slice
     size_t   copy_byte_len;   // Exact payload byte count to copy
+    bool     direct;          // source aligned + len % 4096 == 0: DIO straight into column slot
 };
 
 struct expert_read_plan_t {

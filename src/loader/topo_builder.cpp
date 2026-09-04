@@ -95,24 +95,17 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
 
     topo.experts.resize((size_t) topo.n_layer * topo.n_expert);
 
-    const bool is_v2 = m.layout == model_layout_t::V2_EXPERT_BLOCKS || m.layout == model_layout_t::V2_CHUNK;
-
     for (uint32_t l = 0; l < topo.n_layer; ++l) {
         std::vector<const expert_tensor_t*> branches;
         for (const auto& et : m.expert) if (et.layer == (int32_t) l) branches.push_back(&et);
         if (branches.empty()) continue;
         topo.moe_layers.push_back(l);
 
-        // sub-pool group key: v2 slot holds the whole 4K-aligned block (bsize);
-        // original/v1 slot holds the raw per-branch byte sum.
-        uint64_t layer_expert_size;
-        if (is_v2) {
-            const size_t flat = (size_t) l * topo.n_expert;
-            layer_expert_size = m.expert_sections[flat * 3 + 1];
-        } else {
-            layer_expert_size = 0;
-            for (const auto* b : branches) layer_expert_size += b->per_expert;
-        }
+        // sub-pool group key: an expert's resident bytes = sum of its compact
+        // per-branch slices (SoA: pool stores per-column compact data, not the
+        // whole v2 block with its inter-branch 4K padding).
+        uint64_t layer_expert_size = 0;
+        for (const auto* b : branches) layer_expert_size += b->per_expert;
 
         for (uint32_t e = 0; e < topo.n_expert; ++e) {
             auto& exp = topo.experts[(size_t) l * topo.n_expert + e];
@@ -120,61 +113,35 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
             exp.expert_idx = (int32_t) e;
             exp.sub_tensors.clear();
             std::vector<sub_tensor_req_t> reqs;
-            uint64_t cur_slot = 0;
-
-            if (is_v2) {
-                // read_plan: whole block via block_srcs - v2 single-file = 1
-                // aligned segment; v2 chunk = N per-file strip segments. All
-                // segments are 4K-aligned (strip layout) so direct DIO works.
-                const size_t flat = (size_t) l * topo.n_expert + e;
-                const uint64_t bsize = m.expert_sections[flat * 3 + 1];
-                exp.total_expert_bytes = bsize;
-                const auto& segs = m.block_srcs[flat];
-                for (const auto& s : segs) {
+            // SoA column ordinal == branch position within the layer's branch
+            // list (ORDER); homogeneous groups make it equal the group column
+            // index. Branches push sub_tensors in the same ORDER.
+            uint32_t col_ord = 0;
+            for (const auto* b : branches) {
+                uint64_t col_start = 0;   // offset of this branch's slice inside its column (0)
+                for (const auto& s : b->per_expert_srcs[e]) {
+                    sub_tensor_info_t st;
+                    st.name = b->name;
+                    st.shard_idx = s.file;
+                    st.abs_file_offset = s.off;
+                    st.byte_size = s.len;
+                    st.slot_offset = col_start;   // offset inside the column slice
+                    st.ggml_type = b->type;
+                    for (int d = 0; d < 4; ++d) st.ne[d] = b->ne[d];
+                    exp.sub_tensors.push_back(st);
                     sub_tensor_req_t req;
                     req.shard_idx = s.file;
                     req.file_offset = s.off;
                     req.byte_size = s.len;
-                    req.slot_offset = s.in_off; // segment position inside the block
+                    req.column = col_ord;
+                    req.col_off = col_start;
                     reqs.push_back(req);
+                    col_start += s.len;
                 }
-                // sub_tensors: per-branch mapping into the block (drives the
-                // llama.cpp tensor -> slot pointer via slot_offset)
-                for (const auto* b : branches) {
-                    sub_tensor_info_t st;
-                    st.name = b->name;
-                    st.shard_idx = 0;
-                    st.abs_file_offset = 0; // informational; reads use block_srcs
-                    st.byte_size = b->per_expert;
-                    st.slot_offset = b->branch_off;
-                    st.ggml_type = b->type;
-                    for (int d = 0; d < 4; ++d) st.ne[d] = b->ne[d];
-                    exp.sub_tensors.push_back(st);
-                }
-            } else {
-                // original / v1: per-branch slices; v1 slices are 4K-aligned
-                for (const auto* b : branches) {
-                    for (const auto& s : b->per_expert_srcs[e]) {
-                        sub_tensor_info_t st;
-                        st.name = b->name;
-                        st.shard_idx = s.file;
-                        st.abs_file_offset = s.off;
-                        st.byte_size = s.len;
-                        st.slot_offset = cur_slot;
-                        st.ggml_type = b->type;
-                        for (int d = 0; d < 4; ++d) st.ne[d] = b->ne[d];
-                        exp.sub_tensors.push_back(st);
-                        sub_tensor_req_t req;
-                        req.shard_idx = s.file;
-                        req.file_offset = s.off;
-                        req.byte_size = s.len;
-                        req.slot_offset = cur_slot;
-                        reqs.push_back(req);
-                        cur_slot += s.len;
-                    }
-                }
-                exp.total_expert_bytes = cur_slot;
+                ++col_ord;
             }
+            exp.total_expert_bytes = 0;
+            for (const auto& b : branches) exp.total_expert_bytes += b->per_expert;
 
             exp.read_plan = build_expert_read_plan(reqs.data(), static_cast<uint32_t>(reqs.size()));
         }

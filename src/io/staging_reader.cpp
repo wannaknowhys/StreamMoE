@@ -25,21 +25,26 @@ expert_read_plan_t build_expert_read_plan(
         tensor_slice_read_t& slice = plan.slices[i];
 
         slice.shard_idx = req.shard_idx;
+        slice.column    = req.column;
 
         // Direct I/O sector alignment arithmetic
         uint64_t aligned_start = align_floor(req.file_offset, sector_size);
         uint64_t aligned_end   = align_ceil(req.file_offset + req.byte_size, sector_size);
         uint32_t aligned_len   = static_cast<uint32_t>(aligned_end - aligned_start);
 
+        // A slice can be DIO'd straight into its column slot only when the
+        // source is already sector-aligned AND the payload length is a sector
+        // multiple (both dst and length then stay aligned for every slot).
+        slice.direct = (aligned_start == req.file_offset) && (req.byte_size % sector_size == 0);
         slice.file_read_start = aligned_start;
         slice.file_read_len   = aligned_len;
         slice.staging_offset  = cur_staging_offset;
         slice.copy_src_offset = cur_staging_offset + (req.file_offset - aligned_start);
-        slice.copy_dst_offset = req.slot_offset;
+        slice.copy_dst_offset = static_cast<size_t>(req.col_off);
         slice.copy_byte_len   = req.byte_size;
 
         cur_staging_offset += align_ceil(aligned_len, sector_size);
-        size_t slot_extent = req.slot_offset + req.byte_size;
+        size_t slot_extent = req.byte_size;
         if (slot_extent > max_slot_extent) {
             max_slot_extent = slot_extent;
         }

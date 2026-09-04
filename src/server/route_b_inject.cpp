@@ -326,7 +326,8 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
             r.shard_idx = s.file;
             r.file_offset = s.off;
             r.byte_size = s.len;
-            r.slot_offset = s.in_off; // segment position inside the dense tensor
+            r.column = 0;
+            r.col_off = s.in_off; // segment position inside the dense tensor
             reqs.push_back(r);
         }
         const expert_read_plan_t plan = build_expert_read_plan(reqs.data(), static_cast<uint32_t>(reqs.size()));

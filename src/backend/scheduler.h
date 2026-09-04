@@ -119,17 +119,42 @@ public:
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
 
-    // Sub-pool layout (docs/MULTI_SUBPOOL.md): the slot space is carved into
-    // per-(group, pool) regions. Slot indices are global across all regions.
-    // A group's CPU-RAM region comes first; device (VRAM) regions follow.
+    // Sub-pool layout (docs/MULTI_SUBPOOL.md §1a): the pool is struct-of-array.
+    // One COLUMN per expert tensor (gate_up / down / ...); a slot (a resident
+    // expert) spans one slice in every column at the same local index. Column c
+    // slice for local slot i sits at `base + col[c].off + i * col[c].stride`.
+    // RAM sub-pool regions come first (pool 0), device (VRAM) regions follow.
+    struct column_t {
+        uint32_t index = 0;      // column index within the sub-pool (== group topo column)
+        std::string tag;         // gate_up / gate / up / down
+        size_t   off    = 0;     // byte offset of this column within the sub-pool region
+        size_t   stride = 0;     // compact per-expert slice bytes
+        bool     direct() const { return stride % 4096 == 0; }  // slice dst always 4K-aligned
+    };
     struct subpool_t {
         uint32_t pool       = 0;   // 0 = CPU RAM, 1 = first device, ...
         uint32_t group      = 0;
         uint32_t slot_begin = 0;
         uint32_t n_slots    = 0;
-        size_t   expert_size = 0;
-        uint8_t* base       = nullptr;
+        size_t   expert_size = 0;  // total bytes per expert = sum of column strides
+        uint8_t* base       = nullptr;   // region base (RAM pool or vram host map)
         void*    dev_buf    = nullptr;   // device buffer handle (executor shells)
+        std::vector<column_t> cols;      // per-tensor SoA columns (ORDER, group topo order)
+        // Column (off, stride) of the branch tag in this sub-pool, else false.
+        bool column_of(const std::string& tag, size_t& off, size_t& stride) const {
+            for (const auto& c : cols) {
+                if (c.tag == tag) { off = c.off; stride = c.stride; return true; }
+            }
+            return false;
+        }
+        // Column offset/stride by topo column index (matches group.columns order).
+        bool column_at(size_t idx, size_t& off, size_t& stride) const {
+            if (idx >= cols.size()) return false;
+            off = cols[idx].off; stride = cols[idx].stride; return true;
+        }
+        uint8_t* col_slice(const column_t& c, uint32_t slot) const {
+            return base + c.off + static_cast<size_t>(slot - slot_begin) * c.stride;
+        }
     };
     // Group index owning `layer`, or (uint32_t)-1.
     uint32_t group_of(uint32_t layer) const;
@@ -148,11 +173,17 @@ public:
     size_t subpools_count() const { return subpools_.size(); }
 
     // Raw slot memory for a pinned/resident slot (compute side).
-    uint8_t* slot_mem(int32_t slot) const {
+    uint8_t* col_slice_ptr(const subpool_t& sp, const column_t& c, int32_t slot) const {
+        return sp.base + c.off + static_cast<size_t>(slot - static_cast<int32_t>(sp.slot_begin)) * c.stride;
+    }
+    // Raw slice memory of `slot` for column index `col` (SoA; an expert spans
+    // columns, so there is no single slot base anymore).
+    uint8_t* slot_col_mem(int32_t slot, uint32_t col) const {
         if (slot < 0 || slot >= static_cast<int32_t>(num_slots_)) return nullptr;
         for (const auto& sp : subpools_) {
             if (slot >= static_cast<int32_t>(sp.slot_begin) && slot < static_cast<int32_t>(sp.slot_begin + sp.n_slots)) {
-                return sp.base + static_cast<size_t>(slot - sp.slot_begin) * sp.expert_size;
+                if (col >= sp.cols.size()) return nullptr;
+                return col_slice_ptr(sp, sp.cols[col], slot);
             }
         }
         return nullptr;
@@ -166,14 +197,21 @@ public:
     void unpin_slot(int32_t slot) {
         if (slot >= 0 && slot < static_cast<int32_t>(num_slots_)) slots_[slot].unpin();
     }
-    // Sub-tensor layout inside a compact slot for a branch name
-    // (e.g. "blk.5.ffn_gate_exps.weight"). Returns true + offset/size if found.
-    bool branch_layout(uint32_t layer, uint32_t expert, const std::string& name,
-                       size_t& slot_offset, size_t& byte_size) const {
-        if (!topo_ || layer >= topo_->n_layer || expert >= topo_->n_expert) return false;
-        const expert_info_t& info = topo_->get_expert(layer, expert);
-        for (const auto& st : info.sub_tensors) {
-            if (st.name == name) { slot_offset = st.slot_offset; byte_size = st.byte_size; return true; }
+    // Executor address of `name`'s tensor slices inside `sp` (SoA column
+    // geometry): every expert slice of that branch lives in one column; slot s
+    // (global) reads at `col base + (s - sp.slot_begin) * stride`. Returns the
+    // column offset within the region + compact per-expert stride.
+    // name is the full tensor name (e.g. "blk.5.ffn_gate_exps.weight").
+    bool column_layout(const expert_scheduler::subpool_t& sp, const std::string& name,
+                       size_t& col_off, size_t& stride, uint32_t& col_index) const {
+        std::string tag;
+        if (name.find("gate_up") != std::string::npos) tag = "gate_up";
+        else if (name.find("ffn_gate_exps") != std::string::npos) tag = "gate";
+        else if (name.find("ffn_up_exps") != std::string::npos) tag = "up";
+        else if (name.find("down_exps") != std::string::npos) tag = "down";
+        else return false;
+        for (const auto& c : sp.cols) {
+            if (c.tag == tag) { col_off = c.off; stride = c.stride; col_index = c.index; return true; }
         }
         return false;
     }

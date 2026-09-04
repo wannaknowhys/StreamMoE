@@ -60,6 +60,22 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
 
     num_slots_ = 0;
     const size_t n_groups = topo.groups.size();
+    // Fill SoA column geometry for a region given its topo group columns and
+    // slot count: column-major layout - col c occupies n_slots*stride_c bytes.
+    auto fill_cols = [&](subpool_t& sp, uint32_t group, uint32_t ns) {
+        sp.cols.clear();
+        const auto& gcols = topo.groups[group].columns;
+        size_t off = 0;
+        for (size_t c = 0; c < gcols.size(); ++c) {
+            column_t col;
+            col.index = static_cast<uint32_t>(c);
+            col.tag = gcols[c].tag;
+            col.stride = gcols[c].per_expert;
+            col.off = off;
+            sp.cols.push_back(col);
+            off += static_cast<size_t>(ns) * col.stride;
+        }
+    };
     for (size_t i = 0; i < n_groups; ++i) {
         const auto& g = topo.groups[i];
         // floor + byte-fraction share of the spare (double to avoid 64-bit overflow)
@@ -69,14 +85,20 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
         const uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * per_layer;
         if (ns < per_layer) ns = per_layer;             // never below one full layer
         if (ns > g_experts_total) ns = g_experts_total; // never more than the group's real experts
-        subpools_.push_back({ 0, static_cast<uint32_t>(i), num_slots_, ns, g.expert_size, nullptr });
+        subpool_t sp;
+        sp.pool = 0;
+        sp.group = static_cast<uint32_t>(i);
+        sp.slot_begin = num_slots_;
+        sp.n_slots = ns;
+        sp.expert_size = g.expert_size;   // = sum of column strides
+        fill_cols(sp, static_cast<uint32_t>(i), ns);
+        subpools_.push_back(std::move(sp));
         num_slots_ += ns;
     }
 
     // Device (VRAM) regions: appended slot runs on top of the RAM sub-pools.
-    // A region must be whole-expert-slot aligned on its group's slot size and
-    // carry a usable host-mapped base; anything else is skipped with a warning
-    // (the pool still runs on CPU RAM alone).
+    // A region must carry a usable host-mapped base; anything else is skipped
+    // with a warning (the pool still runs on CPU RAM alone).
     uint32_t max_pool = 0;
     for (const auto& reg : vregions) {
         if (reg.base == nullptr || reg.group >= n_groups || reg.n_slots == 0) {
@@ -86,7 +108,16 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
             continue;
         }
         const size_t es = topo.groups[reg.group].expert_size;
-        subpools_.push_back({ reg.pool, reg.group, num_slots_, reg.n_slots, es, reg.base, reg.buf });
+        subpool_t sp;
+        sp.pool = reg.pool;
+        sp.group = reg.group;
+        sp.slot_begin = num_slots_;
+        sp.n_slots = reg.n_slots;
+        sp.expert_size = es;
+        sp.base = reg.base;
+        sp.dev_buf = reg.buf;
+        fill_cols(sp, reg.group, reg.n_slots);
+        subpools_.push_back(std::move(sp));
         num_slots_ += reg.n_slots;
         if (reg.pool > max_pool) max_pool = reg.pool;
     }
@@ -123,27 +154,24 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     if (hit_rate_ema_ > 0.95) hit_rate_ema_ = 0.95;
     alpha_.store(1.0 - hit_rate_ema_, std::memory_order_relaxed);
 
-    // Async-load ringbuffer pool (one per model). staging size = max over all
-    // groups (0 for v2, which DIOs straight into the slot). Element stride is
-    // 4K-aligned; the pool size = max_in_flight_ = the real concurrency limit.
+    // Async-load ringbuffer pool (one per model). staging size = max per-expert
+    // read-plan staging over all groups (non-4K columns need a staging window;
+    // 4K-direct columns stage nothing). Element stride is 4K-aligned.
     load_staging_size_ = 0;
-    if (topo.needs_staging()) {
-        for (const auto& g : topo.groups) {
-            size_t gmax = 0;
-            for (uint32_t l : g.layers) {
-                for (uint32_t e = 0; e < topo.n_expert; ++e) {
-                    size_t sz = topo.get_expert(l, e).read_plan.total_staging_size;
-                    if (sz > gmax) gmax = sz;
-                }
+    for (const auto& g : topo.groups) {
+        size_t gmax = 0;
+        for (uint32_t l : g.layers) {
+            for (uint32_t e = 0; e < topo.n_expert; ++e) {
+                size_t sz = topo.get_expert(l, e).read_plan.total_staging_size;
+                if (sz > gmax) gmax = sz;
             }
-            if (gmax > load_staging_size_) load_staging_size_ = gmax;
         }
+        if (gmax > load_staging_size_) load_staging_size_ = gmax;
     }
     // Concurrency = one layer's worst-case expert touch set (n_expert) scaled by
-    // device sub-pool count and layout cost. v2/direct has no staging so it can
-    // afford 2x for aggressive prefetch; v1/original (staging per slot) stays 1x.
+    // device sub-pool count.
     const uint32_t dev_factor    = 1; // CPU-only today; GPU sub-pools multiply later
-    const uint32_t layout_factor = topo.needs_staging() ? 1u : 2u;
+    const uint32_t layout_factor = load_staging_size_ ? 1u : 2u;
     max_in_flight_ = std::max<uint32_t>(16u, topo.n_expert * dev_factor * layout_factor);
     const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
     load_stride_ = header_sz + align_ceil(load_staging_size_, DIO_SECTOR_SIZE);
@@ -267,10 +295,15 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     //    alloc_or_evict above) and gets mark_ready() without any DIO.
     if (sp->pool != 0) {
         const subpool_t* rsp = ram_subpool(sp->group);
-        if (rsp && rsp->expert_size == sp->expert_size) {
+        if (rsp && rsp->expert_size == sp->expert_size && rsp->cols.size() == sp->cols.size()) {
             int32_t dst = alloc_or_evict(v_layer, v_expert, 0);   // RAM: make room
             if (dst >= 0) {
-                std::memcpy(slot_mem(dst), slot_mem(victim), sp->expert_size);
+                // SoA: copy per column (device slot slices -> RAM slot slices)
+                for (size_t c = 0; c < sp->cols.size(); ++c) {
+                    std::memcpy(slot_col_mem(dst, static_cast<uint32_t>(c)),
+                                slot_col_mem(victim, static_cast<uint32_t>(c)),
+                                sp->cols[c].stride);
+                }
                 slots_[dst].mark_ready();
                 dir_->set(v_layer, v_expert, 0, static_cast<uint32_t>(dst));
                 LOG_DEBUG("expert_scheduler: demoted L" << v_layer << " E" << v_expert
@@ -311,10 +344,9 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
     const expert_info_t& info = topo_->get_expert(layer, expert);
     t->plan = info.read_plan;
     t->failed = false;
-    t->direct = !topo_->needs_staging();
+    t->direct = false;   // per-slice direct now; staging when any slice is not direct
     const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
-    t->staging = t->direct ? nullptr
-                           : (load_pool_ + static_cast<size_t>(idx) * load_stride_ + header_sz);
+    t->staging = load_pool_ + static_cast<size_t>(idx) * load_stride_ + header_sz;
     t->pending = 0;
     t->req_tsc = tsc_now();   // [TMR] request time: submission begins
     for (uint32_t s = 0; s < t->plan.num_tensors; ++s) {
@@ -323,9 +355,15 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
         r = aio_req_t{};
         r.file = files_[sl.shard_idx];
         r.file_offset = sl.file_read_start;
-        r.aligned_buf = t->direct
-            ? (static_cast<uint8_t*>(slot_mem(slot)) + sl.copy_dst_offset)  // v2: straight into slot
-            : (t->staging + sl.staging_offset);                              // original/v1: staging
+        if (sl.direct) {
+            // source aligned + len 4K multiple: DIO straight into the column slot
+            const uint8_t* dst = slot_col_mem(slot, sl.column);
+            if (!dst) { t->failed = true; break; }
+            r.aligned_buf = const_cast<uint8_t*>(dst) + sl.copy_dst_offset;
+            t->direct = true;
+        } else {
+            r.aligned_buf = t->staging + sl.staging_offset;
+        }
         r.aligned_len = sl.file_read_len;
         r.user_data = t;
         if (dio_->submit_batch(&r, 1) > 0) {
@@ -350,10 +388,13 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
         const int slice = static_cast<int>(done[i] - t->reqs);
         if (done[i]->error_code != 0) {
             t->failed = true;
-        } else if (!t->failed && !t->direct) {
+        } else if (!t->failed && !t->plan.slices[slice].direct) {
             const auto& sl = t->plan.slices[slice];
-            std::memcpy(slot_mem(static_cast<int32_t>(t->slot)) + sl.copy_dst_offset,
-                        t->staging + sl.copy_src_offset, sl.copy_byte_len);
+            const uint8_t* dst = slot_col_mem(static_cast<int32_t>(t->slot), sl.column);
+            if (dst) {
+                std::memcpy(const_cast<uint8_t*>(dst) + sl.copy_dst_offset,
+                            t->staging + sl.copy_src_offset, sl.copy_byte_len);
+            }
         }
         --t->pending;
         if (t->pending == 0) {
