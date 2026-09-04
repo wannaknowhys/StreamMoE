@@ -132,15 +132,33 @@ dir(L,E,p) : LOADING -> READY     // 至此计算线程扫到 READY 才合法
 仍在 IO_INFLIGHT 的槽——假唤醒 / pin 失败。装载完成、move 完成
 （MOVING_IN -> READY）、demote 到 RAM 都用此顺序。
 
-### 3.5 状态表下的计算侧 pin 语义
+### 3.5 计算侧 pin 语义：无状态 exec
 
-`pin_layer` 按 (L,E) 扫：
+exec **刻意对驻留无状态**：它不读状态迁移、不区分 ABSENT / LOADING / MOVING_IN。
+它只尝试 pin，把失败的重新请求：
 
-- 第一个 READY 副本 -> pin（不变）；
-- LOADING / MOVING_IN 副本 -> 在途——**不 pin、也不为它提交请求**；等该 (L,E)
-  的 version 词后重扫（见 §7——决策 6a：exec 绝不提交在途专家）；
-- 全 ABSENT -> 提交（该专家确实没在任何地方装载）；
-- FAILED -> 报错。
+```
+exec pin_layer(bitmap):
+  loop:
+    for each needed (L,E):
+      找 READY 副本（dir scan）-> try_pin -> 成功：记 handle
+      否则（ABSENT / LOADING / MOVING_IN / pin 竞争）-> 记 still-need
+    if 无 still-need: return 全部 handle
+    提交一条请求 { layer, still-need bitmap, n_load_target = count }
+    睡在批完成信号上（全部 still-need READY 时 wake-once）
+    // 调度线程保证每个 still-need 专家变 READY（自己装 或 已有的在途装载），
+    // exec 醒后重 pin；仍有竞争就循环
+```
+
+幂等、自愈：重试轮重测"仍非 READY"的集合，以**当轮重测数**重新提交
+（绝不是 round-1 总数）。exec 不需要知道某专家是否已被人（含预取）装载——调度
+保证它变 READY，届时唤醒 exec。
+
+FAILED（装载/move 硬失败）作为错误上抛，不无限重试。
+
+> 决策沿革：早前"决策 6a"（exec 因能看到 LOADING 而**不提交**在途专家）被取代。
+> exec 在提交时无法可靠区分"会由我自己的请求装载"与"已为别人在装"（竞争 +
+> 预取），故保持无状态，由调度拥有"让每个 still-need 变 READY"的职责。
 
 ## 4. 删 owner_（槽 -> (L,E)）
 
@@ -276,28 +294,54 @@ L-2 的 top K/2，……（score 低者先逐；score 线估算后置，见 §8�
 收到 layer-L 批后，算本池需几个新槽，一次规划逐 K 个 victim（L-1 的 top K/2 等），
 再装载。这是目标终态；per-expert `alloc_or_evict` 包装可作为底下单槽原语保留。
 
-## 7. 批进度记账移到调度线程侧
+## 7. 调度侧：per-model 单活跃请求槽
 
-已定：这层批"还剩几个在装"的记账属于调度线程（它反正逐位处理）。exec 应在整批
-READY 时**只醒一次**，而不是醒 N 次去比较一个它不拥有的计数。
+已定：批进度记账在调度线程；exec 在其请求整批 READY 时**只醒一次**。调度线程把
+exec 请求串行为**每模型一个活跃请求**——任一时刻每个 `expert_scheduler`（本就
+per-model，MULTI_MODEL_POOL）只服务一个 exec 请求。于是"谁在等"是每模型单个对象，
+无需 waiter 列表。
 
-**完成语义（单一条规则，勿拆）**：批的唤醒信号只在**每个 needed (L,E) 真正
-READY** 时触发。`remaining` 只在真实 READY 时递减，**绝不"因 skip 算完成"**。
-具体，调度线程对每个 needed 位：
+### 7.1 活跃槽纪律
 
-- **已 READY**（exec scan 后被人抢先装好）-> 立即递减（exec 能 pin——它真 READY）；
-- **LOADING / MOVING_IN**（在途）-> 这里**不递减**；exec 侧决策 6a 保证 exec 不提交
-  在途专家，所以这只发生在竞态窗口（exec 见 ABSENT，随后别人开始装它）。调度线程
-  不重复发起装载；该专家现有的 load/move 会到 READY，经**唯一 drain 完成点**递减；
-- **ABSENT** -> 启动装载；drain 把它 mark_ready 时递减。
+```
+调度循环（global worker 轮询各 per-model scheduler；模型间互不阻塞——
+每个有自己的活跃槽）：
+  per model:
+    if model.active 空:
+      pop 一条 exec 请求 -> active  （记 still-need bitmap + n_load_target）
+      for each still-need (L,E):
+        ABSENT                      -> 发布 LOADING，启动自己的装载
+        LOADING / MOVING_IN（在途，如预取或先前竞争）-> 不启动第二次装载；
+                                      它已是别人的在途装载，会经 drain 到 READY
+    else:
+      继续 drain（active 进行中）；不 pop 新请求
+  drain：每个 (L,E) settle READY（自装载 / 预取 / move 都算）：
+      mark_ready + 状态 -> READY
+      if (L,E) ∈ model.active.still-need: bump active.counter（一次）
+      profile delta rdtsc（将来做，并行附加——不是完成的唯一职责）
+  active.counter == 0 -> 唤醒 exec 一次 -> exec 重 pin -> 清空 active
+```
 
-递减因此总发生在**槽变 READY 的唯一一处**（drain_completions mark_ready +
-状态 -> READY）。批计数归零 = 每个位都被观测到 READY——exec 醒来能 pin 它要的
-每个 handle。任何地方都没有"skip 算完成"。
+因为 drain 是**任何槽变 READY 的唯一地点**，一个属于 active 请求的在途专家
+（由预取或先前竞争装载）恰在它真正 READY 时 bump active 计数。任何地方都没有
+"skip 算完成"，也不需要 per-(L,E) waiter 列表——active 请求是本模型唯一 waiter。
 
-**重试轮重置（exec 侧）**：`pin_layer` 重试（round 2）时，重新提交的
-`slot_request_t.n_load_target` 必须精确等于**当轮二次 scan 后仍 missing 的 bit 数**——
-不是 round 1 的整层计数。调度线程按当轮自己的 n_load_target 倒计数。
+### 7.2 预取不是"没有完整下半的独立事件"——复用完整 DIO 路径
+
+预取（调度主动的预测装载）只是同一 `async_dio_engine` 上的另一次 submit；其完成
+落进**同一个 `drain_completions`**，执行完整 settle（mark_ready + dir set +
+version bump + wake），外加 drain 级的 profile delta-rdtsc 记账作为并行附加。
+它**绝不是"只记 rdtsc、无下半的独立事件"**。推论：
+
+- 预取也必须先发布 `dir = LOADING` 再 submit（否则 exec scan 看不到"在途"、
+  会重复装载；§3.4 顺序适用）；
+- 预取的专家若在 settle 时属于 active 请求，经同一 drain 规则 bump active
+  计数——不需要专门的"预取→active 通知通道"。
+
+### 7.3 重试轮重置（exec 侧）
+
+`pin_layer` 重试时，重新提交的 `n_load_target` 必须精确等于**当轮 scan 重测的
+still-need 数**——绝不是 round-1 总数。调度线程按当轮自己的 n_load_target 倒计数。
 
 ## 8. Open questions / 后置
 
@@ -306,21 +350,26 @@ READY** 时触发。`remaining` 只在真实 READY 时递减，**绝不"因 skip
    **跨层裸比 score 绝对值保持禁止**（见 §6.1 警告）。
 2. **A1 vs A2** directory 布局：推荐 A1（两个并行原子）。
 3. `dir_->set` 语义是否彻底改成"预约 = LOADING、完成 = READY"两段（见 §3.4 顺序）。
+4. **单活跃边界**：§7 模型把 exec 请求按模型串行（每模型一个活跃槽）。这匹配
+   今天单 ctx 单 decode 线程的现实（exec 阻塞到本层请求完成才发下一条）。若同一
+   模型将来跑多个并发 decode context，需要多活跃槽（每 ctx 一个）或 waiter 集
+   ——标记，现在不建。
 
-> 已解决：in-flight 重复请求（决策 6a——exec 绝不提交在途专家；LOADING/MOVING_IN
-> 经 version 词等待，见 §3.5）、move worker 数量 = 1（见 §5.3）。两者曾是 open
-> item，现已在各自小节定案。
+> 本会话已解决：move worker 数量 = 1（见 §5.3）。exec 无状态（见 §3.5）；预取
+> 复用完整 DIO 路径（见 §7.2）；in-flight 重复无需专门处理——活跃槽 + drain
+> 规则即覆盖（§7）。
 
 ## 9. 构建顺序（终态，按组件）
 
 1. Directory：加宽为 (L,E) 键状态（A1）；owner_ 留到第 3 步编译通过。
-2. 装载路径：begin_reload 前先发布 LOADING（顺序不变量）；accept 加 in-flight
-   skip（消灭重复装载窗口）。
+2. 装载路径：begin_reload 前先发布 LOADING（顺序不变量）；每模型单活跃请求槽
+   （消灭重复装载窗口；§7.1）。
 3. 驱逐：alloc_or_evict 内改 (L,E) 键层距选择；删 owner_（8 处用，全在此函数，
    已枚举）。
 4. Move 管线：move_task ring + 1 worker（v2r + r2v）+ 完成 drain；把 v2r 接进
    device victim 的驱逐；r2v 留给将来放置策略。
-5. 批进度记账放调度线程（只醒一次）。
+5. 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once（§7）；exec 侧改无状态
+   pin+resubmit（§3.5）。
 6. 验证：纯 RAM IDENTICAL（如今天）；VRAM 单设备运行到达 `exec_mm_vk`
    （这是 K6/L6b 阻塞项）；directory 状态 + move ring + 驱逐顺序的 UT。
 

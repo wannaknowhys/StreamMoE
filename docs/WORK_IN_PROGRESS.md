@@ -198,15 +198,22 @@
 >    驱逐 drain 会自锁）。
 > 6. **v2r 不做 GPU/vulkan DMA**：独显 host-visible heap 仍是显存，系统 RAM 不在 GPU
 >    地址空间，copy engine 写不到（UMA/APU 才有）。只能 CPU memcpy，故异步 worker。
-> 7. **批进度记账移调度线程**：scheduler 维护 remaining=n_load_target，归零 wake 一次；exec
->    保留 pins[] handle 数组（resolve/unpin 用，独立记账）。
+> 7. **每模型单活跃请求槽（调度侧记账）**：exec 请求 per-model 串行——每 scheduler
+>    （本就 per-model）一个 active 槽；drain 是"任何槽变 READY 的唯一地点"，凡 settle
+>    且属于 active.still-need 的专家 bump active 一次；归零 wake exec 一次。无 waiter
+>    列表、无 "skip 算完成"。多 ctx 并发 decode 需多活跃槽——将来分叉，见设计 §8.4。
+> 8. **exec 无状态（替代 6a）**：exec 不认 ABSENT/LOADING——全 try_pin，失败的收进
+>    请求、睡到全部 READY 唤醒、醒后重扫，幂等自愈。重试轮 n_load_target = 当轮重测数。
+> 9. **预取复用完整 DIO 路径**：预取 = 同一 async_dio_engine 上的 submit，完成走同一
+>    drain（mark_ready + dir set + wake + profile delta rdtsc 附加）；预取也先发
+>    LOADING；settle 时若属 active.still-need 则 bump——无需专门预取→active 通道。
 >
 > **任务（详细 build order 见设计文档 §9）**
 > - [ ] M1 directory 加宽（A1 state_+slot_）；owner_ 留到 M3 编译通过
-> - [ ] M2 装载路径：先发 LOADING 再 begin_reload；accept 加 in-flight skip（消重复装载窗口）
+> - [ ] M2 装载路径：先发 LOADING 再 begin_reload；每模型单活跃请求槽（消重复装载窗口）
 > - [ ] M3 驱逐改 (L,E) 层距（alloc_or_evict 内）；删 owner_（8 处用已枚举）
 > - [ ] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进 device victim 驱逐
-> - [ ] M5 批进度记账移调度线程（只醒一次）
+> - [ ] M5 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once；exec 改无状态 pin+resubmit
 > - [ ] M6 验证：纯 RAM IDENTICAL；VRAM 单设备到达 exec_mm_vk（解 L6b）；新 UT
 > - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛）
 

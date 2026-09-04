@@ -152,16 +152,38 @@ Reverse (dir READY before physical READY) lets a scan see READY and try_pin a
 slot that is still IO_INFLIGHT - false wake / failed pin. Load completion,
 move completion (MOVING_IN -> READY) and demote-to-RAM all use this order.
 
-### 3.5 Compute-side pin semantics under the state table
+### 3.5 Compute-side pin semantics: stateless exec
 
-`pin_layer` scans by (L,E):
+Exec is deliberately **stateless about residency**: it never reads state
+transitions, never distinguishes ABSENT / LOADING / MOVING_IN. It only tries to
+pin and re-asks for whatever failed:
 
-- first READY copy -> pin it (unchanged);
-- a LOADING / MOVING_IN copy -> it is in flight - do NOT pin and do NOT submit
-  a request for it; wait on that (L,E)'s version word and rescan (see §7 - this
-  is decision 6a: exec never submits in-flight experts);
-- all ABSENT -> submit (the expert is genuinely not being loaded anywhere);
-- FAILED -> error.
+```
+exec pin_layer(bitmap):
+  loop:
+    for each needed (L,E):
+      find a READY copy (dir scan) -> try_pin -> success: record handle
+      else (ABSENT / LOADING / MOVING_IN / pin race) -> mark still-need
+    if none still-need: return all handles
+    submit ONE request { layer, still-need bitmap, n_load_target = count } 
+    sleep on the batch completion signal (wake-once on READY of all still-need)
+    // scheduler makes every still-need expert READY (own load or an existing
+    // in-flight one); exec re-pins after the wake; loops on any remaining race
+```
+
+Idempotent, self-healing: a retry round re-measures what is still not READY and
+re-submits with a FRESH n_load_target equal to that re-measured count (never the
+round-1 total). Exec does not need to know whether an expert was already being
+loaded by someone else (incl. a prefetch) - the scheduler guarantees the expert
+becomes READY, and exec is woken at that point.
+
+FAILED (a load/move hard-failed) is surfaced as an error, not retried forever.
+
+> Decision history: an earlier "decision 6a" (exec never *submits* in-flight
+> experts because it can see LOADING) is superseded. Exec cannot reliably
+> distinguish "will be loaded by my own request" from "already loading for
+> someone else" at submit time (races + prefetch), so it stays stateless and
+> the scheduler owns making every still-need expert READY.
 
 ## 4. Remove owner_ (slot -> (L,E))
 
@@ -324,35 +346,63 @@ planning pass (top K/2 from L-1, etc.) before loading. This is the intended
 final shape; the per-expert `alloc_or_evict` wrapper can remain as the
 single-slot primitive underneath.
 
-## 7. Batch progress accounting on the scheduler side
+## 7. Scheduler side: per-model single active request slot
 
-Decided: the "how many of this batch are still loading" bookkeeping belongs on
-the scheduler thread (it processes each bit anyway). Exec should wake ONCE when
-the whole batch is READY, not N times to compare a counter it does not own.
+Decided: batch progress accounting lives on the scheduler thread; exec wakes
+ONCE when its whole request is READY. The scheduler serialises exec requests to
+**one active request per model** - there is at most one exec request being
+served per `expert_scheduler` at a time (the scheduler is already per-model,
+MULTI_MODEL_POOL). This makes "who is waiting" a single object per model, no
+waiter lists needed.
 
-**Completion semantic (single rule, do not split)**: the batch's wake signal
-fires only when EVERY needed (L,E) is truly READY. `remaining` decrements only
-on a real READY, never "on skip". Concretely, for each needed bit the scheduler
-encounters:
+### 7.1 The active-slot discipline
 
-- **already READY** (raced since exec scanned) -> decrement immediately (exec
-  can pin it - it really is READY);
-- **LOADING / MOVING_IN** (in flight) -> do NOT decrement here; it is exec-side
-  decision 6a that exec never submits in-flight experts, so this only happens
-  for a race window (exec saw ABSENT, then another submit started loading it).
-  The scheduler does not start a second load; the expert's existing load/move
-  will reach READY and decrement through the single drain completion point.
-- **ABSENT** -> start the load; it decrements when drain marks it READY.
+```
+scheduler loop (global worker polls each per-model scheduler; models don't block
+each other - each has its own active slot):
+  per model:
+    if model.active empty:
+      pop one exec request -> active  (records still-need bitmap + n_load_target)
+      for each still-need (L,E):
+        ABSENT                        -> publish LOADING, start own load
+        LOADING / MOVING_IN (in flight, e.g. prefetch or a prior race) -> do
+                                          NOT start a second load; it is already
+                                          someone else's in-flight load, which
+                                          will reach READY through drain
+    else:
+      keep draining (active in progress); do not pop a new request
+  drain: every (L,E) that settles READY (own load, prefetch, or move):
+      mark_ready + state -> READY
+      if (L,E) is in model.active.still-need: bump active.counter (once)
+      profile delta rdtsc (future, parallel - not the completion's only job)
+  active.counter == 0 -> wake exec once -> exec re-pins -> active cleared
+```
 
-The decrement therefore always happens at the ONE place a slot becomes READY
-(drain_completions mark_ready + state -> READY). A batch's counter reaches zero
-only when every bit has been observed READY - exec can then pin every handle it
-asked for. No "skip counts as done" anywhere.
+Because drain is the single point where any slot becomes READY, an in-flight
+expert that belongs to the active request (loaded by prefetch or a raced prior
+submit) bumps the active counter exactly when it actually becomes READY. No
+"skip counts as done" anywhere, and no per-(L,E) waiter list - the active
+request is the only waiter for this model.
 
-**Retry-round reset (exec side)**: when `pin_layer` retries (round 2), the
-re-submitted `slot_request_t.n_load_target` MUST equal the still-missing count
-re-measured by the second scan - NOT the round-1 total. The scheduler counts
-down the round's own n_load_target.
+### 7.2 Prefetch is NOT a separate half-event - it reuses the full DIO path
+
+A prefetch (scheduler-initiated predictive load) is just another submit on the
+same `async_dio_engine`; its completion lands in the SAME `drain_completions`
+and performs the full settle (mark_ready + dir set + version bump + wake), plus
+the drain-level profile delta-rdtsc accounting as a parallel extra. It is never
+"a separate event with no lower half that only records rdtsc". Consequences:
+
+- a prefetch must also publish `dir = LOADING` before submitting (so exec's
+  scan sees "in flight", does not double-load; §3.4 ordering applies);
+- a prefetched expert that settles while belonging to the active request bumps
+  the active counter through the same drain rule - no special prefetch->active
+  notification channel is needed.
+
+### 7.3 Retry-round reset (exec side)
+
+When `pin_layer` retries, the re-submitted `n_load_target` MUST equal the
+still-need count re-measured by that round's scan - never the round-1 total.
+The scheduler counts down the round's own n_load_target.
 
 ## 8. Open questions / deferred
 
@@ -363,23 +413,28 @@ down the round's own n_load_target.
 2. **A1 vs A2** directory layout: A1 (two parallel atomics) recommended.
 3. Whether `dir_->set` semantics stay "only at READY" or move to "reserve =
    LOADING, READY = READY" fully (see §3.4 ordering).
+4. **Single-active boundary**: the §7 model serialises exec requests per model
+   (one active slot). This matches today's single-ctx single-decode-thread
+   reality (exec blocks until its layer's request completes). If the same model
+   later runs multiple concurrent decode contexts, multiple active slots (one
+   per ctx) or a waiter set would be needed - flagged, not built now.
 
-> Resolved: in-flight duplicate requests (decision 6a - exec never submits
-> in-flight experts; LOADING/MOVING_IN experts are waited on via version word,
-> see §3.5), and move worker count = 1 (see §5.3). Both were earlier open items
-> and are now settled in their sections.
+> Resolved earlier in this session: move worker count = 1 (see §5.3). Exec is
+> stateless (see §3.5); prefetch reuses the full DIO path (see §7.2); in-flight
+> duplicates need no special handling beyond the active-slot + drain rule (§7).
 
 ## 9. Build order (final shape, component by component)
 
 1. Directory: widen to (L,E)-keyed state (A1); keep owner_ until step 3 compiles.
-2. Load path: publish LOADING before begin_reload (ordering invariant); add
-   in-flight skip in accept (removes duplicate-load window).
+2. Load path: publish LOADING before begin_reload (ordering invariant); single
+   active request slot per model (removes duplicate-load window; §7.1).
 3. Eviction: (L,E)-keyed layer-distance selection inside alloc_or_evict; delete
    owner_ (8 uses, all in alloc_or_evict, already enumerated).
 4. Move pipeline: move_task ring + 1 worker (v2r + r2v) + completion drain;
    wire v2r into eviction of a device victim; r2v available for placement
    policy later.
-5. Batch progress accounting on the scheduler side (wake once).
+5. Scheduler-side accounting: active-slot counter, drain-unified bump, wake-once
+   (§7); exec side becomes stateless pin+resubmit (§3.5).
 6. Verify: pure-RAM IDENTICAL (as today); VRAM single-device run reaches
    `exec_mm_vk` (this is the K6/L6b blocker); UT for directory states + move
    ring + eviction ordering.
