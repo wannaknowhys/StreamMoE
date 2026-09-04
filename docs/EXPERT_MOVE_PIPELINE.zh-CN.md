@@ -83,10 +83,18 @@ owner_    [slot]                  -> (L,E)         （槽 -> 专家，反向）
 ABSENT       无槽      不在本池
 LOADING      槽 Y      已预约，DIO 在飞（槽 IO_INFLIGHT），未 READY
 READY        槽 Y      可 pin（现行为）
-MOVING_OUT   槽 Y      这份正被搬走（v2r/r2v 源）
-MOVING_IN    槽 Y      这份正被搬入（目标），不可 pin
+MOVING_OUT   槽 Y      这份正被搬走（v2r/r2v 源），不可 pin
+                       （源槽保持 EVICTING 直到 move settle）
+MOVING_IN    槽 Y      这份正被搬入（目标），不可 pin；槽 Y 是**已占用的
+                       目标物理槽**（IO_INFLIGHT）——随状态一起发布，绝非占位
 FAILED       无槽      装载/迁移失败
 ```
+
+状态条目要点：
+- 携带槽的状态发布时，`slot` 必须是**真实已预约的物理槽号**（LOADING = 其
+  IO_INFLIGHT 槽；MOVING_IN = 已预约的目标槽）。与 §3.4 同一可见性规则：
+  先发布带合法槽的意图、worker 再行动——绝不发布占位槽。
+- **MOVING_OUT 与 MOVING_IN 都不可 pin**（try_pin 要求 READY），对称——见 §5.6。
 
 一次 move = 两个池两个条目同时：`MOVING_OUT(源池) + MOVING_IN(目标池)`；
 完成后源 → ABSENT，目标 → READY。
@@ -110,6 +118,29 @@ slots_[s].begin_reload()       // 物理槽 -> IO_INFLIGHT
 
 反序（先预约槽、后发布）会留下"槽在装但 directory 看不见"的窗口。固定顺序消灭
 重复装载窗口。
+
+**完成侧写序是镜像，同样必须遵守。** 计算线程扫到 `dir = READY` 时必须能 pin
+物理槽。故完成收尾为：
+
+```
+slots_[s].mark_ready()            // 物理槽 -> READY（释放读者）
+memory fence (seq-cst)
+dir(L,E,p) : LOADING -> READY     // 至此计算线程扫到 READY 才合法
+```
+
+反序（dir 先 READY、物理还 IO_INFLIGHT）会让 scan 见 READY 去 try_pin 一个
+仍在 IO_INFLIGHT 的槽——假唤醒 / pin 失败。装载完成、move 完成
+（MOVING_IN -> READY）、demote 到 RAM 都用此顺序。
+
+### 3.5 状态表下的计算侧 pin 语义
+
+`pin_layer` 按 (L,E) 扫：
+
+- 第一个 READY 副本 -> pin（不变）；
+- LOADING / MOVING_IN 副本 -> 在途——**不 pin、也不为它提交请求**；等该 (L,E)
+  的 version 词后重扫（见 §7——决策 6a：exec 绝不提交在途专家）；
+- 全 ABSENT -> 提交（该专家确实没在任何地方装载）；
+- FAILED -> 报错。
 
 ## 4. 删 owner_（槽 -> (L,E)）
 
@@ -146,6 +177,10 @@ host-visible 目标 buffer。结论：本硬件上 v2r 到普通 malloc RAM 只�
 一个专用 copy worker（数量参数化，先 1）。每专家迁移一个任务；批量提交。worker
 只做纯逐列 memcpy，绝不碰控制面。
 
+为什么只一个 worker（不用池）：v2r 的瓶颈是 **PCIe 读带宽**（vram host-map → RAM），
+不是 CPU 核数——多 worker 不加带宽只加并发度。一个 worker 就饱和链路；数量留参数，
+将来链路更快或 UMA 目标再调。
+
 ```cpp
 struct move_task_t {
     // kind: MOVE_V2R（src=vram 池, dst=RAM 池）或 MOVE_R2V（反向）
@@ -173,10 +208,15 @@ move 任务 ring，仿 async-load ring buffer 模式。
 ```
 调度线程（设备区满，需给新专家 X 腾槽）：
   按 (L,E) 驱逐（§6）选 victim V
+  begin_evict(源槽)                 // READY -> EVICTING（挡住新 try_pin）
+  dir_->clear(V, 源池)              // 不再可 pin
+  while (源槽 refcount != 0) yield  // 等既有计算读者放完（通常 0）——
+                                     // worker 绝不能读计算线程还持有的槽
   entries_(V, 源池)    : READY  -> MOVING_OUT
   dst = alloc_or_evict(RAM)          // dst IO_INFLIGHT（排他）
   entries_(V, RAM)     : ABSENT -> MOVING_IN
-  enqueue move{V vram, RAM dst}      // 非阻塞
+  enqueue move{V vram, RAM dst}      // 非阻塞；worker 拿到任务时源槽必已
+                                     // EVICTING 且 refcount==0
   源槽保持 EVICTING（不 reload）直到 cq
 
 worker：逐列 memcpy(RAM dst, vram src)；推完成
@@ -215,6 +255,10 @@ for delta = 1, 2, ...:
 工作示例（已定）：需要 K 槽 -> 取 L-1 层最低 score 驻留专家的 top K/2、
 L-2 的 top K/2，……（score 低者先逐；score 线估算后置，见 §8）。
 
+**跨层 score 可比性警告**：`adaptive_scores_` 的分布可能逐层不同（某些层是全局
+热点层）。**绝不跨层裸比 score 绝对值**。工作示例已规避这点——**层内**排序、
+每层取 top K/2——保持。将来若改成一锅排序，先层内归一/排名（见 §8）。
+
 ### 6.2 如何枚举本池驻留的 (L-delta) 层专家
 
 两个选项：
@@ -237,22 +281,35 @@ L-2 的 top K/2，……（score 低者先逐；score 线估算后置，见 §8�
 已定：这层批"还剩几个在装"的记账属于调度线程（它反正逐位处理）。exec 应在整批
 READY 时**只醒一次**，而不是醒 N 次去比较一个它不拥有的计数。
 
-- 调度线程维护 per-batch 进度（如小的 batch-slot 数组或并入 in-flight
-  move/load 记账）：`remaining = n_load_target`；每个处理位（装载 READY 或 skip in-flight）
-  递减；到 0 时写一次完成信号并 wake 一次。
-- exec 无论如何保留它的 `pins[]` handle 数组（层计算靠它 resolve 槽、层尾靠它
-  unpin）——那个记账独立。
+**完成语义（单一条规则，勿拆）**：批的唤醒信号只在**每个 needed (L,E) 真正
+READY** 时触发。`remaining` 只在真实 READY 时递减，**绝不"因 skip 算完成"**。
+具体，调度线程对每个 needed 位：
+
+- **已 READY**（exec scan 后被人抢先装好）-> 立即递减（exec 能 pin——它真 READY）；
+- **LOADING / MOVING_IN**（在途）-> 这里**不递减**；exec 侧决策 6a 保证 exec 不提交
+  在途专家，所以这只发生在竞态窗口（exec 见 ABSENT，随后别人开始装它）。调度线程
+  不重复发起装载；该专家现有的 load/move 会到 READY，经**唯一 drain 完成点**递减；
+- **ABSENT** -> 启动装载；drain 把它 mark_ready 时递减。
+
+递减因此总发生在**槽变 READY 的唯一一处**（drain_completions mark_ready +
+状态 -> READY）。批计数归零 = 每个位都被观测到 READY——exec 醒来能 pin 它要的
+每个 handle。任何地方都没有"skip 算完成"。
+
+**重试轮重置（exec 侧）**：`pin_layer` 重试（round 2）时，重新提交的
+`slot_request_t.n_load_target` 必须精确等于**当轮二次 scan 后仍 missing 的 bit 数**——
+不是 round 1 的整层计数。调度线程按当轮自己的 n_load_target 倒计数。
 
 ## 8. Open questions / 后置
 
 1. **score 线估算**："需要 K 槽时，层 L-delta 该用什么 score 阈值？"——后置
    （用户：可将来再说）。先按"最近层优先、按 score 取每层 top K/2"细化。
+   **跨层裸比 score 绝对值保持禁止**（见 §6.1 警告）。
 2. **A1 vs A2** directory 布局：推荐 A1（两个并行原子）。
-3. **in-flight 重复请求处理**：LOADING/MOVING_IN 的 (L,E) 收到第二个请求——skip 且
-   仍计入批目标（调度线程负责让该专家 READY；在途算它的义务）——需在
-   accept_requests 里精确表述。
-4. **move worker 数量**：先 1，参数化。
-5. `dir_->set` 语义是否彻底改成"预约 = LOADING、完成 = READY"两段（见 §3.4 顺序）。
+3. `dir_->set` 语义是否彻底改成"预约 = LOADING、完成 = READY"两段（见 §3.4 顺序）。
+
+> 已解决：in-flight 重复请求（决策 6a——exec 绝不提交在途专家；LOADING/MOVING_IN
+> 经 version 词等待，见 §3.5）、move worker 数量 = 1（见 §5.3）。两者曾是 open
+> item，现已在各自小节定案。
 
 ## 9. 构建顺序（终态，按组件）
 
@@ -271,6 +328,8 @@ READY 时**只醒一次**，而不是醒 N 次去比较一个它不拥有的计�
 
 - `src/backend/slot.h`——directory 状态加宽（A1）或新增 move-task 结构
 - `src/backend/scheduler.h` / `scheduler.cpp`——驱逐、删 owner_、move worker + ring、批记账
+- `src/pool/expert_stats.h`——仅审查：打分本就按 (L,E) 键
+  （`stats_.adaptive_scores_[(L,E)]`）；(L,E) 键驱逐直接读它，无需槽反查
 - `src/backend/minigraph_exec.cpp`——预期不动（exec API 不变：仍是 pin_layer），
   除非批信号移到调度线程侧
 - `tests/test_slot.cpp`、`tests/test_scheduler.cpp`——新状态/move/驱逐 UT

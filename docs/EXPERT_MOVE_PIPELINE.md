@@ -95,10 +95,21 @@ States (per (L,E) x pool; an expert may hold RAM + VRAM copies simultaneously):
 ABSENT       no slot    not in this pool
 LOADING      slot Y     reserved, DIO in flight (slot IO_INFLIGHT), NOT ready
 READY        slot Y     pin-able (current behaviour)
-MOVING_OUT   slot Y     this copy is being moved away (v2r/r2v source)
-MOVING_IN    slot Y     this copy is being moved in (target), not pin-able
+MOVING_OUT   slot Y     this copy is being moved away (v2r/r2v source), not
+                        pin-able (source slot stays EVICTING until the move settles)
+MOVING_IN    slot Y     this copy is being moved in (target), not pin-able;
+                        slot Y is the ALREADY-RESERVED destination physical slot
+                        (IO_INFLIGHT) - set together with the state, never a stub
 FAILED       no slot    load/move failed
 ```
+
+Notes on state entries:
+- When a state carrying a slot is published, `slot` must be the real reserved
+  physical slot id (LOADING = its IO_INFLIGHT slot; MOVING_IN = the reserved
+  destination slot). Same visibility rule as §3.4: publish the intent with a
+  valid slot, THEN the worker acts on it - never publish a placeholder slot.
+- MOVING_OUT and MOVING_IN are both **not pin-able** (try_pin requires READY),
+  symmetric - see §5.6.
 
 A move is two entries in two pools at once: `MOVING_OUT(src pool)` +
 `MOVING_IN(dst pool)`; on completion source -> ABSENT, destination -> READY.
@@ -126,6 +137,31 @@ slots_[s].begin_reload()       // physical slot -> IO_INFLIGHT
 The reverse order (reserve slot first, publish later) leaves a window where
 the slot is loading but the directory cannot see it. Fixed order kills the
 duplicate-load window.
+
+**Completion-side ordering is the mirror and just as binding.** A compute
+scan that sees `dir = READY` MUST be able to pin the physical slot. So the
+completion tail is:
+
+```
+slots_[s].mark_ready()            // physical slot -> READY (releases readers)
+memory fence (seq-cst)
+dir(L,E,p) : LOADING -> READY     // only now may a compute scan observe READY
+```
+
+Reverse (dir READY before physical READY) lets a scan see READY and try_pin a
+slot that is still IO_INFLIGHT - false wake / failed pin. Load completion,
+move completion (MOVING_IN -> READY) and demote-to-RAM all use this order.
+
+### 3.5 Compute-side pin semantics under the state table
+
+`pin_layer` scans by (L,E):
+
+- first READY copy -> pin it (unchanged);
+- a LOADING / MOVING_IN copy -> it is in flight - do NOT pin and do NOT submit
+  a request for it; wait on that (L,E)'s version word and rescan (see §7 - this
+  is decision 6a: exec never submits in-flight experts);
+- all ABSENT -> submit (the expert is genuinely not being loaded anywhere);
+- FAILED -> error.
 
 ## 4. Remove owner_ (slot -> (L,E))
 
@@ -172,6 +208,11 @@ One dedicated copy worker (parameterised count, start at 1). Single task per
 expert move; submit in batches. Worker does pure per-column memcpy, never
 touches control plane.
 
+Why one worker (not a pool): the v2r bottleneck is **PCIe read bandwidth**
+(vram host-map -> RAM), not CPU core count - extra workers do not add bandwidth,
+they only add concurrency. One worker saturates the link; the count stays a
+parameter in case a faster link or UMA target changes that calculus.
+
 ```cpp
 struct move_task_t {
     // kind: MOVE_V2R (src=vram pool, dst=RAM pool) or MOVE_R2V (reverse)
@@ -202,10 +243,16 @@ A ring of move tasks, mirroring the async-load ring buffer pattern.
 ```
 scheduler (device region full, needs slot for new expert X):
   pick victim V by (L,E) eviction (§6)
+  begin_evict(src slot)                // READY -> EVICTING (blocks new try_pin)
+  dir_->clear(V, src_pool)             // no longer pin-able
+  while (src slot refcount != 0) yield // wait for any existing compute reader
+                                       // (usually 0) - worker must never read
+                                       // a slot a compute thread still holds
   entries_(V, src_pool)   : READY  -> MOVING_OUT
   dst = alloc_or_evict(RAM)           // dst IO_INFLIGHT (exclusive)
   entries_(V, RAM)        : ABSENT -> MOVING_IN
-  enqueue move{V src, RAM dst}        // non-blocking
+  enqueue move{V src, RAM dst}        // non-blocking; worker only sees the task
+                                       // once src is EVICTING and refcount==0
   src slot stays EVICTING (NOT reloaded) until cq
 
 worker: per-column memcpy(RAM dst, vram src); push completion
@@ -248,6 +295,12 @@ Worked example (as decided): need K slots -> take top K/2 lowest-score
 resident experts of layer L-1, top K/2 of L-2, ... (score = low evicts first;
 score-line estimation deferred, see §8).
 
+**Cross-layer score comparison caveat**: `adaptive_scores_` distributions may
+differ per layer (some layers are globally hot). NEVER compare raw score
+values ACROSS layers. The worked example already avoids this by ranking
+WITHIN a layer and taking top K/2 per layer - keep that. If a later change
+mixes layers in one ranking, normalise/rank within each layer first (see §8).
+
 ### 6.2 How to enumerate (L-delta) experts resident in this pool
 
 Two options:
@@ -277,26 +330,44 @@ Decided: the "how many of this batch are still loading" bookkeeping belongs on
 the scheduler thread (it processes each bit anyway). Exec should wake ONCE when
 the whole batch is READY, not N times to compare a counter it does not own.
 
-- Scheduler keeps per-batch progress (e.g. a small batch-slot array or the
-  in-flight move/load bookkeeping): `remaining = n_load_target`; every processed bit
-  (loaded READY or skipped in-flight) decrements; at 0, write the completion
-  signal once and wake once.
-- Exec keeps its `pins[]` handle array regardless (layer compute resolves
-  slots from it, layer end unpins from it) - that accounting is independent.
+**Completion semantic (single rule, do not split)**: the batch's wake signal
+fires only when EVERY needed (L,E) is truly READY. `remaining` decrements only
+on a real READY, never "on skip". Concretely, for each needed bit the scheduler
+encounters:
+
+- **already READY** (raced since exec scanned) -> decrement immediately (exec
+  can pin it - it really is READY);
+- **LOADING / MOVING_IN** (in flight) -> do NOT decrement here; it is exec-side
+  decision 6a that exec never submits in-flight experts, so this only happens
+  for a race window (exec saw ABSENT, then another submit started loading it).
+  The scheduler does not start a second load; the expert's existing load/move
+  will reach READY and decrement through the single drain completion point.
+- **ABSENT** -> start the load; it decrements when drain marks it READY.
+
+The decrement therefore always happens at the ONE place a slot becomes READY
+(drain_completions mark_ready + state -> READY). A batch's counter reaches zero
+only when every bit has been observed READY - exec can then pin every handle it
+asked for. No "skip counts as done" anywhere.
+
+**Retry-round reset (exec side)**: when `pin_layer` retries (round 2), the
+re-submitted `slot_request_t.n_load_target` MUST equal the still-missing count
+re-measured by the second scan - NOT the round-1 total. The scheduler counts
+down the round's own n_load_target.
 
 ## 8. Open questions / deferred
 
 1. **Score-line estimation**: "given K slots needed, what score threshold for
    layer L-delta?" - deferred (user: can be done later). Start with "top K/2
-   per layer by score, nearest layer first" and refine.
+   per layer by score, nearest layer first" and refine. Cross-layer raw-score
+   comparison stays forbidden (see §6.1 caveat).
 2. **A1 vs A2** directory layout: A1 (two parallel atomics) recommended.
-3. **In-flight duplicate request handling**: a LOADING/MOVING_IN (L,E) that
-   receives a second request - skip + still count toward the batch target (the
-   scheduler owns making that expert READY; already in flight counts as its
-   obligation) - needs a precise statement in accept_requests.
-4. **move worker count**: start 1, parameterised.
-5. Whether `dir_->set` semantics stay "only at READY" or move to "reserve =
+3. Whether `dir_->set` semantics stay "only at READY" or move to "reserve =
    LOADING, READY = READY" fully (see §3.4 ordering).
+
+> Resolved: in-flight duplicate requests (decision 6a - exec never submits
+> in-flight experts; LOADING/MOVING_IN experts are waited on via version word,
+> see §3.5), and move worker count = 1 (see §5.3). Both were earlier open items
+> and are now settled in their sections.
 
 ## 9. Build order (final shape, component by component)
 
@@ -318,6 +389,9 @@ the whole batch is READY, not N times to compare a counter it does not own.
 - `src/backend/slot.h` - directory state widen (A1) or new move-task structs
 - `src/backend/scheduler.h` / `scheduler.cpp` - eviction, owner_ removal,
   move worker + rings, batch accounting
+- `src/pool/expert_stats.h` - review only: scoring already keyed by (L,E)
+  (`stats_.adaptive_scores_[(L,E)]`); (L,E)-keyed eviction reads it directly,
+  no slot reverse-lookup needed
 - `src/backend/minigraph_exec.cpp` - none expected (exec API unchanged: still
   pin_layer), except batch-await plumbing if signals move scheduler-side
 - `tests/test_slot.cpp`, `tests/test_scheduler.cpp` - new state/move/eviction UT
