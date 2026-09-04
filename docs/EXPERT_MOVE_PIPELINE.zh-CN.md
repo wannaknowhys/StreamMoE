@@ -28,7 +28,7 @@
 
 ## 2. 已落地基座（WORK_IN_PROGRESS L）——不可回归
 
-- `slot_request_t` 96B POD：`{layer, total_tokens, start_rdtsc, seq(=批目标计数),
+- `slot_request_t` 96B POD：`{layer, total_tokens, start_rdtsc, n_load_target(=批装载数),
   batch_ready ptr, needed[8]=512bit bitmap}`。
 - `mpsc_alloc_queue`：普通 POD ring + 每槽发布 generation（release/acquire），
   多生产者安全，无 ABA。绝不用 `std::atomic<96B>`。
@@ -238,7 +238,7 @@ L-2 的 top K/2，……（score 低者先逐；score 线估算后置，见 §8�
 READY 时**只醒一次**，而不是醒 N 次去比较一个它不拥有的计数。
 
 - 调度线程维护 per-batch 进度（如小的 batch-slot 数组或并入 in-flight
-  move/load 记账）：`remaining = seq`；每个处理位（装载 READY 或 skip in-flight）
+  move/load 记账）：`remaining = n_load_target`；每个处理位（装载 READY 或 skip in-flight）
   递减；到 0 时写一次完成信号并 wake 一次。
 - exec 无论如何保留它的 `pins[]` handle 数组（层计算靠它 resolve 槽、层尾靠它
   unpin）——那个记账独立。

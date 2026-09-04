@@ -34,7 +34,7 @@ removes the need for `owner_` entirely.
 
 ## 2. Landed base (WORK_IN_PROGRESS L) - do not regress
 
-- `slot_request_t` 96B POD: `{layer, total_tokens, start_rdtsc, seq(=batch
+- `slot_request_t` 96B POD: `{layer, total_tokens, start_rdtsc, n_load_target(=batch
   target count), batch_ready ptr, needed[8]=512-bit bitmap}`.
 - `mpsc_alloc_queue`: plain POD ring + per-slot publish generation
   (release/acquire), multi-producer safe, no ABA. NO `std::atomic<96B>`.
@@ -278,7 +278,7 @@ the scheduler thread (it processes each bit anyway). Exec should wake ONCE when
 the whole batch is READY, not N times to compare a counter it does not own.
 
 - Scheduler keeps per-batch progress (e.g. a small batch-slot array or the
-  in-flight move/load bookkeeping): `remaining = seq`; every processed bit
+  in-flight move/load bookkeeping): `remaining = n_load_target`; every processed bit
   (loaded READY or skipped in-flight) decrements; at 0, write the completion
   signal once and wake once.
 - Exec keeps its `pins[]` handle array regardless (layer compute resolves

@@ -141,15 +141,15 @@
 >
 > **定案（用户 2026-09）**：
 > 1. **请求 = 整层一条**：`slot_request_t` 从 `{layer,expert,seq}`（12B）改 **96B 定长 POD**（用户定 80B + wake-once 指针 → 96B）：
->    `{layer u32, total_tokens u32, start_rdtsc u64, seq(=batch目标) u32, batch_ready ptr, needed[8]=512bit}`。
->    **seq 从没被读的 per-expert id 重定义为 batch 完成目标计数**；`batch_ready` 是 exec 侧 wake-once 计数词。
+>    `{layer u32, total_tokens u32, start_rdtsc u64, n_load_target u32, batch_ready ptr, needed[8]=512bit}`。
+>    **n_load_target（曾名 seq）从没被读的 per-expert id 重定义为 batch 装载目标数**；`batch_ready` 是 exec 侧 wake-once 计数词。
 > 2. **MPSC 队列就绪位化**：ring 元素普通 POD（96B 不可能进 `std::atomic`，12B 已非 lock-free 退化成锁），
 >    每槽 publish generation（tail+1）+ release/acquire，**多生产者安全**（tail CAS 预留、consumer 等 generation 才读、无 ABA）。
 > 3. **批量 API**：`pin_layer(layer, bitmap, await, out)` 取代 `pin_expert`/`wait_ready` 单专家 API——
 >    exec 把整层活跃集一次 push；scheduler pop 后对 bitmap **集体** `alloc_or_evict` +
 >    并发装载；exec **只醒一次**（wake-once 计数词）。
 > 4. **wake-once（选 B）**：exec 提交 bitmap 后睡在 `batch_ready` 计数词上，scheduler 每处理一个位
->    （含 skip-resident）fetch_add + wake，计数到 seq（=待处理专家数）即醒。**也给了 profile 一个
+>    （含 skip-resident）fetch_add + wake，计数到 n_load_target（=待处理专家数）即醒。**也给了 profile 一个
 >    per-batch 完成点**。fail 也 bump（exec 醒后 rescan 重试，防 spin）。
 > 5. **pin 生命周期不变**（整专家 = 全列切片 READY 才可用）：async_load_t 本就"整专家 pending 聚合 0
 >    才 mark_ready"；批量后 bitmap 位 = 该专家全列载入完成。exec 只在专家 READY 后 pin，层尾全 unpin。
@@ -162,7 +162,7 @@
 > 消费端（M2-4，仅补字段载体）。
 >
 > **任务**
-> - [x] L1 slot.h：slot_request_t 96B 定长（layer/total_tokens/start_rdtsc/seq=target/batch_ready/needed[8]），删 per-expert seq；mpsc 队列普通 POD + 每槽 publish generation + release/acquire，多生产者安全——0518153
+> - [x] L1 slot.h：slot_request_t 96B 定长（layer/total_tokens/start_rdtsc/n_load_target/batch_ready/needed[8]，字段曾名 seq=target）；mpsc 队列普通 POD + 每槽 publish generation + release/acquire，多生产者安全——0518153
 > - [x] L2 scheduler.h：MAX_EXPERTS_PER_LAYER=512；删 pin_expert/wait_ready 单专家 API；加 pin_layer(layer, bitmap, await, out)（wake-once）+ bit 助手——0518153
 > - [x] L3 scheduler.cpp：init n_expert≤512 fail-fast；accept_requests 按 bitmap 集体装载（device-first，per-bit bump）；drain_completions settle 时 bump batch 计数 + wake（成败都 bump 防 spin）——0518153
 > - [x] L4 minigraph_exec：burst 整层一次 pin_layer；legacy 角色 split 批量 pin 到 pin_state、down 只确认 pinned——0518153
@@ -198,7 +198,7 @@
 >    驱逐 drain 会自锁）。
 > 6. **v2r 不做 GPU/vulkan DMA**：独显 host-visible heap 仍是显存，系统 RAM 不在 GPU
 >    地址空间，copy engine 写不到（UMA/APU 才有）。只能 CPU memcpy，故异步 worker。
-> 7. **批进度记账移调度线程**：scheduler 维护 remaining=seq，归零 wake 一次；exec
+> 7. **批进度记账移调度线程**：scheduler 维护 remaining=n_load_target，归零 wake 一次；exec
 >    保留 pins[] handle 数组（resolve/unpin 用，独立记账）。
 >
 > **任务（详细 build order 见设计文档 §9）**
