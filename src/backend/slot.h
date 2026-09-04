@@ -146,6 +146,20 @@ struct slot_meta {
         }
     }
 
+    // Return a used slot (EVICTING / IO_INFLIGHT after its content was copied
+    // away) to EMPTY so alloc_or_evict can reuse it. generation++ invalidates
+    // any stale expert_handle. Used by drain_moves after an async v2r move.
+    void release_to_empty() {
+        uint64_t w = word.load(std::memory_order_relaxed);
+        while (true) {
+            uint32_t gen = slot_word_generation(w) + 1;
+            uint64_t nw = slot_word(SLOT_EMPTY, 0, gen);
+            if (word.compare_exchange_weak(w, nw, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
     void mark_failed() {
         uint64_t w = word.load(std::memory_order_relaxed);
         while (true) {

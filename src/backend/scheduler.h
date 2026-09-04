@@ -20,7 +20,9 @@
 #include "backend/slot.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,6 +50,28 @@ struct expert_handle_t {
     uint32_t expert     = 0;
     uint32_t pool       = 0;   // device pool index (0 = CPU RAM)
     bool     pinned     = false;
+};
+
+// ---- async move pipeline (M4) ---------------------------------------------
+// A cross-pool expert move (v2r: device->RAM, or r2v: RAM->device) is executed
+// by a dedicated move worker thread. The task carries per-column (src,dst) byte
+// ranges resolved at submit time - the worker never touches the scheduler, it
+// only memcpys. On completion the worker pushes the task to the done queue; the
+// scheduler thread performs the control-plane tail (drain_moves).
+class expert_scheduler;
+struct move_task_t {
+    uint32_t layer = 0, expert = 0;
+    uint32_t src_pool = 0, src_slot = 0;
+    uint32_t dst_pool = 0, dst_slot = 0;
+    uint64_t req_tsc = 0;      // [TMR] submit time
+    uint64_t done_tsc = 0;     // [TMR] memcpy finished
+    struct copy_t {
+        const uint8_t* src = nullptr;   // column slice source (resolved)
+        uint8_t*       dst = nullptr;   // column slice destination (resolved)
+        size_t         bytes = 0;
+    };
+    std::vector<copy_t> cols;  // one per tensor column
+    expert_scheduler* owner = nullptr;  // scheduler owning both pools
 };
 
 // One in-flight expert load. The ringbuffer element is a contiguous 4K-aligned
@@ -123,6 +147,19 @@ public:
 
     // Release a pin (refcount--); slot becomes evictable at 0.
     void unpin(const expert_handle_t& h);
+
+    // ---- async move pipeline (M4) ----
+    // Queue a cross-pool move (v2r / r2v) for the move worker. Per-column
+    // (src,dst,bytes) are resolved here from the owning sub-pools. Returns false
+    // when either slot is not in this scheduler or column resolution fails.
+    // Scheduler-thread only (the caller already holds the exclusive slots).
+    bool submit_move(uint32_t layer, uint32_t expert,
+                     uint32_t src_pool, uint32_t src_slot,
+                     uint32_t dst_pool, uint32_t dst_slot);
+    // Control-plane tail for finished moves: called by the global worker loop
+    // after the move worker reports completions. dst slot -> READY + dir READY;
+    // src slot released for reuse. Single-threaded (global scheduler thread).
+    void drain_moves();
 
     // Bitmap helpers (bit e of a layer's expert bitmap).
     static bool bit_test(const uint64_t* bm, uint32_t e) { return (bm[e >> 6] >> (e & 63)) & 1ull; }
@@ -247,6 +284,15 @@ private:
     async_load_t* load_task(uint32_t idx) {
         return reinterpret_cast<async_load_t*>(load_pool_ + static_cast<size_t>(idx) * load_stride_);
     }
+
+    // ---- move worker thread (M4) ----
+    void move_worker_main();      // runs on the move worker thread
+    std::thread  move_thread_;
+    std::mutex   move_mtx_;                    // guards both queues
+    std::condition_variable move_cv_;          // submit queue not-empty
+    std::deque<move_task_t> move_submit_;      // scheduler -> worker
+    std::deque<move_task_t> move_done_;        // worker -> scheduler (drain_moves)
+    std::atomic<bool> move_stop_{false};       // worker exit flag
 
     const moe_model_topology_t* topo_   = nullptr;
     async_dio_engine*           dio_    = nullptr;

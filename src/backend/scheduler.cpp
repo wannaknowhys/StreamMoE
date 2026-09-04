@@ -222,14 +222,124 @@ const expert_scheduler::subpool_t* expert_scheduler::ram_subpool(uint32_t group)
     return nullptr;
 }
 
+// ---- async move pipeline (M4) ---------------------------------------------
+
+bool expert_scheduler::submit_move(uint32_t layer, uint32_t expert,
+                                   uint32_t src_pool, uint32_t src_slot,
+                                   uint32_t dst_pool, uint32_t dst_slot) {
+    const subpool_t* ssp = subpool_of_slot(static_cast<int32_t>(src_slot));
+    const subpool_t* dsp = subpool_of_slot(static_cast<int32_t>(dst_slot));
+    if (!ssp || !dsp) return false;
+    // both pools must belong to the same group (same column set / strides)
+    if (ssp->group != dsp->group || ssp->cols.size() != dsp->cols.size()) return false;
+
+    move_task_t t;
+    t.layer = layer; t.expert = expert;
+    t.src_pool = src_pool; t.src_slot = src_slot;
+    t.dst_pool = dst_pool; t.dst_slot = dst_slot;
+    t.owner = this;
+    t.req_tsc = tsc_now();
+    for (size_t c = 0; c < ssp->cols.size(); ++c) {
+        const column_t& sc = ssp->cols[c];
+        const column_t& dc = dsp->cols[c];
+        if (sc.stride != dc.stride) return false;   // must be same layout
+        move_task_t::copy_t cp;
+        cp.src = col_slice_ptr(*ssp, sc, static_cast<int32_t>(src_slot));
+        cp.dst = col_slice_ptr(*dsp, dc, static_cast<int32_t>(dst_slot));
+        cp.bytes = sc.stride;
+        if (!cp.src || !cp.dst) return false;
+        t.cols.push_back(cp);
+    }
+    {
+        std::lock_guard<std::mutex> lk(move_mtx_);
+        move_submit_.push_back(std::move(t));
+    }
+    move_cv_.notify_one();
+    return true;
+}
+
+void expert_scheduler::move_worker_main() {
+    for (;;) {
+        move_task_t t;
+        {
+            std::unique_lock<std::mutex> lk(move_mtx_);
+            move_cv_.wait(lk, [&] { return move_stop_.load(std::memory_order_relaxed) || !move_submit_.empty(); });
+            if (move_submit_.empty()) {
+                if (move_stop_.load(std::memory_order_relaxed)) break;
+                continue;
+            }
+            t = std::move(move_submit_.front());
+            move_submit_.pop_front();
+        }
+        // pure per-column memcpy - never touches the scheduler control plane
+        for (const auto& cp : t.cols) {
+            std::memcpy(cp.dst, cp.src, cp.bytes);
+        }
+        t.done_tsc = tsc_now();
+        {
+            std::lock_guard<std::mutex> lk(move_mtx_);
+            move_done_.push_back(std::move(t));
+        }
+        // wake the global worker via the shared DIO engine? No - drain_moves is
+        // polled by worker_loop each tick; no explicit wake needed (1ms poll).
+    }
+}
+
+void expert_scheduler::drain_moves() {
+    // Control-plane tail for finished moves (global scheduler thread).
+    for (;;) {
+        move_task_t t;
+        {
+            std::lock_guard<std::mutex> lk(move_mtx_);
+            if (move_done_.empty()) return;
+            t = std::move(move_done_.front());
+            move_done_.pop_front();
+        }
+        // dst slot: IO_INFLIGHT (reserved at submit) -> READY; dir entry lands.
+        slots_[t.dst_slot].mark_ready();
+        dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_READY, t.dst_slot);
+        // src slot: content copied away (was EVICTING / exclusive during the
+        // move). Release it to EMPTY so a requeued alloc can reuse it. If the
+        // move was a r2v the src was a RAM copy that is now redundant - releasing
+        // is also correct (RAM keeps the dst or drops; content is on disk).
+        slots_[t.src_slot].release_to_empty();
+        LOG_DEBUG("expert_scheduler: moved L" << t.layer << " E" << t.expert
+                  << " pool " << t.src_pool << " slot " << t.src_slot
+                  << " -> pool " << t.dst_pool << " slot " << t.dst_slot);
+    }
+}
+
 void expert_scheduler::start() {
     if (running_.exchange(true)) return;
+    // launch the move worker once (idle until submit_move is called)
+    if (!move_thread_.joinable()) {
+        move_stop_.store(false, std::memory_order_relaxed);
+        move_thread_ = std::thread(&expert_scheduler::move_worker_main, this);
+    }
     global_expert_scheduler::instance().register_scheduler(this);
 }
 
 void expert_scheduler::stop() {
     if (!running_.exchange(false)) return;
     global_expert_scheduler::instance().unregister_scheduler(this);
+    // drain any in-flight moves before stopping the worker
+    {
+        std::unique_lock<std::mutex> lk(move_mtx_);
+        while (!move_done_.empty()) {
+            move_task_t t = std::move(move_done_.front());
+            move_done_.pop_front();
+            lk.unlock();
+            slots_[t.dst_slot].mark_ready();
+            dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_READY, t.dst_slot);
+            lk.lock();
+        }
+    }
+    move_stop_.store(true, std::memory_order_relaxed);
+    move_cv_.notify_all();
+    if (move_thread_.joinable()) {
+        move_thread_.join();
+        move_thread_ = std::thread();   // reset so start() can relaunch
+    }
 }
 
 void expert_scheduler::clear_directory(uint32_t layer, uint32_t expert) {
@@ -318,27 +428,31 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
         std::this_thread::yield();
     }
 
-    // 4. Demote, don't drop, device-region victims: move the content into the
-    //    group's CPU-RAM region (which itself drops its coldest expert to make
-    //    room). CPU-RAM victims are dropped (the disk is the next level). The
-    //    content copy happens after the refcount drain, so no reader is pinned
-    //    on the source slot; the destination slot is IO_INFLIGHT (reserved by
-    //    alloc_or_evict above) and gets mark_ready() without any DIO.
+    // 4. Demote device-region victims asynchronously (M4): the victim's content
+    //    is moved to the group's RAM region by the move worker; CPU-RAM victims
+    //    are dropped (disk is the next level). The src (victim) slot cannot be
+    //    reused for the new expert until the copy completes - so we submit the
+    //    move and return -1 (the caller requeues); drain_moves releases the src
+    //    slot to EMPTY once the copy is done, and the requeued expert picks it
+    //    up on the next alloc pass.
     if (sp->pool != 0) {
         const subpool_t* rsp = ram_subpool(sp->group);
         if (rsp && rsp->expert_size == sp->expert_size && rsp->cols.size() == sp->cols.size()) {
-            int32_t dst = alloc_or_evict(v_layer, v_expert, 0);   // RAM: make room
+            // reserve a RAM destination slot (this may itself evict a RAM expert)
+            const int32_t dst = alloc_or_evict(v_layer, v_expert, 0);
             if (dst >= 0) {
-                // SoA: copy per column (device slot slices -> RAM slot slices)
-                for (size_t c = 0; c < sp->cols.size(); ++c) {
-                    std::memcpy(slot_col_mem(dst, static_cast<uint32_t>(c)),
-                                slot_col_mem(victim, static_cast<uint32_t>(c)),
-                                sp->cols[c].stride);
+                if (submit_move(v_layer, v_expert, sp->pool, static_cast<uint32_t>(victim), 0, static_cast<uint32_t>(dst))) {
+                    // dst slot is IO_INFLIGHT; dir entry for v in RAM is LOADING
+                    // (from alloc_or_evict) - flip to MOVING_IN for the async copy.
+                    dir_->transition(v_layer, v_expert, 0, EXPERT_MOVING_IN, static_cast<uint32_t>(dst));
+                    LOG_DEBUG("expert_scheduler: async demote L" << v_layer << " E" << v_expert
+                              << " device slot " << victim << " -> RAM slot " << dst);
+                    return -1;   // src slot stays EVICTING until drain_moves frees it
                 }
-                slots_[dst].mark_ready();
-                dir_->set(v_layer, v_expert, 0, static_cast<uint32_t>(dst));
-                LOG_DEBUG("expert_scheduler: demoted L" << v_layer << " E" << v_expert
-                          << " device slot " << victim << " -> RAM slot " << dst);
+                // submit failed (should not happen): drop the device copy and
+                // release the reserved RAM dst slot.
+                dir_->transition(v_layer, v_expert, 0, EXPERT_ABSENT, SLOT_UNASSIGNED);
+                slots_[dst].release_to_empty();
             }
             // RAM full/pinned: fall through to dropping the device copy (the
             // content stays readable from disk).
@@ -724,6 +838,10 @@ void global_expert_scheduler::worker_loop() {
         // 2. accept alloc requests from every registered pool.
         for (auto* s : snap) {
             if (s->is_running() && s->accept_requests()) any = true;
+        }
+        // 2b. finish async cross-pool moves (dst READY + dir, src released).
+        for (auto* s : snap) {
+            if (s->is_running()) s->drain_moves();
         }
         // 3. adapt eviction alpha (overall hit-rate EMA, scheduler-thread owned).
         for (auto* s : snap) {
