@@ -39,7 +39,13 @@ public:
         std::memset(&p, 0, sizeof(p));
         p.mem_size = size_;
         p.mem_buffer = mem_;
-        p.no_alloc = false;
+        // no_alloc: tensors never get data allocated from this context - the
+        // executors point every tensor's data at their own buffers (pool column
+        // region, host full-alloc dst, staging, heap). A prefill batch's mm
+        // result alone is tens-hundreds of MB; letting ggml_allocate it here
+        // wastes the arena (data is overwritten right after) and blows the
+        // fixed-size context on large batches (ggml_new_object assert).
+        p.no_alloc = true;
         ctx_ = ggml_init(p);
         return ctx_ != nullptr;
     }

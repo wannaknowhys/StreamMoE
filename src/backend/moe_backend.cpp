@@ -245,6 +245,13 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
             LOG_ERROR("stream_moe: scratch arena alloc failed");
             return GGML_STATUS_FAILED;
         }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_DUMP")) {
+            const size_t est = estimate_scratch(nodes.data(), static_cast<int>(nodes.size()));
+            std::fprintf(stderr, "[tmp] graph_compute: n_nodes=%d est=%zuMB arena=%zuMB\n",
+                         (int)nodes.size(), est/(1024*1024), bctx->arena.size()/(1024*1024));
+        }
+#endif
         if (!bctx->arena.reset()) return GGML_STATUS_FAILED;
 
         return moe_exec_mul_mat_id(bctx->arena.ctx(), bctx->cpu, *sched,
