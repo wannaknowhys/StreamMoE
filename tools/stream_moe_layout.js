@@ -125,6 +125,7 @@ function buildLayerBranches(files, nLayer) {
     const names = kv(files, 'stream_moe.expert_branch_names') || [];
     const sizes = kv(files, 'stream_moe.expert_branch_sizes') || [];
     const counts = kv(files, 'stream_moe.expert_branch_counts') || [];
+    const branchAlign = Number(kv(files, 'stream_moe.branch_align') || 0) === 1;
     const layerBranches = [];
     let ni = 0, si = 0;
     for (let l = 0; l < nLayer; l++) {
@@ -135,7 +136,9 @@ function buildLayerBranches(files, nLayer) {
             const name = names[ni++];
             const perExpert = Number(sizes[si++]);
             bs.push({ name, tag: branchOf(name), perExpert, branchOff: off });
-            off += perExpert;
+            // branch_align=1: each branch (tensor) slice starts 4K-aligned
+            // (mirror computeV2Layout); legacy compact otherwise.
+            off = branchAlign ? alignUp(off + perExpert, ALIGN) : off + perExpert;
         }
         layerBranches.push(bs);
     }
@@ -284,11 +287,21 @@ function computeV2Layout(model, offsets) {
     }
     const layers = [...byLayer.keys()].sort((a, b) => a - b);
     const branchesByLayer = new Map();
+    const layerBranchSize = new Map();   // aligned cumulative end per layer (block size constant)
+    // v2 block-internal layout: each branch (tensor) slice starts 4K-aligned
+    // (branch_align=1, 2026-09) so every (expert,tensor) slice source offset is
+    // DIO-able. Each block starts 4K-aligned; inside, branch starts advance by
+    // alignUp(previous end, ALIGN). block size = aligned cumulative end (same
+    // branch set for every expert of a layer, so constant within the layer).
     for (const l of layers) {
         const branches = ORDER.map((tag) => byLayer.get(l).find((t) => t.branch === tag)).filter(Boolean);
         let off = 0;
-        for (const b of branches) { b.blockOff = off; off += b.perExpert; }
+        for (const b of branches) {
+            b.blockOff = off;
+            off = alignUp(off + b.perExpert, ALIGN);   // aligned end of this branch
+        }
         branchesByLayer.set(l, branches);
+        layerBranchSize.set(l, off);
     }
     const blocks = [];
     const layerBlockIdx = new Map();
@@ -296,7 +309,7 @@ function computeV2Layout(model, offsets) {
     for (const l of layers) {
         const branches = branchesByLayer.get(l);
         const raw = branches.reduce((a, b) => a + b.perExpert, 0);
-        const size = alignUp(raw, ALIGN);
+        const size = layerBranchSize.get(l);
         layerBlockIdx.set(l, blocks.length);
         for (let e = 0; e < model.nExpert; e++) {
             blocks.push({ off: cur, size, raw });
@@ -331,6 +344,7 @@ function v2LayoutKV(layout) {
         'stream_moe.expert_branch_names': bnames,
         'stream_moe.expert_branch_sizes': bsizes,
         'stream_moe.expert_branch_counts': bcounts,
+        'stream_moe.branch_align': 1,   // 2026-09: each branch slice inside a block starts 4K-aligned
     };
 }
 
@@ -431,10 +445,19 @@ async function writeV2(model, out) {
         const blkBase = layout.layerBlockIdx.get(l);
         for (let e = 0; e < model.nExpert; e++) {
             const blk = layout.blocks[blkBase + e];
+            // copy each branch (tensor) slice to its 4K-aligned block-offset
             for (const b of branches) {
                 for (const s of b.perExpertSrcs[e]) ops.push([s.fi, s.off, s.len, blk.off + b.blockOff + s.inOff]);
             }
-            if (blk.raw < blk.size) fillOps.push([blk.off + blk.raw, blk.size - blk.raw]);
+            // fill every pad gap: between branches and after the last branch,
+            // so a whole-aligned block span is fully in-file (DIO windows never
+            // overrun); branch starts are 4K-aligned (branch_align=1).
+            let gap = 0;
+            for (const b of branches) {
+                if (b.blockOff > gap) fillOps.push([blk.off + gap, b.blockOff - gap]);
+                gap = b.blockOff + b.perExpert;
+            }
+            if (gap < blk.size) fillOps.push([blk.off + gap, blk.size - gap]);
         }
     }
     await call({ cmd: 'copy', src: model.files.map((f) => f.path), dst: out, ops }).then((r) => { if (!r.ok) throw new Error('copy v2: ' + r.error); });
@@ -486,9 +509,17 @@ async function writeV2chunk(model, outBase, N, ratio) {
             const stripLen = blkSlices[b][i] * ALIGN;
             const fileBase = (denseSlices[i] + blkPrefix[b][i]) * ALIGN;
             const segs = contentToSegs(blockContentOf(b), blocks[b].off + bStart * ALIGN, stripLen);
-            let maxEnd = 0;
-            for (const s of segs) { ops.push([s.fi, s.off, s.len, fileBase + s.logOff]); maxEnd = Math.max(maxEnd, s.logOff + s.len); }
-            if (maxEnd < stripLen) fillOps.push([fileBase + maxEnd, stripLen - maxEnd]);
+            const covered = segs.map((s) => [s.logOff, s.logOff + s.len]).sort((a, c) => a[0] - c[0]);
+            for (const s of segs) ops.push([s.fi, s.off, s.len, fileBase + s.logOff]);
+            // fill the complement of branch data within the strip (inter-branch
+            // 4K pads from branch_align=1 + tail) so the strip's physical area
+            // matches chunk_slices and merge never overruns EOF.
+            let cursor = 0;
+            for (const [a, bEnd] of covered) {
+                if (a > cursor) fillOps.push([fileBase + cursor, a - cursor]);
+                cursor = Math.max(cursor, bEnd);
+            }
+            if (cursor < stripLen) fillOps.push([fileBase + cursor, stripLen - cursor]);
         }
         await call({ cmd: 'copy', src: srcFiles, dst: outs[i], ops }).then((r) => { if (!r.ok) throw new Error('copy v2chunk: ' + r.error); });
         if (fillOps.length) await call({ cmd: 'fill', dst: outs[i], ops: fillOps }).then((r) => { if (!r.ok) throw new Error('fill v2chunk: ' + r.error); });

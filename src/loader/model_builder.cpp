@@ -132,7 +132,7 @@ std::vector<block_t> build_blocks(const std::vector<uint64_t>& sections) {
 
 std::vector<std::vector<branch_t>> build_layer_branches(
         const std::vector<std::string>& bnames, const std::vector<uint64_t>& bsizes,
-        const std::vector<uint64_t>& bcounts, uint32_t n_layer) {
+        const std::vector<uint64_t>& bcounts, uint32_t n_layer, bool branch_align) {
     std::vector<std::vector<branch_t>> layers(n_layer);
     size_t ni = 0, si = 0;
     for (uint32_t l = 0; l < n_layer; ++l) {
@@ -148,7 +148,9 @@ std::vector<std::vector<branch_t>> build_layer_branches(
             else if (b.name.find("ffn_up_exps") != std::string::npos) b.tag = "up";
             else if (b.name.find("down_exps") != std::string::npos) b.tag = "down";
             b.branch_off = off;
-            off += b.per_expert;
+            // branch_align=1: each branch slice starts 4K-aligned (mirror
+            // layout.js computeV2Layout); legacy compact otherwise.
+            off = branch_align ? align_up(off + b.per_expert, ALIGN) : off + b.per_expert;
             layers[l].push_back(b);
         }
     }
@@ -264,8 +266,9 @@ model_t parse_model(const std::vector<std::string>& paths) {
         kv_str_arr(ctx0, "stream_moe.expert_branch_names", bnames);
         kv_u64_arr(ctx0, "stream_moe.expert_branch_sizes", bsizes);
         kv_u64_arr(ctx0, "stream_moe.expert_branch_counts", bcounts);
+        model.branch_align = kv_int(ctx0, "stream_moe.branch_align") == 1;
         const std::vector<block_t> blocks = build_blocks(model.expert_sections);
-        const auto layers = build_layer_branches(bnames, bsizes, bcounts, model.n_layer);
+        const auto layers = build_layer_branches(bnames, bsizes, bcounts, model.n_layer, model.branch_align);
         model.dense_section = { 0, 0 };
         for (size_t i = 0; i < model.files.size(); ++i) model.chunk_slices.emplace_back();
         if (model.incomplete) {

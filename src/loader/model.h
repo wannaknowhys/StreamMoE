@@ -84,6 +84,8 @@ struct model_t {
     std::vector<std::vector<std::string>> branch_names; // per-layer branch names
     std::vector<std::vector<uint64_t>>    branch_sizes; // per-layer perExpert bytes
     std::vector<std::vector<uint64_t>>    chunk_slices; // per file: [denseBlocks, blockSlices...]
+    bool branch_align = false; // v2: each branch (tensor) slice starts 4K-aligned
+                               // inside the block (stream_moe.branch_align=1, 2026-09)
 
     // ---- helpers (concept) ----
     bool is_v2_blocks() const {
