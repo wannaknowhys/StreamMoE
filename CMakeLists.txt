@@ -100,3 +100,9 @@ if(WIN32)
 endif()
 add_test(NAME test_slot COMMAND test_slot WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# test_mix_plan: pure mixed-region split planner, no llama dependency.
+add_executable(test_mix_plan src/backend/mix_split.cpp tests/test_mix_plan.cpp)
+streammoe_inc(test_mix_plan)
+add_test(NAME test_mix_plan COMMAND test_mix_plan WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+
