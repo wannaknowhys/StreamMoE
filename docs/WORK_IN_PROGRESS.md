@@ -122,15 +122,16 @@
 - [x] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）——57a2838
 - [x] K2 跑转换 gemma original→新 v2（v2align，branch_align=1），验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（16/16 切片采样逐字节一致）——N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf
 - [x] **K3 loader/topo（SoA 列描述）**：`moe_loader.h` expert_group_t 加 `columns`（tag/ggml_type/ne/per_expert/per_expert_4k）；topo_builder 按 (tag,type,perExpert) 合并派生。**纯增量**（AoS 不动，数值不变，prefill-from IDENTICAL）。实测 gemma v2align：group0 = gate_up Q4_K[staging]+down Q5_1[direct]；group1 = gate_up[staging]+down Q8_0[staging]。——9ce6e1f
-- [ ] **K4 scheduler（SoA 槽分配 + 装载目标；D1/D2 已确认 2026-09）**：
-  1. `subpool_t` 分列：组内每列 `{base, stride(perExpert), slot_begin/n_slots 共享}`；列基址从 RAM 池/VRAM buffer 连续 carve；**控制面零改动**（slot_meta/expert_directory/owner/pin/驱逐照旧——槽 s = 各列同 index 一组切片）
-  2. `async_load_t`/`start_async_load`/`drain_completions`：一个专家 = **每列一次 DIO**（gate_up/down 各自源 4K 对齐）；perExpert 4K → DIO 直写列槽；非 4K → staging memcpy 列槽；demote/move（RAM↔vram）逐列拷贝
-  3. budget/floor（init）：列占字节和 = 原 expert_size；`slot_mem(slot)` 改按列寻址 API（exec 侧 K5 消费）；`branch_layout` 改定位列
-- [ ] **K5 minigraph_exec（w3d 单张量壳）**：
-  1. resolve(L,E) 后按**张量（src0 权重名）**定位其列：`w3d->data = 列基址 + (槽相对列首偏移)`、`w3d->nb[2] = perExpert`（= vulkan 硬编码紧凑步长，天然命中）、`ne[2] = n_slots`（列槽数）
-  2. 每层每张量单独一个 mini-graph（现状每张量本就是一个 MUL_MAT_ID 节点——天然匹配）；vulkan 走 `exec_mm_vk` 同构造（arena/stage/ids 上传）
-  3. 单区限制（mixed RAM/VRAM 激活集报错 J6）沿用；per-tensor 切片都 resident 才算专家 READY
-- [ ] **K6 数值门**：v2align 跑 `moe_129_8192_vk` 基线（应 IDENTICAL——数据字节不变仅 pad 移位）+ 全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）
+- [x] **K4 scheduler（SoA 槽分配 + 装载目标；D1/D2 已确认 2026-09）**——4604e1c：
+  1. `subpool_t` 分列：组内每列 `{tag, off, stride(perExpert)}`；区域列主序 carve（RAM 池/VRAM buffer 连续），列 c 槽 s = base+off+(s-slot_begin)×stride；**控制面零改动**（slot_meta/expert_directory/owner/pin/驱逐照旧）
+  2. `start_async_load`/`drain_completions`：**每分支一次 DIO**（read_plan slice 带 column）；`slice.direct` = 源对齐 + perExpert%4096==0 → DIO 直写列槽，否则 staging memcpy 列槽；demote（device→RAM）逐列 memcpy
+  3. budget/floor：group.expert_size = 紧凑 ΣperExpert（不再含块 pad）；`slot_mem` → `slot_col_mem(slot,col)`（槽无单址）；`branch_layout` → `column_layout(sp,name)`
+- [x] **K5 minigraph_exec（w3d 单张量壳）**——4604e1c：
+  1. legacy + burst + exec_mm_vk 三处：resolve 后 `column_layout` 取 (col_off, col_stride)，w3d data = 区域基址+col_off、nb[2]=col_stride（= vulkan 硬编码紧凑步长，天然命中）、ne[2]=n_slots
+  2. CPU/vk 同构造；单区限制（mixed RAM/VRAM 激活集报错 J6）沿用
+- [ ] **K6 数值门**：
+  - [x] **CPU/RAM 路径 IDENTICAL**（v2align prefill-from vs moe_129_8192_vk 基线逐字节一致，129-token 全对齐）——SoA 装载/列寻址/分列 staging/direct 全部正确
+  - [ ] **全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）**——**被既有 demote 风暴阻塞**：Vulkan0:2048 + RAM:1024~8192 下 129/15-token prefill 触发 ~1300/277 次 device→RAM demote（每层新活跃集驱逐上层的 J 节既有行为，旧 v2 文件同样卡超时，非 SoA 回归），激活集未稳定驻留 vram → exec 走 CPU、未触发 exec_mm_vk。待办：独立验证 device 触发路径（如大 vram 池容纳整模型 / 缩小到单层活跃集 / 修正 accept 放置），确认 vulkan 吃 SoA 列后数值正确
 - [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
 
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
