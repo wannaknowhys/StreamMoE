@@ -2,7 +2,7 @@
 
 > 会话任务清单，边做边更新（多 commit，每步成功即提交）。
 > **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
-> **本轮：Linux async DIO 真异步化（评估待做）仍在。** 另完成：E3 死锁修复验证、verify_prefill.js 修复、backend 分歧分析（docs/BACKEND_DIVERGENCE_ANALYSIS.md）。
+> **本轮（2026-09-04）**：v2 块内张量对齐 + SoA pool 布局改造定案。转换器（K1/K2）已完成并验证；引擎 SoA 改动点（K3-K6）细化。v1 sections-v1 否决。
 
 ## 背景状态（已落地，commit 403a5d2）
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
@@ -119,12 +119,21 @@
   - 异步 ring buffer / pending 聚合 / staging 基础设施已有（async_load_t reqs[pending]）
 
 **任务**
-- [ ] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）
-- [ ] K2 跑转换 gemma original→新 v2，验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（转换矩阵）
-- [ ] K3 loader/topo：sub_tensor.slot_offset 语义从"专家块内拼接"改"张量列区内的槽/列描述"；read plan 携带 per-expert DIO 对齐性（direct vs staging）
-- [ ] K4 scheduler：subpool 槽空间从 AoS（base + slot×expert_size）改 SoA 分列（每列 base + stride）；async_load 目标偏移按列算
-- [ ] K5 minigraph_exec：w3d 壳改单张量指向（data=列基址+off、nb[2]=perExpert、ne[2]=n_slots）；CPU/vulkan 同构造
-- [ ] K6 数值门：v2 回归（moe_129_8192_vk 基线 IDENTICAL）+ 全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）
+- [x] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）——57a2838
+- [x] K2 跑转换 gemma original→新 v2（v2align，branch_align=1），验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（16/16 切片采样逐字节一致）——N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf
+- [ ] **K3 loader/topo（SoA 列描述）**：
+  1. `moe_loader.h` sub_tensor_info_t：slot_offset 语义从"块内紧凑拼接偏移"改**列描述**——每专家每张量落在**自己的张量列**，slot = (列, 槽序号)；`expert_info_t` 记录该 (L,E) 的每个子张量 → 列索引 + 列内偏移（相对列基址）
+  2. `read_plan_t`（staging_reader.h）现有 per-tensor slice（file_read_start/file_read_len/copy_dst_offset）语义：copy_dst_offset 指向"列内专家切片位置"而非"槽内拼接位置"；**新增 per-slice direct 标记**（perExpert%4096==0 → 免 staging）
+  3. topo_builder 组识别不变（组 = per-expert 总字节相同），但组内不再一个"整块槽空间"，而是每张量一个列区（stride = 该张量 perExpert）；gemma gate_up 列 30 层同 quant 可共享一列
+- [ ] **K4 scheduler（SoA 槽分配 + 装载目标）**：
+  1. `subpool_t` 改多列：`{slot_begin, n_slots}` + **每列 `{base, stride(perExpert), n_tensors?}`**；`expert_size` 概念从"整专家字节"拆成 per-column stride；`slot_mem(slot)` 不再是单一 base+e×expert_size——executor 取列基址 + 槽偏移（见 K5）
+  2. `async_load_t`/`start_async_load`/`drain_completions`：一个专家 = 每张量一 req（现状 v2 direct 整块 1 req）；direct 分支 aligned_buf 指向列槽，staging 分支 memcpy 到列槽；demote/move（RAM↔vram）改逐列拷贝
+  3. budget/floor 计算（init）按列 stride 而非 expert_size；vram_region 区也按列描述
+- [ ] **K5 minigraph_exec（w3d 单张量壳）**：
+  1. resolve(L,E) 后按**张量（src0 权重名）**定位其列：`w3d->data = 列基址 + (槽相对列首偏移)`、`w3d->nb[2] = perExpert`、`ne[2] = n_slots`（列槽数）
+  2. 每层每张量单独一个 mini-graph（现状每张量本就是一个 MUL_MAT_ID 节点——天然匹配）；vulkan 走 `exec_mm_vk` 同构造（arena/stage/ids 上传）
+  3. 单区限制（mixed RAM/VRAM 激活集报错 J6）沿用；per-tensor 切片都 resident 才算专家 READY
+- [ ] **K6 数值门**：v2align 跑 `moe_129_8192_vk` 基线（应 IDENTICAL——数据字节不变仅 pad 移位）+ 全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）
 - [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
 
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
