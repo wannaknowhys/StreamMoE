@@ -222,7 +222,7 @@ diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vu
 index c1d86aaac..0cfba9029 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -18872,6 +18872,12 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
+@@ -18872,6 +18872,13 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
      }
  }
  
@@ -230,6 +230,7 @@ index c1d86aaac..0cfba9029 100644
 +// Bodies live in the parent repo frag (patches/route-b/common).
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "stmoe_routeb_vk_hostmap.frag"
++#include "stmoe_routeb_vk_dma.frag"
 +#endif
 +
  // Extension availability

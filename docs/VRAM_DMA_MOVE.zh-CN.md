@@ -45,8 +45,14 @@ ms/专家）。
 - **直接 vkCmdCopyBuffer 进普通 malloc 池槽**：需要池内存是 vulkan buffer
   （import，被上面否决）。
 
-结论：**一块固定 2 GB CACHED staging buffer**（heap0 / memtype 7）作 DMA 跳板，
-按 ~10 专家槽位定尺以支持并发，再快速 memcpy 进普通 RAM 槽。RAM 槽寻址
+Host-map 带宽是**不对称的**：vram rebar CPU **写 ~8 GB/s**（PCIe posted write）
+但 CPU **读 ~0.02 GB/s**。后果：
+- r2v（RAM/磁盘字节载入 vram = CPU 写 vram host-map）**不需要 staging**——现状
+  DIO 直写路径已跑在快的写速度上。
+- 只有 v2r demote（把 vram 读回 RAM）慢；这是唯一需要下面 DMA/staging 修复的路径。
+
+结论：**一块固定 2 GB CACHED staging buffer**（heap0 / memtype 7）作 **v2r 专用**
+DMA 跳板，按 ~10 专家槽位定尺以支持并发，再快速 memcpy 进普通 RAM 槽。RAM 槽寻址
 （base + 偏移）不变。
 
 ## 4. 设计
@@ -115,7 +121,7 @@ scheduler 在 model pool 上存 `{ctx, fn}`；`move_worker_main` 在 `src_pool !
    ms/专家降到 ~0.5 ms；之前几乎不可用的 decode 应变得可用。
 4. 回归：纯 RAM 路径必须逐字节 IDENTICAL（无 DMA 服务 → 纯 memcpy）。重跑
    mixed 执行数值门。
-5. r2v（RAM→vram）稍后复用同一 staging/dma 服务的反向。
+5. r2v 无需改动：vram host-map 写已 ~8 GB/s（DIO 直载路径），DMA 服务只管 v2r。
 
 ## 6. 涉及文件
 

@@ -48,9 +48,18 @@ GB/s, pipelined 10 submits 10.2 GB/s (all ~0.35-0.39 ms/expert).
 - **Direct vkCmdCopyBuffer into ordinary malloc pool slots**: requires the
   pool memory to be a vulkan buffer (import, rejected above).
 
+Host-map bandwidth is **asymmetric**: VRAM rebar CPU **write is ~8 GB/s** (PCIe
+posted writes) but CPU **read is ~0.02 GB/s**. Consequences:
+- r2v (loading RAM/disk bytes into VRAM, = CPU writes to the vram host-map)
+  needs **no staging** - the current DIO-direct write path already runs at the
+  fast write speed.
+- Only v2r demote (reading VRAM back to RAM) is slow; that is the single path
+  that needs the DMA/staging fix below.
+
 Conclusion: **one fixed 2 GB CACHED staging buffer** (heap0 / memtype 7) as a
-DMA bounce, sized ~10 expert slots for concurrency, then a fast memcpy into the
-ordinary RAM slot. The RAM slot addressing (base + offset) is unchanged.
+DMA bounce for v2r only, sized ~10 expert slots for concurrency, then a fast
+memcpy into the ordinary RAM slot. The RAM slot addressing (base + offset) is
+unchanged.
 
 ## 4. Design
 
@@ -125,7 +134,8 @@ the numbers land.
    becomes responsive.
 4. Regression: pure-RAM path must stay byte-IDENTICAL (no DMA service -> plain
    memcpy). Mixed execution numeric gate re-run.
-5. r2v (RAM->VRAM) later uses the same staging/dma service reversed.
+5. r2v needs no change: VRAM host-map writes already run at ~8 GB/s (the DIO
+   direct-load path), so the DMA service is v2r-only.
 
 ## 6. Files touched
 
