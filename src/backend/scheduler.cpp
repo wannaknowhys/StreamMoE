@@ -477,7 +477,7 @@ bool expert_scheduler::accept_requests() {
         if (n_left) {
             slot_request_t rq = {};
             rq.layer = req.layer;
-            rq.seq = req.seq;                    // keep the SAME completion target
+            rq.n_load_target = req.n_load_target;    // keep the SAME completion target
             rq.batch_ready = req.batch_ready;
             for (uint32_t w = 0; w < BITMAP_WORDS; ++w) rq.needed[w] = leftover[w];
             requests_.push(rq);
@@ -556,10 +556,11 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
     }
 
     // Submit ONE batch request for the missing subset. `await` counts down per
-    // completed expert; exec sleeps once until seq (== n_missing) is reached.
+    // completed expert; exec sleeps once until n_load_target (== n_missing) is
+    // reached.
     slot_request_t req;
     req.layer = layer;
-    req.seq = n_missing;
+    req.n_load_target = n_missing;
     for (uint32_t w = 0; w < BITMAP_WORDS; ++w) req.needed[w] = missing[w];
     await.reset();
     await.target = n_missing;
@@ -597,7 +598,7 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
         if (round == 0) {
             // transient failure / extra load needed: rebuild a fresh request and
             // retry once. Guarded against infinite spin.
-            req.seq = still_missing;
+            req.n_load_target = still_missing;
             for (uint32_t w = 0; w < BITMAP_WORDS; ++w) req.needed[w] = 0;
             for (uint32_t e = 0; e < n_experts; ++e) if (bit_test(missing, e)) bit_set(req.needed, e);
             await.reset();

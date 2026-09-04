@@ -120,7 +120,7 @@ static bool test_mpsc_queue() {
     for (uint32_t i = 0; i < 8; ++i) {
         slot_request_t r;
         r.layer = 1;
-        r.seq = i + 1;
+        r.n_load_target = i + 1;
         r.needed[0] = 1ull << i;   // expert i
         q.push(r);
     }

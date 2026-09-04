@@ -257,13 +257,13 @@ private:
 // Compute threads push a WHOLE-LAYER request (bitmap of needed experts);
 // scheduler thread pops. A request is a fixed POD:
 //   header   layer u32 + total_tokens u32 + start_rdtsc u64   (16B)
-//   wake     seq (target count) u32 + batch_ready ptr u64      (16B)
+//   wake     n_load_target (load count) u32 + batch_ready ptr u64      (16B)
 //   bitmap   needed[8]                                        (64B)
 //            == 96B total (the batch_ready pointer is the wake-once carrier;
 //            without it exec would sleep per-expert version word).
-// Producer sets seq = number of experts it expects the scheduler to load and
-// passes a pointer to its own counter; scheduler bumps + wakes it once per
-// completed expert; exec sleeps once until count == seq.
+// Producer sets n_load_target = number of experts it expects the scheduler to
+// load and passes a pointer to its own counter; scheduler bumps + wakes it
+// once per completed expert; exec sleeps once until count == n_load_target.
 // Ring elements are PLAIN PODs guarded by a per-slot publish generation +
 // release/acquire on head/tail - NOT std::atomic<T> (12B was already
 // non-lock-free -> hidden lock; 96B would be worse). Multi-producer safe.
@@ -274,9 +274,9 @@ struct slot_request_t {
     uint32_t layer        = 0;   // layer index this request covers
     uint32_t total_tokens = 0;   // [profile] batch tokens (ids->ne[1])
     uint64_t start_rdtsc  = 0;   // [profile] batch submit time (raw TSC)
-    // seq repurposed (2026-09): number of experts this request expects the
-    // scheduler to process. Compute waits on *batch_ready until it reaches seq.
-    uint32_t seq          = 0;
+    // n_load_target (2026-09): number of experts this request expects the
+    // scheduler to load. Compute waits on *batch_ready until it reaches this.
+    uint32_t n_load_target = 0;
     // wake-once counter (compute-side batch_await_t::done). A raw pointer keeps
     // slot_request_t trivially copyable for the plain ring.
     std::atomic<uint32_t>* batch_ready = nullptr;
@@ -287,7 +287,7 @@ static_assert(sizeof(slot_request_t) == 96, "slot_request_t layout drifted");
 // Convenience for the exec side: the wake-once counter + expected count.
 struct batch_await_t {
     std::atomic<uint32_t> done{0};   // scheduler fetch_add per completed expert
-    uint32_t target = 0;             // == slot_request_t::seq
+    uint32_t target = 0;             // == slot_request_t::n_load_target
     // Wait until `done` reaches `target` (wake-once; scheduler wakes this word).
     void wait() {
         uint32_t cur = done.load(std::memory_order_acquire);
@@ -327,7 +327,7 @@ public:
         const uint32_t slot = tail % cap_;
         ring_[slot] = r;   // plain write payload
         // publish: the slot's generation = this reservation (head+1 base).
-        // Consumers wait until seq matches before reading (no ABA across wrap).
+        // Consumers wait until the generation matches before reading (no ABA).
         seqs_[slot].store(tail + 1, std::memory_order_release);
     }
 
