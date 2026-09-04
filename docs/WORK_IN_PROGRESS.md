@@ -209,13 +209,19 @@
 >    LOADING；settle 时若属 active.still-need 则 bump——无需专门预取→active 通道。
 >
 > **任务（详细 build order 见设计文档 §9）**
-> - [ ] M1 directory 加宽（A1 state_+slot_）；owner_ 留到 M3 编译通过
-> - [ ] M2 装载路径：先发 LOADING 再 begin_reload；每模型单活跃请求槽（消重复装载窗口）
-> - [ ] M3 驱逐改 (L,E) 层距（alloc_or_evict 内）；删 owner_（8 处用已枚举）
-> - [ ] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进 device victim 驱逐
+> - [x] M1 directory 加宽（A1 state_+slot_）——6b6300e
+> - [x] M2 装载路径：先发 LOADING 再 begin_reload；state-aware accept——dbaff8f
+> - [x] M3 驱逐改 (L,E) 层距（alloc_or_evict 内）；删 owner_——45b14de
+> - [x] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进驱逐——fdf4982
+>       + **2026-09 DMA 提速**：v2r demote 改 transfer-queue DMA（stmoe_vk_dma_read，
+>       ggml_vk_buffer_read 同步路径，cached staging），158ms→~1ms/专家（717bac8）。
+>       r2v 无需改（rebar 写 ~8GB/s）。实测见 docs/VRAM_DMA_MOVE.md。
 > - [ ] M5 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once；exec 改无状态 pin+resubmit
-> - [ ] M6 验证：纯 RAM IDENTICAL；VRAM 单设备到达 exec_mm_vk（解 L6b）；新 UT
-> - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛）
+>       （当前仍 per-request bitmap，无 active-slot——未做）
+> - [~] M6 验证：纯 RAM 路径零影响（DMA 代码只在 v2r 触发，RAM 走 memcpy 不变）；VRAM
+>       demote 场景 DMA 内容 0 BAD（4-token 64MB，238 demote，列级对比纯 RAM golden）；
+>       129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
+> - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛；EXPERT_MOVE_PIPELINE 更新 M4 DMA）
 
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
