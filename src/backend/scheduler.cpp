@@ -254,6 +254,10 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     // 1. free slot (within this group's sub-pool)
     for (uint32_t i = lo; i < hi; ++i) {
         if (slot_word_state(slots_[i].load()) == SLOT_EMPTY) {
+            // Ordering invariant (§3.4): publish LOADING (intent + slot) BEFORE
+            // the physical slot goes IO_INFLIGHT, so a compute scan can never see
+            // "slot busy but dir ABSENT" (which would double-submit the expert).
+            dir_->transition(layer, expert, pool, EXPERT_LOADING, static_cast<uint32_t>(i));
             slots_[i].begin_reload();
             owner_[i] = {layer, expert};
             return static_cast<int32_t>(i);
@@ -326,6 +330,10 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
 
     slots_[victim].begin_reload();
     owner_[victim] = {layer, expert};
+    // Ordering invariant (§3.4): the victim slot is now being (re)loaded for the
+    // NEW (layer, expert). Publish LOADING before/with begin_reload (begin_reload
+    // above already ran for the free-slot path; here publish intent now).
+    dir_->transition(layer, expert, sp->pool, EXPERT_LOADING, static_cast<uint32_t>(victim));
     return victim;
 }
 
@@ -415,6 +423,10 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 n_misses_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 slots_[t->slot].mark_failed();
+                // Revert LOADING -> ABSENT so a later retry can reload the
+                // expert (an ABSENT dir entry is what triggers a new load). A
+                // FAILED dir state would make accept skip it forever.
+                dir_->transition(t->layer, t->expert, t->pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
                 LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
             }
             // wake-once: every settle (success OR failure) advances the batch
@@ -458,19 +470,38 @@ bool expert_scheduler::accept_requests() {
         for (uint32_t e = 0; e < n_experts; ++e) {
             if (!bit_test(req.needed, e)) continue;
             if (load_free_.empty()) { bit_set(leftover, e); ++n_left; continue; }
-            uint32_t pool = 0;
-            if (dir_->scan(req.layer, e, &pool) != SLOT_UNASSIGNED) {
-                bump();   // raced with another submit: resident already
-                continue;
-            }
+            // Branch on the expert's directory state across pools (M2):
+            //   READY            -> already resident (raced): bump, nothing to load
+            //   LOADING/MOVING_* -> in flight from a prior tick's alloc: do NOT
+            //                        start a second load; the in-flight settle
+            //                        bumps through drain. Skipping without bump
+            //                        here is correct (drain does it once).
+            //   ABSENT / FAILED  -> genuinely needs a load: alloc + submit.
             uint32_t gidx = group_of(req.layer);
+            if (gidx == static_cast<uint32_t>(-1)) { bit_set(leftover, e); ++n_left; continue; }
+            bool in_flight = false, resident = false;
+            for (uint32_t p = 0; p < n_pools_; ++p) {
+                const expert_state st = dir_->state(req.layer, e, p);
+                if (st == EXPERT_READY) resident = true;
+                else if (st == EXPERT_LOADING || st == EXPERT_MOVING_IN || st == EXPERT_MOVING_OUT) in_flight = true;
+            }
+            if (resident) { bump(); continue; }
+            if (in_flight) continue;   // drain will bump when it settles
             int32_t slot = -1;
             const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
             if (dsp) slot = alloc_or_evict(req.layer, e, dsp->pool);
             if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
             if (slot < 0) { bit_set(leftover, e); ++n_left; continue; }
             async_load_t* t = start_async_load(slot, req.layer, e);
-            if (!t) { bit_set(leftover, e); ++n_left; continue; }
+            if (!t) {
+                // No async-load ring slot: revert LOADING -> ABSENT so a later
+                // pass can retry (an in-flight dir entry with no load would be
+                // skipped forever). The physical slot stays IO_INFLIGHT (the
+                // ring-full case is transient; next alloc picks an EMPTY one).
+                dir_->transition(req.layer, e, subpool_of_slot(slot) ? subpool_of_slot(slot)->pool : 0,
+                                 EXPERT_ABSENT, SLOT_UNASSIGNED);
+                bit_set(leftover, e); ++n_left; continue;
+            }
             t->batch_ready = req.batch_ready;   // drain bumps when this settles
         }
         // requeue whatever could not be placed this pass (ring full / no victim)
