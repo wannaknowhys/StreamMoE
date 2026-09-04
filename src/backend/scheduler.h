@@ -281,7 +281,6 @@ private:
     uint64_t hit_rate_init_denom_ = 1;      // initial hit rate = pool bytes / total expert bytes
 
     std::unique_ptr<slot_meta[]>    slots_;              // std::atomic makes slot_meta non-copyable
-    std::vector<std::pair<uint32_t, uint32_t>> owner_;   // scheduler-private
     expert_directory*               dir_ = nullptr;
     std::unique_ptr<expert_directory> dir_owned_;
 

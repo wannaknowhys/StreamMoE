@@ -154,7 +154,6 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     }
 
     slots_ = std::make_unique<slot_meta[]>(num_slots_);
-    owner_.resize(num_slots_, {0, 0});
     dir_owned_ = std::make_unique<expert_directory>(topo.n_layer, topo.n_expert, n_pools_, num_slots_);
     dir_ = dir_owned_.get();
 
@@ -259,43 +258,61 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
             // "slot busy but dir ABSENT" (which would double-submit the expert).
             dir_->transition(layer, expert, pool, EXPERT_LOADING, static_cast<uint32_t>(i));
             slots_[i].begin_reload();
-            owner_[i] = {layer, expert};
             return static_cast<int32_t>(i);
         }
     }
 
-    // 2. evict victim: READY && refcount==0, lowest hybrid score then oldest.
-    //    score = alpha * 1/(1+recency) + (1-alpha) * freq   (smaller = evict first)
-    //    recency = max(0, cur_token - last_used_token); alpha = clamp(1-hit_rate_ema, .1, .9)
-    //    Freshly-loaded, never-pinned slots are protected (evicting one would
-    //    undo an in-flight load) UNLESS the pool has no other victim - a pool
-    //    full of protected slots must still make room or the scheduler stalls.
+    // 2. Evict victim, keyed on (L,E) with layer-distance preference (M3, design
+    //    §6). We need a free slot for (layer, expert) in this pool; choose a
+    //    resident expert to evict. Enumerate layers nearest to `layer` first
+    //    (the just-finished layers are most likely stale in a decode), scan that
+    //    layer's experts for a READY slot in THIS pool, pick the lowest hybrid
+    //    score in the nearest layer that has any evictable candidate. owner_ is
+    //    gone - the (L,E) comes from the traversal, the slot from dir.find.
+    //    score = alpha * 1/(1+recency) + (1-alpha) * freq (smaller evicts first)
+    //    recency = max(0, cur_token - last_used_token).
     int32_t victim = -1;
-    double  best_score = std::numeric_limits<double>::infinity();
+    uint32_t v_layer = 0, v_expert = 0;
     const uint64_t cur = token_.load(std::memory_order_relaxed);
     const double a = alpha_.load(std::memory_order_relaxed);
+    // Freshly-loaded, never-pinned experts are protected (evicting one would undo
+    // an in-flight load) UNLESS nothing else is evictable - a pool full of
+    // protected slots must still make room or the scheduler stalls.
     for (int pass = 0; pass < 2 && victim < 0; ++pass) {
         const bool allow_fresh = (pass == 1);
-        for (uint32_t i = lo; i < hi; ++i) {
-            uint64_t w = slots_[i].load();
-            if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
-            const uint64_t last = dir_->last_used(owner_[i].first, owner_[i].second);
-            if (!allow_fresh && last == 0) continue;
-            const uint64_t recency = (cur > last) ? (cur - last) : 0;
-        const double freq = stats_.get_adaptive_frequency(owner_[i].first, owner_[i].second);
-        const double score = a * (1.0 / (1.0 + static_cast<double>(recency))) + (1.0 - a) * freq;
-        if (score < best_score) {
-            best_score = score;
-            victim = static_cast<int32_t>(i);
-        }
+        // Scan layers nearest to `layer` first: L-1, L-2, ... down to 0. The
+        // model runs all layers per token, so a just-finished layer is stale
+        // for many tokens while a not-yet-run layer (L+1) is about to be used -
+        // do not prefer evicting it. Delta bounded by `layer` (no negative L).
+        for (uint32_t delta = 1; delta <= layer; ++delta) {
+            const uint32_t L_u = layer - delta;
+            double best_in_layer = std::numeric_limits<double>::infinity();
+            int32_t cand = -1;
+            uint32_t cand_e = 0;
+            for (uint32_t e = 0; e < topo_->n_expert; ++e) {
+                const uint32_t s = dir_->find(L_u, e, pool);   // READY in this pool only
+                if (s == SLOT_UNASSIGNED) continue;
+                uint64_t w = slots_[s].load();
+                if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
+                const uint64_t last = dir_->last_used(L_u, e);
+                if (!allow_fresh && last == 0) continue;
+                const uint64_t recency = (cur > last) ? (cur - last) : 0;
+                const double freq = stats_.get_adaptive_frequency(L_u, e);
+                const double score = a * (1.0 / (1.0 + static_cast<double>(recency))) + (1.0 - a) * freq;
+                if (score < best_in_layer) {
+                    best_in_layer = score;
+                    cand = static_cast<int32_t>(s);
+                    cand_e = e;
+                }
+            }
+            if (cand >= 0) { victim = cand; v_layer = L_u; v_expert = cand_e; break; }
+            // no evictable expert in this layer; widen to the next-older layer.
         }
     }
     if (victim < 0) return -1; // all slots pinned/in-flight
 
     // 3. evict: READY -> EVICTING, block new pins, drain refcount.
     if (!slots_[victim].begin_evict()) return -1;
-    const uint32_t v_layer = owner_[victim].first;
-    const uint32_t v_expert = owner_[victim].second;
     dir_->clear(v_layer, v_expert, sp->pool);
     while (slot_word_refcount(slots_[victim].load()) != 0) {
         std::this_thread::yield();
@@ -329,7 +346,6 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     }
 
     slots_[victim].begin_reload();
-    owner_[victim] = {layer, expert};
     // Ordering invariant (§3.4): the victim slot is now being (re)loaded for the
     // NEW (layer, expert). Publish LOADING before/with begin_reload (begin_reload
     // above already ran for the free-slot path; here publish intent now).
