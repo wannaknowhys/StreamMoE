@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-04（v2 块内张量对齐 + SoA pool 布局改造定案；v1 否决）。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-05（NO_VICTIM 驱逐死锁修复 + stall 兜底，5d08bb3；dbg tag 改 RelWithDebInfo）。维护者每阶段收尾更新"当前状态"与"下一步"。
 
 ---
 
@@ -31,6 +31,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`StreamMoE`→route_b（无导出代码的旗舰对话 build，见下）；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`StreamMoE` + `upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；`--expert-backend` **隐含 no-op-offload**，见下）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖。
 - **op_offload 与数值形态**：llama 默认 `op_offload=true`（把 host 计算自动 offload 到 device，-ngl 0 也占 Vulkan0 compute buffer ~1.3G）。`--expert-backend` 在 frag 里隐含 `--no-op-offload`（route B 拥有专家放置权，3932d33）——Vulkan0 splits=0 实测。但 **GGML_VULKAN=ON 编译本身改变数值**（CPU buft 换 Vulkan0 host buft 等 host 内存形态，gate 边界 expert-flip 级噪声）——回归按构建形态选基线：CPU-only 编对 `baseline_regression\baseline\moe_129_8192`，默认 vulkan 编对 `moe_129_8192_vk`（run_baseline.bat 首参，见该 README）。
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
+- **驱逐死锁修复（2026-09-05，5d08bb3）**：alloc_or_evict 改组内 ring 扫描（修 layer-0 候选集空导致的 NO_VICTIM 单核自旋 + exec 永久等 batch 死锁）+ accept_requests 进展感知 + wall-clock 2s stall 兜底 fail-settle（唤醒 exec 上抛错误）。CPU 基线回归 IDENTICAL PASS。详见 WIP N 节。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
 ### VRAM 数据层（2026-09，路线 A：数据层先行）

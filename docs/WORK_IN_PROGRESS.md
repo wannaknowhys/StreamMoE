@@ -171,6 +171,28 @@
 > - [ ] **L6b vram GPU 触发（K6 阻塞延续）**：批量 pin 后纯 RAM 无 demote、极快；但 vram 池场景仍触发 ~918 次 device→RAM demote 且 129-token 超时（1-token 0 demote 但无 MoE 前向不触发 GPU；15-token 277 demote）。demote 风暴是 J 节既有容量/放置语义（vram 428 槽 < 逐层累积驻留），非批量 pin 引入。需独立处理：放置策略（当前层优先驻留 vram / 防跨层驱逐）或足够大 vram。1-token 单层解码可能是不触发 GPU 的正确复现入口（需确认 prefill 首 token 是否真过 MoE）。
 > - [ ] L7 文档同步（WIP L 节已写；补 CHECKPOINT 一行引用）
 
+### N. NO_VICTIM 驱逐死锁修复 + 无进展 stall 兜底（2026-09 落地 5d08bb3）
+> **根因（lldb 定位，进程 27544）**：`alloc_or_evict` 驱逐扫描是固定下窗 `delta 1..layer`——
+> **layer 0 候选集恒空**（delta 无负层），池满后任何新 layer-0 专家 miss 永远无法驱逐 →
+> `accept_requests` 收 leftover requeue + `worker_loop` 因 any=true 不 sleep → **单核 100% 自旋**
+> + exec 在 `batch_await.wait()` 永久睡（此前 `-p hi` decode ~20 轮后卡死在 `*Selected response:*`）。
+> 也解释了为何长 decode（>池容量累积）必死、短 `-n` 能过、vram 池场景更易触发。
+>
+> **修复**：
+> 1. **驱逐组内 ring**（alloc_or_evict）：从当前层 `(pos + n - k) % n` 环扫本 group 全部层，
+>    layer 自身 ref0 旧专家优先（本 token 不用 = 最安全 victim），L0 自然覆盖高层兜底；
+>    victim 限本组 slot 区间（顺带消除跨 group 列几何误用）。**数值门 = CPU 基线回归 IDENTICAL PASS**。
+> 2. **accept_requests 进展感知**：仅 requeue 不放置 → 返回 false → worker 退避 sleep（不再空转）；
+>    ring-full 不算 stall（DIO 背压，drain 自解）。
+> 3. **stall 兜底 fail-settle**：同一请求 wall-clock 连续 2s 无放置（no_slot）→ leftover bits
+>    逐个 bump（wake-once）唤醒 exec → rescan 仍缺 → pin_layer -1 → GGML_STATUS_FAILED 上抛
+>    （链已核实：decode -3 → server "Compute error." send_error → cli 报错退出）。
+>
+> **验证**：RelWithDebInfo dbg build `-p hi -st` 自然退出 + 正文完整（修复前单核自旋卡死）；
+> 纯 RAM 与 Vulkan0:2048 池均跑通；CPU 基线回归 moe/upstream 全 IDENTICAL PASS。
+> **与 K6/L6b 关联**：demote 风暴在环形驱逐下不再死锁（能跑通而非卡超时），
+> K6 "vulkan 吃 SoA 列数值正确" 的 device 触发路径值得按 L6b 待办重测。
+
 ### M. Expert Move Pipeline + (L,E)-Keyed Eviction（2026-09 设计定稿）
 > **完整设计见 `docs/EXPERT_MOVE_PIPELINE.md`（EN）/ `.zh-CN.md`** —— 一次工作会话
 > 敲定的下一轮 scheduler 重构，建在已落地 L 节批量 pin 之上。本文档含 open questions
