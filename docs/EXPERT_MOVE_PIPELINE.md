@@ -9,6 +9,12 @@
 > Related: `docs/WORK_IN_PROGRESS.md` L / J, `docs/Backend.md` §2/§4,
 > `docs/EXPERT_SCHEDULER_DESIGN.md`, `src/backend/scheduler.{h,cpp}`,
 > `src/backend/slot.h`.
+>
+> **2026-09-04 revision**: build-order steps 1-4 landed (M1-M4, commits
+> 6b6300e / dbaff8f / 45b14de / fdf4982). M5 (active-slot accounting) and M7
+> (doc convergence) still open; M6 partial. Step 4's v2r is now transfer-queue
+> DMA, which **overturns §5.2's "CPU-memcpy-only" conclusion** - see the
+> revision box there and `docs/VRAM_DMA_MOVE.md`.
 
 ## 1. Motivation / why we redesign
 
@@ -211,18 +217,28 @@ source slot - do NOT drop mid-copy. Dropping was considered and rejected for
 state clarity; a `MOVING` state + scheduler-side in-flight record keeps the
 model clean.)
 
-### 5.2 Why not GPU/vulkan DMA for v2r
+### 5.2 v2r device read: "CPU-memcpy-only" is REVISED (DMA via cached staging)
 
-`vkCmdCopyBuffer` / copy engines can copy device<->device and
-device<->host-visible-vulkan-buffer. On a discrete GPU (RX 590) the
-host-visible heap is still VRAM (rebar BAR1); the 128GB system-RAM pool is NOT
-in the GPU address space, so a copy engine cannot write it. A real
-`vkCmdCopyBuffer` vram->system-RAM target does not exist on discrete GPUs
-(only on UMA/APU). Cross-backend `ggml_backend_tensor_copy` likewise falls back
-to memcpy or requires a host-visible target buffer that would occupy VRAM.
-Conclusion: v2r to ordinary malloc RAM is CPU-memcpy-only on this hardware.
-Asynchronous CPU memcpy workers are the fix; GPU copy-engine DMA is noted for
-a future UMA/APU target.
+Original reasoning (kept for history): `vkCmdCopyBuffer` / copy engines can copy
+device<->device and device<->host-visible-vulkan-buffer. On a discrete GPU (RX
+590) the host-visible heap is still VRAM (rebar BAR1); the 128GB system-RAM pool
+is NOT in the GPU address space, so a copy engine cannot write it. A real
+`vkCmdCopyBuffer` vram->system-RAM target does not exist on discrete GPUs (only
+on UMA/APU). Cross-backend `ggml_backend_tensor_copy` likewise falls back to
+memcpy or requires a host-visible target buffer that would occupy VRAM.
+Conclusion then: v2r to ordinary malloc RAM is CPU-memcpy-only on this
+hardware; GPU copy-engine DMA is a future UMA/APU target.
+
+> **2026-09-04 revision - that conclusion was wrong for a two-step path.**
+> A discrete GPU's copy engine cannot write *ordinary malloc* RAM (correct
+> above), but it CAN write a CACHED host-visible *vulkan* host buffer (heap0 /
+> memtype 7), and reading that host buffer back at cached speed is fast.
+> Measured on RX590: `vkCmdCopyBuffer` vram -> cached staging ~14 GB/s, memcpy
+> staging -> RAM slot ~21+ GB/s => one demote went from ~158 ms (rebar CPU read
+> at 0.02 GB/s) to ~0.5 ms. v2r is now transfer-queue DMA through ggml-vulkan's
+> cached staging (`stmoe_vk_dma_read`, wrapping its internal
+> `ggml_vk_buffer_read`), then a memcpy into the RAM slot. Full design and the
+> rejected whole-pool-import alternative: `docs/VRAM_DMA_MOVE.md`.
 
 ### 5.3 Task shape (move_task)
 
@@ -230,10 +246,13 @@ One dedicated copy worker (parameterised count, start at 1). Single task per
 expert move; submit in batches. Worker does pure per-column memcpy, never
 touches control plane.
 
-Why one worker (not a pool): the v2r bottleneck is **PCIe read bandwidth**
-(vram host-map -> RAM), not CPU core count - extra workers do not add bandwidth,
-they only add concurrency. One worker saturates the link; the count stays a
-parameter in case a faster link or UMA target changes that calculus.
+Why one worker (not a pool): the v2r bottleneck is the **device->host link
+bandwidth**, not CPU core count - extra workers do not add bandwidth, they only
+add concurrency. Pre-DMA this was the PCIe read of the rebar map (0.02 GB/s);
+after the §5.2 revision it is the transfer-queue DMA + staging memcpy (~14
+GB/s), still not CPU-bound. One worker (submit + fence wait + staging memcpy)
+saturates it; the count stays a parameter in case a faster link or UMA target
+changes that calculus.
 
 ```cpp
 struct move_task_t {
@@ -425,19 +444,23 @@ The scheduler counts down the round's own n_load_target.
 
 ## 9. Build order (final shape, component by component)
 
-1. Directory: widen to (L,E)-keyed state (A1); keep owner_ until step 3 compiles.
+1. Directory: widen to (L,E)-keyed state (A1); keep owner_ until step 3 compiles. **[done - M1, 6b6300e]**
 2. Load path: publish LOADING before begin_reload (ordering invariant); single
    active request slot per model (removes duplicate-load window; §7.1).
+   **[done for the LOADING-before + state-aware accept side - M2, dbaff8f;
+   single-active-slot NOT done - it is part of M5]**
 3. Eviction: (L,E)-keyed layer-distance selection inside alloc_or_evict; delete
-   owner_ (8 uses, all in alloc_or_evict, already enumerated).
+   owner_ (8 uses, all in alloc_or_evict, already enumerated). **[done - M3, 45b14de]**
 4. Move pipeline: move_task ring + 1 worker (v2r + r2v) + completion drain;
    wire v2r into eviction of a device victim; r2v available for placement
-   policy later.
+   policy later. **[done - M4, fdf4982; v2r now DMA per §5.2 revision - 717bac8]**
 5. Scheduler-side accounting: active-slot counter, drain-unified bump, wake-once
-   (§7); exec side becomes stateless pin+resubmit (§3.5).
+   (§7); exec side becomes stateless pin+resubmit (§3.5). **[NOT done - M5 open]**
 6. Verify: pure-RAM IDENTICAL (as today); VRAM single-device run reaches
    `exec_mm_vk` (this is the K6/L6b blocker); UT for directory states + move
-   ring + eviction ordering.
+   ring + eviction ordering. **[partial - M6: pure-RAM path unchanged (RAM sources
+   have dev_buf==null -> memcpy), DMA content gate 0 BAD, VRAM demote storms
+   eliminated; exec_mm_vk arrival + state/move UT still open]**
 
 ## 10. Files touched
 

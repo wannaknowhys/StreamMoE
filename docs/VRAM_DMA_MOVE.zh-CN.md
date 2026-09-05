@@ -2,9 +2,11 @@
 
 [English](VRAM_DMA_MOVE.md) | [简体中文](VRAM_DMA_MOVE.zh-CN.md)
 
-> 状态：**设计定稿，2026-09**。工作会话实测了 RX590 的 transfer 路径并敲定方案；
-> 实现随后进行。建立在 `docs/EXPERT_MOVE_PIPELINE.md`（M4 异步 move worker +
-> (L,E) 键驱逐）与 VRAM 数据层（docs/WORK_IN_PROGRESS.md J 节）之上。
+> 状态：**已实现 + 已验证，2026-09**。工作会话实测了 RX590 的 transfer 路径、
+> 敲定方案并随 M4 move worker 落地（commit 816f8aa / 717bac8；各步状态见 §5）。
+> 建立在 `docs/EXPERT_MOVE_PIPELINE.md`（M4 异步 move worker + (L,E) 键驱逐）与
+> VRAM 数据层（docs/WORK_IN_PROGRESS.md J 节）之上。注意：本工作**推翻了**
+> EXPERT_MOVE_PIPELINE §5.2 的"v2r 只能 CPU memcpy"结论——见该节修订框。
 
 ## 1. 问题
 
@@ -59,75 +61,96 @@ DMA 跳板，按 ~10 专家槽位定尺以支持并发，再快速 memcpy 进普
 
 ### 4.1 分层（保持 scheduler 无 ggml）
 
-`expert_scheduler` 是纯 C++（无 ggml/vulkan）。它不该学 vulkan。设备侧 DMA
-服务由 route B / moe_backend 持有（它们握着 vulkan device/queue/buffers），
-以普通函数指针 + 不透明 ctx 的形式注入 scheduler（挂在 model pool 上）。
+`expert_scheduler` 是纯 C++（无 ggml/vulkan）。它不该学 vulkan 类型。落地实现把
+DMA 读导出为**一个全 void 参数的普通函数**，由 `ggml-vulkan.cpp` route-B 锚点
+include 的 frag 定义（锚点处内部 vulkan 类型与 TU-static `ggml_vk_buffer_read`
+可见）。scheduler 以 `extern` 声明并直接调用；任何 vulkan/ggml 类型都不跨界。
 
 ```
-route_b_inject (vulkan device/queue/buffers)
-   |  提供: vram_dma 服务（函数指针 + 不透明 ctx）
-   v
+ggml-vulkan.cpp（vendored，已 patch）
+   + route-B 锚点 include stmoe_routeb_vk_dma.frag
+      导出: stmoe_vk_dma_read(void*, size_t, void*, size_t)
+            stmoe_vk_dma_available()
 expert_scheduler.move_worker   （控制面不变）
-   |  每个 move 任务:
-   |    1. dma_service->download(vram_buf, src_slot_off, bytes, staging_slot_ptr)
-   |       = vkCmdCopyBuffer(vram_buf -> staging buf 的槽位)  [transfer queue]
-   |    2. memcpy(RAM 槽 dst, staging_slot_ptr, bytes)        [worker CPU]
-   |    3. 分阶段报 rdtsc delta
+   |  每个 move 任务的每个列:
+   |    src_pool != 0 && copy.dev_buf -> stmoe_vk_dma_read(dev_buf, dev_off,
+   |                                                        dst, bytes)  [v2r]
+   |    否则                        -> 普通 memcpy（RAM 源；r2v 仍 DIO 直写——
+   |                                  host-map 写本身快）
+   |  分阶段报 rdtsc delta
 ```
 
+- frag 包装 ggml-vulkan 内部 `ggml_vk_buffer_read`（锚点上方 static）：同步
+  transfer-queue `vkCmdCopyBuffer` 到 ggml 的 HOST_CACHED staging，再 memcpy 到
+  `dst`。staging buffer 与 fence wait 归 ggml-vulkan 管——route B 不自建。
 - scheduler 控制面（submit_move / 状态机 / drain_moves）**不变**。
-- move_task 保留 per-column (src,dst) 范围；worker 对设备源改走 DMA 服务，不再
-  memcpy rebar map。
-- **worker 线程保留**（仍做 staging→RAM memcpy + fence wait）；只是不再读慢的
-  rebar map。
+  `move_task_t::copy_t` 只新增 `dev_buf`（void* 设备区句柄）+ `dev_off`（区内
+  字节偏移），submit 时由区的 vk buffer 填入（scheduler.cpp:257）。
+- **worker 线程保留**（仍发 DMA + 做 fence wait / 任何 staging 拷贝）；只是不再
+  读慢的 rebar map。
 
-### 4.2 Staging 布局
+### 4.2 Staging
 
-- 一块固定 CACHED staging buffer，~10 个专家槽位（gemma 专家 3.63 MB →
-  ~37 MB），若模型专家更大则在驱动 2 GB 窗口内按需增长。
-- 槽 stride = expert_size（紧凑）。worker 轮转使用 staging 槽；只有该槽的
-  memcpy 到 RAM 槽完成后才复用，保证一个槽不会有两个 in-flight DMA 写。
+Staging 是 ggml-vulkan 内部 `sync_staging`（HOST_CACHED，heap0 / memtype 7）。
+每次 `dma_read` 一次同步提交：transfer-queue 拷 vram → staging → memcpy staging
+→ `dst`，每 call 一次 fence wait。
 
-### 4.3 DMA 服务接口（moe_backend 侧）
+早期设想的"固定多槽 staging ring（~10 槽，轮转复用）"**没有做**：实测 ~0.5-1
+ms/专家（§5）已比 rebar 读快 ~150-300×，move worker 不再是 decode 瓶颈。流水式
+staging ring（多个 copy 在飞）只摊薄每次 call 的 fence wait；等 move worker 再上
+profile 再说。
+
+### 4.3 导出接口（frag 侧）
 
 ```cpp
-// 由 moe_backend/route_b 持有；每个 model pool 注册一次
-struct vram_dma_ctx;  // opaque
-using vram_dma_download_t = bool (*)(vram_dma_ctx* c, uint32_t pool,
-                                     void* vram_buf, size_t vram_off,
-                                     uint8_t* staging_dst, size_t bytes);
+// patches/route-b/common/stmoe_routeb_vk_dma.frag - 在 ggml-vulkan.cpp route-B
+// 锚点 include；包装 TU-static ggml_vk_buffer_read。
+void stmoe_vk_dma_read(void * buffer /* ggml_backend_buffer_t */, size_t off,
+                       void * dst, size_t bytes); // 同步
+bool stmoe_vk_dma_available(void);                // 仅诊断
 ```
 
-scheduler 在 model pool 上存 `{ctx, fn}`；`move_worker_main` 在 `src_pool != 0`
-时调 `fn`，RAM 源回退普通 memcpy。
+调用侧 `buffer` 是不透明句柄（vram 区的 `ggml_backend_buffer_t`，以 `void*`
+存在区上并拷进 move 任务）。无需 moe_backend/route_b 注册对象——符号与区 buffer
+同在一个 ggml-vulkan TU，直接链接。
 
 ### 4.4 计时（rdtsc，STREAM_MOE_LOG=debug 门控）
 
 每个 move 记：
 - `dma_us` = vkCmdCopyBuffer submit → queue idle（下载时间）
-- `mc_us`  = memcpy staging → RAM 槽（搬迁时间）
+- `mc_us`  = staging → RAM 槽拷贝时间（内部 staging 路径下为 0——已含在 dma_read）
 - 加既有 queued 总时间
 
 据此可重新评估"删掉 memcpy worker"：若 `dma_us + mc_us` 很小、worker 不再是
-瓶颈，worker 可能并入调度线程（在那 submit + fence wait）。等数字落地再定。
+瓶颈，worker 可能并入调度线程（在那 submit + fence wait）。当前 ~1 ms/专家，
+说明暂仍留 worker。
 
 ## 5. 构建顺序
 
-1. moe_backend：首次使用时建 cached staging buffer + transfer queue；暴露
-   `vram_dma_download`（vkCmdCopyBuffer + fence）。
-2. scheduler：在 model pool 注入 DMA 服务；move_worker 对设备源用它、RAM 源
-   保持 memcpy；加分阶段 rdtsc 日志。
+1. 为 route B 包装 ggml-vulkan 内部 device→host 路径：route-B 锚点的 frag 导出
+   `stmoe_vk_dma_read`（包装 TU-static `ggml_vk_buffer_read`）。**[done - 816f8aa]**
+2. scheduler：move worker 对设备源用 DMA、RAM 源保持 memcpy；加分阶段 rdtsc 日志。
+   **[done - copy_t.dev_buf/dev_off + worker DMA 分支 + dma/mc 计时 - 717bac8]**
 3. 用现有 VRAM 配置验证（RAM 1GB + Vulkan0 64MB）：demote 风暴应从 ~158
    ms/专家降到 ~0.5 ms；之前几乎不可用的 decode 应变得可用。
-4. 回归：纯 RAM 路径必须逐字节 IDENTICAL（无 DMA 服务 → 纯 memcpy）。重跑
-   mixed 执行数值门。
-5. r2v 无需改动：vram host-map 写已 ~8 GB/s（DIO 直载路径），DMA 服务只管 v2r。
+   **[done - 4-token 64MB：238 次 DMA demote ~0.9-1.5 ms（首个 ~10 ms = staging
+   懒初始化）；129-token 64MB 跑通（~14 s，冷 DIO + CPU 计算主导）]**
+4. 回归：纯 RAM 路径必须逐字节 IDENTICAL（RAM 源 dev_buf==null → 纯 memcpy，
+   路径不变）。重跑 mixed 执行数值门。
+   **[done - 4-token DMA demote 遍 vs 纯 RAM golden：64 列，0 BAD（22 bit / 42
+   ulp，符合 mixed CPU/GPU 切分预期）]**
+5. r2v 无需改动：vram host-map 写已 ~8 GB/s（DIO 直载路径），DMA 只管 v2r。
+   **[done - r2v 仍 DIO 直写]**
 
 ## 6. 涉及文件
 
-- `src/backend/scheduler.h` / `scheduler.cpp` - 注入 DMA 服务；worker 路径
-- `src/backend/moe_backend.h` / `moe_backend.cpp` - cached staging buffer +
-  transfer queue + `vram_dma_download`
-- `src/server/route_b_inject.cpp` - 每池创建并注册服务
-- `docs/WORK_IN_PROGRESS.md`、`docs/CHECKPOINT.md` - 状态
-- 新 UT（可选）：staging 槽生命周期
+- `patches/route-b/common/stmoe_routeb_vk_dma.frag` - 新增：导出
+  `stmoe_vk_dma_read` / `stmoe_vk_dma_available`；在 vendored ggml-vulkan.cpp
+  的 route-B 锚点 include（记录于 `streammoe-macros.patch`，一行 include）。
+- `src/backend/scheduler.h` / `scheduler.cpp` - `move_task_t::copy_t` 与
+  region.dev_buf 新增 `dev_buf`/`dev_off`；move worker 对设备源分支到
+  `stmoe_vk_dma_read`（extern 声明，全 void 参数）；dma/mc rdtsc 计时（STREAM_MOE_LOG=debug 门控）。
+- `docs/WORK_IN_PROGRESS.md`、`docs/CHECKPOINT.md` - 状态（M 节、当前状态）。
+- 测量探针（temp/，仅本地）：vram_bw / vram_heaps / vram_dma / demote10 /
+  rebar_write——§1-§2 数字来源。
+- 新 UT（可选，未写）：staging 槽生命周期——后置（未建专用 staging ring，§4.2）。

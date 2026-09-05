@@ -7,6 +7,11 @@
 > 本文档捕获**完整设计**，避免会话间丢失。
 > 相关：`docs/WORK_IN_PROGRESS.md` L / J 节、`docs/Backend.md` §2/§4、
 > `docs/EXPERT_SCHEDULER_DESIGN.md`、`src/backend/scheduler.{h,cpp}`、`src/backend/slot.h`。
+>
+> **2026-09-04 修订**：构建顺序 1-4 已落地（M1-M4，commit 6b6300e / dbaff8f /
+> 45b14de / fdf4982）。M5（活跃槽记账）与 M7（文档收敛）未做；M6 部分。步骤 4 的
+> v2r 现走 transfer-queue DMA，**推翻了 §5.2 的"只能 CPU memcpy"结论**——见该节
+> 修订框与 `docs/VRAM_DMA_MOVE.md`。
 
 ## 1. 动机 / 为什么重构
 
@@ -180,24 +185,35 @@ FAILED（装载/move 硬失败）作为错误上抛，不无限重试。
 （工作决定：**等 copy 完成再复用源槽——不在 copy 中途 drop**。drop 曾考虑过，因
 状态清晰度被否；`MOVING` 状态 + 调度线程 in-flight 记录保持模型干净。）
 
-### 5.2 为什么 v2r 不用 GPU/vulkan DMA
+### 5.2 v2r 设备读："只能 CPU memcpy"已被实测推翻（经 cached staging 走 DMA）
 
-`vkCmdCopyBuffer` / copy engine 只能做 device↔device 与
+保留的原始论证（历史）：`vkCmdCopyBuffer` / copy engine 只能做 device↔device 与
 device↔host-visible-vulkan-buffer。独显（RX 590）的 host-visible heap 仍是显存
 （rebar BAR1）；128GB 系统 RAM 池不在 GPU 地址空间，copy engine 写不到它。
 独显上不存在真正的 `vkCmdCopyBuffer` vram→系统 RAM 目标（只有 UMA/APU 有）。
 跨后端 `ggml_backend_tensor_copy` 同样回落到 memcpy，或要求一个占显存的
-host-visible 目标 buffer。结论：本硬件上 v2r 到普通 malloc RAM 只能 CPU memcpy。
-异步 CPU memcpy worker 是解；GPU copy-engine DMA 记为未来 UMA/APU 目标。
+host-visible 目标 buffer。当时结论：本硬件上 v2r 到普通 malloc RAM 只能 CPU
+memcpy；GPU copy-engine DMA 记为未来 UMA/APU 目标。
+
+> **2026-09-04 修订——该结论对"两步路径"是错的。** copy engine 确实写不进
+> *普通 malloc* RAM（上面正确），但能写 **CACHED host-visible *vulkan* host
+> buffer**（heap0 / memtype 7），再从该 host buffer 以 cached 速度读回很快。
+> RX590 实测：`vkCmdCopyBuffer` vram → cached staging ~14 GB/s、staging → RAM 槽
+> memcpy ~21+ GB/s ⇒ 单个 demote 从 ~158 ms（rebar CPU 读 0.02 GB/s）降到 ~0.5 ms。
+> v2r 现为 transfer-queue DMA 经 ggml-vulkan 的 cached staging
+> （`stmoe_vk_dma_read`，包装其内部 `ggml_vk_buffer_read`）+ 之后 memcpy 进 RAM 槽。
+> 完整设计与被否决的整池 import 方案：`docs/VRAM_DMA_MOVE.md`。
 
 ### 5.3 任务形态（move_task）
 
 一个专用 copy worker（数量参数化，先 1）。每专家迁移一个任务；批量提交。worker
 只做纯逐列 memcpy，绝不碰控制面。
 
-为什么只一个 worker（不用池）：v2r 的瓶颈是 **PCIe 读带宽**（vram host-map → RAM），
-不是 CPU 核数——多 worker 不加带宽只加并发度。一个 worker 就饱和链路；数量留参数，
-将来链路更快或 UMA 目标再调。
+为什么只一个 worker（不用池）：v2r 的瓶颈是 **设备→host 链路带宽**，不是 CPU
+核数——多 worker 不加带宽只加并发度。DMA 前是 rebar map 的 PCIe 读（0.02
+GB/s）；按 §5.2 修订后是 transfer-queue DMA + staging memcpy（~14 GB/s 链路），
+仍非 CPU 瓶颈。一个 worker（submit + fence wait + staging memcpy）就饱和；
+数量留参数，将来链路更快或 UMA 目标再调。
 
 ```cpp
 struct move_task_t {
@@ -361,17 +377,21 @@ still-need 数**——绝不是 round-1 总数。调度线程按当轮自己的 
 
 ## 9. 构建顺序（终态，按组件）
 
-1. Directory：加宽为 (L,E) 键状态（A1）；owner_ 留到第 3 步编译通过。
+1. Directory：加宽为 (L,E) 键状态（A1）；owner_ 留到第 3 步编译通过。**[done - M1, 6b6300e]**
 2. 装载路径：begin_reload 前先发布 LOADING（顺序不变量）；每模型单活跃请求槽
-   （消灭重复装载窗口；§7.1）。
+   （消灭重复装载窗口；§7.1）。**[先发 LOADING + state-aware accept 已做 - M2,
+   dbaff8f；单活跃槽未做——属 M5]**
 3. 驱逐：alloc_or_evict 内改 (L,E) 键层距选择；删 owner_（8 处用，全在此函数，
-   已枚举）。
+   已枚举）。**[done - M3, 45b14de]**
 4. Move 管线：move_task ring + 1 worker（v2r + r2v）+ 完成 drain；把 v2r 接进
-   device victim 的驱逐；r2v 留给将来放置策略。
+   device victim 的驱逐；r2v 留给将来放置策略。**[done - M4, fdf4982；v2r 现为
+   DMA（§5.2 修订）- 717bac8]**
 5. 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once（§7）；exec 侧改无状态
-   pin+resubmit（§3.5）。
+   pin+resubmit（§3.5）。**[未做 - M5 open]**
 6. 验证：纯 RAM IDENTICAL（如今天）；VRAM 单设备运行到达 `exec_mm_vk`
    （这是 K6/L6b 阻塞项）；directory 状态 + move ring + 驱逐顺序的 UT。
+   **[部分 - M6：纯 RAM 路径不变（RAM 源 dev_buf==null → memcpy）、DMA 内容门
+   0 BAD、VRAM demote 风暴消除；exec_mm_vk 到达 + 状态/move UT 未做]**
 
 ## 10. 涉及文件
 
