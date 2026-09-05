@@ -708,7 +708,7 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
 // Controlled by env:
 //   STREAM_MOE_TMP_DUMP      =1 enable
 //   STREAM_MOE_TMP_DUMP_DIR   dump directory (created on demand)
-//   STREAM_MOE_TMP_DUMP_LAYER layer to dump (default 0)
+//   STREAM_MOE_TMP_DUMP_LAYER layer to dump ("all" = every layer; default 0)
 //   STREAM_MOE_TMP_DUMP_OUT_ONLY =1 only ffn_moe_out (exit) nodes (mixed run)
 // Layout of one node's files under <dir>/L<layer>/i<seq>_<op>_<tag>:
 //   .bin                 full output bytes (after execution)
@@ -719,7 +719,7 @@ struct tmp_dump_cfg_t {
     bool   on = false, out_only = false;
     bool   mm_only = false;   // keep only mm outputs + moe_out (small offline gate)
     std::string dir;
-    int32_t layer = 0;
+    int32_t layer = 0;   // -1 = all layers
 };
 const tmp_dump_cfg_t & tmp_dump_cfg() {
     static tmp_dump_cfg_t c = [] {
@@ -730,7 +730,7 @@ const tmp_dump_cfg_t & tmp_dump_cfg() {
             const char * d  = std::getenv("STREAM_MOE_TMP_DUMP_DIR");
             r.dir = d && *d ? d : "temp/tmp_l0_dump";
             const char * l  = std::getenv("STREAM_MOE_TMP_DUMP_LAYER");
-            if (l && *l) r.layer = atoi(l);
+            if (l && *l) r.layer = std::string(l) == "all" ? -1 : atoi(l);
             const char * o  = std::getenv("STREAM_MOE_TMP_DUMP_OUT_ONLY");
             if (o && std::string(o) == "1") r.out_only = true;
             const char * m  = std::getenv("STREAM_MOE_TMP_DUMP_MM_ONLY");
@@ -812,7 +812,7 @@ static void tmp_dump_node(expert_scheduler & sched, const moe_model_topology_t &
                           const std::vector<expert_handle_t> & pins, int32_t layer,
                           size_t seq, ggml_tensor * nd) {
     const tmp_dump_cfg_t & cfg = tmp_dump_cfg();
-    if (!cfg.on || layer != cfg.layer) return;
+    if (!cfg.on || (cfg.layer >= 0 && layer != cfg.layer)) return;
     const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
     if (cfg.out_only && !is_out) return;
     const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;

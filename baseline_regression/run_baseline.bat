@@ -99,13 +99,15 @@ echo %BL% | findstr /C:"_vk" >nul && set "KLTHRESH=4.5"
 
 echo.
 echo [5/5] kv_cos (baseline moe vs new moe, expect ~1.0) ...
+rem kv_cos.js (2026-09): correct f16 decode; a cell prints NaN when either side
+rem has no finite row data (unwritten/NaN cache) - treated as "not comparable".
 node %BR%\tools\kv_cos.js %BL%\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin > "%OUT%\kv_cos.txt"
 
 echo.
 echo [6/6] expert-flip vs divergence match (moe vs baseline moe) ...
 node %BR%\tools\div_match.js %BL% %OUT%\moe
 set "OUTP=%OUT:\=/%"
-node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0,min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' cos_min='+(min===2?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
+node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0;let min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;if(Number.isNaN(v))continue;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' comparable='+n+' cos_min='+(n===0?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
 
 echo.
 echo =====================================================================
