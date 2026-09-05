@@ -70,6 +70,15 @@ rem   build without the macro (production green). Diagnostics are #ifdef
 rem   STREAM_MOE_TEMP and must stay gated - the dbg tag is the only way they build.
 set STREAM_MOE_TEMP_FLAG=
 if "%TAG%"=="StreamMoE_dump_dbg"   set STREAM_MOE_TEMP_FLAG=-DSTREAM_MOE_TEMP
+rem ---- build type by tag ----
+rem   StreamMoE_dump_dbg uses RelWithDebInfo (clang-cl: /O2 /Ob1 /Zi + /debug link)
+rem   = production optimization + MSVC-compatible PDB. Timing/numerics stay ~Release
+rem   (reproducible async/scheduler hangs), and the PDB allows a debugger (lldb / VS)
+rem   to attach and symbolicate. Deliberately NOT Debug: /Od would shift async/DIO
+rem   timing and CMake try_compile would add /RTC1 (the clang-cl ASan conflict of
+rem   the `asan` branch); RelWithDebInfo keeps both concerns off.
+set STREAM_MOE_BUILD_TYPE=Release
+if "%TAG%"=="StreamMoE_dump_dbg"   set STREAM_MOE_BUILD_TYPE=RelWithDebInfo
 rem ---- CPU arch + backend by tag ----
 rem   main: production route-B. TODO: switch to GGML_CPU_ALL_VARIANTS (official
 rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pinned
@@ -112,7 +121,7 @@ if "%GGML_VULKAN%"=="ON" (
     -DCMAKE_C_COMPILER=%CLANG% ^
     -DCMAKE_CXX_COMPILER=%CLANGXX% ^
     -DCMAKE_RC_COMPILER=%RC% ^
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ^
+    -DCMAKE_BUILD_TYPE=%STREAM_MOE_BUILD_TYPE% -DBUILD_SHARED_LIBS=OFF ^
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
     -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=%LLAMA_BUILD_TOOLS% ^
     -DLLAMA_ALL_WARNINGS=OFF ^

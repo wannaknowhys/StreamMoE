@@ -411,36 +411,50 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
     SCHED_DIAG("sched: alloc L" << layer << " E" << expert << " pool " << pool
               << " no free slot in [" << lo << "," << hi << ") - must evict");
 
-    // 2. Evict victim, keyed on (L,E) with layer-distance preference (M3, design
-    //    §6). We need a free slot for (layer, expert) in this pool; choose a
-    //    resident expert to evict. Enumerate layers nearest to `layer` first
-    //    (the just-finished layers are most likely stale in a decode), scan that
-    //    layer's experts for a READY slot in THIS pool, pick the lowest hybrid
-    //    score in the nearest layer that has any evictable candidate. owner_ is
-    //    gone - the (L,E) comes from the traversal, the slot from dir.find.
+    // 2. Evict victim, keyed on (L,E) with ring layer preference (M3 design §6,
+    //    2026-09 fix). We need a free slot for (layer, expert) in this pool.
+    //    Choose a resident expert to evict. Enumerate candidate layers as a RING
+    //    over this group's own layers, starting at `layer` and stepping downward
+    //    (layer, layer-1, ..., group's lowest, group's highest, ..., layer+1):
+    //      - `layer` first: its own resident-but-not-active experts (refcount 0)
+    //        are the lowest-harm victims (stale copies from earlier tokens that
+    //        this layer's active set no longer references).
+    //      - the fixed downward window (delta 1..layer) of the pre-fix code left
+    //        layer 0 with NO candidates at all - once the pool filled, any new
+    //        layer-0 expert miss could never evict -> NO_VICTIM requeue storm
+    //        (single-core spin) + exec deadlock. The ring closes that hole by
+    //        making every layer reachable.
+    //    Within one layer we scan every expert for a READY slot in THIS pool and
+    //    pick the lowest hybrid score. The ring covers group.g_layers only - a
+    //    victim must live in this group's sub-pool (its slot range [lo, hi)),
+    //    otherwise the reload would use a different group's column geometry.
     //    score = alpha * 1/(1+recency) + (1-alpha) * freq (smaller evicts first)
     //    recency = max(0, cur_token - last_used_token).
     int32_t victim = -1;
     uint32_t v_layer = 0, v_expert = 0;
     const uint64_t cur = token_.load(std::memory_order_relaxed);
     const double a = alpha_.load(std::memory_order_relaxed);
+    const std::vector<uint32_t>& g_layers = topo_->groups[gidx].layers;
+    const uint32_t n_g_layers = static_cast<uint32_t>(g_layers.size());
+    uint32_t pos = 0;
+    for (; pos < n_g_layers; ++pos) if (g_layers[pos] == layer) break;
+    if (pos == n_g_layers) {
+        LOG_ERROR("expert_scheduler: layer " << layer << " not in group " << gidx << " layer list");
+        return -1;
+    }
     // Freshly-loaded, never-pinned experts are protected (evicting one would undo
     // an in-flight load) UNLESS nothing else is evictable - a pool full of
     // protected slots must still make room or the scheduler stalls.
     for (int pass = 0; pass < 2 && victim < 0; ++pass) {
         const bool allow_fresh = (pass == 1);
-        // Scan layers nearest to `layer` first: L-1, L-2, ... down to 0. The
-        // model runs all layers per token, so a just-finished layer is stale
-        // for many tokens while a not-yet-run layer (L+1) is about to be used -
-        // do not prefer evicting it. Delta bounded by `layer` (no negative L).
-        for (uint32_t delta = 1; delta <= layer; ++delta) {
-            const uint32_t L_u = layer - delta;
+        for (uint32_t k = 0; k < n_g_layers; ++k) {
+            const uint32_t L_u = g_layers[(pos + n_g_layers - k) % n_g_layers];
             double best_in_layer = std::numeric_limits<double>::infinity();
             int32_t cand = -1;
             uint32_t cand_e = 0;
             for (uint32_t e = 0; e < topo_->n_expert; ++e) {
                 const uint32_t s = dir_->find(L_u, e, pool);   // READY in this pool only
-                if (s == SLOT_UNASSIGNED) continue;
+                if (s == SLOT_UNASSIGNED || s < lo || s >= hi) continue;   // stay in this group's region
                 uint64_t w = slots_[s].load();
                 if (slot_word_state(w) != SLOT_READY || slot_word_refcount(w) != 0) continue;
                 const uint64_t last = dir_->last_used(L_u, e);
@@ -455,7 +469,7 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
                 }
             }
             if (cand >= 0) { victim = cand; v_layer = L_u; v_expert = cand_e; break; }
-            // no evictable expert in this layer; widen to the next-older layer.
+            // no evictable expert in this layer; continue around the ring.
         }
     }
     if (victim < 0) {
@@ -642,10 +656,16 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
 }
 
 bool expert_scheduler::accept_requests() {
-    bool any = false;
+    // Returns true when this pass made real progress (started a load or fully
+    // satisfied a request). A pass that only requeues an unplaceable leftover
+    // returns false - the worker loop then sleeps instead of spinning at 100%
+    // while no DIO/move/eviction can make room. Stall bound (2026-09): a request
+    // that stays unplaceable for STALL_FAIL_MS of continuous no-progress (wall
+    // clock) is fail-settled (its leftover bits bumped as failures to wake exec)
+    // so a genuine capacity deadlock surfaces as a hard error instead of a spin.
+    bool progress = false;
     slot_request_t req;
     while (requests_.pop(req)) {
-        any = true;
         SCHED_DIAG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
                   << " target=" << req.n_load_target << " load_free=" << load_free_.size());
         // One request = one whole layer's missing expert set (bitmap). Each set
@@ -654,10 +674,12 @@ bool expert_scheduler::accept_requests() {
         // settles (drain_completions). Placement: device region first (keeps the
         // active set on one region while the executor has no per-region split
         // yet), RAM fallback.
-        if (load_free_.empty()) { requests_.push(req); break; }
+        if (load_free_.empty()) { requests_.push(req); break; }   // ring-full: transient backpressure
         const uint32_t n_experts = topo_->n_expert;
         uint64_t leftover[BITMAP_WORDS] = { 0 };
         uint32_t n_left = 0;
+        bool started_load = false;      // any expert submitted to the DIO ring this pass
+        bool no_slot = false;           // any expert failed alloc (no free slot / no victim)
         auto bump = [&]() {   // one processed bit -> one toward the batch target
             if (req.batch_ready) {
                 req.batch_ready->fetch_add(1, std::memory_order_acq_rel);
@@ -682,7 +704,7 @@ bool expert_scheduler::accept_requests() {
                 if (st == EXPERT_READY) resident = true;
                 else if (st == EXPERT_LOADING || st == EXPERT_MOVING_IN || st == EXPERT_MOVING_OUT) in_flight = true;
             }
-            if (resident) { bump(); continue; }
+            if (resident) { bump(); progress = true; continue; }
             if (in_flight) continue;   // drain will bump when it settles
             int32_t slot = -1;
             const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
@@ -690,6 +712,7 @@ bool expert_scheduler::accept_requests() {
             if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
             if (slot < 0) {
                 SCHED_DIAG("sched: L" << req.layer << " E" << e << " no slot in vram or ram (leftover)");
+                no_slot = true;
                 bit_set(leftover, e); ++n_left; continue;
             }
             async_load_t* t = start_async_load(slot, req.layer, e);
@@ -704,9 +727,46 @@ bool expert_scheduler::accept_requests() {
                 bit_set(leftover, e); ++n_left; continue;
             }
             t->batch_ready = req.batch_ready;   // drain bumps when this settles
+            started_load = true;
+            progress = true;
         }
-        // requeue whatever could not be placed this pass (ring full / no victim)
+        // requeue whatever could not be placed this pass (ring full / no victim).
         if (n_left) {
+            // Stall bound (2026-09): if this request could not place anything
+            // because the pool is full with no evictable victim (no_slot), start
+            // / keep a wall-clock window. Only a run of CONTINUOUS no-progress
+            // over the SAME request past STALL_FAIL_MS fail-settles it - starting
+            // a new load this pass (real headroom: a free slot or a fresh evict)
+            // resets the window. Ring-full is excluded (that is DIO backpressure
+            // that drain_completions resolves); in-flight bits are not leftover.
+            if (started_load) {
+                stall_active_ = false;   // made headroom; re-arm on the next stuck pass
+            } else if (no_slot) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!stall_active_ || stall_batch_ != req.batch_ready || stall_layer_ != req.layer) {
+                    stall_active_ = true;
+                    stall_batch_  = req.batch_ready;
+                    stall_layer_  = req.layer;
+                    stall_since_  = now;
+                } else if (now - stall_since_ >= STALL_FAIL_MS) {
+                    LOG_ERROR("expert_scheduler: L" << req.layer << " unplaceable for "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(now - stall_since_).count()
+                              << " ms (pool full, no evictable victim) - fail-settling "
+                              << n_left << " leftover bit(s) to break the stall");
+                    // wake-once semantics: bump every leftover bit as a failed
+                    // settle. exec wakes (done == target), rescans, and its
+                    // bounded retry round then propagates GGML_STATUS_FAILED.
+                    for (uint32_t w = 0; w < BITMAP_WORDS; ++w) {
+                        uint64_t m = leftover[w];
+                        while (m) {
+                            bump();
+                            m &= m - 1;   // clear lowest set bit
+                        }
+                    }
+                    stall_active_ = false;   // settled; a fresh retry re-arms the bound
+                    break;                  // do NOT requeue this request
+                }
+            }
             slot_request_t rq = {};
             rq.layer = req.layer;
             rq.n_load_target = req.n_load_target;    // keep the SAME completion target
@@ -714,9 +774,11 @@ bool expert_scheduler::accept_requests() {
             for (uint32_t w = 0; w < BITMAP_WORDS; ++w) rq.needed[w] = leftover[w];
             requests_.push(rq);
             break;   // backpressure: don't starve other queues in this tick
+        } else {
+            stall_active_ = false;   // request fully satisfied: clear the stall window
         }
     }
-    return any;
+    return progress;
 }
 
 void expert_scheduler::update_alpha() {

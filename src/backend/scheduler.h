@@ -20,6 +20,7 @@
 #include "backend/slot.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -344,6 +345,19 @@ private:
 
     mpsc_alloc_queue        requests_{4096};
     std::atomic<bool>       running_{false};
+
+    // Stall backstop (2026-09): consecutive accept_requests ticks that placed
+    // NO expert (pool full + no evictable victim) are bounded. If a request
+    // stays unplaceable for STALL_FAIL_MS of continuous no-progress (wall
+    // clock), the unplaceable leftover is settled as FAILED (batch_ready
+    // bumped to wake exec) instead of requeued forever - exec's rescan + retry
+    // round then surfaces a hard error (pin_layer -> GGML_STATUS_FAILED). Owned
+    // by the scheduler thread (accept_requests) only.
+    std::chrono::steady_clock::time_point stall_since_{};
+    bool                              stall_active_ = false;
+    std::atomic<uint32_t>*            stall_batch_  = nullptr;   // request identity (batch_ready ptr)
+    uint32_t                          stall_layer_  = 0;         // request identity (layer)
+    static constexpr auto             STALL_FAIL_MS = std::chrono::milliseconds(2000);
 
     std::atomic<uint64_t>   n_lookups_{0};
     std::atomic<uint64_t>   n_hits_{0};
