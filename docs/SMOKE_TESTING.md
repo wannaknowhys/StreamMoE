@@ -27,6 +27,15 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 - Qwen3-VL-2B-Instruct Q4_K_M（dense）：✅ 6s 加载，chat 返回 "Hi!"。
 - gemma-4-26B-A4B-it-UD-Q4_K_M（MoE）：✅ **已重新下载**（15.78 GB，GGUF magic 有效，之前是 0 字节占位）。用于 M3 之后 route B 专家池验证（`--expert-backend`）。
 
+## 验证记录（2026-09-05，staging_mask 修复 + `-st` 退出对照）
+
+背景：`src/backend/scheduler.cpp` 修 `async_load_t::staging_mask` 复用未清零（commit `2d0accb`，v2align 下 stale bit 会把 staging 旧数据 memcpy 覆盖已 direct 读好的列 → 权重静默损坏）。修复后两处冒烟验证：
+
+- **修复验证（route-B / v2align）**：`build\StreamMoE\llama-build\bin\llama-cli.exe -m gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf --expert-backend --moe-ram-pool 8192 --fit off --no-warmup -t 16 -c 4096 --temp 0 -p hi -n 24`（证据 `temp\hi_cli_v2align.txt`）→ 输出连贯 thinking + 候选回复，无乱码/脱轨 → 修复正确，非正确性回归。StreamMoE 与 StreamMoE_dump 两 tag 均重编成功。
+- **`-st` 正常退出对照（upstream 原版）**：`build\upstream_dump\llama-build\bin\llama-cli.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -p hi -st -n 1024 -t 16 <nul`（证据 `temp\cli_upstream_hi_st_20260905.txt`）→ **rc=0 完整退出**，回答完整可读（thinking + `Hello! How can I help you today?`）。**结论：cli 不自动退出不是 bug——交互模式须 `-st`（single-turn）才单轮结束退出**。
+
+> ⚠️ **另一个独立 bug（与本修复无关，待查）**：StreamMoE_dump（route-B）长回复会卡在 `*Selected response:*` 点（thinking 结束、正文开始处），单核空转、文件不再增长、进程不退出（v2align + `--expert-backend`，`-p hi` 无 `-st` 亦复现）。upstream 同输入正常出正文。怀疑 route-B 在进入正式回答的 decode 段停住，需另行排查（非 staging_mask 修复引入）。
+
 ## 何时切回 DeepSeek-V4-Flash
 
 **专家池子系统（M3 route B 注入）跑通之后**，才用 `N:\AI_LLM\DeepSeek-V4-Flash-0731\...UD-Q8_K_XL` 做短程测试（届时专家池接管 N: 冷盘专家装载，冒烟不至于几分钟）。
