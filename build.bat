@@ -55,6 +55,7 @@ rem   StreamMoE_dump        -> route_b,prefill_export + vulkan (full StreamMoE e
 rem                            with the Vulkan0 device-pool path; vs upstream_dump)
 set STREAM_MOE_FEATURES=
 if "%TAG%"=="main"                 set STREAM_MOE_FEATURES=route_b
+if "%TAG%"=="StreamMoE_chat"       set STREAM_MOE_FEATURES=route_b
 if "%TAG%"=="upstream_dump"        set STREAM_MOE_FEATURES=prefill_export
 if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_FEATURES=prefill_export
 if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_FEATURES=route_b,prefill_export
@@ -72,15 +73,17 @@ rem         ggml-cpu-<arch> runtime dispatch, see F:/Dev/computer-use/llama); pi
 rem         to znver3 (5950X) for now.
 rem   upstream_dump: prefill export, no vulkan (clean upstream baseline).
 rem   upstream_vulkan_dump: vulkan backend for Vulkan0 comparison.
-rem   StreamMoE_dump / StreamMoE_dump_dbg: vulkan backend too - the route-B
-rem         Vulkan0 device-pool path (M1+) needs the device registered; runs still
-rem         default to CPU unless -ngl is given, so numerics land on the same CPU
-rem         kernels.
+rem   StreamMoE_dump / StreamMoE_dump_dbg / StreamMoE_chat: vulkan backend too -
+rem         the route-B Vulkan0 device-pool path (M1+) needs the device
+rem         registered; runs still default to CPU unless -ngl is given, so
+rem         numerics land on the same CPU kernels. StreamMoE_chat = route_b only
+rem         (no prefill export code), for llama-cli dialogue / speed checks.
 set STREAM_MOE_CPU_FLAGS=-march=znver3
 set GGML_VULKAN_DEFAULT=OFF
 if "%TAG%"=="upstream_vulkan_dump" set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE_dump_dbg"   set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="StreamMoE_chat"       set GGML_VULKAN_DEFAULT=ON
 rem env GGML_VULKAN=OFF still overrides (e.g. to rebuild a CPU-only StreamMoE_dump
 rem for an IDENTICAL baseline regression - see baseline_regression/README.md).
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
@@ -239,6 +242,8 @@ echo   build.bat test       - Build and run all unit tests
 echo   build.bat clean      - Remove build\ (all tags)
 echo Optional [tag] sub-path for llamalibs/build (default: main).
 echo   llamalibs main           - route-B llama-server (build\main)
+echo   llamalibs StreamMoE_chat - route-B + vulkan, NO prefill export
+echo                             (build\StreamMoE_chat; llama-cli dialogue / speed)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
 echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
 echo   llamalibs StreamMoE_dump_dbg - StreamMoE_dump + STREAM_MOE_TEMP diagnostic
