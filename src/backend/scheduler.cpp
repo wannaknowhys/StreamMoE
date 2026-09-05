@@ -12,6 +12,17 @@
 // rebar host reads vs ~14 GB/s via the device transfer queue.
 void stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
 
+// Per-expert / per-event diagnostics (move, load, alloc, evict, pin ticks) are
+// temporary debug output: compiled only under STREAM_MOE_TEMP (the
+// StreamMoE_dump_dbg tag). Without the macro the argument expression is not
+// even evaluated (no ostringstream cost). ring-full (:691) intentionally stays
+// a plain LOG_DEBUG - it is a real retry traceback worth having in any build.
+#ifdef STREAM_MOE_TEMP
+#define SCHED_DIAG(msg) LOG_DEBUG(msg)
+#else
+#define SCHED_DIAG(msg) do { } while (0)
+#endif
+
 namespace stream_moe {
 
 expert_scheduler::~expert_scheduler() {
@@ -298,7 +309,7 @@ void expert_scheduler::move_worker_main() {
             }
         }
         t.done_tsc = tsc_now();
-        LOG_DEBUG("sched: move L" << t.layer << " E" << t.expert
+        SCHED_DIAG("sched: move L" << t.layer << " E" << t.expert
                   << (dma_ns ? " dma=" + std::to_string(tsc_delta_ns(dma_ns) / 1000) + "us" : "")
                   << " mc=" << (tsc_delta_ns(mc_ns) / 1000) << "us"
                   << " (queued=" << (tsc_delta_ns(t.done_tsc - t.req_tsc) / 1000) << "us)");
@@ -329,7 +340,7 @@ void expert_scheduler::drain_moves() {
         // move was a r2v the src was a RAM copy that is now redundant - releasing
         // is also correct (RAM keeps the dst or drops; content is on disk).
         slots_[t.src_slot].release_to_empty();
-        LOG_DEBUG("expert_scheduler: moved L" << t.layer << " E" << t.expert
+        SCHED_DIAG("expert_scheduler: moved L" << t.layer << " E" << t.expert
                   << " pool " << t.src_pool << " slot " << t.src_slot
                   << " -> pool " << t.dst_pool << " slot " << t.dst_slot);
     }
@@ -397,7 +408,7 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
             return static_cast<int32_t>(i);
         }
     }
-    LOG_DEBUG("sched: alloc L" << layer << " E" << expert << " pool " << pool
+    SCHED_DIAG("sched: alloc L" << layer << " E" << expert << " pool " << pool
               << " no free slot in [" << lo << "," << hi << ") - must evict");
 
     // 2. Evict victim, keyed on (L,E) with layer-distance preference (M3, design
@@ -448,11 +459,11 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
         }
     }
     if (victim < 0) {
-        LOG_DEBUG("sched: alloc L" << layer << " E" << expert << " pool " << pool
+        SCHED_DIAG("sched: alloc L" << layer << " E" << expert << " pool " << pool
                   << " NO evictable victim (all pinned/fresh)");
         return -1; // all slots pinned/in-flight
     }
-    LOG_DEBUG("sched: evict L" << v_layer << " E" << v_expert << " (slot " << victim
+    SCHED_DIAG("sched: evict L" << v_layer << " E" << v_expert << " (slot " << victim
               << ") to make room for L" << layer << " E" << expert << " in pool " << pool);
 
     // 3. evict: READY -> EVICTING, block new pins, drain refcount.
@@ -479,7 +490,7 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
                     // dst slot is IO_INFLIGHT; dir entry for v in RAM is LOADING
                     // (from alloc_or_evict) - flip to MOVING_IN for the async copy.
                     dir_->transition(v_layer, v_expert, 0, EXPERT_MOVING_IN, static_cast<uint32_t>(dst));
-                    LOG_DEBUG("expert_scheduler: async demote L" << v_layer << " E" << v_expert
+                    SCHED_DIAG("expert_scheduler: async demote L" << v_layer << " E" << v_expert
                               << " device slot " << victim << " -> RAM slot " << dst);
                     return -1;   // src slot stays EVICTING until drain_moves frees it
                 }
@@ -600,7 +611,7 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 slots_[t->slot].mark_ready();
                 dir_->set(t->layer, t->expert, t->pool, t->slot);
                 n_misses_.fetch_add(1, std::memory_order_relaxed);
-                LOG_DEBUG("sched: loaded L" << t->layer << " E" << t->expert
+                SCHED_DIAG("sched: loaded L" << t->layer << " E" << t->expert
                           << " -> pool " << t->pool << " slot " << t->slot
                           << " (staging_mask=" << (unsigned)t->staging_mask << ")"
                           << " dio=" << (t->dio_tsc > t->req_tsc ? tsc_delta_ns(t->dio_tsc - t->req_tsc) / 1000 : 0) << "us");
@@ -634,7 +645,7 @@ bool expert_scheduler::accept_requests() {
     slot_request_t req;
     while (requests_.pop(req)) {
         any = true;
-        LOG_DEBUG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
+        SCHED_DIAG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
                   << " target=" << req.n_load_target << " load_free=" << load_free_.size());
         // One request = one whole layer's missing expert set (bitmap). Each set
         // bit counts once toward the batch's completion word: already-resident
@@ -677,7 +688,7 @@ bool expert_scheduler::accept_requests() {
             if (dsp) slot = alloc_or_evict(req.layer, e, dsp->pool);
             if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
             if (slot < 0) {
-                LOG_DEBUG("sched: L" << req.layer << " E" << e << " no slot in vram or ram (leftover)");
+                SCHED_DIAG("sched: L" << req.layer << " E" << e << " no slot in vram or ram (leftover)");
                 bit_set(leftover, e); ++n_left; continue;
             }
             async_load_t* t = start_async_load(slot, req.layer, e);
@@ -778,7 +789,7 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
     // Submit ONE batch request for the missing subset. `await` counts down per
     // completed expert; exec sleeps once until n_load_target (== n_missing) is
     // reached.
-    LOG_DEBUG("exec->sched: pin_layer L" << layer << " want=" << want
+    SCHED_DIAG("exec->sched: pin_layer L" << layer << " want=" << want
               << " hit=" << n_hit << " miss=" << n_missing);
     slot_request_t req;
     req.layer = layer;
@@ -816,7 +827,7 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
                 ++still_missing;
             }
         }
-        LOG_DEBUG("exec<-sched: pin_layer L" << layer << " round " << round
+        SCHED_DIAG("exec<-sched: pin_layer L" << layer << " round " << round
                   << " pinned=" << (want - still_missing) << "/" << want
                   << " still_missing=" << still_missing);
         if (still_missing == 0) return static_cast<int32_t>(want);
