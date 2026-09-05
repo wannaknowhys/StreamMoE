@@ -541,6 +541,7 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
     const size_t header_sz = align_ceil(sizeof(async_load_t), DIO_SECTOR_SIZE);
     t->staging = load_pool_ + static_cast<size_t>(idx) * load_stride_ + header_sz;
     t->pending = 0;
+    t->staging_mask = 0;   // reused task: clear per-slice staging bits from the prior load
     t->req_tsc = tsc_now();   // [TMR] request time: submission begins
     for (uint32_t s = 0; s < t->plan.num_tensors; ++s) {
         const auto& sl = t->plan.slices[s];
