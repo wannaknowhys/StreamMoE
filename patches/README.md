@@ -70,7 +70,8 @@ git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_ti
 
 | tag | STREAM_MOE_FEATURES | 宏（根 CMakeLists 定义）| 用途 |
 |---|---|---|---|
-| `main` | route_b | STREAM_MOE_ROUTE_B | route-B 完整推理（生产）|
+| `main` | route_b | STREAM_MOE_ROUTE_B | route-B 完整推理（生产，纯 CPU 数值）|
+| `StreamMoE` | route_b | STREAM_MOE_ROUTE_B | **旗舰**：route-B + vulkan（vram device-pool 路径），无导出代码——llama-cli 对话/服务 |
 | `upstream_dump` | prefill_export | STREAM_MOE_PREFILL_EXPORT | prefill 导出（上游基准，无 vulkan）|
 | `upstream_vulkan_dump` | prefill_export | STREAM_MOE_PREFILL_EXPORT | 同 + vulkan（Vulkan0 对比）|
 | `StreamMoE_dump` | route_b,prefill_export | 两者 | 完整 StreamMoE 导出 |
