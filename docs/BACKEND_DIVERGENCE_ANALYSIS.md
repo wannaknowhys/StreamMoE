@@ -67,3 +67,28 @@
 - 需要"路由 IDENTICAL + cos→ulp"的强一致验证 → 用 v2 布局（不触发边界翻转）或 deepseek Q8
   （不匹配 repack → 同内核）。
 - 池容量验证口径：moe 不同池大小产物必须 IDENTICAL（`--moe-ram-pool` 只影响驻留不影响数值）。
+
+## 6. 2026-09-05 补充：GPU（vulkan）执行无"绝对理想还原"——路线 B 也不例外
+
+> 触发：K6 vram GPU 数值门。route-B 在 RAM:1024+Vulkan0:2048 下跑 129-token prefill-from，
+> 对 CPU 基线 DIVERGED（embd cos 0.988、expert flip 3336、10 unexplained）。一度怀疑
+> v2align 文件/loader/route-B 混算 bug。判别实验证明与 route-B 无关。
+
+**判别实验链**：
+1. **同 build 纯 RAM**：v2.gguf 与 v2align.gguf 对 CPU 基线 `moe_129_8192` 均 **IDENTICAL**
+   （embd/hidden 逐字节 + expert history 全同）→ 装载/寻址/SoA 列/route-B 无回归，两文件等价。
+2. **route-B GPU 混算**（RAM:1024+Vulkan0:2048）：164 vk round + 152 cpu round 混跑 →
+   expert flip 3336、10 unexplained。差异落在跨 backend 浮点混算。
+3. **纯 upstream_vulkan_dump（无 route-B、原版 gguf、`-ngl 12` GPU 执行）对 CPU upstream 基线**：
+   embd token#0 cos **0.983**、expert flip **3436/61920（105/129 tokens = 81.4%）**、
+   16 unexplained——**与 route-B GPU 混算形态几乎一致**。
+
+**结论（以后不纠结）**：
+- **GPU（vulkan）执行相对 CPU 天生产生 ~80% token 专家翻转 + 数值漂移**，与是否 route-B 无关——
+  连纯 upstream 原版在 GPU 上都不能复现 CPU 的逐字节/逐路由结果。**vk 没有绝对理想还原**。
+- route-B 的 GPU 混算差异不是 route-B 引入的 bug，落在"任何 GPU vs CPU 后端"固有噪声框架内。
+- K6 数值门**预期修正**：目标不是 "GPU == CPU IDENTICAL"，而是 "GPU 上 route-B 装载/寻址无 bug"。
+  判据建议：同 GPU 下 route-B vs 纯 upstream 的差异应远小于 GPU-vs-CPU；或结构等价论证
+  （w3d 壳 stride=col_stride 与 CPU 同构造、同代码路径）已足够。
+- `moe_129_8192_vk` 基线（旧 vulkan build 产物）无需强求重建到与 CPU 一致——vk 基线只能
+  追踪"同版本 GPU build 自洽"，且要同版本才能比较。
