@@ -1439,6 +1439,13 @@ struct chain_ctx_t {
     // produce them via append_expert_fold + exit memcpy instead. Off = the old
     // IDENTICAL whole-clone behaviour (bring-up gate).
     bool fold_repl = false;
+    // SS7.8 multi-device structure (single-device CPU phase: device_used == 1):
+    //   per-device acc_d[d_out, n_t] = the device's expert-folded output (the
+    //   fold result lands here), and RAM add_in[device_used, d_out, n_t] = the
+    //   anonymous-add input, one slot per device (index k = device ordinal).
+    int64_t                 d_out = 0;
+    int64_t                 device_used = 0;
+    std::vector<float>      add_in;     // host mirror of the RAM [device_used, d_out, n_t]
 };
 
 // Append a routed mm as a shell mul_mat_id writing straight into the hidden dst
@@ -1604,20 +1611,38 @@ static bool append_scatter_to_fullwidth(chain_ctx_t & c, ggml_tensor * per_token
     return false;
 }
 
-// Exit: run the graph; when fold_repl, write the accumulator into moe_out's
-// llama dst (the anonymous fold + moe_out were skipped on the graph).
+// Exit: run the graph; when fold_repl, follow the SS7.8 three-stage shape:
+//   1) graph_compute (the whole bucket chain + expert folds run here);
+//   2) copy each participating device's acc_d into its RAM add_in slot
+//      (CPU phase: memcpy; GPU phase: one ggml_backend_tensor_copy per device,
+//      device->host via tensor_get -> vulkan get_tensor -> vk_buffer_read);
+//   3) host fold: sum add_in's device_used slots -> [d_out, n_t] -> moe_out.
 static bool chain_exit(chain_ctx_t & c, ggml_tensor * acc) {
     if (ggml_backend_graph_compute(c.cpu, c.gf) != GGML_STATUS_SUCCESS) {
         LOG_ERROR("stream_moe: chain graph compute failed for layer " << c.layer);
         return false;
     }
     if (!c.fold_repl) return true;   // moe_out computed on the graph
+
     ggml_tensor * moe_out = nullptr;
     for (const auto * cn : c.ex->compute) {
         if (cn->name && strstr(cn->name, "ffn_moe_out") != nullptr) { moe_out = const_cast<ggml_tensor*>(cn); break; }
     }
-    if (moe_out && acc && acc->data) {
-        std::memcpy(moe_out->data, acc->data, ggml_nbytes(moe_out));
+    if (!moe_out || !acc || !acc->data) return true;
+    const size_t slot = (size_t)(c.d_out * c.n_t);
+
+    // stage 2: acc_d (device-folded output, expert width 1) -> add_in[k]
+    // Single device today (device_used == 1): k = 0. GPU phase: this is the
+    // ggml_backend_tensor_copy(acc_d, add_in_slot) boundary.
+    if (c.add_in.size() < slot * (size_t)c.device_used) c.add_in.resize(slot * (size_t)c.device_used);
+    std::memcpy(c.add_in.data(), acc->data, slot * sizeof(float));
+
+    // stage 3: host fold over device_used slots -> moe_out (dense is on CPU).
+    // First slot overwrites moe_out, later slots accumulate.
+    float * out = (float *) moe_out->data;
+    for (size_t d = 0; d < (size_t)c.device_used; ++d) {
+        const float * src = c.add_in.data() + d * slot;
+        for (size_t i = 0; i < slot; ++i) out[i] = d == 0 ? src[i] : out[i] + src[i];
     }
     return true;
 }
@@ -1651,15 +1676,20 @@ static enum ggml_status exec_layer_burst_chain(int32_t layer, ggml_context * ctx
         break;
     }
 
-    // Single full-width bucket today.
+    // Single full-width bucket today (SS7.8: device_used == 1 in this CPU
+    // phase). The per-device accumulator acc_d is the expert-folded output; RAM
+    // add_in lives in chain_ctx and is filled by chain_exit.
     ggml_tensor * last = append_bucket_chain(c);
     if (!last) { LOG_ERROR("stream_moe: chain append_bucket_chain failed L" << layer); return GGML_STATUS_FAILED; }
     ggml_tensor * acc = nullptr;
     if (c.fold_repl) {
-        // weighted (=last before fold when fold_repl) -> expert fold -> full width
+        // weighted (=last before fold when fold_repl) -> expert fold -> the
+        // per-device acc_d columns [d_out, n_t] (expert width 1)
         acc = append_expert_fold(c, last);
         if (!acc) { LOG_ERROR("stream_moe: chain append_expert_fold failed L" << layer); return GGML_STATUS_FAILED; }
         if (!append_scatter_to_fullwidth(c, acc)) { return GGML_STATUS_FAILED; }
+        c.d_out       = acc->ne[0];
+        c.device_used = 1;
     }
     if (!chain_exit(c, acc)) { return GGML_STATUS_FAILED; }
 
