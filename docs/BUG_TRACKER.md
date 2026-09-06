@@ -79,6 +79,12 @@
 | B32 | FIXED | prompt_tokens 分母不可信 | src/main.cpp:130 | ✅ libllama tokenizer 计数 |
 | B33 | OPEN | `build.bat llamalibs main` 链接失败：route_b 源码无条件引用 `stmoe_vk_buffer_host_ptr/host_offset`（ggml-vulkan host-map 符号），但 main tag `GGML_VULKAN=OFF` 不编 vulkan → undefined symbol | src/backend/minigraph_exec.cpp + vendored route-b | ⏳ 既有（非 mixed 引入）；route_b 需在无 vulkan 时条件编译或提供 stub；StreamMoE_dump/dbg（VULKAN=ON）不受影响 |
 
+## P1b 容量设计限制（记录，暂不修，2026-09-05）
+
+| ID | 状态 | 问题 | 位置 | 备注 |
+|----|------|------|------|------|
+| B36 | OPEN | `--moe-expert-pools RAM:1,Vulkan0:2048` 直接报错 "too small: needs at least 983 MB"——init 强制**每组 RAM 池 ≥ 一整层全量专家**（scheduler.cpp:79-84 floor），纯 vram 也被 RAM-only 口径卡死。**用户直觉：纯 RAM 4G 能跑、纯 vram 4G 该不该也行？vram 24G 全驻留（该用原版场景）为何不让？** M5 active-slot + stall fail 兜底后，vram 区若放得下活跃集本可跑 | src/backend/scheduler.cpp init floor 校验（sum_floor > pool_bytes 时 RAM-only）| 只记录。将来放宽为"每 group RAM **或** vram 一方能放一层即可"，或按 pool 分开算 floor；K6 纯 vram 数值门（WIP K6）会用到 |
+
 ## P3 保留资产
 
 GGUF 元数据/多分片发现、per-expert offset/read plan、4KB sector staging reader、Windows IOCP DIO、pin/unpin 生命周期语义、LRU/LFU/EST1 驱逐算法、RDTSCP profiler + JSONL、HTTP server、bench_agent.js 测评线（对应资产已在 route B 落地：`src/backend/`、`src/io/`、`src/loader/`、`src/pool/`）。
