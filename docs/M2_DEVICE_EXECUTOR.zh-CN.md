@@ -37,6 +37,38 @@
 构建顺序注意：**分析（倒序 last-use dump）是第 1 步且纯观测**——先做、dump、`exit 0`，
 用真实依赖数据决定分配器，再写任何执行器代码。
 
+### 0.1 已落地布局 + 与理想差距实测（2026-09-05，commit e6995dd）
+
+已落地：`moe_chain_assign_backend` 现在为每层算**节点级 interval 布局**（常算，非 debug）：
+每个结果取最后 reader（last_use），按 exec 序贪心 first-fit——占用者已死（last_use < 当前序）
+的 slot 可复用。产物 `moe_layer_exec_t.out_off[i]` + `result_bytes` + `layout_ok`；
+exec `hide_burst` 把 compute[i] 输出写 `out_off[i]`（无布局时回落 per-node bump）。
+验证：gemma + deepseek 对 CPU 基线 IDENTICAL；`STREAM_MOE_CAP_DUMP` 打印布局。
+
+**布局随 ubatch 自动缩放**：布局存 `g_layer_exec`，每次 graph **重建**时由 assign 重算。
+llama `process_ubatch` 调 `can_reuse(gparams)`——gparams 含 ubatch 尺寸，ubatch 变则
+reuse 失败 → 重建 graph → 重跑 assign → 布局按新张量字节重算。同 shape decode 复用
+graph（布局不变，而 shape 未变故正确）。实测 12610-token prefill-from（-b 13000、
+-ub 2048、ctx 20000）：result_bytes 出现 ~766KB / 12MB / 62MB / 392MB 四档，跟随该图
+构建时的 batch。slot **拓扑**（哪些节点共享 slot）只由依赖决定；只有 slot **字节尺寸**
+随 ubatch 缩放。
+
+**与理想差距（实测，gemma 14 节点/层）**：
+- layout = 191488 B/层 vs full-alloc 参照 417312 B（省 54%）。
+- 3 slot/层：slot0 90112B（gate_up 45K + down-mm 90K + weighted 90K）、slot1 90112B
+  （geglu 22K + down_scaled 90K + 5 个小 ADD/scale 节点）、slot2 11264B（GET_ROWS 32B + 3 ADD）。
+- 理想（best-fit / interval-coloring 最小化总面积）应把 ADD 链放一个 ~11K 小槽、大 mm 输出
+  进大槽，可达 ~130K/层 → 当前高约 47%。
+- 根因：贪心 first-fit 合法（无活区间冲突）但非最小——小 ADD 被并进大 slot，因为
+  first-fit 从不考虑"与既有小槽共享"。分配器"依赖正确、面积非最优"；节点序（exec 序）决定适配。
+- 注意：exec 一次只跑一层、arena 跨层复用 → 成本是"一层布局 × ubatch 缩放"，不是"层数×布局"。
+
+**理想算法（后续）**：区间调度/一维装箱——把结果 buffer 看成栈，按 (produce, last_use)
+分配并 best-fit-decreasing（大块先落位），即最小化"同时存活字节的峰值"，等价于按大小类
+对 interval 图着色。当前 first-fit 是保守通用 DAG fallback；理想保留同一依赖分析，但装箱前
+先按大小类分组。普适性：first-fit 对任意 DAG 形状安全（gemma fused gate_up + deepseek
+独立 gate/up/down 均已验证）；理想装得更紧但需每 arch 的大小类分组启发。
+
 ## 1. 目标
 
 私有化 MoE 层按**每设备专家列链**执行，从一开始就是最终形态（无 CPU-only 过渡执行器）。

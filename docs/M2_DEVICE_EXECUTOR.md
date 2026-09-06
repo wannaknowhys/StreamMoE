@@ -57,6 +57,52 @@ Build order note: the ANALYSIS (reverse last-use dump) is step 1 and is purely
 observational - do it, dump, `exit 0`, and decide the allocator from real
 dependency data before writing any executor code.
 
+### 0.1 Landed layout + measured gap to ideal (2026-09-05, commit e6995dd)
+
+Landed: `moe_chain_assign_backend` now computes a node-level interval layout for
+every layer (always, not debug): per result take the LAST reader index
+(last_use), then greedy first-fit in exec order - a node reuses a slot whose
+occupant died (last_use < current index). Output `moe_layer_exec_t.out_off[i]`
++ `result_bytes` + `layout_ok`; exec `hide_burst` writes compute[i]'s output to
+`out_off[i]` (per-node bump fallback when no layout). Verified: gemma + deepseek
+run IDENTICAL to the CPU baseline; `STREAM_MOE_CAP_DUMP` prints the layout.
+
+**Layout scales with ubatch automatically**: layout lives in `g_layer_exec`,
+rebuilt by `moe_chain_assign_backend` on every graph REBUILD. llama's
+`process_ubatch` calls `can_reuse(gparams)` - gparams carries the ubatch size,
+so a changed ubatch fails reuse, rebuilds the graph, and re-runs assign -> the
+layout is recomputed with the new tensor byte sizes. Same-shape decodes reuse
+the graph (and the layout, which is then correct because the shape is
+unchanged). Measured on a 12610-token prefill-from (-b 13000, -ub 2048, ctx
+20000): result_bytes varied across four tiers ~766KB / 12MB / 62MB / 392MB,
+tracking the batch the graph was built for. Slot TOPOLOGY (which nodes share a
+slot) is dependency-only; only slot BYTE sizes scale with ubatch.
+
+**Gap to ideal (measured, gemma 14 nodes/layer)**:
+- layout = 191488 B/layer vs full-alloc reference 417312 B (saves 54%).
+- 3 slots/layer: slot0 90112 B (gate_up 45K + down-mm 90K + weighted 90K),
+  slot1 90112 B (geglu 22K + down_scaled 90K + 5 small ADD/scale nodes),
+  slot2 11264 B (GET_ROWS 32B + 3 ADDs).
+- Ideal (best-fit / interval-coloring minimizing total area) would put the ADD
+  chain in ONE small slot (~11K) and the large mm outputs in the big slots,
+  reaching ~130K/layer -> current is ~47% above ideal.
+- Cause: greedy FIRST-FIT is legal (no live-range conflict) but not minimal -
+  small ADDs get glued into a large slot because first-fit never considers
+  "share with the existing small slot". The allocator is dependency-correct,
+  not area-optimal. Node order (exec order) decides the fit.
+
+**Ideal algorithm** (for later): interval scheduling / one-dimensional bin
+packing over the result buffer viewed as a stack - assign by (produce,
+last_use) and place nodes best-fit-decreasing (large blocks land first), i.e.
+minimize peak simultaneous-live BYTES, equivalent to coloring the interval
+graph by size class. Current first-fit is the conservative general-DAG
+fallback; the ideal keeps the same dependency analysis but groups nodes by
+size class before packing. Generality: first-fit handles any DAG shape safely
+(gemma's fused gate_up + deepseek's split gate/up/down both verified); the
+ideal packs tighter but needs a size-class grouping heuristic per arch. Buffer
+budget note: arena is reused across layers (exec is one layer at a time), so
+the cost is ONE layer's layout, scaled by ubatch - not layers x layout.
+
 ## 1. Goal
 
 Execute a privatised MoE layer as **per-device expert-column chains**, in the
