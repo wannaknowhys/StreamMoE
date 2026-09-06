@@ -168,21 +168,29 @@ per-device arena、无设备侧整链。
 **分析层（verify/assign）——大多已落地，需设备化**
 - [x] 闭包收集 + 链内依赖/last-use + 布局（best-fit out_off/result_bytes）——完成（e6995dd, 488930f）。
 - [ ] `moe_node_plan`（每步 in[prod+off] 相对偏移）——布局只覆盖每节点 out 偏移；输入仍由执行器临时解析。
-- [ ] **设备列规划**：每设备拥有哪些 (k,t) contribution 列、在每节点输出里占哪段。现
-      `scatter_sub_dst`/`build_mix_plan` 执行期临时算；per-device mini graph 需 build-time 产物。
-- [ ] **per-device arena 定尺寸**：把整层 best-fit 布局扩展为每设备只装自己算的列（布局复用、
-      按设备定尺寸；ping-pong 对是 interval 布局特例）。
+- [ ] **每设备整链执行规划**：每设备拥有哪些专家 / contribution 列（mix_plan 的 pool 划分），
+      按 compute 节点表达（该设备产生某节点输出的哪个切片、需要它哪些输入）。每设备对**自己
+      的列**跑完整节点链（算到 contribution），不只 mm。
+
+**Per-device arena（用户决策 2026-09-05：不做按设备收缩）**
+- [ ] 参与一层的每个设备各申请**一整层结果块**（现有 best-fit 布局的 result_bytes）——**不**
+      按设备列切 arena。理由：各设备布局几何相同（同一 out_off[]）、简单统一；设备列只是运行
+      时划分，只影响每设备实际填哪些切片，不影响块几何。成本 = 每参与设备一块整层 best-fit 块
+      （小；arena 跨层复用）。
+- [ ] 桶执行：设备在自己块内**只算自己分到的桶（列）**，其余切片不动。
 
 **执行器资源**
 - [ ] per-device ping-pong / 事件跟踪（async GPU 不能让下一层覆写在飞结果，§3 同步纪律）。
 - [ ] 执行入口从 verify 产物 + 本次 pin 分布**实例化模板**（填 data/ids/偏移，不改结构）。
+- [ ] 每设备列执行：设备沿层内每个 compute 节点的**自己切片**走（同节点链、限自己列），
+      设备侧直达 contribution，无 host 往返。
 
 **异步执行骨架**
 - [ ] `exec_round_vk` → 异步提交（`graph_compute_async`）+ 完成跟踪，取代每 round 同步+回读。
 - [ ] CPU/VK 重叠：设备图异步提交后主线继续算 CPU 列，层尾 converge。
 - [ ] converge 点：强制同步每设备，经 host map 读回 contribution，折进 moe_out（通用出口
       merge/scatter，§5）。
-- [ ] 独立 per-device 结果块（设备化 §4.1 布局）。
+- [ ] 每个参与设备各持自己的**整层结果块**（§4.1 几何，每设备一块，不按列切）。
 
 **验证门**
 - [ ] 设备执行落地后纯设备数值门（K6 形态；注意 GPU 对 CPU 无绝对还原——验证结构等价而非字节
@@ -193,5 +201,7 @@ per-device arena、无设备侧整链。
 **profile（延后，§6）**
 - [ ] profile ring + 每设备完成时间戳；slot_request_t 已带 total_tokens/start_rdtsc 字段。
 
-建议下一步：先把布局从"整层单块"扩展为"per-device 列切片 + build-time 设备列规划"
-（分析层先行——纯新增不动执行器，CAP_DUMP/CSV + sim.js 可验证），再在其上加异步骨架。
+建议下一步：让每个参与设备**用自己的桶（列）把整节点链算进自己的整层结果块**（同一 best-fit
+布局，每设备一块）。build-time：把设备列划分表达成每节点的切片，供执行器实例化每设备整链模板；
+exec-time：每设备异步提交、主线算 CPU 桶、层尾 converge。先做纯分析层增量（CAP_DUMP/CSV +
+sim.js 可验证），再在其上加异步骨架。
