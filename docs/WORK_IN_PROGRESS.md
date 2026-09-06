@@ -238,12 +238,19 @@
 >       + **2026-09 DMA 提速**：v2r demote 改 transfer-queue DMA（stmoe_vk_dma_read，
 >       ggml_vk_buffer_read 同步路径，cached staging），158ms→~1ms/专家（717bac8）。
 >       r2v 无需改（rebar 写 ~8GB/s）。实测见 docs/VRAM_DMA_MOVE.md。
-> - [ ] M5 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once；exec 改无状态 pin+resubmit
->       （当前仍 per-request bitmap，无 active-slot——未做）
+> - [x] M5 调度侧记账（active-slot + exec 单程，2026-09-05）：exec 本地 try_pin 已 READY 的 A；
+>       其余 B 作为**一个 active 请求**提交，scheduler 侧 active 槽统一登记 + 现查三态 triage
+>       （READY→替 pin / ABSENT→装载 / LOADING→等 drain，closes register-vs-settle 竞态）；
+>       drain/move settle 统一替 exec pin B（RAII ledger）+ 归零 wake-once；失败 RAII 回滚 +
+>       failed 信号。exec 醒后 scan B 拿 slot 不再重复 pin（单程，去掉两轮 round/rescan）。
+>       设计：EXPERT_MOVE_PIPELINE §7.4。验证：CPU 基线回归 IDENTICAL PASS、-p hi -st 自然退出、
+>       Vulkan0:2048 池跑通。slot_request_t 96→104B（+failed 指针）。
 > - [~] M6 验证：纯 RAM 路径零影响（DMA 代码只在 v2r 触发，RAM 走 memcpy 不变）；VRAM
 >       demote 场景 DMA 内容 0 BAD（4-token 64MB，238 demote，列级对比纯 RAM golden）；
 >       129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
 > - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛；EXPERT_MOVE_PIPELINE 更新 M4 DMA）
+> - [ ] M8 UT：M5 §7.4 四个并发验收用例（登记前 settle / B 含 ABSENT / B 中途失败回滚 / 单活跃）——
+>       test_scheduler 目前因 stmoe_vk_dma_read 链接问题不编（既有），M8 需先修 test 链接或改独立测试
 
 - [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）

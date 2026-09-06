@@ -359,6 +359,93 @@ version bump + wake），外加 drain 级的 profile delta-rdtsc 记账作为并
 `pin_layer` 重试时，重新提交的 `n_load_target` 必须精确等于**当轮 scan 重测的
 still-need 数**——绝不是 round-1 总数。调度线程按当轮自己的 n_load_target 倒计数。
 
+### 7.4 M5 落地规格——active 槽 + exec 单程（2026-09-05）
+
+> 取代 §3.5 的 loop / §7.3 的两轮 exec 形态。**exec 改单程**：已 READY 的自己就地 pin
+> （A 集），其余（B 集）作为**一个 active 请求**交给 scheduler；醒后**不再 rescan/重复
+> pin**——scheduler 已替 B pin 好。exec 算完对 A∪B 统一释放。
+
+**为什么成立（pin 责任切分）**：
+- A 与 B 永不重叠：A = exec scan 时 `try_pin` CAS 成功的那批；B = 其余。exec 提交 B 的
+  一刻 partition 即固定。
+- 保护无需新规则：A 由自身 refcount 就地保护（已 +1）；B 由 **LOADING→READY 状态转换**
+  保护直到 drain 同一步替它 pin（M2 LOADING-before 不变量）。不需要发明 "declared
+  interest"。
+- 全有或全无的 pin 只发生在**一处**（scheduler 侧），永无半 pin 中间态。
+
+**scheduler 侧 active 槽（`expert_scheduler` 成员，per-model）**：
+```cpp
+struct active_request_t {
+    uint32_t layer = 0;
+    uint64_t still_need[BITMAP_WORDS] = {0};   // B bitmap
+    uint32_t n_left = 0;                        // B 里还没 READY+pin 的项数
+    bool     failed = false;                    // 某个 B 装载/move 硬失败
+    std::atomic<uint32_t>* batch_ready = nullptr;  // wake-once 计数词（exec）
+};
+active_request_t active_;   // 空 = 无在途请求
+```
+- `accept_requests()` 是**唯一登记点**：pop 一个 exec 请求存入 `active_`，然后**同一
+  scheduler 线程轮内**立即逐项 triage B（同一临界区）：
+  READY    -> 当场 CAS pin 并记账（n_left--）
+  ABSENT   -> alloc + 提交装载（走 M3 驱逐腾位）；稍后经 drain settle
+  LOADING / MOVING_* -> 留给 drain（在飞，settle 时会 pin）
+- `active_` 非空期间不 pop 新 exec 请求（单活跃纪律 §7.1），只 drain/move/settle。
+
+**drain_completions() 是唯一 settle 点并**代为 pin（owner 线程，无需额外通知）：
+- drain 在 scheduler 线程内由 `worker_loop` 同步调用（wait_events→drain_completions）。
+  "drain 如何通知 scheduler？"是伪问题——drain 本就是 scheduler 自己的线程步骤，直接
+  bump exec 的唤醒词。
+- settle (L,E) 时：mark_ready + dir→READY，然后若 (L,E) ∈ active_.still_need →
+  CAS pin + n_left--。
+- n_left==0 → wake exec 一次（成功）。某装载/move 硬失败 → 回滚：释放已 pin 的全部
+  B 项（RAII 记录按 bitmap 记账）、置 active_.failed、wake exec（失败信号）。
+- 无 "skip 算完成"、无 per-(L,E) waiter 列表、无独立 bump 路径。
+
+**RAII pin 记账（全有或全无）**：scheduler 记录已 pin 的 B 项；失败路径精确释放这些再
+wake exec。exec 永远看不到"半 pin 的 B"。
+
+**两个登记时刻的竞态，必须编码 + 测试（Claude 审阅）**：
+1. **登记前 settle（丢事件窗口）**：某专家在 exec scan（B 含它为 LOADING）之后、
+   scheduler 登记 active_ **之前**就 settle 成 READY（先跑的是 drain 那轮，当时无
+   active_）——它的 drain 事件就此永久丢失。修法：登记步骤必须在同一轮**现查每个 B 项的
+   当前状态**（READY→当场 pin；ABSENT→当场装载；LOADING→留给 drain）。不是隐含前提，
+   是硬验收用例："B 项在登记前一瞬 settle"仍必须被 pin。
+2. **B 里 ABSENT 项需要显式装载**：把 ABSENT 项塞进 active_.still_need 不会让它自己变
+   LOADING——必须有人显式 alloc + submit。漏掉这步 = active_ 永远等一个没人装的专家
+   （活锁）。写进登记步骤（上面 accept_requests 的 ABSENT 分支），不能靠隐含。
+
+**exec 侧——单程 pin_layer（取代 §3.5 loop / §7.3 两轮）**：
+```
+exec pin_layer(layer, needed, await, out):
+  A = {}; B = {}
+  for each needed (L,E):
+    scan dir 找 READY 副本（任意 pool）
+    READY -> try_pin（原子 CAS READY→READY+1）成功 -> A += handle
+            （CAS 失败 = 瞬时竞态 -> 视作 missing 进 B）
+    否则  -> B
+  if B 空: return A（全 pin 完成）
+  提交 ONE 请求 { layer, B bitmap, batch_ready } -> active_
+  睡在 batch 计数词上（单次唤醒）
+  醒:
+    if active_.failed: 释放 A, return -1                  // 错误路径
+    for each B item: dir->scan -> READY slot（scheduler 已 pin，不要再次 try_pin）
+                    -> 记 handle；scan miss 在非 failed 下不可能
+    return A + B handles
+```
+exec 算完对 A∪B 逐个 unpin()。**绝不重复 pin B**（refcount 已被 scheduler +1），
+**绝不 loop 重测**。
+
+**与 N 节 stall 兜底（5d08bb3）的关系**：有 active 槽后，"某个 B 装载永远无法完成"
+（池容量 / IO 死亡）仍需 no-progress 检测，但 fail-settle 从"bump 计数假装 settle"改成
+"置 active_.failed + RAII 释放已 pin 的 B + 带失败信号 wake exec"。账在 active_ 里清，
+不再 hack 计数词。
+
+**并发验收用例（UT）**：
+- B 项在 active_ 登记**同一轮**先 settle 成 READY → 登记时必须补 pin（竞态 1）。
+- B 含 ABSENT 项 → 登记时必须提交装载（竞态 2）；验证经 drain 变 READY 且 exec 恰好醒一次。
+- B 中途失败：已 pin 的 B 全释放、exec 带 failed 唤醒、exec 释放 A 并报错；refcount 归零。
+- 单活跃：active_ 忙时第二个 exec 请求不被 pop，直到第一个 settle 完。
+
 ## 8. Open questions / 后置
 
 1. **score 线估算**："需要 K 槽时，层 L-delta 该用什么 score 阈值？"——后置

@@ -423,6 +423,113 @@ When `pin_layer` retries, the re-submitted `n_load_target` MUST equal the
 still-need count re-measured by that round's scan - never the round-1 total.
 The scheduler counts down the round's own n_load_target.
 
+### 7.4 M5 landing spec - active slot + single-pass exec (2026-09-05)
+
+> Supersedes the §3.5 loop / §7.3 two-round exec shape. **Exec goes single-pass**:
+> it pins what is already READY itself (set A), hands the rest (set B) to the
+> scheduler as ONE active request, and - on wake - does NOT re-scan/re-pin:
+> the scheduler has already pinned B for it. Exec releases A u B after compute.
+
+**Why this is sound (pin ownership split):**
+- A and B never overlap: A = the set whose `try_pin` CAS succeeded during the
+  exec scan; B = everything else. Partition is fixed the moment exec submits B.
+- Protection needs no new rule: A is protected by its refcount (already +1);
+  B is protected by the LOADING -> READY state transition until the scheduler
+  pins it in the same drain step (M2 LOADING-before invariant). No invented
+  "declared interest" concept.
+- All-or-nothing pinning happens in exactly ONE place (the scheduler side),
+  never half-pinned, never an orphaned middle state.
+
+**Scheduler-side active slot (a member of `expert_scheduler`, per-model):**
+```cpp
+struct active_request_t {
+    uint32_t layer = 0;
+    uint64_t still_need[BITMAP_WORDS] = {0};   // set B bitmap
+    uint32_t n_left = 0;                        // B items not yet READY+pinned
+    bool     failed = false;                    // a B load/move hard-failed
+    std::atomic<uint32_t>* batch_ready = nullptr;  // wake-once counter (exec)
+};
+active_request_t active_;   // empty iff no request in flight
+```
+- `accept_requests()` is the ONLY place that registers a request: it pops one
+  exec request, stores it in `active_`, then immediately triages every B item
+  (same critical section / same scheduler-thread turn):
+  READY    -> CAS-pin it now, account it (n_left--)
+  ABSENT   -> alloc + submit a load (eviction path, M3); it will settle via drain
+  LOADING / MOVING_* -> leave to drain (in flight; settle will pin)
+- While `active_` is non-empty the scheduler does NOT pop a new exec request
+  (single-active discipline, §7.1); it only drains / moves / settles.
+
+**drain_completions() is the single settle point and DOES the pin (owner
+thread, no extra notification needed):**
+- drain runs on the scheduler thread inside `worker_loop` (wait_events ->
+  drain_completions is synchronous). "How does drain notify the scheduler?" is
+  a non-question: drain IS the scheduler's own thread step. It bumps the exec
+  wake word directly.
+- On settle of (L,E): mark_ready + dir -> READY, then if (L,E) in
+  active_.still_need -> CAS-pin + decrement n_left.
+- n_left == 0 -> wake exec ONCE (success). A hard failure (load/move FAILED)
+  -> roll back: release every already-pinned B item (RAII record of what was
+  pinned, bitmap-keyed), set active_.failed, wake exec (failure signal).
+- No "skip counts as done", no per-(L,E) waiter list, no separate bump path.
+
+**RAII pin accounting (all-or-nothing):** the scheduler keeps a small record of
+which B items it has pinned; on the failure path it releases exactly those
+before waking exec. Exec never sees a partially-pinned B.
+
+**Two register-time races that MUST be coded + tested (peer review, Claude):**
+1. **Settle before register (lost-event window).** An expert may settle to
+   READY *between* exec's scan (B includes it as LOADING) and the scheduler
+   registering active_ (the drain turn ran first, when no active_ existed).
+   The drain event for it is then gone forever. Fix: the registration step
+   MUST re-scan the current state of every B item in the same turn (READY ->
+   pin now; ABSENT -> load now; LOADING -> wait for drain). Not an implied
+   assumption - a hard acceptance case: "B item settles right before
+   registration" must still get pinned.
+2. **ABSENT in B needs an explicit load.** Putting an ABSENT item into
+   active_.still_need does not make it LOADING by itself - someone must
+   explicitly alloc + submit it. Without this step active_ waits forever on an
+   expert nobody is loading (livelock). Write it into the register step
+   (accept_requests ABSENT branch above), not left implicit.
+
+**Exec side - single-pass pin_layer (replaces §3.5 loop / §7.3 rounds):**
+```
+exec pin_layer(layer, needed, await, out):
+  A = {}; B = {}
+  for each needed (L,E):
+    scan dir for a READY copy (any pool)
+    READY -> try_pin (atomic CAS READY->READY+1); success -> A += handle
+            (CAS failure = transient race -> treat as missing, B)
+    else  -> B
+  if B empty: return A (all pinned)
+  submit ONE request { layer, B bitmap, batch_ready } -> active_
+  sleep on batch word (single wake)
+  wake:
+    if active_.failed: release A, return -1         // error path
+    for each B item: dir->scan -> READY slot (already pinned by scheduler,
+      do NOT try_pin again) -> record handle; scan miss = impossible unless
+      failed (guarded above)
+    return A + B handles
+```
+Exec releases A u B with unpin() after compute. It never re-pins B (refcount
+already +1 by the scheduler) and never loops to re-measure.
+
+**Relationship to the N-section stall backstop (5d08bb3):** with the active
+slot, no-progress detection still guards "a B load can never complete" (pool
+capacity / IO death), but the fail-settle changes from "bump counters to fake
+a settle" to "mark active_.failed + RAII-release pinned B + wake exec with the
+failure signal". The ledger lives in active_, not in hack bumps.
+
+**Concurrency acceptance cases (UT):**
+- B item settles (READY) in the same scheduler turn BEFORE active_ registration
+  -> must be pinned at registration (race 1).
+- B contains an ABSENT item -> must get a load submitted at registration
+  (race 2); verify it becomes READY via drain and exec is woken exactly once.
+- Failure mid-B: some B already pinned -> all pinned B released, exec woken
+  with failed, exec releases A and reports error; refcounts end at zero.
+- Single-active: a second exec request arriving while active_ is busy is not
+  popped until the first settles.
+
 ## 8. Open questions / deferred
 
 1. **Score-line estimation**: "given K slots needed, what score threshold for
