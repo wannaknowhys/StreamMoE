@@ -205,3 +205,34 @@ per-device arena、无设备侧整链。
 布局，每设备一块）。build-time：把设备列划分表达成每节点的切片，供执行器实例化每设备整链模板；
 exec-time：每设备异步提交、主线算 CPU 桶、层尾 converge。先做纯分析层增量（CAP_DUMP/CSV +
 sim.js 可验证），再在其上加异步骨架。
+
+## 7.2 桶链串行 + per-device 输出区（设计定稿，2026-09-06 用户决策）
+
+多桶拼接长链 mini-graph（形态 B）的收敛设计。三个已确认决策：
+
+1. **长图本身就是串行**——一个 device 一张图、同 backend 按拓扑序执行、无跨节点并行时，
+   把各桶链拼进这一张图 = 严格串行：桶2 链只在桶1 链结束后才开始。无需每桶一次 submit，
+   也无需人为加依赖边——单图单后端本身就是串行。
+   **为什么成立（关键前提）**：执行器不走 ggml 自动 buffer 分配——是 `no_alloc` + tensor 壳 +
+   手动 `nd->data = arena_base + out_off`（CPU 路径的 hide_burst 就是这套）。ggml/vulkan 自动
+   allocator 看不到桶间复用（两链无数据依赖，会被当可并行、各给不重叠 buffer，arena = 所有桶之
+   和）。**手动 out_off 才是让串行复用中间区安全又免费的原因**。这机制与设备无关：vulkan（和
+   CUDA）以 `(data - buffer_base) + view_offs` 定位张量在 buffer 内的偏移，从不 deref `data`
+   本身（`stmoe_vk_buffer_host_offset` 返回 `vk_ptr_base + off`；exec_round_vk 已这样用壳）。
+   所以每节点 `data = arena_base + out_off` 在 vulkan/CUDA 上原样成立。
+2. **每桶链尾把贡献 ADD 进本 device 自己的输出区**（同块 arena 内预留区 / per-device 累加器）。
+   桶尾 add 消费掉结果后，该桶中间区即死，下一桶链复用**同一批 `out_off[]` 字节区**。最终输出 =
+   层尾对各 device 输出区做**一次性读回 / 跨 device merge**（§5：只有 contribution 跨设备边界，
+   且只在全部设备完成后一次）。
+3. **per-device arena = 整层满宽块**（已落地 best-fit 布局的 result_bytes，几何与 CPU 相同，
+   每参与设备一块）。这是最坏情况上界：单桶链峰值 live 字节 ≤ 整层峰值，故块内任意桶排列都安全，
+   且跨设备几何逐字节一致（同一 `out_off[]`，无需按设备重算偏移）。简单统一，不做按设备列切片。
+
+下游推论：
+- moe_out / 匿名 per-topk 收敛 ADD **不放进任何桶链内跑**。多桶形态下 llama 那棵固定 ADD 树
+  （按每 token k 连续搭的）对不上被拆散的 k 列，所以折叠是**汇聚步骤**：按原始 (t,k) 映射 gather
+  各设备贡献列、加进外部 dst（§2.1/§5 的私有化汇聚图，phase 2）。CPU phase 1 安全恰恰因为
+  scatter 在宿主 main dst 重新凑齐了每 token 的完整 k 行，让现有捕获的匿名 ADD 树原样跑。
+- 设备端桶链用**降维列形状**（mm 输出 [d, w_b, n_active]，非满 [d, n_k, n_t]）；verify 算的
+  满宽字节级 `out_off` 因此不直接是桶节点的字节布局。继承的是 interval/槽**结构**；跑降维形状时
+  per-device arena 字节按设备列跨度线性缩放（推迟到 GPU 桶阶段——CPU phase 1 保持满宽只验数值）。

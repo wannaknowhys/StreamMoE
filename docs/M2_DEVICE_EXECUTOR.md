@@ -359,3 +359,58 @@ can instantiate the per-device whole-chain template; exec-time: async submit
 per device, run the CPU bucket on the calling thread, converge at layer end.
 Pure analysis-layer addition first (verifiable via CAP_DUMP/CSV + sim.js),
 then the async skeleton on top.
+
+## 7.2 Bucket-chain serialization + per-device output region (design agreed
+##     2026-09-06, user)
+
+Converged design for the multi-bucket concatenated mini graph (shape B). Three
+decisions, all confirmed:
+
+1. **A long graph IS serial** - if one device runs one graph whose nodes are
+   executed in topological order on the same backend with NO cross-node
+   parallelism, concatenating the buckets' chains into that one graph is a
+   strict serialisation: bucket 2's chain starts only after bucket 1's chain
+   ended. No extra submit per bucket is needed and no artificial edges must be
+   forced - serialisation is simply what a single graph on one backend means.
+   CAVEAT (why this holds): the executor does NOT rely on ggml's automatic
+   buffer allocator. It is `no_alloc` + tensor shells with manually assigned
+   `nd->data = arena_base + out_off` (this is what hide_burst already does on
+   the CPU path). A ggml/vulkan auto-allocator would NOT see cross-bucket
+   reuse (the two chains have no data dependency, so it treats them as
+   parallel and gives each a disjoint buffer, needing the sum of all buckets).
+   Manual `out_off` is what makes serial reuse of the intermediate region
+   safe and free. This is device-agnostic: vulkan (and CUDA) derive a tensor's
+   buffer offset as `(data - buffer_base) + view_offs` and never dereference
+   `data` itself (`stmoe_vk_buffer_host_offset` returns `vk_ptr_base + off`;
+   exec_round_vk already uses shells this way). So per-node
+   `data = arena_base + out_off` works on vulkan/CUDA unchanged.
+2. **Each bucket chain ends by ADDing its contribution into the device's OWN
+   output region** (a reserved area of the same device arena block / the
+   per-device accumulator). Once the bucket's tail add consumed its results,
+   that bucket's intermediate region is dead and the next bucket chain reuses
+   the SAME `out_off[]` byte regions. Final output = one read-back / cross-
+   device merge of each device's output region at the layer end (SS5: only the
+   contributions cross the device boundary, once, after every device finished).
+3. **Per-device arena = a FULL whole-layer block** (result_bytes of the landed
+   best-fit layout, same geometry as CPU, one per participating device). This
+   is a worst-case upper bound: a single bucket chain's peak live bytes are
+   <= the whole-layer peak, so any bucket packing inside is safe, and the
+   geometry is byte-identical across devices (same `out_off[]`, no per-device
+   offset rescaling). Simple and uniform; not column-sliced per device.
+
+Downstream implications:
+- moe_out / the anonymous per-topk convergence adds are NOT run inside any
+  bucket chain. In the multi-bucket shape the fixed llama ADD tree (built for
+  contiguous per-token k) does not match the split k columns, so the fold is a
+  converge step that gathers each device's contribution columns by the
+  original (t,k) mapping and adds into the external dst (SS2.1/SS5 - the
+  privatised converge graph, phase 2). CPU phase 1 is safe precisely because
+  scatter re-materialises full k rows in the host main dst, letting the
+  existing captured anonymous ADD tree run unchanged.
+- Device-computed bucket chains use REDUCED column shapes (mm output
+  [d, w_b, n_active], not the full [d, n_k, n_t]); the full-width byte-level
+  `out_off` from verify is therefore NOT directly the bucket nodes' byte
+  layout. What carries over is the interval/slot STRUCTURE; per-device arena
+  bytes scale linearly with the device's column span when reduced shapes run
+  (deferred to the GPU bucket phase - CPU phase 1 stays full-width and only
+  validates numerics).
