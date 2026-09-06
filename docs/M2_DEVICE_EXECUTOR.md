@@ -687,3 +687,52 @@ Next: CPU virtual two-bucket experiment (full tokens, k split into two buckets,
 each bucket runs its compact chain, bucket-tail sum_w -> per-device partial sum
 column (expert width 1), both added to the accumulator = moe_out equivalent;
 numerics vs moe_out under the relaxed gate).
+
+## 7.8 Full multi-device mini-graph construction order (user, 2026-09-06)
+
+Construction-time shape (after buckets are split, BEFORE the bucket loop):
+
+For EVERY device d that has buckets:
+- Build a **per-device accumulator** `acc_d[d_out, n_t]` = the device's expert-
+  folded output (expert axis already contracted). `acc_d` is a DEVICE-side
+  ordinary vk buffer.
+- On RAM build `add_in[device_used, d_out, n_t]` = the anonymous-add INPUT:
+  one slot `[d_out, n_t]` per device (index k = the device ordinal; device_used
+  is the count of participating devices this batch).
+
+Then, per bucket of device d:
+- `append_expert_fold`: sum the CURRENT bucket's experts and ACCUMULATE into
+  `acc_d` (`[d_out, n_t]`, expert width 1; in-place add across the bucket loop).
+
+Chain tail (after all of device d's buckets are folded into acc_d):
+- **One `ggml_backend_tensor_copy` (acc_d -> add_in[k])**: the cross-backend
+  transfer from the device accumulator (vk buffer) into the RAM anonymous-add
+  input slot. No hand-written DMA node is needed: ggml's cross-backend copy is
+  the transport. `ggml_backend_tensor_copy` routes device->host through
+  `tensor_get` -> vulkan `ggml_backend_vk_buffer_get_tensor` ->
+  `ggml_vk_buffer_read` (transfer-queue DMA + cached staging; the same path as
+  our v2r DMA). Async variant first tries the backend's cpy_tensor_async,
+  falling back to a synchronized blocking copy. For the CURRENT RAM-pool
+  (dense on CPU) phase the final fold runs on HOST.
+
+Finally, the anonymous add:
+- Fold `add_in[device_used, d_out, n_t]` (sum over the device axis) ->
+  `[d_out, n_t]` = the add result (moe_out-equivalent; the cross-device fold,
+  re-partitioned per SS7.7: leaves go from experts to devices).
+- TODO (future): when dense moves to a device (the no-RAM-pool / dense-offload
+  path, TODO.md stage 7 and the M2 dense-offload notes), the final fold should
+  run on the DEVICE WHERE DENSE LIVES, not host. This is the "anonymous add
+  follows dense placement" evolution; the fold is then a device-side add_in
+  consumer reading all participating devices' slots. Recorded here rather than
+  TODO.md because it is an execution-structure evolution of this design; the
+  dense PLACEMENT mechanics themselves stay in TODO.md stage 7.
+
+Slot-staleness (does a fixed add_in[k] slot leak garbage across batches?):
+- Yes, if a device participated last batch but not this one, its slot holds a
+  stale partial sum and WOULD corrupt the final fold if read.
+- Cleanest fix (consistent with SS7.6.4 discipline): the final fold reads ONLY
+  the slots of devices participating THIS batch (fold iterates the per-batch
+  participation set / bitmap), so stale slots are never read - no clearing
+  needed. Alternative: memset the whole add_in before each batch's folds, or
+  clear only non-participating slots. Preferred = participation-set filtering
+  in the fold.

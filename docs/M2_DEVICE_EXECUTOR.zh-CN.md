@@ -418,3 +418,39 @@ acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收
 
 下一步：CPU 虚拟两桶实验（满 token、k 切成两桶；每桶跑自己的 compact 链、桶尾 Σ_w → 每桶一个专家宽
 度 1 的全 token 列；两桶都加进累加器 = moe_out 等价；对 moe_out 过宽松 gate）。
+
+## 7.8 完整多 device mini-graph 构造顺序（2026-09-06 用户）
+
+构造期形态（分完桶之后、**桶循环之前**）：
+
+对**每个有桶的 device d**：
+- 建 **per-device 累加器 `acc_d[d_out, n_t]`** = 该 device 的专家折叠输出（专家轴已收缩）。`acc_d`
+  是 **device 端普通 vk buffer**。
+- 在 RAM 建 `add_in[device_used, d_out, n_t]` = **匿名 add 的输入**：每 device 一个槽
+  `[d_out, n_t]`（索引 k = device ordinal；device_used = 本次参与 device 数）。
+
+然后对 device d 的每个桶：
+- `append_expert_fold`：把**当前桶**的专家求和并**累加进 `acc_d`**（`[d_out, n_t]`、专家宽 1；桶循环内
+  in-place 累加）。
+
+链尾（device d 的全部桶折进 acc_d 之后）：
+- **一次 `ggml_backend_tensor_copy(acc_d → add_in[k])`**：从 device 累加器（vk buffer）到 RAM
+  匿名 add 输入槽的**跨 backend 传输**。**无需手写 DMA 节点**——ggml 的跨 backend copy 就是传输
+  通道：`ggml_backend_tensor_copy` 的 device→host 归边走 `tensor_get` → vulkan
+  `ggml_backend_vk_buffer_get_tensor` → `ggml_vk_buffer_read`（transfer-queue DMA + cached
+  staging，与 v2r DMA 同路径）。async 变体先试 backend 的 cpy_tensor_async，回退同步阻塞 copy。
+  当前 RAM-pool（dense 在 CPU）阶段，最终 fold 在 **HOST** 跑。
+
+最后，匿名 add：
+- 折叠 `add_in[device_used, d_out, n_t]`（沿 device 轴求和）→ `[d_out, n_t]` = add 结果
+  （moe_out 等价；跨 device 折叠，§7.7 归约重分组：叶从专家变 device）。
+- **TODO（未来）**：dense 进 vram / no-RAM-pool 路径（TODO.md 阶段 7 与 M2 dense-offload 注）后，
+  最终 fold 应在 **dense 所在 device** 上跑、不在 host。这是"匿名 add 跟随 dense 放置"的演化；届时
+  fold 是 device 侧 add_in 消费者、读全部参与 device 的槽。记在这里而非 TODO.md，因为它是本设计的
+  执行结构演化；dense 放置**机制本身**留在 TODO.md 阶段 7。
+
+**槽滞留（固定 add_in[k] 槽跨 batch 会不会留垃圾？）**：
+- 会——若某 device 上批参与、本批未参与，其槽残留旧部分和，若被最终 fold 读到就污染。
+- 最干净的修法（与 §7.6.4 纪律一致）：最终 fold **只读本批参与 device 的槽**（fold 遍历每批参与
+  集合/位图），垃圾槽永不读 → 无需清零。替代：每批 fold 前整块 memset add_in，或只清未参与槽。
+  首选 = fold 端按参与集合过滤。
