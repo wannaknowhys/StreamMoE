@@ -74,6 +74,14 @@ struct moe_layer_exec_t {
     std::vector<ggml_tensor*>   compute;        // compute nodes, exec order
     std::vector<moe_view_alias_t> view_aliases; // views over hidden producers
     std::vector<ggml_tensor*>   input_layouts;  // layout tensors feeding compute
+    // Result-buffer layout (node-level interval reuse, computed by verify):
+    // out_off[i] = byte offset inside the layer's result buffer where
+    // compute[i]'s output lands; the buffer itself is one block of
+    // result_bytes, reused across layers. -1 = full-alloc fallback needed
+    // (layout conflict) - the executor then falls back to per-node offsets.
+    std::vector<int64_t> out_off;     // aligned with compute
+    size_t               result_bytes = 0;   // layer result buffer size (max over compute)
+    bool                 layout_ok    = false;
 };
 // Layer of the privatised exec sequence containing `node` (pointer match), or
 // -1 when `node` is not a captured privatised compute node.

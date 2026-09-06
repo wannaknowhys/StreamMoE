@@ -214,6 +214,95 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         }
     }
 
+    // ---- result-buffer layout (node-level interval reuse) ----------------
+    // Runs after the closure is complete (g_layer_exec holds every layer's
+    // compute sequence, views excluded). For each layer: resolve every
+    // chain-internal edge (consumer reads producer; views alias to the
+    // producer) and take each result's LAST reader index (last_use). A result
+    // stays live until last_use executes. Greedy interval packing in exec
+    // order: a slot whose occupant's last_use < current index is free (its
+    // reader already ran), so the node reuses it. Needs ~2 slots (gemma) /
+    // 3 (deepseek) per layer instead of one slot per node. Output:
+    //   ex.out_off[i]   = byte offset of compute[i]'s output in the layer block
+    //   ex.result_bytes = the layer block size (reused across layers by exec)
+    //   ex.layout_ok    = false -> exec falls back to per-node bump (defensive)
+    for (auto & kv : g_layer_exec) {
+        moe_layer_exec_t & ex = kv.second;
+        const auto & comp = ex.compute;
+        const size_t C = comp.size();
+        ex.out_off.assign(C, -1);
+        ex.result_bytes = 0;
+        ex.layout_ok = false;
+        if (C == 0) { ex.layout_ok = true; continue; }
+        // producer identity: tensor (possibly a view) -> compute index
+        auto prod_of = [&](const ggml_tensor * t) -> int {
+            const ggml_tensor * p = t;
+            while (p && is_view_op(p)) p = p->src[0];
+            if (!p) return -1;
+            for (size_t i = 0; i < C; ++i) if (comp[i] == p) return (int) i;
+            return -1;
+        };
+        // last reader index per producer (result live until that reader runs)
+        std::vector<int> last_use(C, -1);
+        for (int c = (int) C - 1; c >= 0; --c) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const int p = prod_of(comp[c] ? comp[c]->src[s] : nullptr);
+                if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;
+            }
+        }
+        struct slot_t { size_t size = 0; int end = 0; bool used = false; };
+        std::vector<slot_t> slots;
+        std::vector<int> node_slot(C, -1);
+        for (size_t i = 0; i < C; ++i) {
+            const size_t nb = comp[i] ? ggml_nbytes(comp[i]) : 0;
+            const int end = last_use[i] < 0 ? (int) C : last_use[i] + 1;
+            int chosen = -1;
+            for (size_t s = 0; s < slots.size(); ++s) {
+                if (!slots[s].used || slots[s].end <= (int) i) { chosen = (int) s; break; }
+            }
+            if (chosen < 0) { chosen = (int) slots.size(); slots.push_back({}); }
+            slot_t & st = slots[chosen];
+            st.used = true;
+            if (nb > st.size) st.size = nb;
+            st.end = std::max(st.end, end);
+            node_slot[i] = chosen;
+        }
+        // assign ascending slot bases (interleaved nodes sharing a slot reuse
+        // the SAME base - the earlier occupant is dead by then, so overwriting
+        // is safe). result_bytes = total across slots (one layer block).
+        std::vector<size_t> slot_base(slots.size(), 0);
+        {
+            size_t acc = 0;
+            for (size_t s = 0; s < slots.size(); ++s) { slot_base[s] = acc; acc += slots[s].size; }
+            ex.result_bytes = acc;
+        }
+        for (size_t i = 0; i < C; ++i) {
+            const int s = node_slot[i];
+            ex.out_off[i] = (int64_t) slot_base[s];
+        }
+        ex.layout_ok = true;
+    }
+#ifdef STREAM_MOE_TEMP
+    if (getenv("STREAM_MOE_CAP_DUMP")) {
+        fprintf(stderr, "\n=== [cap-dump] result-buffer layout (interval, node-level) ===\n");
+        size_t gmax = 0;
+        for (const auto & kv : g_layer_exec) {
+            const moe_layer_exec_t & ex = kv.second;
+            fprintf(stderr, "  L%d: %zu compute, result_bytes=%zu layout_ok=%d\n",
+                    kv.first, ex.compute.size(), ex.result_bytes, (int) ex.layout_ok);
+            for (size_t i = 0; i < ex.compute.size() && i < ex.out_off.size(); ++i) {
+                fprintf(stderr, "    compute#%2zu off=%8lld %-12s %s\n", i,
+                        (long long) ex.out_off[i],
+                        ggml_op_name(ex.compute[i] ? ex.compute[i]->op : GGML_OP_NONE),
+                        ex.compute[i] && ex.compute[i]->name ? ex.compute[i]->name : "(anon)");
+            }
+            if (ex.result_bytes > gmax) gmax = ex.result_bytes;
+        }
+        fprintf(stderr, "[cap-dump] max layer result block = %zu bytes\n", gmax);
+        fflush(stderr);
+    }
+#endif
+
     return true;
 }
 
@@ -422,119 +511,6 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
             g_even_max / (1024 * 1024), g_odd_max / (1024 * 1024),
             (g_even_max + g_odd_max) / (1024 * 1024));
 #endif
-
-    // ---- long-range dependency check: ping-pong clobbers any hidden output
-    // still needed more than one compute step later. If a compute node's data
-    // input (traced through view aliases) comes from compute#j with j < i-1,
-    // fall back to full allocation (each node gets its own byte range).
-    for (auto & kv : by_layer) {
-        const auto & v = kv.second;
-        std::vector<int> comp;
-        for (int idx : v) if (!is_view_op(gf->nodes[idx])) comp.push_back(idx);
-        for (size_t ci = 0; ci < comp.size() && moe_chain_pingpong_ok(); ++ci) {
-            const ggml_tensor * cn = gf->nodes[comp[ci]];
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                const ggml_tensor * t = cn->src[s];
-                if (!t) continue;
-                const ggml_tensor * prod = t;
-                while (prod && is_view_op(prod)) prod = prod->src[0];   // alias -> producer
-                if (!prod) continue;
-                int pi = -1;
-                for (int k = 0; k < N; ++k) if (gf->nodes[k] == prod) { pi = k; break; }
-                if (pi < 0 || !chain[pi]) continue;                      // non-chain input (weights/gate): ok
-                int pcomp = -1;
-                for (size_t k = 0; k < comp.size(); ++k) if (comp[k] == pi) { pcomp = (int) k; break; }
-                if (pcomp >= 0 && (int) ci > pcomp + 1) {
-                    // Weighted/experts outputs are large blocks whose moe_out
-                    // summation reads distinct slices at increasing offsets; the
-                    // ping-pong write only touches the buffer head, so slices are
-                    // read before any clobber (regression-verified). Skip.
-                    if (prod->name && strstr(prod->name, "weighted")) continue;
-                    size_t lsum = 0;
-                    for (int idx : v) if (!is_view_op(gf->nodes[idx])) lsum += ggml_nbytes(gf->nodes[idx]);
-                    fprintf(stderr,
-                        "[route_b_cap] long-range dep: L%d compute#%zu (node %s) reads compute#%d -> full-alloc fallback\n",
-                        kv.first, ci, cn->name ? cn->name : "?", pcomp);
-                    moe_chain_set_full_alloc(lsum);
-                    break;
-                }
-            }
-        }
-    }
-
-    // ---- [CAP-DUMP] closure-internal dependency / last-use analysis ----
-    // Observational only (STREAM_MOE_CAP_DUMP=1 + dbg tag): print each layer's
-    // compute sequence, every chain-internal src edge (consumer compute#c reads
-    // producer compute#p, span = c - p), and each result's LAST consumer index
-    // (last-use = the free moment for buffer reuse). Then exit 0 - do NOT run.
-    // Decides the result-buffer allocator (ping-pong vs interval vs full-alloc)
-    // from real data before writing executor code. 2026-09-05 user decision.
-#ifdef STREAM_MOE_TEMP
-    if (getenv("STREAM_MOE_CAP_DUMP")) {
-        for (auto & kv : by_layer) {
-            const int L = kv.first;
-            const auto & v = kv.second;
-            std::vector<int> comp;          // compute-only node global indices, exec order
-            std::vector<int> comp_of(N, -1);
-            for (int idx : v) {
-                if (is_view_op(gf->nodes[idx])) continue;
-                comp_of[idx] = (int) comp.size();
-                comp.push_back(idx);
-            }
-            const size_t C = comp.size();
-            fprintf(stderr, "\n=== [cap-dump] L%d: %zu compute nodes (exec order) ===\n", L, C);
-            // map global node idx -> exec compute# (producer identity for edges)
-            auto cmp_of = [&](const ggml_tensor * t) -> int {
-                const ggml_tensor * prod = t;
-                while (prod && is_view_op(prod)) prod = prod->src[0];
-                if (!prod) return -1;
-                for (size_t i = 0; i < C; ++i) if (gf->nodes[comp[i]] == prod) return (int) i;
-                return -1;
-            };
-            std::vector<int> last_use(C, -1);
-            // reverse pass: for consumer c (reverse), every producer p it reads
-            // gets last_use updated to c (later iterations only move it earlier,
-            // so scanning reverse keeps the FIRST consumer seen from the end = max).
-            for (int c = (int) C - 1; c >= 0; --c) {
-                const ggml_tensor * cn = gf->nodes[comp[c]];
-                for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                    const int p = cmp_of(cn->src[s]);
-                    if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;  // last (highest) reader
-                }
-            }
-            for (size_t ci = 0; ci < C; ++ci) {
-                const ggml_tensor * cn = gf->nodes[comp[ci]];
-                fprintf(stderr, "  compute#%2zu  %-12s span=%zuB  %s%s\n", ci,
-                        ggml_op_name(cn->op), ggml_nbytes(cn),
-                        cn->name ? cn->name : "(anon)", is_view_op(cn) ? "" : "");
-                // consumers of this result + spans
-                for (size_t cj = 0; cj < C; ++cj) {
-                    const ggml_tensor * c2 = gf->nodes[comp[cj]];
-                    bool reads = false;
-                    for (int s = 0; s < GGML_MAX_SRC; ++s) if (cmp_of(c2->src[s]) == (int) ci) { reads = true; break; }
-                    if (reads) {
-                        const int span = (int) cj - (int) ci;
-                        fprintf(stderr, "         <- consumed by compute#%zu (span +%d)%s\n",
-                                cj, span,
-                                last_use[ci] == (int) cj ? "   [LAST-USE]" : "");
-                    }
-                }
-                if (last_use[ci] < 0 && ci + 1 < C) {
-                    fprintf(stderr, "         (result never consumed inside the layer closure)\n");
-                }
-            }
-            fprintf(stderr, "  --- last-use (free moment, buffer reusable from this point) ---\n");
-            for (size_t ci = 0; ci < C; ++ci) {
-                fprintf(stderr, "    compute#%2zu last_use=%-3s max_span=%d\n", ci,
-                        last_use[ci] < 0 ? "-" : std::to_string(last_use[ci]).c_str(),
-                        last_use[ci] < 0 ? -1 : last_use[ci] - (int) ci);
-            }
-        }
-        fprintf(stderr, "\n[cap-dump] done - exiting (analysis only).\n");
-        fflush(stderr);
-        exit(0);
-    }
-#endif // STREAM_MOE_TEMP
 
     // ---- external-consumer check: no node OUTSIDE the chain may reference a
     // chain node except the moe_out end (which post-norm/dense legitimately

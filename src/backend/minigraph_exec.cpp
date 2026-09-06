@@ -409,14 +409,33 @@ static enum ggml_status exec_split_legacy_impl(
 // get their data pointer refreshed when the producer output lands, so later
 // (even dense-side) readers see the right memory.
 
-// ---- per-layer full-alloc hide (unconditional; burst knows the layer) -----
+// ---- per-layer layout-aware hide (burst knows the layer) ------------------
+// hide_burst routes compute[i]'s output to the layer result block at the
+// verify-computed offset (node-level interval reuse, layout_ok). Fallback when
+// the layer has no usable layout: per-node bump (s_layer_off[layer]).
 static bool hide_burst(ggml_tensor * nd, int32_t layer) {
     ensure_layer_state(layer);
+    const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+    int64_t off = -1;
+    if (ex && ex->layout_ok) {
+        const int32_t idx = moe_chain_layer_index(layer, nd);
+        if (idx >= 0 && idx < (int32_t) ex->out_off.size() && ex->out_off[idx] >= 0) {
+            off = ex->out_off[idx];
+        }
+    }
+    if (off < 0) {
+        // fallback: per-node bump (no verify layout for this layer)
+        const size_t need = ggml_nbytes(nd);
+        void * pb = moe_chain_fullalloc_buffer(s_layer_off[layer] + need);
+        if (!pb) return false;
+        nd->data = static_cast<char*>(pb) + s_layer_off[layer];
+        s_layer_off[layer] += need;
+        return true;
+    }
     const size_t need = ggml_nbytes(nd);
-    void * pb = moe_chain_fullalloc_buffer(s_layer_off[layer] + need);
+    void * pb = moe_chain_fullalloc_buffer(static_cast<size_t>(off) + need);
     if (!pb) return false;
-    nd->data = static_cast<char*>(pb) + s_layer_off[layer];
-    s_layer_off[layer] += need;
+    nd->data = static_cast<char*>(pb) + off;
     return true;
 }
 
@@ -1051,12 +1070,17 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     (void)0;
 
     bool ok = true;
-    // Hidden outputs use the per-layer full-alloc buffer (each compute node its
-    // own range); mm nodes run through exec_mixed_mm (per-pool rounds, CPU or
-    // vulkan) writing back to the hidden host dst, then the weightless chain
-    // runs on the host. The retired whole-layer device-resident executor
-    // (b4-2/C2b4) was removed - it repurposed main-graph tensor buffers.
-    moe_chain_set_full_alloc(lsum);
+    // Hidden outputs use the per-layer result block. When verify produced a
+    // node-level interval layout (layout_ok) the block is sized from it
+    // (result_bytes, ~2-3 slots/layer); otherwise fall back to the full-alloc
+    // sum (every node its own range). mm nodes run through exec_mixed_mm
+    // (per-pool rounds, CPU or vulkan) writing back to the hidden host dst,
+    // then the weightless chain runs on the host.
+    {
+        const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+        const size_t need = (ex && ex->layout_ok) ? ex->result_bytes : lsum;
+        moe_chain_set_full_alloc(need);
+    }
     reset_layer(layer);
 #ifdef STREAM_MOE_TEMP
     {
