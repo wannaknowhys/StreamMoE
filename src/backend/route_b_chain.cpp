@@ -321,6 +321,49 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
                 }
             }
         }
+
+        // ---- external-leaf (input-side) analysis (SS7.6.5) -------------------
+        // Every src of a closure compute node whose producer (views unwrapped)
+        // is NOT a node of this layer's compute sequence is an external leaf:
+        // a llama-side tensor the closure consumes. The per-device graph must
+        // upload or reference these as leaf inputs. Classify by the consuming
+        // op / src slot for the offline dump (no executor change).
+        ex.external_leaves.clear();
+        auto in_compute = [&](const ggml_tensor * p) -> bool {
+            for (const auto * cn : ex.compute) if (cn == p) return true;
+            return false;
+        };
+        for (const auto * cn : ex.compute) {
+            if (!cn) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * t = cn->src[s];
+                if (!t) continue;
+                // unwrap view/layout chain to the producer root
+                const ggml_tensor * p = t;
+                while (p && is_view_op(p)) p = p->src[0];
+                if (!p) continue;
+                if (in_compute(p)) continue;   // chain-internal (or leaf of chain)
+                // external leaf - dedupe by tensor pointer
+                bool seen = false;
+                for (const auto & el : ex.external_leaves)
+                    if (el.tensor == const_cast<ggml_tensor*>(p)) { seen = true; break; }
+                if (seen) continue;
+                const char * role = "other";
+                if (cn->op == GGML_OP_MUL_MAT_ID) {
+                    if (s == 0) role = "w";       // expert weight (pool-shell base)
+                    else if (s == 1) role = "cur"; // activation (norm output)
+                    else if (s == 2) role = "ids"; // routing ids
+                } else if (cn->op == GGML_OP_MUL || cn->op == GGML_OP_GET_ROWS ||
+                           cn->op == GGML_OP_REPEAT) {
+                    role = "scale";               // per-expert scale sources
+                }
+                moe_layer_exec_t::ext_leaf_t el;
+                el.tensor = const_cast<ggml_tensor*>(p);
+                el.role   = role;
+                el.user   = cn->name ? cn->name : ggml_op_name(cn->op);
+                ex.external_leaves.push_back(el);
+            }
+        }
     }
 #ifdef STREAM_MOE_TEMP
     if (getenv("STREAM_MOE_CAP_DUMP")) {
@@ -353,6 +396,20 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
                 fprintf(stderr, "\n");
             }
             if (ex.result_bytes > gmax) gmax = ex.result_bytes;
+            // external leaves consumed by this layer's closure (SS7.6.5)
+            if (!ex.external_leaves.empty()) {
+                fprintf(stderr, "    external leaves (%zu):\n", ex.external_leaves.size());
+                for (const auto & el : ex.external_leaves) {
+                    fprintf(stderr, "      [%s] %-5s used by %-30s ne=[%lld,%lld,%lld] nb=%zu\n",
+                            el.tensor && el.tensor->name ? el.tensor->name : "?",
+                            el.role ? el.role : "?",
+                            el.user ? el.user : "?",
+                            (long long)(el.tensor ? el.tensor->ne[0] : 0),
+                            (long long)(el.tensor ? el.tensor->ne[1] : 0),
+                            (long long)(el.tensor ? el.tensor->ne[2] : 0),
+                            el.tensor ? ggml_nbytes(el.tensor) : 0);
+                }
+            }
         }
         fprintf(stderr, "[cap-dump] max layer result block = %zu bytes\n", gmax);
         fflush(stderr);

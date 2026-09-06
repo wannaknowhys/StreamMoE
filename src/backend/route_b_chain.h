@@ -82,6 +82,18 @@ struct moe_layer_exec_t {
     std::vector<int64_t> out_off;     // aligned with compute
     size_t               result_bytes = 0;   // layer result buffer size (max over compute)
     bool                 layout_ok    = false;
+    // External leaves consumed by the closure (verify input-side analysis,
+    // SS7.6.5): srcs of closure compute nodes whose producer (after unwrapping
+    // views) is NOT inside this layer's compute sequence. These are the llama-
+    // side tensors a per-device graph must upload / reference as leaf inputs
+    // (cur, ids/routing, scale/weight sources). role tags what the consuming
+    // mm (or weightless) node used it for, for the offline dump.
+    struct ext_leaf_t {
+        ggml_tensor * tensor = nullptr;
+        const char  * role   = nullptr;   // "cur" / "ids" / "w" / "scale" / "other"
+        const char  * user   = nullptr;   // consuming node's name / op
+    };
+    std::vector<ext_leaf_t> external_leaves;
 };
 // Layer of the privatised exec sequence containing `node` (pointer match), or
 // -1 when `node` is not a captured privatised compute node.
