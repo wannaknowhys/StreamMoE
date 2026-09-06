@@ -625,17 +625,65 @@ transport itself is GPU-phase work only.
    sum over its k columns), NOT per-column scatter. Host adds only the
    accumulators of devices that actually had buckets (uninvolved regions must
    be untouched or zeroed - garbage must never be folded in).
-5. **verify needs an EXTERNAL-LEAF (input-side) analysis - not yet implemented.**
-   Current verify only checks the OUTPUT side (SS7.4/route_b_chain.cpp 608-630:
-   no chain node referenced by an external consumer except moe_out). The INPUT
-   side is not enumerated: which tensors the closure consumes that are NOT in
-   the closure (producer outside the chain, unwrap views to the root). Needed
-   for per-device graph construction (which llama tensors must be uploaded /
-   referenced as leaves). At minimum: cur (norm output per layer, must be
-   uploaded), ids/routing (gating output), expert weight columns (pool shells),
-   scale/weights sources. Design: walk every closure compute node's srcs; a src
-   whose producer is not in the closure is an external leaf; classify after
-   unwrapping views.
+5. **verify external-leaf (input-side) analysis - IMPLEMENTED (5987048).**
+   `moe_layer_exec_t.external_leaves` lists every closure compute src whose
+   producer (views unwrapped) is NOT inside the layer's compute sequence,
+   classified by consuming op/src slot (w / cur / ids / scale / other). Dumped
+   under STREAM_MOE_CAP_DUMP. Measured: gemma 6 leaves/layer (2 w shells - fused
+   gate_up + down; cur = per-layer norm output; ids = argsort; 2 scale),
+   deepseek 6 leaves/layer but 3 w shells (gate + up + down split). These are
+   the llama-side tensors a per-device graph uploads / references as leaves.
 
-Next step: implement the external-leaf list in verify (pure analysis, dumpable,
-no executor change).
+6. **Bucket-tail merge is ggml-native and GPU-runnable (verified 2026-09-06).**
+   The bucket-tail conversion `weighted [d_out, w_b, n_active]` into the
+   accumulator is NOT a view problem (view = affine strided slice only; cannot
+   reduce or scatter arbitrarily). Two clean primitives cover it:
+   - bucket-internal sum over w (the per-token expert part-sums): `ggml_permute`
+     (view-only, moves the w axis to ne0) + `ggml_sum_rows` -> `[d_out, n_active]`.
+     permute/sum_rows are native CPU + vulkan (SUMM_ROWS in supports_op).
+   - placing those columns into the `[d_out, n_t]` accumulator: `ggml_acc`
+     (= GGML_OP_ACC, CPU ops.cpp:1156 + vulkan supports). Semantics verified
+     byte-identical against a manual loop: dst[offset + i*nb] += src1[i] for
+     every src1 element; nb1 = col_stride * d_out * esize, offset selects the
+     start. So a strided/contiguous scatter-add is a single acc node - this is
+     the SPARSE form of the dense 0/1 selection-matrix multiply (which ggml
+     cannot express sparsely and would cost d_out*n_active*n_t flops vs
+     d_out*n_active for acc).
+   Constraint: one acc expresses one arithmetic-progression column map
+   `t = t0 + a*stride` (acc src1 may be 2D/3D so nb1/nb2/nb3 give an
+   arithmetic GRID); arbitrary-scattered token sets need one acc per
+   segment (inplace, chained on the same accumulator) or host fold.
+
+## 7.7 Reduction re-partition: the cross-device accumulator in reduction terms
+
+The anonymous per-token cross-expert fold is the per-token reduction over its
+routed experts (llama-graph.cpp 2274-2304):
+
+```
+moe_out[t] = sum_{k in topk(t)} contrib(k, t)        // reduction domain = experts
+```
+
+Multi-device re-partitions the SAME reduction by associativity (only float
+summation order changes - relaxed gate, SS7.3):
+
+```
+moe_out[t] = sum_{d in devices}  acc_d[t]
+acc_d[t]   = sum_{k in topk(t) ∩ device_d}  contrib(k, t)   // expert axis contracted
+```
+
+Terminology:
+- **acc_d = per-device partial sum** (local accumulator, SS7.6.1). The expert /
+  routed-expert axis is CONTRACTED (reduced away); the accumulator shape
+  `[d_out, n_t]` is ISOMORPHIC to the anonymous-fold output - it is that fold's
+  partial-reduction result on one device.
+- Whole transform = **two-stage / hierarchical reduction**: stage 1 =
+  partial fold over the device's routed experts (device graph tail), stage 2 =
+  cross-device fold over the participating devices (host / exit).
+- "from summing over experts to summing over devices" = **reduction
+  re-partition**: fold leaves go from n_experts to n_devices, each leaf already
+  a reduced partial sum.
+
+Next: CPU virtual two-bucket experiment (full tokens, k split into two buckets,
+each bucket runs its compact chain, bucket-tail sum_w -> per-device partial sum
+column (expert width 1), both added to the accumulator = moe_out equivalent;
+numerics vs moe_out under the relaxed gate).

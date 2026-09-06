@@ -378,11 +378,43 @@ CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器
 4. **跨 device 折叠 = CPU 只加本次涉及 device 的部分和**。device 图尾 = 覆盖写自己的累加器（对它的
    k 列的部分和），**不是逐列 scatter**。host 只加"本次真的有桶的 device"的累加器（未参与区必须
    不碰或清零——垃圾绝不能混入折叠）。
-5. **verify 需要 external-leaf（输入侧）分析——还没实现**。当前 verify 只查输出侧（§7.4 /
-   route_b_chain.cpp 608-630：除 moe_out 外无链外消费者引用链节点）。输入侧没枚举：闭包消费了哪些
-   **不在闭包内**的张量（producer 在链外，剥 view 到根）。per-device 建图需要它（哪些 llama 张量
-   要上传/当 leaf 引用）。至少：cur（norm 输出每层一个，要上传）、ids/路由（gating 输出）、专家权重
-   列（池壳）、scale/weights 源。设计：遍历闭包 compute 的 src，producer 不在闭包内的 = 外部 leaf，
-   剥 view 后分类。
+5. **verify external-leaf（输入侧）分析——已实现（5987048）**。
+   `moe_layer_exec_t.external_leaves` 列出每个闭包 compute src 中、剥 view 后 producer **不在本层
+   compute 序列**的张量，按消费 op/src 槽分类（w / cur / ids / scale / other）。STREAM_MOE_CAP_DUMP
+   下可打印。实测：gemma 每层 6 个（2 个 w 壳——融合 gate_up + down；cur = 每层 norm 输出；ids =
+   argsort；2 个 scale）；deepseek 每层也是 6 个但 **3 个 w 壳**（gate + up + down 分离）。这些就是
+   per-device 图要上传/引用的 llama 侧 leaf。
+6. **桶尾归并是 ggml 原生且 GPU 可跑（2026-09-06 验证）**。桶尾把 `weighted [d_out, w_b, n_active]`
+   转换进累加器**不是 view 问题**（view = 仿射定步长切片，不能 reduce 也不能任意 scatter）。两个干净
+   原语覆盖：
+   - 桶内 Σ_w（每 token 的专家部分和）：`ggml_permute`（view-only，把 w 轴挪到 ne0）+ `ggml_sum_rows`
+     → `[d_out, n_active]`。permute/sum_rows 是 CPU + vulkan 原生（supports_op 有 SUM_ROWS）。
+   - 把这些列放进 `[d_out, n_t]` 累加器：`ggml_acc`（= GGML_OP_ACC，CPU ops.cpp:1156 + vulkan
+     supports）。语义已对拍手动循环**逐字节一致**：对 src1 每元素 `dst[offset + i·nb] += src1[i]`；
+     `nb1 = 列跨度 × d_out × esize`、offset 定起点。所以定步长/连续的 scatter-add 是**单个 acc 节点**——
+     这是稠密 0/1 选择矩阵乘的**稀疏形式**（ggml 无法稀疏表达，稠密要 d_out×n_active×n_t flops，
+     acc 只要 d_out×n_active）。
+   约束：单个 acc 表达一个**等差列映射** `t = t0 + a·stride`（acc 的 src1 可 2D/3D，nb1/nb2/nb3 给出
+   等差**网格**）；任意散列 token 集需要每段一个 acc（inplace、链在同一个累加器上）或 host 折叠。
 
-下一步：在 verify 实现 external-leaf 清单（纯分析，可 dump，不动 executor）。
+## 7.7 归约重分组：用归约术语表述跨 device 累加器
+
+匿名 per-token 跨专家折叠 = 对每 token 在其路由专家上做归约（llama-graph.cpp 2274-2304）：
+```
+moe_out[t] = Σ_{k ∈ topk(t)}  contrib(k, t)        // 归约域 = 专家
+```
+多 device 靠结合律重排同一归约（只差浮点求和顺序——宽松 gate，§7.3）：
+```
+moe_out[t] = Σ_{d ∈ devices}  acc_d[t]
+acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收缩
+```
+术语：
+- **acc_d = per-device 部分和**（局部累加器，§7.6.1）。专家/路由轴被**收缩（reduce away）**；累加器形状
+  `[d_out, n_t]` 与匿名折叠输出**同构**——它是该折叠在单 device 上的**部分归约结果**。
+- 整体 = **两阶段/分层归约（two-stage / hierarchical reduction）**：stage 1 = device 图尾对该 device
+  路由专家的**局部归约**；stage 2 = 出口对参与 device 的**跨 device 归约**。
+- "从按专家累加变成按 device 累加" = **归约重分组（reduction re-partition）**：折叠树叶数从 n_experts
+  变 n_devices，每叶本身已是归约好的部分和。
+
+下一步：CPU 虚拟两桶实验（满 token、k 切成两桶；每桶跑自己的 compact 链、桶尾 Σ_w → 每桶一个专家宽
+度 1 的全 token 列；两桶都加进累加器 = moe_out 等价；对 moe_out 过宽松 gate）。
