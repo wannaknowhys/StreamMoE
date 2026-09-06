@@ -250,37 +250,74 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
                 if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;
             }
         }
-        struct slot_t { size_t size = 0; int end = 0; bool used = false; };
-        std::vector<slot_t> slots;
-        std::vector<int> node_slot(C, -1);
-        for (size_t i = 0; i < C; ++i) {
-            const size_t nb = comp[i] ? ggml_nbytes(comp[i]) : 0;
-            const int end = last_use[i] < 0 ? (int) C : last_use[i] + 1;
-            int chosen = -1;
-            for (size_t s = 0; s < slots.size(); ++s) {
-                if (!slots[s].used || slots[s].end <= (int) i) { chosen = (int) s; break; }
+        // Result-buffer layout by best-fit decreasing (offline interval packing,
+        // docs layout_sim sim.js): place nodes in size-descending order; each
+        // node gets the lowest offset whose byte range does not collide with any
+        // already-placed result whose live interval [i, last_use] overlaps it.
+        // Larger blocks land first so small blocks fill the gaps left behind -
+        // reaches the lower bound (peak simultaneous-live bytes) on gemma and
+        // deepseek (~6-20% below the old exec-order first-fit slot allocator).
+        // Outputs absolute per-node offsets into one per-layer block.
+        struct blk_t { int64_t off = 0; size_t size = 0; int start = 0, end = 0; };
+        std::vector<int> order(C);
+        for (size_t i = 0; i < C; ++i) order[i] = (int) i;
+        std::sort(order.begin(), order.end(), [&](int x, int y) {
+            const size_t sx = comp[x] ? ggml_nbytes(comp[x]) : 0;
+            const size_t sy = comp[y] ? ggml_nbytes(comp[y]) : 0;
+            if (sx != sy) return sx > sy;             // larger first
+            return x < y;
+        });
+        std::vector<blk_t> placed;
+        int64_t arena = 0;
+        for (const int ni : order) {
+            const size_t nb = comp[ni] ? ggml_nbytes(comp[ni]) : 0;
+            const int start = ni;
+            const int end = last_use[ni] < 0 ? (int) C : last_use[ni];
+            int64_t off = 0;
+            for (;;) {
+                // blocks whose interval overlaps [start,end] AND whose bytes
+                // overlap [off, off+nb) block this offset
+                int64_t furthest = -1;
+                for (const auto & p : placed) {
+                    const bool t_ov = !(end < p.start || p.end < start);
+                    if (!t_ov) continue;
+                    const bool s_ov = off < (int64_t)(p.off + (int64_t) p.size) &&
+                                      (int64_t) p.off < off + (int64_t) nb;
+                    if (s_ov) furthest = std::max(furthest, p.off + (int64_t) p.size);
+                }
+                if (furthest < 0) break;   // no overlapping block: this off fits
+                off = furthest;            // jump past the blocker
             }
-            if (chosen < 0) { chosen = (int) slots.size(); slots.push_back({}); }
-            slot_t & st = slots[chosen];
-            st.used = true;
-            if (nb > st.size) st.size = nb;
-            st.end = std::max(st.end, end);
-            node_slot[i] = chosen;
-        }
-        // assign ascending slot bases (interleaved nodes sharing a slot reuse
-        // the SAME base - the earlier occupant is dead by then, so overwriting
-        // is safe). result_bytes = total across slots (one layer block).
-        std::vector<size_t> slot_base(slots.size(), 0);
-        {
-            size_t acc = 0;
-            for (size_t s = 0; s < slots.size(); ++s) { slot_base[s] = acc; acc += slots[s].size; }
-            ex.result_bytes = acc;
+            placed.push_back({ off, nb, start, end });
+            arena = std::max(arena, off + (int64_t) nb);
         }
         for (size_t i = 0; i < C; ++i) {
-            const int s = node_slot[i];
-            ex.out_off[i] = (int64_t) slot_base[s];
+            // recover per-node offset from placed (order maps to node id)
+            for (const auto & p : placed) if (p.start == (int) i) { ex.out_off[i] = p.off; break; }
         }
+        // ---- layout self-check (always): results whose live intervals overlap
+        // in exec time must not share byte ranges. Violation -> per-node bump.
+        ex.result_bytes = (size_t) arena;
         ex.layout_ok = true;
+        for (size_t a = 0; a < C && ex.layout_ok; ++a) {
+            for (size_t b = a + 1; b < C; ++b) {
+                const int la = last_use[a] < 0 ? (int) C : last_use[a];
+                const int lb = last_use[b] < 0 ? (int) C : last_use[b];
+                if (!(!((int) a > lb || (int) b > la))) continue;   // time-disjoint: ok
+                const int64_t oa = ex.out_off[a], ob = ex.out_off[b];
+                const size_t sa = comp[a] ? ggml_nbytes(comp[a]) : 0;
+                const size_t sb = comp[b] ? ggml_nbytes(comp[b]) : 0;
+                const bool space_overlap = !((int64_t)(oa + (int64_t) sa) <= ob ||
+                                             (int64_t)(ob + (int64_t) sb) <= oa);
+                if (space_overlap) {
+                    fprintf(stderr,
+                        "[route_b_cap] LAYOUT CLASH: L%d node a=%zu(last %d,off %lld,sz %zu) "
+                        "overlaps b=%zu(last %d,off %lld,sz %zu)\n",
+                        kv.first, a, la, (long long) oa, sa, b, lb, (long long) ob, sb);
+                    ex.layout_ok = false;
+                }
+            }
+        }
     }
 #ifdef STREAM_MOE_TEMP
     if (getenv("STREAM_MOE_CAP_DUMP")) {
@@ -288,18 +325,71 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         size_t gmax = 0;
         for (const auto & kv : g_layer_exec) {
             const moe_layer_exec_t & ex = kv.second;
-            fprintf(stderr, "  L%d: %zu compute, result_bytes=%zu layout_ok=%d\n",
-                    kv.first, ex.compute.size(), ex.result_bytes, (int) ex.layout_ok);
-            for (size_t i = 0; i < ex.compute.size() && i < ex.out_off.size(); ++i) {
-                fprintf(stderr, "    compute#%2zu off=%8lld %-12s %s\n", i,
-                        (long long) ex.out_off[i],
-                        ggml_op_name(ex.compute[i] ? ex.compute[i]->op : GGML_OP_NONE),
-                        ex.compute[i] && ex.compute[i]->name ? ex.compute[i]->name : "(anon)");
+            size_t sum_all = 0;   // full-alloc reference (every node its own block)
+            for (const auto * nd : ex.compute) sum_all += nd ? ggml_nbytes(nd) : 0;
+            fprintf(stderr, "  L%d: %zu compute, layout=%zuB  full-alloc(ref)=%zuB  (interval saves %.0f%%)\n",
+                    kv.first, ex.compute.size(), ex.result_bytes, sum_all,
+                    sum_all ? 100.0 * (1.0 - (double) ex.result_bytes / (double) sum_all) : 0.0);
+            // group nodes by out_off (== same reuse slot), print each slot's
+            // occupants and their individual bytes to expose per-slot waste
+            // (slot is sized to its largest occupant; smaller reusees overlap).
+            std::map<int64_t, std::vector<size_t>> by_off;
+            for (size_t i = 0; i < ex.compute.size(); ++i) {
+                if (i < ex.out_off.size()) by_off[ex.out_off[i]].push_back(i);
+            }
+            size_t slot_n = 0;
+            for (const auto & b : by_off) {
+                fprintf(stderr, "    slot#%zu @ off=%-8lld size=%zu occupants=",
+                        slot_n++, (long long) b.first,
+                        [&] { size_t m = 0; for (auto i : b.second) m = std::max(m, ggml_nbytes(ex.compute[i])); return m; }());
+                for (size_t k = 0; k < b.second.size(); ++k) {
+                    const size_t i = b.second[k];
+                    const ggml_tensor * nd = ex.compute[i];
+                    fprintf(stderr, "%s%s(%zuB)", k ? "," : "", nd && nd->name ? nd->name : "?", ggml_nbytes(nd));
+                }
+                fprintf(stderr, "\n");
             }
             if (ex.result_bytes > gmax) gmax = ex.result_bytes;
         }
         fprintf(stderr, "[cap-dump] max layer result block = %zu bytes\n", gmax);
         fflush(stderr);
+    }
+    // Machine-readable export for the offline layout simulator
+    // (diagnostics/layout_sim): one row per compute node.
+    //   layer,exec_idx,name,op,bytes,last_use
+    // last_use = index of the LAST node that reads this result (-1 if never read
+    // inside the layer = live to the end). Interval is [exec_idx, last_use].
+    if (getenv("STREAM_MOE_CAP_CSV")) {
+        fprintf(stdout, "#layer,exec_idx,name,op,bytes,last_use\n");
+        for (const auto & kv : g_layer_exec) {
+            const moe_layer_exec_t & ex = kv.second;
+            const auto & comp = ex.compute;
+            const size_t C = comp.size();
+            if (C == 0) continue;
+            auto prod_of = [&](const ggml_tensor * t) -> int {
+                const ggml_tensor * p = t;
+                while (p && is_view_op(p)) p = p->src[0];
+                if (!p) return -1;
+                for (size_t i = 0; i < C; ++i) if (comp[i] == p) return (int) i;
+                return -1;
+            };
+            std::vector<int> last_use(C, -1);
+            for (int c = (int) C - 1; c >= 0; --c)
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const int p = prod_of(comp[c] ? comp[c]->src[s] : nullptr);
+                    if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;
+                }
+            for (size_t i = 0; i < C; ++i) {
+                const ggml_tensor * nd = comp[i];
+                fprintf(stdout, "%d,%zu,%s,%s,%zu,%d\n",
+                        kv.first, i,
+                        nd && nd->name ? nd->name : "(anon)",
+                        nd ? ggml_op_name(nd->op) : "?",
+                        nd ? ggml_nbytes(nd) : 0,
+                        last_use[i]);
+            }
+        }
+        fflush(stdout);
     }
 #endif
 
