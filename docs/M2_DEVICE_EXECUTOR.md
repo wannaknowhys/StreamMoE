@@ -478,3 +478,14 @@ keep and reuse, no per-layer free:
 Both resources are per-device: bucket-chain intermediates placed per the
 verify layout inside the device's arena block; the accumulator is that
 device's own output region.
+
+**Relaxed-gate calibration (measured 2026-09-06, 129-token gemma L0 dumps,
+temp/bucket_acc_calib.js)**: the accumulator is CONSTRUCTIVELY identical to
+llama's linear per-k fold (k-order reference reproduces moe_out byte-for-byte,
+0 diff). Reordering the fold changes only float summation order:
+- `buckets 2+3+rest natural` (same-bucket k stays ascending) = 0 diff - real
+  peel buckets that preserve in-bucket k order are EXACT;
+- any cross-bucket reorder / shuffle: maxAbs <= 7.6e-6 (~1 f32 ulp of the
+  value scale), cos = 1.000000000, ~55% of elements differ by exactly 1 ulp;
+- per-token random shuffle worst case: maxAbs <= 3.8e-6.
+Gate to use downstream: **maxAbs <= 1e-5 (f32 1-2 ulp), cos ~= 1.0**.

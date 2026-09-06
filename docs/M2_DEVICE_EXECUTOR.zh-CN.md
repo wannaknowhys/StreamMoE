@@ -277,3 +277,12 @@ per-device 资源生命周期（arena + 累加器）——用户确认：可常�
 
 两者都 per-device：桶链中间量按 verify 布局放进 device 的 arena 块；累加器即该 device 自己的
 输出区。
+
+**宽松 gate 标定（2026-09-06 实测，129-token gemma L0 dump，temp/bucket_acc_calib.js）**：
+累加器与 llama 线性逐 k 折叠**构造性等价**（k 序参考逐字节复现 moe_out，0 差）。重排折叠序只
+改浮点求和顺序：
+- `buckets 2+3+rest natural`（同桶内 k 保持升序）= 0 差——真实 peel 桶若保持桶内 k 序则**精确**；
+- 任意跨桶重排/shuffle：maxAbs ≤ 7.6e-6（值尺度约 1 f32 ulp），cos = 1.000000000，~55% 元素恰差
+  1 ulp；
+- per-token 全随机 shuffle 最坏情形：maxAbs ≤ 3.8e-6。
+后续数值门建议用：**maxAbs ≤ 1e-5（f32 1-2 ulp），cos ≈ 1.0**。
