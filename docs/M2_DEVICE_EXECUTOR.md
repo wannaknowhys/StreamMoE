@@ -414,3 +414,67 @@ Downstream implications:
   bytes scale linearly with the device's column span when reduced shapes run
   (deferred to the GPU bucket phase - CPU phase 1 stays full-width and only
   validates numerics).
+
+## 7.3 CPU phase-1 prototype: whole-layer burst graph + per-device accumulator
+##     (user decision 2026-09-06)
+
+SUPERSEDES the CPU-phase-1 remark in SS7.2 ("scatter re-materialises full k
+rows, let the captured anonymous ADD tree run unchanged"). The user wants the
+FINAL shape exercised on CPU from the start: llama's graph is ALL no-op except
+its entry and exit, and one burst graph per layer runs every bucket's chain
+plus one dedicated accumulator that REPLACES the anonymous per-topk fold.
+
+Anatomy of the anonymous fold (verified, llama-graph.cpp ~2289): it is a
+SEQUENTIAL per-k accumulation, not a binary tree:
+`moe_out = cur_experts[0]; for i = 1..n_k-1: moe_out += view_2d(experts, i)`.
+So an accumulator that adds contribution columns row by row is the SAME shape
+of computation - only the ORDER differs (bucket order vs k order), which lands
+inside the accepted relaxed gate.
+
+Exec-time flow (one layer burst):
+
+1. Entry (first privatised split of the layer) triggers the burst:
+   - pin_layer the layer's whole active expert set (existing M5 single-pass);
+     afterwards every expert's owning pool/device is known.
+   - Build the buckets from the (token, pool) hit-count peel; the plan is
+     computed ONCE and reused across the layer's mm nodes (same ids).
+   - Assemble ONE graph holding every bucket chain, serialised (manual
+     `out_off` region reuse per SS7.2.1), plus one per-device ACCUMULATOR
+     buffer `[d_out, n_t]`. Each bucket chain = compact-column
+     gate/up mm -> clamp/glu -> down mm -> scale; its tail ADDs (by the
+     bucket's (t,k) scatter map) the weighted contribution columns into the
+     accumulator rows. Accumulation order = bucket order, NOT llama's k order
+     -> ULP-level difference vs the baseline is EXPECTED and ACCEPTED: the
+     numeric gate is relaxed (epsilon / structural equality), not bit
+     IDENTICAL.
+   - Run one CPU graph_compute.
+2. Middle privatised splits of the same layer: no-op (already the case).
+3. Exit (moe_out split / burst tail): memcpy the accumulator into the main-
+   graph moe_out dst (llama owns that buffer; it is never hidden).
+
+This burst graph is the CPU prototype of ONE device running ONE whole layer.
+Once it matches, the GPU phase copies the same construction per device: the
+device's bucket chains feed that device's OWN accumulator (= the SS7.2 output
+region), and the exit becomes the converge step reading every device's
+accumulator and merging. No second design pass.
+
+Per-device resource lifecycle (arena + accumulator) - user confirmed, OK to
+keep and reuse, no per-layer free:
+
+- **Per-device arena** (verify layout `out_off[]` / `result_bytes`):
+  process-lifetime, grow-only, reused across layers by offset reset
+  (`reset_layer`) + overwrite - the same mode as today's `g_fullalloc_buf`.
+  Reuse is safe ONLY because a layer ends with full sync (graph_compute
+  returns after the converge). Release point = device teardown / process exit.
+- **Per-device accumulator** `[d_out, n_t]`: process-lifetime, grow-only
+  (d_out fixed; n_t grows with the largest ubatch seen). MUST be zeroed before
+  each layer - accumulation is `dst[t] += col`, and a token row that no bucket
+  touched this layer would otherwise keep stale upper-layer data. One
+  `d_out x n_t` memset per layer, cheap.
+- No per-layer free of either. Future async cross-layer overlap needs per-
+  device ping-pong pairs (SS3/SS4 minimum) - M2-2 work, not now. Both are held
+  per device (the existing `device_exec_ctx_t` / `g_dev_execs`).
+
+Both resources are per-device: bucket-chain intermediates placed per the
+verify layout inside the device's arena block; the accumulator is that
+device's own output region.

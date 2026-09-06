@@ -236,3 +236,44 @@ sim.js 可验证），再在其上加异步骨架。
 - 设备端桶链用**降维列形状**（mm 输出 [d, w_b, n_active]，非满 [d, n_k, n_t]）；verify 算的
   满宽字节级 `out_off` 因此不直接是桶节点的字节布局。继承的是 interval/槽**结构**；跑降维形状时
   per-device arena 字节按设备列跨度线性缩放（推迟到 GPU 桶阶段——CPU phase 1 保持满宽只验数值）。
+
+## 7.3 CPU phase-1 原型：整层 burst 图 + per-device 累加器（2026-09-06 用户决策）
+
+**SUPERSEDE** §7.2 里"CPU phase 1：scatter 凑齐 k 行、让捕获的匿名 ADD 树原样跑"的说法。用户要
+从一开始就在 CPU 上练**终态**：llama 图除入口与出口外全 no-op，一层一张 burst 图跑所有桶链 + 一个
+专用累加器，累加器**取代**匿名 per-topk 折叠。
+
+匿名折叠的真实结构（已核实 llama-graph.cpp ~2289）：是**逐 k 顺序累加、非二叉树**——
+`moe_out = cur_experts[0]; for i = 1..n_k-1: moe_out += view_2d(experts, i)`。所以累加器逐行加
+贡献列与它是**同构计算**——只差顺序（桶序 vs k 序），落在已接受的宽松 gate 内。
+
+exec-time 流程（一层 burst）：
+1. **入口**（层首个私有 split）触发 burst：
+   - pin_layer 整层激活专家（现有 M5 单程）→ 之后每专家所属 pool/device 已知；
+   - 按 (token,pool) 命中数 peel 算桶；计划**算一次**、跨层内各 mm 复用（同 ids）；
+   - 拼**一张图**装所有桶链（串行，手动 `out_off` 区复用，§7.2.1）+ 一个 per-device
+     **累加器** `[d_out, n_t]`。每桶链 = 紧凑列 gate/up mm → clamp/glu → down mm → scale；
+     链尾按该桶 (t,k) scatter 映射把加权贡献列 **add 进累加器行**。累加顺序 = 桶序（非 llama
+     k 序）→ 对基线有 ULP 级差异是**预期且接受**：数值门放宽（epsilon / 结构等价），非 bit
+     IDENTICAL；
+   - 一次 CPU graph_compute。
+2. 同层中间私有 split：no-op（现已是）。
+3. **出口**（moe_out split / burst 尾）：累加器 memcpy → 主图 moe_out dst（llama 拥有的
+   buffer，从不 hide）。
+
+这张 burst 图 = **一个 device 跑一整个层**的 CPU 原型。调通后 GPU 阶段每 device 照抄同一构造：
+device 的桶链喂进该 device **自己的**累加器（= §7.2 输出区），出口换成 converge 读各 device
+累加器 merge。无需二次设计。
+
+per-device 资源生命周期（arena + 累加器）——用户确认：可常驻可复用，无逐层释放：
+- **per-device arena**（verify 布局 `out_off[]`/`result_bytes`）：进程常驻、grow-only，跨层靠
+  offset 归零（`reset_layer`）+ 覆盖复用——与现在 `g_fullalloc_buf` 同模式。复用安全只因层结束
+  = 全同步（graph_compute 在 converge 后返回）。释放点 = 设备销毁/进程退出。
+- **per-device 累加器** `[d_out, n_t]`：进程常驻、grow-only（d_out 固定；n_t 随最大 ubatch
+  grow）。**每层前必须清零**——累加是 `dst[t] += col`，本层没被任何桶写到的 token 行会残留上层
+  数据。每层一次 `d_out x n_t` memset，很便宜。
+- 两者都不逐层 free。未来 async 跨层重叠需要 per-device ping-pong 对（§3/§4 最小值）——M2-2
+  的事，现在不做。两者都挂 per-device（现有 `device_exec_ctx_t` / `g_dev_execs`）。
+
+两者都 per-device：桶链中间量按 verify 布局放进 device 的 arena 块；累加器即该 device 自己的
+输出区。
