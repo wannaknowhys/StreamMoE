@@ -359,3 +359,30 @@ v2r cached-staging DMA 通道。
 
 CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器折叠的**数值**（对 dump/基线）；DMA
 传输本身只属 GPU 阶段。
+
+## 7.6 §7.5 后的澄清（2026-09-06）——累加器在 device 端、它就是匿名折叠；需
+##     external-leaf 分析
+
+1. **per-device 累加器在 DEVICE 上，不在 host RAM**。修正 §7.5"折进累加器在 host RAM 做"的措辞。
+   每个有桶的 device 拥有一个专属 `[d_out, n_t]` 区（device 驻留输出块）。它存在是因为 device
+   **增量折叠**自己的桶：多个桶算完就加进同一区（等全部桶算完会逼你缓冲每桶贡献）。跨到 host 的
+   是 device 累加器的**连续** `[d_out, n_t]` 部分和块，DMA 异步（§7.5 传输规则照用）。
+2. **累加器大小与专家无关**——只有 `[d_out, n_t]`（d_out 常数、n_t=ubatch token）。MoE 输出 = 每
+   token 对其路由专家求和（Σ over k）；k 维被折掉，只剩 token 维。专家/桶/device 数只影响"哪些列
+   加进 t 行"，从不影响累加器形状。
+3. **累加器就是匿名 per-topk 折叠（同一数据结构）**。dump 证实：每个匿名 ADD 输出与 moe_out 都是
+   **连续** `[d_out, n_t]`（weighted 是 `[d_out, n_k, n_t]`；llama-graph.cpp 2274-2304 逐 k 切 view
+   相加）。moe_out 的 dst 就是单 device（全列）情形下累加器的实例。所以 per-device 累加器 = 匿名
+   折叠在该 device 的 k 列上的一份；跨 device CPU 加各部分和 = 补全同一折叠的其余 add（与
+   moe_out = Σ_k weighted 位同构，宽松 gate 见 §7.3）。
+4. **跨 device 折叠 = CPU 只加本次涉及 device 的部分和**。device 图尾 = 覆盖写自己的累加器（对它的
+   k 列的部分和），**不是逐列 scatter**。host 只加"本次真的有桶的 device"的累加器（未参与区必须
+   不碰或清零——垃圾绝不能混入折叠）。
+5. **verify 需要 external-leaf（输入侧）分析——还没实现**。当前 verify 只查输出侧（§7.4 /
+   route_b_chain.cpp 608-630：除 moe_out 外无链外消费者引用链节点）。输入侧没枚举：闭包消费了哪些
+   **不在闭包内**的张量（producer 在链外，剥 view 到根）。per-device 建图需要它（哪些 llama 张量
+   要上传/当 leaf 引用）。至少：cur（norm 输出每层一个，要上传）、ids/路由（gating 输出）、专家权重
+   列（池壳）、scale/weights 源。设计：遍历闭包 compute 的 src，producer 不在闭包内的 = 外部 leaf，
+   剥 view 后分类。
+
+下一步：在 verify 实现 external-leaf 清单（纯分析，可 dump，不动 executor）。

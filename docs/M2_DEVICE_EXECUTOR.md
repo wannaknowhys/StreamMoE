@@ -595,3 +595,47 @@ The v2r cached-staging DMA channel is the transport.
 CPU phase cannot fake the DMA (principle 11): it validates the NUMERICS of
 compact bucket chains + accumulator folding against dumps/baselines; the DMA
 transport itself is GPU-phase work only.
+
+## 7.6 Clarifications after 7.5 (2026-09-06) - accumulator is ON DEVICE, and it
+##     IS the anonymous fold; external-leaf analysis needed
+
+1. **The per-device accumulator lives on the DEVICE, not in host RAM.** This
+   corrects the SS7.5 wording ("fold into the accumulator happens on host RAM").
+   Every device that has buckets owns a dedicated `[d_out, n_t]` region (its
+   device-resident output block). It exists because a device folds its buckets
+   INCREMENTALLY: multiple buckets per device add into the same region as they
+   complete (waiting for all buckets would force buffering every bucket's
+   contribution). What crosses to host is the device accumulator's CONTIGUOUS
+   `[d_out, n_t]` partial-sum block, DMA async (SS7.5 transport rules hold).
+2. **The accumulator is size-independent of experts** - only `[d_out, n_t]`
+   (d_out constant, n_t = ubatch tokens). MoE output = per-token sum over its
+   routed experts (sum over k); the k dimension is folded away, only the token
+   dimension remains. Expert/bucket/device counts affect WHICH columns add into
+   a t row, never the accumulator shape.
+3. **The accumulator IS the anonymous per-topk fold (same data structure).**
+   Verified from dumps: every anonymous ADD output and moe_out is a CONTIGUOUS
+   `[d_out, n_t]` tensor (weighted is `[d_out, n_k, n_t]`, llama-graph.cpp
+   2274-2304 slices per-k views and adds). moe_out's dst is the single-device
+   (full-column) instance of the accumulator. So a per-device accumulator =
+   one instance of the anonymous fold over THAT device's k columns; cross-device
+   CPU addition of the partial sums completes the remaining adds of the same
+   fold (bit-isomorphic to moe_out = sum_k weighted, per SS7.3 relaxed gate).
+4. **Cross-device fold = CPU sums the partial sums of the devices INVOLVED this
+   batch.** Device graph tail = overwrite-write its own accumulator (partial
+   sum over its k columns), NOT per-column scatter. Host adds only the
+   accumulators of devices that actually had buckets (uninvolved regions must
+   be untouched or zeroed - garbage must never be folded in).
+5. **verify needs an EXTERNAL-LEAF (input-side) analysis - not yet implemented.**
+   Current verify only checks the OUTPUT side (SS7.4/route_b_chain.cpp 608-630:
+   no chain node referenced by an external consumer except moe_out). The INPUT
+   side is not enumerated: which tensors the closure consumes that are NOT in
+   the closure (producer outside the chain, unwrap views to the root). Needed
+   for per-device graph construction (which llama tensors must be uploaded /
+   referenced as leaves). At minimum: cur (norm output per layer, must be
+   uploaded), ids/routing (gating output), expert weight columns (pool shells),
+   scale/weights sources. Design: walk every closure compute node's srcs; a src
+   whose producer is not in the closure is an external leaf; classify after
+   unwrapping views.
+
+Next step: implement the external-leaf list in verify (pure analysis, dumpable,
+no executor change).
