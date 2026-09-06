@@ -335,6 +335,9 @@ void expert_scheduler::drain_moves() {
         // dst slot: IO_INFLIGHT (reserved at submit) -> READY; dir entry lands.
         slots_[t.dst_slot].mark_ready();
         dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_READY, t.dst_slot);
+        // If this move's target was an active B item (r2v placement for a request
+        // in flight), account it exactly like a DIO settle; otherwise no-op.
+        active_settle(t.layer, t.expert, t.dst_slot);
         // src slot: content copied away (was EVICTING / exclusive during the
         // move). Release it to EMPTY so a requeued alloc can reuse it. If the
         // move was a r2v the src was a RAM copy that is now redundant - releasing
@@ -602,6 +605,94 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
     return t;
 }
 
+// ---- M5 active-request helpers (scheduler thread only) ----
+
+void expert_scheduler::active_register(const slot_request_t& req) {
+    active_present_ = true;
+    active_layer_ = req.layer;
+    for (uint32_t w = 0; w < BITMAP_WORDS; ++w) active_still_need_[w] = req.needed[w];
+    active_n_left_ = req.n_load_target;
+    active_pinned_slots_.clear();
+    active_batch_ready_ = req.batch_ready;
+    active_failed_      = req.failed;
+    active_stall_armed_ = false;
+    SCHED_DIAG("sched: active registered L" << active_layer_ << " n_left=" << active_n_left_);
+    // Triage every B item NOW (same scheduler turn; §7.4 race 1): a bit that
+    // settled to READY between exec's scan and our registration has NO pending
+    // drain event anymore - pin it here or it is lost forever.
+    const uint32_t n_experts = topo_->n_expert;
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        if (!bit_test(active_still_need_, e)) continue;
+        uint32_t pool = 0;
+        const uint32_t s = dir_->scan(active_layer_, e, &pool);
+        if (s == SLOT_UNASSIGNED) continue;            // ABSENT / no READY copy yet
+        if (slot_word_state(slots_[s].load()) != SLOT_READY) continue;  // in flight
+        // READY now: pin for exec, account, clear the bit.
+        const int64_t g = slots_[s].try_pin();
+        if (g >= 0) {
+            bit_clear(active_still_need_, e);
+            active_pinned_slots_.push_back(s);
+            if (active_n_left_ == 0) { active_fail("triage n_left underflow"); return; }
+            --active_n_left_;
+            active_stall_armed_ = false;
+            if (active_batch_ready_) {
+                active_batch_ready_->fetch_add(1, std::memory_order_acq_rel);
+                slot_wake_all(active_batch_ready_);
+            }
+        }
+    }
+    SCHED_DIAG("sched: active triaged L" << active_layer_ << " still=" << active_n_left_);
+    if (active_n_left_ == 0) active_finish();   // every B item was already READY
+}
+
+void expert_scheduler::active_settle(uint32_t layer, uint32_t expert, uint32_t slot) {
+    // A B load just became READY (drain). Pin for exec, account, clear the bit.
+    if (!active_present_ || layer != active_layer_ || !bit_test(active_still_need_, expert)) return;
+    const int64_t g = slots_[slot].try_pin();
+    if (g < 0) { active_fail("settle pin failed"); return; }
+    bit_clear(active_still_need_, expert);
+    active_pinned_slots_.push_back(slot);
+    if (active_n_left_ == 0) { active_fail("settle n_left underflow"); return; }
+    --active_n_left_;
+    active_stall_armed_ = false;
+    if (active_batch_ready_) {
+        active_batch_ready_->fetch_add(1, std::memory_order_acq_rel);
+        slot_wake_all(active_batch_ready_);
+    }
+    if (active_n_left_ == 0) active_finish();
+}
+
+void expert_scheduler::active_fail(const char* why) {
+    LOG_ERROR("expert_scheduler: active L" << active_layer_ << " failed (" << why
+              << ") - releasing " << active_pinned_slots_.size() << " pinned B slot(s)");
+    for (const uint32_t s : active_pinned_slots_) {
+        if (s < num_slots_) slots_[s].unpin();
+    }
+    if (active_failed_) {
+        active_failed_->store(true, std::memory_order_release);
+        slot_wake_all(active_failed_);          // wakes exec's failed check
+        if (active_batch_ready_) slot_wake_all(active_batch_ready_);  // wakes exec's wait sleep
+    }
+    active_clear_state();
+}
+
+void expert_scheduler::active_finish() {
+    // done already == target (bumped once per settled B item). Wake exec once.
+    if (active_batch_ready_) slot_wake_all(active_batch_ready_);
+    active_clear_state();
+}
+
+void expert_scheduler::active_clear_state() {
+    active_present_ = false;
+    active_layer_ = 0;
+    for (uint32_t w = 0; w < BITMAP_WORDS; ++w) active_still_need_[w] = 0;
+    active_n_left_ = 0;
+    active_pinned_slots_.clear();
+    active_batch_ready_ = nullptr;
+    active_failed_ = nullptr;
+    active_stall_armed_ = false;
+}
+
 void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
     // IOCP has no batch completion - we aggregate per async_load_t via `pending`.
     for (uint32_t i = 0; i < n; ++i) {
@@ -638,14 +729,20 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
                 dir_->transition(t->layer, t->expert, t->pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
                 LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
             }
-            // wake-once: every settle (success OR failure) advances the batch
-            // counter so exec never spins forever; exec rescans and pins what
-            // is actually READY, retrying failures.
-            if (t->batch_ready) {
-                std::atomic<uint32_t>* c = t->batch_ready;
-                c->fetch_add(1, std::memory_order_acq_rel);
-                slot_wake_all(c);
+            // M5 settle accounting: a load for the active request (B subset)
+            // that just became READY -> pin for exec (refcount+1, RAII ledger,
+            // done bump). At zero n_left active_finish wakes exec once. exec
+            // never re-pins B - the pin happens HERE on the owner thread.
+            if (!t->failed && active_present_ && t->layer == active_layer_ &&
+                bit_test(active_still_need_, t->expert)) {
+                active_settle(t->layer, t->expert, t->slot);
+            } else if (t->failed && active_present_ && t->layer == active_layer_ &&
+                       bit_test(active_still_need_, t->expert)) {
+                // A B load hard-failed: all-or-nothing. Release the already
+                // pinned B slots, set failed, wake exec once.
+                active_fail("async load failed");
             }
+            // Non-active settles (prefetch / legacy) just mark READY - nothing to wake.
             t->done_tsc = tsc_now();   // [TMR] slot settled (ready or failed)
             const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
             const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
@@ -656,129 +753,121 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
 }
 
 bool expert_scheduler::accept_requests() {
-    // Returns true when this pass made real progress (started a load or fully
-    // satisfied a request). A pass that only requeues an unplaceable leftover
-    // returns false - the worker loop then sleeps instead of spinning at 100%
-    // while no DIO/move/eviction can make room. Stall bound (2026-09): a request
-    // that stays unplaceable for STALL_FAIL_MS of continuous no-progress (wall
-    // clock) is fail-settled (its leftover bits bumped as failures to wake exec)
-    // so a genuine capacity deadlock surfaces as a hard error instead of a spin.
-    bool progress = false;
-    slot_request_t req;
-    while (requests_.pop(req)) {
-        SCHED_DIAG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
-                  << " target=" << req.n_load_target << " load_free=" << load_free_.size());
-        // One request = one whole layer's missing expert set (bitmap). Each set
-        // bit counts once toward the batch's completion word: already-resident
-        // bits (raced) bump immediately, others bump when their async load
-        // settles (drain_completions). Placement: device region first (keeps the
-        // active set on one region while the executor has no per-region split
-        // yet), RAM fallback.
-        if (load_free_.empty()) { requests_.push(req); break; }   // ring-full: transient backpressure
-        const uint32_t n_experts = topo_->n_expert;
-        uint64_t leftover[BITMAP_WORDS] = { 0 };
-        uint32_t n_left = 0;
-        bool started_load = false;      // any expert submitted to the DIO ring this pass
-        bool no_slot = false;           // any expert failed alloc (no free slot / no victim)
-        auto bump = [&]() {   // one processed bit -> one toward the batch target
-            if (req.batch_ready) {
-                req.batch_ready->fetch_add(1, std::memory_order_acq_rel);
-                slot_wake_all(req.batch_ready);
-            }
-        };
+    // M5 single-active discipline: one ACTIVE request per model. While an active
+    // request is in flight we do NOT pop a new one - we only serve the active:
+    // start loads for its ABSENT B items, pin B items that raced to READY since
+    // registration, and arm/check the stall clock when nothing can be placed.
+    // Completion happens in drain (active_settle -> active_finish clears the
+    // slot). exec submits the whole still-missing layer bitmap once - there is
+    // no leftover requeue.
+    //
+    // Returns true when this pass made real progress (started a load / pinned a
+    // raced B item / registered a new request); a pass that made no progress
+    // returns false and the worker loop sleeps instead of spinning.
+    const uint32_t n_experts = topo_->n_expert;
+
+    if (active_present_) {
+        bool started_load = false, no_slot = false;
         for (uint32_t e = 0; e < n_experts; ++e) {
-            if (!bit_test(req.needed, e)) continue;
-            if (load_free_.empty()) { bit_set(leftover, e); ++n_left; continue; }
-            // Branch on the expert's directory state across pools (M2):
-            //   READY            -> already resident (raced): bump, nothing to load
-            //   LOADING/MOVING_* -> in flight from a prior tick's alloc: do NOT
-            //                        start a second load; the in-flight settle
-            //                        bumps through drain. Skipping without bump
-            //                        here is correct (drain does it once).
-            //   ABSENT / FAILED  -> genuinely needs a load: alloc + submit.
-            uint32_t gidx = group_of(req.layer);
-            if (gidx == static_cast<uint32_t>(-1)) { bit_set(leftover, e); ++n_left; continue; }
+            if (!bit_test(active_still_need_, e)) continue;
+            if (load_free_.empty()) break;   // ring-full: try again next tick
+            const uint32_t gidx = group_of(active_layer_);
+            if (gidx == static_cast<uint32_t>(-1)) { active_fail("bad layer"); return true; }
             bool in_flight = false, resident = false;
             for (uint32_t p = 0; p < n_pools_; ++p) {
-                const expert_state st = dir_->state(req.layer, e, p);
+                const expert_state st = dir_->state(active_layer_, e, p);
                 if (st == EXPERT_READY) resident = true;
                 else if (st == EXPERT_LOADING || st == EXPERT_MOVING_IN || st == EXPERT_MOVING_OUT) in_flight = true;
             }
-            if (resident) { bump(); progress = true; continue; }
-            if (in_flight) continue;   // drain will bump when it settles
+            if (resident) {
+                // Raced to READY since registration: pin it exactly like drain
+                // would (clears the bit + bumps). No second load is started.
+                uint32_t pool = 0;
+                const uint32_t s = dir_->scan(active_layer_, e, &pool);
+                if (s != SLOT_UNASSIGNED) { active_settle(active_layer_, e, s); }
+                continue;
+            }
+            if (in_flight) continue;   // drain settles + pins it
             int32_t slot = -1;
-            const subpool_t* dsp = (gidx == static_cast<uint32_t>(-1)) ? nullptr : vram_subpool(gidx);
-            if (dsp) slot = alloc_or_evict(req.layer, e, dsp->pool);
-            if (slot < 0) slot = alloc_or_evict(req.layer, e, 0);
-            if (slot < 0) {
-                SCHED_DIAG("sched: L" << req.layer << " E" << e << " no slot in vram or ram (leftover)");
-                no_slot = true;
-                bit_set(leftover, e); ++n_left; continue;
-            }
-            async_load_t* t = start_async_load(slot, req.layer, e);
+            const subpool_t* dsp = vram_subpool(gidx);
+            if (dsp) slot = alloc_or_evict(active_layer_, e, dsp->pool);
+            if (slot < 0) slot = alloc_or_evict(active_layer_, e, 0);
+            if (slot < 0) { no_slot = true; continue; }
+            async_load_t* t = start_async_load(slot, active_layer_, e);
             if (!t) {
-                // No async-load ring slot: revert LOADING -> ABSENT so a later
-                // pass can retry (an in-flight dir entry with no load would be
-                // skipped forever). The physical slot stays IO_INFLIGHT (the
-                // ring-full case is transient; next alloc picks an EMPTY one).
-                dir_->transition(req.layer, e, subpool_of_slot(slot) ? subpool_of_slot(slot)->pool : 0,
+                // Ring-full: revert LOADING -> ABSENT so a later pass retries.
+                dir_->transition(active_layer_, e,
+                                 subpool_of_slot(slot) ? subpool_of_slot(slot)->pool : 0,
                                  EXPERT_ABSENT, SLOT_UNASSIGNED);
-                LOG_DEBUG("sched: L" << req.layer << " E" << e << " ring-full (slot " << slot << "), reverted to ABSENT");
-                bit_set(leftover, e); ++n_left; continue;
+                break;
             }
-            t->batch_ready = req.batch_ready;   // drain bumps when this settles
             started_load = true;
-            progress = true;
         }
-        // requeue whatever could not be placed this pass (ring full / no victim).
-        if (n_left) {
-            // Stall bound (2026-09): if this request could not place anything
-            // because the pool is full with no evictable victim (no_slot), start
-            // / keep a wall-clock window. Only a run of CONTINUOUS no-progress
-            // over the SAME request past STALL_FAIL_MS fail-settles it - starting
-            // a new load this pass (real headroom: a free slot or a fresh evict)
-            // resets the window. Ring-full is excluded (that is DIO backpressure
-            // that drain_completions resolves); in-flight bits are not leftover.
-            if (started_load) {
-                stall_active_ = false;   // made headroom; re-arm on the next stuck pass
-            } else if (no_slot) {
-                const auto now = std::chrono::steady_clock::now();
-                if (!stall_active_ || stall_batch_ != req.batch_ready || stall_layer_ != req.layer) {
-                    stall_active_ = true;
-                    stall_batch_  = req.batch_ready;
-                    stall_layer_  = req.layer;
-                    stall_since_  = now;
-                } else if (now - stall_since_ >= STALL_FAIL_MS) {
-                    LOG_ERROR("expert_scheduler: L" << req.layer << " unplaceable for "
-                              << std::chrono::duration_cast<std::chrono::milliseconds>(now - stall_since_).count()
-                              << " ms (pool full, no evictable victim) - fail-settling "
-                              << n_left << " leftover bit(s) to break the stall");
-                    // wake-once semantics: bump every leftover bit as a failed
-                    // settle. exec wakes (done == target), rescans, and its
-                    // bounded retry round then propagates GGML_STATUS_FAILED.
-                    for (uint32_t w = 0; w < BITMAP_WORDS; ++w) {
-                        uint64_t m = leftover[w];
-                        while (m) {
-                            bump();
-                            m &= m - 1;   // clear lowest set bit
-                        }
-                    }
-                    stall_active_ = false;   // settled; a fresh retry re-arms the bound
-                    break;                  // do NOT requeue this request
-                }
+        // Stall bound: nothing placed this pass and the pool is full with no
+        // evictable victim -> wall-clock window; past it, fail the whole active
+        // request (releases pinned B via RAII, sets failed, wakes exec).
+        if (started_load || active_n_left_ == 0) {
+            active_stall_armed_ = false;
+        } else if (no_slot) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!active_stall_armed_) {
+                active_stall_armed_ = true;
+                active_stall_since_ = now;
+            } else if (now - active_stall_since_ >= STALL_FAIL_MS) {
+                active_fail("no evictable victim (stall)");
+                return true;
             }
-            slot_request_t rq = {};
-            rq.layer = req.layer;
-            rq.n_load_target = req.n_load_target;    // keep the SAME completion target
-            rq.batch_ready = req.batch_ready;
-            for (uint32_t w = 0; w < BITMAP_WORDS; ++w) rq.needed[w] = leftover[w];
-            requests_.push(rq);
-            break;   // backpressure: don't starve other queues in this tick
-        } else {
-            stall_active_ = false;   // request fully satisfied: clear the stall window
         }
+        return started_load;
     }
-    return progress;
+
+    // No active request: pop ONE exec request and register it as active. The
+    // serve path above (next pass, or the same pass after registration) drives
+    // it to completion. exec is single-ctx/single-decode-thread per model, so at
+    // most one request is ever queued behind an in-flight active; a queued one
+    // waits here until active_clears.
+    slot_request_t req;
+    if (!requests_.pop(req)) return false;
+    SCHED_DIAG("sched: accept req L" << req.layer << " needed-bits=" << bit_count(req.needed, topo_->n_expert)
+              << " target=" << req.n_load_target << " load_free=" << load_free_.size());
+    active_register(req);
+    // Immediately serve the newly registered request (its ABSENT items need a
+    // load this tick, not next tick).
+    bool served = false;
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        if (!bit_test(active_still_need_, e)) continue;
+        if (load_free_.empty()) break;
+        const uint32_t gidx = group_of(active_layer_);
+        if (gidx == static_cast<uint32_t>(-1)) { active_fail("bad layer"); return true; }
+        bool in_flight = false, resident = false;
+        for (uint32_t p = 0; p < n_pools_; ++p) {
+            const expert_state st = dir_->state(active_layer_, e, p);
+            if (st == EXPERT_READY) resident = true;
+            else if (st == EXPERT_LOADING || st == EXPERT_MOVING_IN || st == EXPERT_MOVING_OUT) in_flight = true;
+        }
+        if (resident) {
+            uint32_t pool = 0;
+            const uint32_t s = dir_->scan(active_layer_, e, &pool);
+            if (s != SLOT_UNASSIGNED) active_settle(active_layer_, e, s);
+            continue;
+        }
+        if (in_flight) continue;
+        int32_t slot = -1;
+        const subpool_t* dsp = vram_subpool(gidx);
+        if (dsp) slot = alloc_or_evict(active_layer_, e, dsp->pool);
+        if (slot < 0) slot = alloc_or_evict(active_layer_, e, 0);
+        if (slot < 0) continue;
+        async_load_t* t = start_async_load(slot, active_layer_, e);
+        if (!t) {
+            dir_->transition(active_layer_, e,
+                             subpool_of_slot(slot) ? subpool_of_slot(slot)->pool : 0,
+                             EXPERT_ABSENT, SLOT_UNASSIGNED);
+            break;
+        }
+        served = true;
+    }
+    (void)served;
+    return true;
 }
 
 void expert_scheduler::update_alpha() {
@@ -809,9 +898,13 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
         return -1;
     }
 
-    // Two-pass: split the set into already-resident (pin now) and missing
-    // (one batch request). Because the directory is read-only for compute and
-    // only the scheduler mutates residency, do the split here by scanning.
+    // M5 single-pass (docs/EXPERT_MOVE_PIPELINE.md §7.4): split into A (pinned
+    // HERE right now - refcount +1 protects it while we wait) and B (submitted
+    // as ONE active request; the scheduler pins every B item for us). On wake
+    // exec scans B to record slots - it does NOT re-pin (refcount already +1 by
+    // the scheduler) and does NOT loop/re-measure. Releasing after compute is a
+    // single unpin per returned handle (A + B), balancing exec's +1 (A) and the
+    // scheduler's +1 (B).
     uint64_t missing[BITMAP_WORDS] = { 0 };
     uint32_t n_missing = 0, n_hit = 0;
     uint32_t o = 0;
@@ -820,25 +913,18 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
         uint32_t pool = 0;
         uint32_t s = dir_->scan(layer, e, &pool);
         if (s == SLOT_UNASSIGNED) {
-            bit_set(missing, e);
+            bit_set(missing, e);   // no READY copy anywhere: B
             ++n_missing;
             continue;
         }
-        if (slot_word_state(slots_[s].load()) != SLOT_READY) {
-            // in-flight/evicting: not pin-able yet; request it too (idempotent -
-            // the scheduler skips already-resident bits).
-            bit_set(missing, e);
-            ++n_missing;
-            continue;
-        }
-        int64_t gen = slots_[s].try_pin();
+        int64_t gen = slots_[s].try_pin();   // atomic CAS READY -> READY+ref
         if (gen >= 0) {
             out[o++] = { static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, e, pool, true };
             ++n_hit;
             const uint64_t t = token_.fetch_add(1, std::memory_order_relaxed) + 1;
             dir_->touch_last_used(layer, e, t);
         } else {
-            bit_set(missing, e);   // transient (another pin racing); request it
+            bit_set(missing, e);   // READY at scan but CAS failed (evicting / race): B
             ++n_missing;
         }
     }
@@ -849,9 +935,10 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
         return static_cast<int32_t>(want);
     }
 
-    // Submit ONE batch request for the missing subset. `await` counts down per
-    // completed expert; exec sleeps once until n_load_target (== n_missing) is
-    // reached.
+    // Submit ONE active request for B. `await` counts the scheduler's per-settle
+    // pins; exec sleeps once until done == n_load_target (all B pinned) or the
+    // failed flag is set (any B hard-failed; RAII already released what was
+    // pinned). No retry round - a genuine capacity deadlock surfaces as failed.
     SCHED_DIAG("exec->sched: pin_layer L" << layer << " want=" << want
               << " hit=" << n_hit << " miss=" << n_missing);
     slot_request_t req;
@@ -861,55 +948,39 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
     await.reset();
     await.target = n_missing;
     req.batch_ready = &await.done;
-
-    // Wait for the batch to settle (wake-once). Re-scan on completion: some
-    // bits may have been raced/resident meanwhile; pin whatever is ready.
+    req.failed      = &await.failed;
     n_lookups_.fetch_add(want, std::memory_order_relaxed);
     n_hits_.fetch_add(n_hit, std::memory_order_relaxed);
 
-    for (uint32_t round = 0; round < 2; ++round) {
-        requests_.push(req);                 // MPSC batch submit (blocking if full)
-        await.wait();                        // single wake: done == target
-        // pin the bits that are now resident
-        uint32_t still_missing = 0;
-        for (uint32_t e = 0; e < n_experts; ++e) {
-            if (!bit_test(missing, e)) continue;
-            uint32_t pool = 0;
-            uint32_t s = dir_->scan(layer, e, &pool);
-            if (s == SLOT_UNASSIGNED || slot_word_state(slots_[s].load()) != SLOT_READY) {
-                ++still_missing;
-                continue;
-            }
-            int64_t gen = slots_[s].try_pin();
-            if (gen >= 0) {
-                out[o++] = { static_cast<int32_t>(s), static_cast<uint32_t>(gen), layer, e, pool, true };
-                const uint64_t t = token_.fetch_add(1, std::memory_order_relaxed) + 1;
-                dir_->touch_last_used(layer, e, t);
-                bit_clear(missing, e);      // pinned
-            } else {
-                ++still_missing;
-            }
-        }
-        SCHED_DIAG("exec<-sched: pin_layer L" << layer << " round " << round
-                  << " pinned=" << (want - still_missing) << "/" << want
-                  << " still_missing=" << still_missing);
-        if (still_missing == 0) return static_cast<int32_t>(want);
-        if (round == 0) {
-            // transient failure / extra load needed: rebuild a fresh request and
-            // retry once. Guarded against infinite spin.
-            req.n_load_target = still_missing;
-            for (uint32_t w = 0; w < BITMAP_WORDS; ++w) req.needed[w] = 0;
-            for (uint32_t e = 0; e < n_experts; ++e) if (bit_test(missing, e)) bit_set(req.needed, e);
-            await.reset();
-            await.target = still_missing;
-            req.batch_ready = &await.done;
-        } else {
-            LOG_ERROR("expert_scheduler: pin_layer retry limit for L" << layer
-                      << " (still missing " << still_missing << ")");
+    requests_.push(req);                 // MPSC batch submit (blocking if full)
+    await.wait();                        // wake-once: done == target, or failed
+
+    if (await.is_failed()) {
+        // All-or-nothing: release the A pins we took (B was already released by
+        // active_fail's RAII), report failure to the caller (GGML_STATUS_FAILED).
+        for (uint32_t i = 0; i < o; ++i) unpin(out[i]);
+        LOG_ERROR("expert_scheduler: pin_layer L" << layer << " failed (B load error)");
+        return -1;
+    }
+
+    // Success: every B item is READY and already pinned by the scheduler. Record
+    // their slots (scan; do NOT try_pin again). The refcounts we return are the
+    // scheduler's +1 - exec releases them once with unpin() after compute.
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        if (!bit_test(missing, e)) continue;
+        uint32_t pool = 0;
+        const uint32_t s = dir_->scan(layer, e, &pool);
+        if (s == SLOT_UNASSIGNED) {
+            LOG_ERROR("expert_scheduler: pin_layer L" << layer << " E" << e
+                      << " READY expected but not found after active completion");
+            // roll back what we already collected in this post-wait scan + A
+            for (uint32_t i = 0; i < o; ++i) unpin(out[i]);
             return -1;
         }
+        out[o++] = { static_cast<int32_t>(s), slot_word_generation(slots_[s].load()),
+                     layer, e, pool, true };
     }
-    return -1;
+    return static_cast<int32_t>(want);
 }
 
 void expert_scheduler::unpin(const expert_handle_t& h) {

@@ -102,6 +102,9 @@ struct async_load_t {
     uint8_t* staging = nullptr;
     // wake-once (2026-09): this load belongs to a layer batch; on completion
     // (mark_ready) we fetch_add the owner's counter and wake it.
+    // (2026-09-05 M5: the per-load batch word is retired - the scheduler's
+    // single active slot owns all completion accounting via active_settle /
+    // drain; this field stays as history and is no longer written or read.)
     std::atomic<uint32_t>* batch_ready = nullptr;
     uint64_t req_tsc = 0;     // [TMR] raw TSC: async load requested
     uint64_t dio_tsc = 0;     // [TMR] raw TSC: all DIO reads completed
@@ -297,6 +300,22 @@ private:
     async_load_t* load_task(uint32_t idx) {
         return reinterpret_cast<async_load_t*>(load_pool_ + static_cast<size_t>(idx) * load_stride_);
     }
+    // ---- M5 active-request helpers (scheduler thread only) ----
+    // Register a just-popped exec request as the single active one, triage every
+    // B item (READY -> pin now; ABSENT -> alloc + load; LOADING/MOVING -> wait
+    // for drain). Closes the register-vs-settle race (§7.4 case 1) by re-scanning
+    // current state here, in the same scheduler turn.
+    void active_register(const slot_request_t& req);
+    // Pin one settled/READY B item for exec (refcount+1, RAII ledger, done bump).
+    void active_settle(uint32_t layer, uint32_t expert, uint32_t slot);
+    // All-or-nothing failure: release every pinned B slot (RAII), set the exec
+    // failed flag, wake the batch word once, clear the active slot.
+    void active_fail(const char* why);
+    // Success: n_left reached zero (all B pinned). Wake exec exactly once (done
+    // already == target from the per-settle bumps) and clear the active slot.
+    void active_finish();
+    // Clear the active-slot bookkeeping (shared tail of active_finish/active_fail).
+    void active_clear_state();
 
     // ---- move worker thread (M4) ----
     void move_worker_main();      // runs on the move worker thread
@@ -346,18 +365,32 @@ private:
     mpsc_alloc_queue        requests_{4096};
     std::atomic<bool>       running_{false};
 
-    // Stall backstop (2026-09): consecutive accept_requests ticks that placed
-    // NO expert (pool full + no evictable victim) are bounded. If a request
-    // stays unplaceable for STALL_FAIL_MS of continuous no-progress (wall
-    // clock), the unplaceable leftover is settled as FAILED (batch_ready
-    // bumped to wake exec) instead of requeued forever - exec's rescan + retry
-    // round then surfaces a hard error (pin_layer -> GGML_STATUS_FAILED). Owned
-    // by the scheduler thread (accept_requests) only.
-    std::chrono::steady_clock::time_point stall_since_{};
-    bool                              stall_active_ = false;
-    std::atomic<uint32_t>*            stall_batch_  = nullptr;   // request identity (batch_ready ptr)
-    uint32_t                          stall_layer_  = 0;         // request identity (layer)
-    static constexpr auto             STALL_FAIL_MS = std::chrono::milliseconds(2000);
+    // M5 active request slot (2026-09, docs/EXPERT_MOVE_PIPELINE.md §7.4). The
+    // scheduler serves ONE exec request per model at a time: exec submits the
+    // whole still-missing bitmap B of a layer; accept_requests registers it here
+    // and triages every B item (READY -> pin now, ABSENT -> load, LOADING ->
+    // wait for drain). drain_completions is the single settle point: on READY of
+    // a B item it pins for exec (refcount +1) and decrements n_left; at zero it
+    // wakes exec once. Pinning B here (not by exec rescan) makes exec single-pass
+    // and closes the register-vs-settle race (§7.4 acceptance case 1). Owned by
+    // the scheduler thread; `batch_ready`/`failed` are the exec-visible atoms.
+    bool     active_present_ = false;
+    uint32_t active_layer_ = 0;
+    uint64_t active_still_need_[BITMAP_WORDS] = { 0 };  // B bitmap (never READY yet)
+    uint32_t active_n_left_ = 0;                        // B items not yet READY+pinned
+    // RAII ledger of slots the scheduler pinned for exec's B; released on failure.
+    std::vector<uint32_t> active_pinned_slots_;
+    std::atomic<uint32_t>* active_batch_ready_ = nullptr;   // exec wake word
+    std::atomic<bool>*      active_failed_      = nullptr;  // exec all-or-nothing flag
+    // Stall bound (2026-09): if the active request makes no progress for
+    // STALL_FAIL_MS (no B item settles / no new load starts because the pool is
+    // full with no evictable victim), fail the whole active request: release the
+    // pinned B slots (RAII), set failed, wake exec - surfaces a hard error
+    // instead of spinning / sleeping forever. Ring-full is excluded (DIO
+    // backpressure that drain resolves). Wall-clock, scheduler thread only.
+    std::chrono::steady_clock::time_point active_stall_since_{};
+    bool                                active_stall_armed_ = false;
+    static constexpr auto               STALL_FAIL_MS = std::chrono::milliseconds(2000);
 
     std::atomic<uint64_t>   n_lookups_{0};
     std::atomic<uint64_t>   n_hits_{0};

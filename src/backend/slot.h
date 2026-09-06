@@ -335,23 +335,30 @@ struct slot_request_t {
     // wake-once counter (compute-side batch_await_t::done). A raw pointer keeps
     // slot_request_t trivially copyable for the plain ring.
     std::atomic<uint32_t>* batch_ready = nullptr;
+    // All-or-nothing failure flag (M5): the scheduler sets *failed (and wakes
+    // the batch word) when any still-need expert hard-fails. Exec wakes, reads
+    // failed, and rolls its own pins back instead of scanning a partial B.
+    std::atomic<bool>*      failed = nullptr;
     uint64_t needed[BITMAP_WORDS] = { 0 };         // bit e -> expert e needed
 };
-static_assert(sizeof(slot_request_t) == 96, "slot_request_t layout drifted");
+static_assert(sizeof(slot_request_t) == 104, "slot_request_t layout drifted");
 
 // Convenience for the exec side: the wake-once counter + expected count.
 struct batch_await_t {
-    std::atomic<uint32_t> done{0};   // scheduler fetch_add per completed expert
+    std::atomic<uint32_t> done{0};   // scheduler fetch_add per settled expert
+    std::atomic<bool>     failed{false};   // scheduler sets on any hard failure
     uint32_t target = 0;             // == slot_request_t::n_load_target
-    // Wait until `done` reaches `target` (wake-once; scheduler wakes this word).
+    // Wait until `done` reaches `target` OR `failed` is set (wake-once; the
+    // scheduler wakes this word on every settle and on failure).
     void wait() {
         uint32_t cur = done.load(std::memory_order_acquire);
-        while (cur < target) {
+        while (cur < target && !failed.load(std::memory_order_acquire)) {
             slot_wait_addr(&done, &cur, sizeof(cur));
             cur = done.load(std::memory_order_acquire);
         }
     }
-    void reset() { done.store(0, std::memory_order_relaxed); target = 0; }
+    bool is_failed() const { return failed.load(std::memory_order_acquire); }
+    void reset() { done.store(0, std::memory_order_relaxed); failed.store(false, std::memory_order_relaxed); target = 0; }
 };
 
 class mpsc_alloc_queue {
