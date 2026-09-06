@@ -57,6 +57,10 @@
     - CPU 阶段的工作若要与 GPU 等价，就照着 GPU 的结构写：链在 arena 上跑、节点 data 钉死 offset、一次图整层算；"主节点只在入口唤醒、其余 no-op" 这类结构本身就是 GPU 形态，可以直接落。
     - 这条优先于"先 CPU 验证再迁移"的惯性：**验证手段宁可换成 dump/log 对拍，也不要为 CPU 另造一套将来不用的执行结构。**
 
+12. **数值验证用宽松 gate，不追 bit 级 IDENTICAL（2026-09-06 用户立）**
+    - 重构/桶化/并行化会改变浮点累加顺序，产生正常的 ulp 级误差——**只要在 gate 内（实测标定：maxAbs ≤ 1e-5 / cos ≈ 1.0，见 M2_DEVICE_EXECUTOR.md §7.3），且整体逻辑正确，即视为通过**。
+    - 别为"逐字节一致"去硬凑中间顺序、别把 ulp 差当 bug 排查。判据是结构等价 + 量级 gate，不是 bit 复刻。
+
 ## 三、协作规则
 
 - 开始任务前：先读本文件 + `docs/CHECKPOINT.md`（当前状态）+ `docs/PROJECT_STRUCTURE.md`（结构）。
