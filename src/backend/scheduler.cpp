@@ -27,6 +27,15 @@ void stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
 namespace stream_moe {
 
 expert_scheduler::~expert_scheduler() {
+#ifdef STREAM_MOE_TEMP
+    // Quiesce before the exit audit: a prefetch DIO load or a cross-pool move
+    // may still be in flight. Sleep FIRST (still registered - the worker thread
+    // keeps draining this pool's completions + moves, settling them to READY +
+    // refcount 0), THEN stop() joins the worker. A sleep after stop() would be
+    // useless: stop() unregisters first and no one settles the in-flight IO,
+    // leaving slots in IO_INFLIGHT / EVICTING -> spurious audit hits.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+#endif
     stop();
 #ifdef STREAM_MOE_TEMP
     // Exit-time slot leak audit: after stop() the scheduler thread is gone and
