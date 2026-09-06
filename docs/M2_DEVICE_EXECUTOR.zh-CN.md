@@ -286,3 +286,38 @@ per-device 资源生命周期（arena + 累加器）——用户确认：可常�
   1 ulp；
 - per-token 全随机 shuffle 最坏情形：maxAbs ≤ 3.8e-6。
 后续数值门建议用：**maxAbs ≤ 1e-5（f32 1-2 ulp），cos ≈ 1.0**。
+
+## 7.4 已落地：CPU 整层 clone 图（commit fa94ecb，2026-09-06）
+
+per-device mini-graph 的 CPU 阶段现在是**真·单 cgraph**：把一层的每个 compute 节点在 exec
+scratch ctx 里重建为新 ggml op 张量，整层作为**一张图 / 一次 `ggml_backend_graph_compute`**。
+env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_burst` 内选择它。
+129-token gemma 全 30 层验证 IDENTICAL（embd/hidden/KV vs 同 binary 不带该 env）。
+
+实现细节：
+
+- **mm** 重建为壳 `mul_mat_id`：`w3d` leaf（`data = sp.base + col_off`、`nb[2] = col_stride`、
+  `ne[2] = n_slots`）+ 经 `pin_slot` 把路由 ids 转 slot-local 的 `ids` leaf + **`cur` 做成 leaf 只
+  引用 `cur->data`（不拷贝）**：leaf 是新张量带 cur 的 ne/nb/type、`data = cur->data`。包装是必须的
+  ——直接把主图 cur 张量（op 节点）喂给 `ggml_build_forward_expand` 会递归把其上游（norm、前几层）
+  拖进图。mm 输出写隐藏 dst（`mm->data = nd->data`）。
+- **每个 weightless / 匿名 per-topk ADD / moe_out 节点都克隆**：新张量带主节点的 ne/nb/type +
+  `op` + `op_params`，每个 src 包成 leaf 携带主图 data 指针。view 保留其 ne/nb/data（已 refresh 到
+  隐藏 producer = 位置映射）。因此 clone 图**没有外部 op 节点**；ggml plan 无条件执行每个 clone。
+  节点间数据流经共享 arena 区按层序传递：producer clone 写它自己的区，consumer clone 经 src leaf
+  读同一区。
+- **缓冲**：中间/输出区这里**不用 verify interval 布局**——chain 模式调 `hide_output`（per-node
+  full-alloc bump，每节点独立区），因为单 cgraph 内所有输出共存到结束；`out_off` 的区间共享假设逐
+  节点顺序执行。moe_out 写 llama 的 dst（不 hide）。view 在图跑前 refresh 到隐藏 producer。这是当前
+  CPU 事实；verify 布局定 per-device arena 尺寸仍是 GPU 阶段工作。
+- **分桶**：此路径**还没跑多桶**。当前 chain 模式要求每个 mm 单满宽 round（单一 subpool 拥有全部
+  列）= 单 device 情形。真多桶 / 多 device（每 device 自己列的子图、`build_mix_plan` peel 喂每
+  device 列集）是在此 builder 之上的下一步。
+
+踩坑记录（此前 hide+append 尝试失败的根因）：
+1. `ggml_build_forward_expand` 会追 src op 节点——主图 src 必须先变成 data leaf 才能进我们的图。
+2. 手动塞 `gf->nodes[]` 不 expand 会让 mm dst 没被写（全 0）；节点必须经 build_forward_expand
+   （或等价）注册 CPU plan 才执行。
+3. 单 cgraph 不能用 interval 共享布局（同时存活）；per-device arena 落地前需要 per-node full-alloc。
+4. "shell mm 在图 + 原 weightless 节点"的混合形态被 (1)+(2) 打破：weightless 引用主图张量，ggml
+   无法 plan；全克隆干净消除歧义。

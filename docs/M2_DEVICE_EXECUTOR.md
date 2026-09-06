@@ -489,3 +489,56 @@ llama's linear per-k fold (k-order reference reproduces moe_out byte-for-byte,
   value scale), cos = 1.000000000, ~55% of elements differ by exactly 1 ulp;
 - per-token random shuffle worst case: maxAbs <= 3.8e-6.
 Gate to use downstream: **maxAbs <= 1e-5 (f32 1-2 ulp), cos ~= 1.0**.
+
+## 7.4 Landed: whole-layer clone graph on CPU (commit fa94ecb, 2026-09-06)
+
+The CPU phase of the per-device mini-graph is now a REAL single cgraph: rebuild
+every compute node of a layer as a fresh ggml op tensor in the exec scratch ctx
+and run the whole layer as ONE graph / one `ggml_backend_graph_compute`. Env
+`STREAM_MOE_TMP_CHAIN_GRAPH` (STREAM_MOE_TEMP build only) selects it inside
+`exec_layer_burst`. Verified IDENTICAL on 129-token gemma (all 30 layers, embd /
+hidden / KV vs the same binary without the env).
+
+How it works (implementation details):
+
+- **mm** is rebuilt as a shell `mul_mat_id`: `w3d` leaf over the pool weight
+  column (`data = sp.base + col_off`, `nb[2] = col_stride`, `ne[2] = n_slots`),
+  a slot-local `ids` leaf rebuilt from the routed ids through `pin_slot`, and
+  `cur` as a LEAF that only references `cur->data` (NOT a copy): the leaf is a
+  fresh tensor with cur's ne/nb/type and `data = cur->data`. Wrapping is
+  mandatory - feeding the main-graph cur tensor (an op node) straight into
+  `ggml_build_forward_expand` would recursively drag its upstream chain
+  (norm, previous layers) into the graph. The mm output writes the hidden dst
+  (`mm->data = nd->data`).
+- **Every weightless / anonymous per-topk add / moe_out node is cloned**: a
+  fresh tensor with the main node's ne/nb/type + `op` + `op_params`, and every
+  src wrapped as a LEAF carrying the main-graph data pointer. Views keep their
+  ne/nb/data (already refreshed to the hidden producer = the position mapping).
+  The clone graph therefore has NO external op nodes; ggml's plan executes each
+  clone unconditionally. Inter-node data flows through the shared arena regions
+  in layer order: producer clone writes its region, consumer clone reads the
+  same region via its src leaf.
+- **Buffers**: intermediate/output regions are NOT the verify interval layout
+  here - chain mode calls `hide_output` (per-node full-alloc bump, each node its
+  own region) because in ONE cgraph all outputs coexist until the end; the
+  interval sharing of `out_off` assumes per-node sequential execution. moe_out
+  writes llama's dst (not hidden). Views are refreshed to hidden producers
+  before the graph runs. This is the current CPU truth; per-device arena sizing
+  from the verify layout remains GPU-phase work.
+- **Bucketing**: NOT yet run as multi-bucket on this path. Current chain mode
+  requires ONE full-width round per mm (single subpool owns every column) - the
+  single-device case. Real multi-bucket / multi-device execution (each device a
+  sub-graph over its own columns, `build_mix_plan` peel feeding per-device
+  column sets) is the next step on top of this builder.
+
+Key gotchas learned (why the earlier hide+append attempts failed):
+1. `ggml_build_forward_expand` follows src op nodes - every main-graph src must
+   become a data leaf before it enters our graph.
+2. Manually stuffing `gf->nodes[]` without expand left the mm dst unwritten
+   (0s); nodes must be registered via build_forward_expand (or equivalent) for
+   the CPU plan to execute them.
+3. One cgraph cannot use the interval-shared layout (simultaneous liveness);
+   full-alloc per-node regions are required until per-device arenas land.
+4. The mixed "shell mm in graph + original weightless nodes" shape is broken by
+   (1)+(2): the weightless nodes reference main-graph tensors that ggml cannot
+   plan; cloning everything cleanly removes the ambiguity.
