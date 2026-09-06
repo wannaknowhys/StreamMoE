@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-05（NO_VICTIM 驱逐死锁修复 5d08bb3；M5 active-slot + exec 单程落地；dbg tag RelWithDebInfo）。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-05（NO_VICTIM 驱逐死锁 5d08bb3；M5 active-slot + exec 单程 f03e6a4 + 文档 5fa2ce1；dbg 退出泄漏审计 98f4d6d/8ab6f2a；deepseek 70G 池验证）。维护者每阶段收尾更新"当前状态"与"下一步"。
 
 ---
 
@@ -33,6 +33,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
 - **驱逐死锁修复（2026-09-05，5d08bb3）**：alloc_or_evict 改组内 ring 扫描（修 layer-0 候选集空导致的 NO_VICTIM 单核自旋 + exec 永久等 batch 死锁）+ accept_requests 进展感知 + wall-clock 2s stall 兜底 fail-settle（唤醒 exec 上抛错误）。CPU 基线回归 IDENTICAL PASS。详见 WIP N 节。
 - **M5 active-slot + exec 单程（2026-09-05，WIP M5 勾掉）**：exec 本地 pin A、B 作单 active 请求交 scheduler 统一替 pin（drain settle 归属检查 + RAII 记账 + 归零 wake / 失败回滚），exec 醒后 scan B 拿 slot 不再 rescan。slot_request_t 96→104B。设计 EXPERT_MOVE_PIPELINE §7.4。回归 IDENTICAL PASS。
+- **dbg 退出泄漏审计（2026-09-05，98f4d6d/8ab6f2a，STREAM_MOE_TEMP）**：~expert_scheduler 静默 500ms → stop → 逐 slot 查 refcount>0/残留 state。deepseek 70G 池（5621 slots）`-p hi -st` 自然退出 + exit audit 0 泄漏。
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
 ### VRAM 数据层（2026-09，路线 A：数据层先行）

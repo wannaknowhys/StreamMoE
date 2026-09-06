@@ -34,7 +34,12 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 - **修复验证（route-B / v2align）**：`build\StreamMoE\llama-build\bin\llama-cli.exe -m gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf --expert-backend --moe-ram-pool 8192 --fit off --no-warmup -t 16 -c 4096 --temp 0 -p hi -n 24`（证据 `temp\hi_cli_v2align.txt`）→ 输出连贯 thinking + 候选回复，无乱码/脱轨 → 修复正确，非正确性回归。StreamMoE 与 StreamMoE_dump 两 tag 均重编成功。
 - **`-st` 正常退出对照（upstream 原版）**：`build\upstream_dump\llama-build\bin\llama-cli.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -p hi -st -n 1024 -t 16 <nul`（证据 `temp\cli_upstream_hi_st_20260905.txt`）→ **rc=0 完整退出**，回答完整可读（thinking + `Hello! How can I help you today?`）。**结论：cli 不自动退出不是 bug——交互模式须 `-st`（single-turn）才单轮结束退出**。
 
-> ⚠️ **另一个独立 bug（与本修复无关，待查）**：StreamMoE_dump（route-B）长回复会卡在 `*Selected response:*` 点（thinking 结束、正文开始处），单核空转、文件不再增长、进程不退出（v2align + `--expert-backend`，`-p hi` 无 `-st` 亦复现）。upstream 同输入正常出正文。怀疑 route-B 在进入正式回答的 decode 段停住，需另行排查（非 staging_mask 修复引入）。
+> ⚠️ **staging_mask 卡 response 点已定位（2026-09-05，5d08bb3）**：`alloc_or_evict` 驱逐窗口 `delta 1..layer` 对 **layer 0 候选集恒空** → 池满后新 L0 miss 永不驱逐 → NO_VICTIM requeue 自旋 + exec 死等。修法 = 驱逐改组内 ring 扫描（layer 自身 ref0 旧专家优先）+ stall 兜底（2s 无进展 fail-settle 唤醒 exec 上抛）。详见 WIP N 节。
+
+## 验证记录（2026-09-05，M5 active-slot + deepseek 70G）
+
+- **DeepSeek-V4-Flash 70G 池 `-p hi -st`（dbg RelWithDebInfo build）**：`llama-cli -m N:\AI_LLM\DeepSeek-V4-Flash-0731\...UD-Q8_K_XL-00001-of-00005.gguf --expert-backend --moe-ram-pool 71680 --fit off --no-warmup -t 16 -c 4096 --temp 0 -p hi -n 600 -st`（证据 `temp\cli_ds_hi_st.txt`）→ **自然退出 rc=0**，thinking 闭合 + 正文 `Hello`，无 error/assert/stall。M5 单程 pin/unpin 账在 5-shard Q8 direct 装载下零泄漏：exit audit `pool ok - 4259/5621 slots used, all refcount 0`。
+- **dbg 退出泄漏审计**（STREAM_MOE_TEMP，98f4d6d/8ab6f2a）：`~expert_scheduler` 先静默 500ms（worker 仍注册、排空在飞 IO/move）→ stop → 逐 slot 查 refcount>0 / 残留 state 反查 (L,E) 打 stdout。RAM、Vulkan0:2048、deepseek 70G 三场景退出全 0 泄漏；注入式 try_pin 测试证实能抓 `slot 64 Ref1 state=2 (L7E127)`。
 
 ## 何时切回 DeepSeek-V4-Flash
 

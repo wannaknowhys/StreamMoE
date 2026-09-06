@@ -244,7 +244,13 @@
 >       drain/move settle 统一替 exec pin B（RAII ledger）+ 归零 wake-once；失败 RAII 回滚 +
 >       failed 信号。exec 醒后 scan B 拿 slot 不再重复 pin（单程，去掉两轮 round/rescan）。
 >       设计：EXPERT_MOVE_PIPELINE §7.4。验证：CPU 基线回归 IDENTICAL PASS、-p hi -st 自然退出、
->       Vulkan0:2048 池跑通。slot_request_t 96→104B（+failed 指针）。
+>       Vulkan0:2048 池跑通、**DeepSeek-V4-Flash 70G 池（5621 slots, Q8 direct, 5 shard）hi -st
+>       跑通**。slot_request_t 96→104B（+failed 指针）。
+> - [x] M5b 退出泄漏审计（STREAM_MOE_TEMP / dbg tag，98f4d6d + 8ab6f2a）：~expert_scheduler 析构先
+>       静默 500ms（仍注册、worker 排空在飞 prefetch/move）→ stop() → 逐 slot 查 refcount>0 或
+>       残留 state（EVICTING/IO_INFLIGHT/FAILED），反查 (L,E) 打 stdout；干净打一行
+>       "pool ok - N/M slots used, all refcount 0"。注入测试证实能抓 slot 泄漏；
+>       RAM/Vulkan0/deepseek 三场景退出全 0 泄漏。
 > - [~] M6 验证：纯 RAM 路径零影响（DMA 代码只在 v2r 触发，RAM 走 memcpy 不变）；VRAM
 >       demote 场景 DMA 内容 0 BAD（4-token 64MB，238 demote，列级对比纯 RAM golden）；
 >       129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
