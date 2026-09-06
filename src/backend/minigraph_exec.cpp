@@ -1402,129 +1402,272 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
     return true;
 }
 
-// Whole-layer clone-graph executor (GPU mini-graph shape on CPU, env
-// STREAM_MOE_TMP_CHAIN_GRAPH). Rebuild EVERY compute node of a layer as a fresh
-// ggml op tensor in the exec scratch ctx and run the whole layer as ONE cgraph
-// / one graph_compute - the CPU twin of the per-device mini-graph builder
-// (docs/M2_DEVICE_EXECUTOR.md SS2). On GPU each device rebuilds its column
-// chain the same way: mm = shell mul_mat_id over the pool weight column, every
-// weightless op cloned with identical op/params/ne/nb. Intermediates stay in
-// the arena block (hide_output's per-node regions); only moe_out touches the
-// llama dst.
+// Whole-layer clone-graph executor, refactored into append_* units (GPU
+// mini-graph shape on CPU, env STREAM_MOE_TMP_CHAIN_GRAPH). Rebuild the layer
+// as ONE cgraph / one graph_compute: for each bucket append the bucket's chain
+// (mm shell + weightless clones), fold the bucket's experts (sum over w) into
+// per-token columns, scatter into the full-width accumulator, then the exit
+// writes moe_out's dst. This is the CPU twin of the per-device mini-graph
+// builder (docs/M2_DEVICE_EXECUTOR.md SS2/SS7.7). Currently ONE full-width
+// bucket per layer (single device / all columns); the append_scatter step is a
+// WIDTH-CHECK mock until multi-bucket token subsets land.
 //
 // Clone srcs are wrapped as LEAVES carrying the main-graph data pointer (already
-// positioned by the hide/refresh flow) so the clone graph has NO external op
-// nodes; nodes are added with ggml_build_forward_expand, executed in the layer
-// order, and inter-node data flow happens through the shared arena regions
-// (producer clone writes its hide region, consumer clone reads the same region
-// via its src leaf). This is why mm standalone (its own single-node graph) was
-// verified IDENTICAL, and why chain = the same nodes in one graph.
+// positioned by the hide/refresh flow) so the graph has NO external op nodes;
+// nodes are added with ggml_build_forward_expand, executed in layer order, and
+// inter-node data flows through the shared arena regions (producer clone writes
+// its hide region, consumer clone reads it via its src leaf).
+
+struct chain_ctx_t {
+    ggml_context *             ctx  = nullptr;
+    ggml_backend_t             cpu  = nullptr;
+    expert_scheduler *         sched = nullptr;
+    const moe_model_topology_t * topo = nullptr;
+    int32_t                    layer = -1;
+    const std::vector<expert_handle_t> * pins = nullptr;
+    ggml_cgraph *              gf = nullptr;
+    const moe_layer_exec_t *   ex = nullptr;
+    // in-flight bucket geometry (full-width today: w == ids->ne[0])
+    int64_t                    w_b = 0;   // experts per token in this bucket
+    int64_t                    n_t = 0;   // tokens (full-width == ids->ne[1])
+    // slot-local ids buffers per mm, kept alive until graph_compute (their
+    // data pointers feed ids leaves; vector moves keep the heap data address).
+    std::vector<std::vector<int32_t>> mm_ids_pool;
+    // float buffers for no_alloc fold intermediates (kept alive until compute)
+    std::vector<std::vector<float>>    fold_buf;
+    // fold_repl: skip the anonymous per-topk fold + moe_out on the graph and
+    // produce them via append_expert_fold + exit memcpy instead. Off = the old
+    // IDENTICAL whole-clone behaviour (bring-up gate).
+    bool fold_repl = false;
+};
+
+// Append a routed mm as a shell mul_mat_id writing straight into the hidden dst
+// (full-width round assumption: every (k,t) expert in ONE subpool). Returns the
+// mm tensor.
+static ggml_tensor * append_mm_shell(chain_ctx_t & c, ggml_tensor * nd) {
+    ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+    ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+    ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
+    if (!ids->data || !cur->data) return nullptr;
+    parsed_node_t pn = parse_weight_name(w->name);
+    if (!pn.ok) return nullptr;
+    uint32_t gidx = c.sched->group_of(pn.layer);
+    if (gidx == static_cast<uint32_t>(-1)) return nullptr;
+
+    const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+    int32_t slot_begin = -1;
+    c.mm_ids_pool.emplace_back(n_ids, 0);           // keep alive until graph_compute
+    std::vector<int32_t> & mm_ids = c.mm_ids_pool.back();
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = MOE_ID_AT(ids, (int)(i / (size_t)ids->ne[0]), (int)(i % (size_t)ids->ne[0]));
+        if (e < 0 || e >= static_cast<int32_t>(c.topo->n_expert)) return nullptr;
+        const int32_t slot = pin_slot(*c.pins, pn.layer, static_cast<uint32_t>(e));
+        if (slot < 0) return nullptr;
+        const expert_scheduler::subpool_t * osp = c.sched->subpool_of_slot(slot);
+        if (!osp) return nullptr;
+        if (slot_begin < 0) slot_begin = static_cast<int32_t>(osp->slot_begin);
+        if (static_cast<int32_t>(osp->slot_begin) != slot_begin) return nullptr;
+        mm_ids[i] = slot - static_cast<int32_t>(osp->slot_begin);
+    }
+    const int32_t se0 = MOE_ID_AT(ids, 0, 0);
+    const expert_scheduler::subpool_t * sp = se0 < 0 ? nullptr
+        : c.sched->subpool_of_slot(pin_slot(*c.pins, pn.layer, static_cast<uint32_t>(se0)));
+    if (!sp) return nullptr;
+    size_t col_off = 0, col_stride = 0; uint32_t col_index = 0;
+    if (!c.sched->column_layout(*sp, w->name, col_off, col_stride, col_index)) return nullptr;
+
+    ggml_tensor * w3d = ggml_new_tensor_3d(c.ctx, w->type, w->ne[0], w->ne[1], 1);
+    w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
+    w3d->nb[2] = col_stride;
+    w3d->nb[3] = col_stride * sp->n_slots;
+    w3d->data  = sp->base + col_off;
+
+    ggml_tensor * ids_leaf = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    ids_leaf->data = mm_ids.data();   // pool keeps it alive until compute
+
+    ggml_tensor * cur_leaf = ggml_new_tensor_4d(c.ctx, cur->type,
+                                                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    cur_leaf->nb[0] = cur->nb[0]; cur_leaf->nb[1] = cur->nb[1];
+    cur_leaf->nb[2] = cur->nb[2]; cur_leaf->nb[3] = cur->nb[3];
+    cur_leaf->data = cur->data;
+
+    ggml_tensor * mm = ggml_mul_mat_id(c.ctx, w3d, cur_leaf, ids_leaf);
+    mm->data = nd->data;   // shell mm writes the hidden dst directly
+    ggml_build_forward_expand(c.gf, mm);
+    return mm;
+}
+
+// Clone a weightless / anonymous / moe_out op tensor: fresh node with identical
+// op/params/ne/nb, every src wrapped as a leaf carrying the main-graph data
+// pointer. Returns the clone.
+static ggml_tensor * append_op_clone(chain_ctx_t & c, ggml_tensor * nd) {
+    ggml_tensor * cl = ggml_new_tensor_4d(c.ctx, nd->type,
+                                          nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
+    cl->nb[0] = nd->nb[0]; cl->nb[1] = nd->nb[1];
+    cl->nb[2] = nd->nb[2]; cl->nb[3] = nd->nb[3];
+    cl->op = nd->op;
+    for (size_t i = 0; i < GGML_MAX_OP_PARAMS; ++i) cl->op_params[i] = nd->op_params[i];
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        ggml_tensor * src = nd->src[s];
+        if (!src) continue;
+        ggml_tensor * sv = ggml_new_tensor_4d(c.ctx, src->type,
+                                              src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        sv->nb[0] = src->nb[0]; sv->nb[1] = src->nb[1];
+        sv->nb[2] = src->nb[2]; sv->nb[3] = src->nb[3];
+        sv->data = src->data;
+        cl->src[s] = sv;
+        if (!sv->data) return nullptr;
+    }
+    cl->data = nd->data;   // out = llama dst (not hidden); else hide position
+    ggml_build_forward_expand(c.gf, cl);
+    return cl;
+}
+
+// Append one bucket's chain: walk the layer's compute sequence and clone the
+// mm shells + weightless ops that belong to this bucket. When c.fold_repl is
+// false the WHOLE sequence (including the anonymous per-topk fold and moe_out)
+// is cloned - the old IDENTICAL behaviour; when true the anonymous fold is
+// skipped (replaced by append_expert_fold). Returns the last clone.
+static ggml_tensor * append_bucket_chain(chain_ctx_t & c) {
+    ggml_tensor * last = nullptr;
+    for (const auto * cn : c.ex->compute) {
+        ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
+        if (is_view_op(nd)) continue;
+        const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
+        const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+        const bool is_fold = !is_mm && !is_out &&
+            nd->op == GGML_OP_ADD && !(nd->name && strstr(nd->name, "ffn_moe_"));
+        if (is_mm) {
+            last = append_mm_shell(c, nd);
+            if (!last) return nullptr;
+        } else if (is_out) {
+            if (!c.fold_repl) {
+                last = append_op_clone(c, nd);   // old behaviour: moe_out on graph
+                if (!last) return nullptr;
+            }   // fold_repl: exit writes it from the accumulator
+        } else if (is_fold) {
+            if (!c.fold_repl) {   // old behaviour: clone the anonymous adds
+                last = append_op_clone(c, nd);
+                if (!last) return nullptr;
+            }   // fold_repl: skipped, replaced by append_expert_fold
+        } else {
+            last = append_op_clone(c, nd);
+            if (!last) return nullptr;
+        }
+    }
+    return last;
+}
+
+// Fold the bucket's experts: sum over the per-token expert axis (w_b, currently
+// the full ids->ne[0]) so the weighted output [d_out, w_b, n_t] becomes a
+// per-token column [d_out, n_t]. Returns the folded tensor (width == n_t).
+// Intermediate/output buffers are manually kept alive (no_alloc ctx).
+static ggml_tensor * append_expert_fold(chain_ctx_t & c, ggml_tensor * weighted) {
+    if (!weighted) return nullptr;
+    const int64_t ne0 = weighted->ne[0];   // d_out
+    const int64_t nw  = weighted->ne[1];   // w_b (experts per token)
+    const int64_t nt  = weighted->ne[2];   // n_t tokens
+    // permute (view) so the expert axis (ne1) becomes ne0, materialise it
+    // contiguous (sum_rows needs nb0 == esize), then sum over the expert axis:
+    // sum_rows -> [1, d_out, n_t]; cont to [d_out, n_t].
+    ggml_tensor * p   = ggml_permute(c.ctx, weighted, 1, 0, 2, 3);   // view: [nw, d_out, n_t]
+    ggml_tensor * pc  = ggml_cont(c.ctx, p);                         // contiguous [nw, d_out, n_t]
+    c.fold_buf.emplace_back((size_t)(nw * ne0 * nt), 0.0f);
+    pc->data = c.fold_buf.back().data();
+    ggml_tensor * s   = ggml_sum_rows(c.ctx, pc);                    // [1, d_out, n_t]
+    c.fold_buf.emplace_back((size_t)(ne0 * nt), 0.0f);               // s data
+    s->data = c.fold_buf.back().data();
+    ggml_tensor * acc = ggml_cont_2d(c.ctx, s, ne0, nt);             // [d_out, n_t]
+    if (!acc) return nullptr;
+    c.fold_buf.emplace_back((size_t)(ne0 * nt), 0.0f);               // acc data
+    acc->data = c.fold_buf.back().data();
+    ggml_build_forward_expand(c.gf, acc);
+    c.w_b = 1;
+    c.n_t = nt;
+    return acc;
+}
+
+// Scatter the bucket's per-token columns into the full-width accumulator
+// [d_out, n_t]. MOCK: for the current single full-width bucket the per-token
+// fold already has width == n_t, so nothing to scatter; assert width parity and
+// abort loudly if a future bucket needs a real (sub-token) scatter.
+static bool append_scatter_to_fullwidth(chain_ctx_t & c, ggml_tensor * per_token) {
+    if (!per_token) return false;
+    const int64_t width = per_token->ne[1];   // n_tokens the bucket produced
+    if (width == c.n_t) {
+        return true;   // full-width bucket: already in accumulator geometry
+    }
+    fprintf(stderr,
+        "[stream_moe] append_scatter_to_fullwidth: MOCK ABORT - bucket width %lld != n_t %lld. "
+        "Multi-bucket sub-token scatter not implemented yet.\n",
+        (long long) width, (long long) c.n_t);
+    return false;
+}
+
+// Exit: run the graph; when fold_repl, write the accumulator into moe_out's
+// llama dst (the anonymous fold + moe_out were skipped on the graph).
+static bool chain_exit(chain_ctx_t & c, ggml_tensor * acc) {
+    if (ggml_backend_graph_compute(c.cpu, c.gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: chain graph compute failed for layer " << c.layer);
+        return false;
+    }
+    if (!c.fold_repl) return true;   // moe_out computed on the graph
+    ggml_tensor * moe_out = nullptr;
+    for (const auto * cn : c.ex->compute) {
+        if (cn->name && strstr(cn->name, "ffn_moe_out") != nullptr) { moe_out = const_cast<ggml_tensor*>(cn); break; }
+    }
+    if (moe_out && acc && acc->data) {
+        std::memcpy(moe_out->data, acc->data, ggml_nbytes(moe_out));
+    }
+    return true;
+}
+
+// Whole-layer single-graph path: for each bucket append its chain, fold its
+// experts, scatter to full width, then the exit writes moe_out.
 static enum ggml_status exec_layer_burst_chain(int32_t layer, ggml_context * ctx,
                                                ggml_backend_t cpu,
                                                expert_scheduler & sched,
                                                const moe_layer_exec_t * ex,
                                                const std::vector<expert_handle_t>& pins) {
-    const moe_model_topology_t& topo = sched.topology();
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    std::vector<int32_t> mm_ids;   // slot-local ids per mm, lives until compute
+    chain_ctx_t c;
+    c.ctx   = ctx;
+    c.cpu   = cpu;
+    c.sched = &sched;
+    c.topo  = &sched.topology();
+    c.layer = layer;
+    c.pins  = &pins;
+    c.gf    = gf;
+    c.ex    = ex;
+#ifdef STREAM_MOE_TEMP
+    c.fold_repl = std::getenv("STREAM_MOE_TMP_CHAIN_FOLD") != nullptr;
+#endif
 
+    // Set full-width geometry from the first routed mm's ids (single bucket).
     for (const auto * cn : ex->compute) {
-        ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
-        if (is_view_op(nd)) continue;   // views handled via view_aliases refresh
-        const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
-        const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
-
-        if (is_mm) {
-            ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
-            ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
-            ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
-            if (!ids->data || !cur->data) return GGML_STATUS_FAILED;
-            parsed_node_t pn = parse_weight_name(w->name);
-            if (!pn.ok) return GGML_STATUS_FAILED;
-            uint32_t gidx = sched.group_of(pn.layer);
-            if (gidx == static_cast<uint32_t>(-1)) return GGML_STATUS_FAILED;
-
-            // Full-width round: every (k,t) expert in ONE subpool.
-            const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
-            int32_t slot_begin = -1;
-            mm_ids.assign(n_ids, 0);
-            for (size_t i = 0; i < n_ids; ++i) {
-                const int32_t e = MOE_ID_AT(ids, (int)(i / (size_t)ids->ne[0]), (int)(i % (size_t)ids->ne[0]));
-                if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) return GGML_STATUS_FAILED;
-                const int32_t slot = pin_slot(pins, pn.layer, static_cast<uint32_t>(e));
-                if (slot < 0) return GGML_STATUS_FAILED;
-                const expert_scheduler::subpool_t * osp = sched.subpool_of_slot(slot);
-                if (!osp) return GGML_STATUS_FAILED;
-                if (slot_begin < 0) slot_begin = static_cast<int32_t>(osp->slot_begin);
-                if (static_cast<int32_t>(osp->slot_begin) != slot_begin) {
-                    LOG_ERROR("stream_moe: chain mode needs a single subpool per mm");
-                    return GGML_STATUS_FAILED;
-                }
-                mm_ids[i] = slot - static_cast<int32_t>(osp->slot_begin);
-            }
-            const int32_t se0 = MOE_ID_AT(ids, 0, 0);
-            const expert_scheduler::subpool_t * sp = se0 < 0 ? nullptr
-                : sched.subpool_of_slot(pin_slot(pins, pn.layer, static_cast<uint32_t>(se0)));
-            if (!sp) return GGML_STATUS_FAILED;
-            size_t col_off = 0, col_stride = 0; uint32_t col_index = 0;
-            if (!sched.column_layout(*sp, w->name, col_off, col_stride, col_index)) return GGML_STATUS_FAILED;
-
-            ggml_tensor * w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
-            w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
-            w3d->nb[2] = col_stride;
-            w3d->nb[3] = col_stride * sp->n_slots;
-            w3d->data  = sp->base + col_off;
-
-            ggml_tensor * ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
-            ids_leaf->data = mm_ids.data();
-
-            // Wrap cur as a leaf too: build_forward_expand must not drag the
-            // main-graph cur chain (norm/upstream) into this graph. The leaf
-            // carries cur->data (positioned by llama/hide) and its ne/nb.
-            ggml_tensor * cur_leaf = ggml_new_tensor_4d(ctx, cur->type,
-                                                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-            cur_leaf->nb[0] = cur->nb[0]; cur_leaf->nb[1] = cur->nb[1];
-            cur_leaf->nb[2] = cur->nb[2]; cur_leaf->nb[3] = cur->nb[3];
-            cur_leaf->data = cur->data;
-
-            ggml_tensor * mm = ggml_mul_mat_id(ctx, w3d, cur_leaf, ids_leaf);
-            mm->data = nd->data;   // shell mm writes the hidden dst directly
-            ggml_build_forward_expand(gf, mm);
-        } else {
-            // Clone the main-graph op tensor; every src becomes a leaf with the
-            // main-graph data pointer (already positioned by hide/refresh), so
-            // ggml's plan sees only op-NONE srcs and executes this clone.
-            ggml_tensor * c = ggml_new_tensor_4d(ctx, nd->type,
-                                                 nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
-            c->nb[0] = nd->nb[0]; c->nb[1] = nd->nb[1];
-            c->nb[2] = nd->nb[2]; c->nb[3] = nd->nb[3];
-            c->op = nd->op;
-            for (size_t i = 0; i < GGML_MAX_OP_PARAMS; ++i) c->op_params[i] = nd->op_params[i];
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                ggml_tensor * src = nd->src[s];
-                if (!src) continue;
-                ggml_tensor * sv = ggml_new_tensor_4d(ctx, src->type,
-                                                      src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
-                sv->nb[0] = src->nb[0]; sv->nb[1] = src->nb[1];
-                sv->nb[2] = src->nb[2]; sv->nb[3] = src->nb[3];
-                sv->data = src->data;
-                c->src[s] = sv;
-                if (!sv->data) return GGML_STATUS_FAILED;
-            }
-            c->data = nd->data;   // out = llama dst (not hidden); else hide position
-            ggml_build_forward_expand(gf, c);
-        }
+        if (!cn || cn->op != GGML_OP_MUL_MAT_ID || !cn->src[2]) continue;
+        c.w_b = cn->src[2]->ne[0];
+        c.n_t = cn->src[2]->ne[1];
+        break;
     }
 
-    if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
-        LOG_ERROR("stream_moe: chain graph compute failed for layer " << layer);
-        return GGML_STATUS_FAILED;
+    // Single full-width bucket today.
+    ggml_tensor * last = append_bucket_chain(c);
+    if (!last) { LOG_ERROR("stream_moe: chain append_bucket_chain failed L" << layer); return GGML_STATUS_FAILED; }
+    ggml_tensor * acc = nullptr;
+    if (c.fold_repl) {
+        // weighted (=last before fold when fold_repl) -> expert fold -> full width
+        acc = append_expert_fold(c, last);
+        if (!acc) { LOG_ERROR("stream_moe: chain append_expert_fold failed L" << layer); return GGML_STATUS_FAILED; }
+        if (!append_scatter_to_fullwidth(c, acc)) { return GGML_STATUS_FAILED; }
     }
+    if (!chain_exit(c, acc)) { return GGML_STATUS_FAILED; }
+
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DUMP")) {
         size_t seq = 0;
         for (const auto * cn : ex->compute) {
-            tmp_dump_node(sched, topo, pins, layer, seq, const_cast<ggml_tensor*>(cn));
+            tmp_dump_node(*c.sched, *c.topo, *c.pins, layer, seq, const_cast<ggml_tensor*>(cn));
             ++seq;
         }
     }
