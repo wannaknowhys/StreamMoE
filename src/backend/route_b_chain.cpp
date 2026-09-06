@@ -214,15 +214,18 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         }
     }
 
-    // ---- result-buffer layout (node-level interval reuse) ----------------
+    // ---- result-buffer layout (best-fit decreasing, node-level) ----------
     // Runs after the closure is complete (g_layer_exec holds every layer's
     // compute sequence, views excluded). For each layer: resolve every
     // chain-internal edge (consumer reads producer; views alias to the
-    // producer) and take each result's LAST reader index (last_use). A result
-    // stays live until last_use executes. Greedy interval packing in exec
-    // order: a slot whose occupant's last_use < current index is free (its
-    // reader already ran), so the node reuses it. Needs ~2 slots (gemma) /
-    // 3 (deepseek) per layer instead of one slot per node. Output:
+    // producer) and take each result's LAST reader index (last_use); a result
+    // stays live until last_use executes. Pack compute outputs into one
+    // per-layer result block by BEST-FIT DECREASING: place nodes by size
+    // descending, each at the lowest offset whose bytes do not collide with an
+    // already-placed result whose live interval overlaps. Large blocks land
+    // first so small ones fill their gaps (reaches the peak-simultaneous-live
+    // lower bound; gemma ~180KB/layer, deepseek ~197KB/layer at 1 token, vs
+    // full-alloc 417/524KB). Validated in diagnostics/layout_sim. Output:
     //   ex.out_off[i]   = byte offset of compute[i]'s output in the layer block
     //   ex.result_bytes = the layer block size (reused across layers by exec)
     //   ex.layout_ok    = false -> exec falls back to per-node bump (defensive)
