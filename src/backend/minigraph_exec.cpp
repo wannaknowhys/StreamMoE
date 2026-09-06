@@ -831,6 +831,127 @@ static void tmp_split_test(const char * which, ggml_context * ctx, ggml_backend_
                          topo, n_k, n_t, main_dst, f.c_str());
     }
 }
+
+// ---- bucket-granularity dump (TEMP) ---------------------------------------
+// Dumps every compact mm ROUND (one bucket) of a mixed mm node: the round's
+// pool-local slot ids, the rebuilt activation, the compact mm output and its
+// (t,k) scatter map. Offline tooling can then place each bucket's output back
+// into the full-width main dst and compare column-by-column against a
+// full-width baseline dump, WITHOUT waiting for the whole layer burst to
+// finish. Controlled by env (independent from STREAM_MOE_TMP_DUMP):
+//   STREAM_MOE_TMP_BUCKET_DUMP       =1 enable
+//   STREAM_MOE_TMP_BUCKET_DUMP_DIR    dump directory (default temp/tmp_bucket_dump)
+//   STREAM_MOE_TMP_BUCKET_DUMP_LAYER  layer to dump (default 0)
+// Self-contained (own mkdir/write) so it can live before the tmp_dump_*
+// harness further down the file.
+
+static void tmp_bucket_mkdirs(const std::string & path) {
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] == '/' || path[i] == '\\') {
+#ifdef _WIN32
+            _mkdir(cur.c_str());
+#else
+            ::mkdir(cur.c_str(), 0755);
+#endif
+        }
+    }
+    if (!cur.empty()) {
+#ifdef _WIN32
+        _mkdir(cur.c_str());
+#else
+        ::mkdir(cur.c_str(), 0755);
+#endif
+    }
+}
+static void tmp_bucket_write(const std::string & path, const void * data, size_t bytes) {
+    tmp_bucket_mkdirs(path.substr(0, path.find_last_of("/\\")));
+    if (!data || bytes == 0) return;
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) { LOG_ERROR("stream_moe: [tmp] bucket dump open failed " << path); return; }
+    const size_t wr = fwrite(data, 1, bytes, f);
+    fclose(f);
+    if (wr != bytes) LOG_ERROR("stream_moe: [tmp] bucket dump short write " << path);
+}
+static void tmp_bucket_meta(const std::string & path, int64_t ne0, int64_t ne1, int64_t ne2,
+                            const char * type, size_t nbytes, const char * tag) {
+    char j[512];
+    snprintf(j, sizeof(j),
+             "{\"ne\":[%lld,%lld,%lld],\"type\":\"%s\",\"nbytes\":%zu,\"tag\":\"%s\"}\n",
+             (long long) ne0, (long long) ne1, (long long) ne2, type, nbytes, tag ? tag : "");
+    tmp_bucket_write(path + ".json", j, strlen(j));
+}
+struct tmp_bucket_cfg_t {
+    bool on = false;
+    std::string dir;
+    int32_t layer = 0;
+};
+const tmp_bucket_cfg_t & tmp_bucket_cfg() {
+    static tmp_bucket_cfg_t c = [] {
+        tmp_bucket_cfg_t r;
+        const char * en = std::getenv("STREAM_MOE_TMP_BUCKET_DUMP");
+        if (en && std::string(en) == "1") {
+            r.on = true;
+            const char * d = std::getenv("STREAM_MOE_TMP_BUCKET_DUMP_DIR");
+            r.dir = d && *d ? d : "temp/tmp_bucket_dump";
+            const char * l = std::getenv("STREAM_MOE_TMP_BUCKET_DUMP_LAYER");
+            if (l && *l) r.layer = atoi(l);
+        }
+        return r;
+    } ();
+    return c;
+}
+// Dump one compact round (bucket) of a mixed mm node.
+//  - ids_sub: pool-local slot ids [width * n_active]
+//  - cur_sub: rebuilt activation [d_in, width, n_active]
+//  - out:     compact mm output [d_out, width, n_active]
+//  - scatter: (t,k) sidecar, one "t k" per (a*width+s), text
+static void tmp_dump_bucket_round(uint32_t layer, size_t round_idx, ggml_tensor * nd,
+                                  uint32_t pool, uint32_t width, uint32_t n_active,
+                                  const std::vector<int32_t>& ids_sub,
+                                  const std::vector<float>& cur_sub, size_t d_in,
+                                  const std::vector<float>& out,
+                                  const std::vector<mix_scatter_t>& scatter) {
+    const tmp_bucket_cfg_t & cfg = tmp_bucket_cfg();
+    if (!cfg.on || static_cast<int32_t>(layer) != cfg.layer) return;
+    if (out.empty() || scatter.empty()) return;
+    char sub[64];
+    snprintf(sub, sizeof(sub), "L%u", layer);
+    const std::string dir = cfg.dir + "/" + sub;
+    char b[64];
+    snprintf(b, sizeof(b), "r%03zu_p%u_w%u_a%u", round_idx, pool, width, n_active);
+    const size_t d_out = static_cast<size_t>(nd->ne[0]);
+    const size_t ncols = static_cast<size_t>(width) * n_active;
+    const size_t esize = sizeof(float);
+    // weight name, sanitized, for the offline alignment key
+    const char * wn = (nd->src[0] && nd->src[0]->name) ? nd->src[0]->name : "anon";
+    std::string s(wn);
+    for (auto & ch : s) {
+        if (ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' ||
+            ch == '"' || ch == '<' || ch == '>' || ch == '|') ch = '_';
+    }
+    const std::string pre = dir + "/" + s + "_" + b;
+    tmp_bucket_write(pre + ".ids_sub.bin", ids_sub.data(), ids_sub.size() * sizeof(int32_t));
+    tmp_bucket_meta(pre + ".ids_sub.bin", ncols, 1, 1, "i32", ids_sub.size() * sizeof(int32_t), "ids_sub");
+    if (!cur_sub.empty()) {
+        tmp_bucket_write(pre + ".cur_sub.bin", cur_sub.data(), cur_sub.size() * sizeof(float));
+        tmp_bucket_meta(pre + ".cur_sub.bin", static_cast<int64_t>(d_in), width, n_active,
+                        "f32", cur_sub.size() * esize, "cur_sub");
+    }
+    tmp_bucket_write(pre + ".out.bin", out.data(), out.size() * sizeof(float));
+    tmp_bucket_meta(pre + ".out.bin", static_cast<int64_t>(d_out), width, n_active,
+                    "f32", out.size() * esize, "out");
+    // scatter as text: one "t k" per (a*width+s) row
+    std::string sc;
+    sc.reserve(scatter.size() * 12);
+    for (const auto & e : scatter) {
+        char line[32];
+        snprintf(line, sizeof(line), "%u %u\n", e.t, e.k);
+        sc += line;
+    }
+    tmp_bucket_write(pre + ".scatter.txt", sc.data(), sc.size());
+}
 #endif // STREAM_MOE_TEMP
 
 // Execute one mixed MUL_MAT_ID node: run each pool's peel rounds on that pool's
@@ -866,6 +987,7 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
     uint8_t * main_dst = static_cast<uint8_t*>(nd->data);
     const size_t esize = sizeof(float);
 
+    size_t round_idx = 0;
     for (const auto & r : plan.rounds) {
         if (r.ids.empty()) continue;
         // subpool owning this round's experts (first slot decides)
@@ -908,7 +1030,15 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
             ? exec_round_cpu(ctx, cpu, w, *sp, col_off, col_stride, ids_sub, r.width, r.n_active, cur_sub, d_in, nd, out)
             : exec_round_vk(ctx, w, *sp, col_off, col_stride, ids_sub, r.width, r.n_active, cur_sub, d_in, out);
         if (!ok) return false;
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_BUCKET_DUMP")) {
+            tmp_dump_bucket_round(static_cast<uint32_t>(layer), round_idx, nd,
+                                  r.pool, r.width, r.n_active, ids_sub, cur_sub, d_in,
+                                  out, r.scatter);
+        }
+#endif
         scatter_sub_dst(main_dst, n_k, r.scatter, r.width, r.n_active, out.data(), d_out, esize);
+        ++round_idx;
     }
 #ifdef STREAM_MOE_TEMP
     // Column-split self-test: single full-width round (all columns to one pool)
