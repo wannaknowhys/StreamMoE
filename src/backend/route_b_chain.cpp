@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -460,6 +461,80 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
             }
         }
     }
+
+    // ---- [CAP-DUMP] closure-internal dependency / last-use analysis ----
+    // Observational only (STREAM_MOE_CAP_DUMP=1 + dbg tag): print each layer's
+    // compute sequence, every chain-internal src edge (consumer compute#c reads
+    // producer compute#p, span = c - p), and each result's LAST consumer index
+    // (last-use = the free moment for buffer reuse). Then exit 0 - do NOT run.
+    // Decides the result-buffer allocator (ping-pong vs interval vs full-alloc)
+    // from real data before writing executor code. 2026-09-05 user decision.
+#ifdef STREAM_MOE_TEMP
+    if (getenv("STREAM_MOE_CAP_DUMP")) {
+        for (auto & kv : by_layer) {
+            const int L = kv.first;
+            const auto & v = kv.second;
+            std::vector<int> comp;          // compute-only node global indices, exec order
+            std::vector<int> comp_of(N, -1);
+            for (int idx : v) {
+                if (is_view_op(gf->nodes[idx])) continue;
+                comp_of[idx] = (int) comp.size();
+                comp.push_back(idx);
+            }
+            const size_t C = comp.size();
+            fprintf(stderr, "\n=== [cap-dump] L%d: %zu compute nodes (exec order) ===\n", L, C);
+            // map global node idx -> exec compute# (producer identity for edges)
+            auto cmp_of = [&](const ggml_tensor * t) -> int {
+                const ggml_tensor * prod = t;
+                while (prod && is_view_op(prod)) prod = prod->src[0];
+                if (!prod) return -1;
+                for (size_t i = 0; i < C; ++i) if (gf->nodes[comp[i]] == prod) return (int) i;
+                return -1;
+            };
+            std::vector<int> last_use(C, -1);
+            // reverse pass: for consumer c (reverse), every producer p it reads
+            // gets last_use updated to c (later iterations only move it earlier,
+            // so scanning reverse keeps the FIRST consumer seen from the end = max).
+            for (int c = (int) C - 1; c >= 0; --c) {
+                const ggml_tensor * cn = gf->nodes[comp[c]];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const int p = cmp_of(cn->src[s]);
+                    if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;  // last (highest) reader
+                }
+            }
+            for (size_t ci = 0; ci < C; ++ci) {
+                const ggml_tensor * cn = gf->nodes[comp[ci]];
+                fprintf(stderr, "  compute#%2zu  %-12s span=%zuB  %s%s\n", ci,
+                        ggml_op_name(cn->op), ggml_nbytes(cn),
+                        cn->name ? cn->name : "(anon)", is_view_op(cn) ? "" : "");
+                // consumers of this result + spans
+                for (size_t cj = 0; cj < C; ++cj) {
+                    const ggml_tensor * c2 = gf->nodes[comp[cj]];
+                    bool reads = false;
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) if (cmp_of(c2->src[s]) == (int) ci) { reads = true; break; }
+                    if (reads) {
+                        const int span = (int) cj - (int) ci;
+                        fprintf(stderr, "         <- consumed by compute#%zu (span +%d)%s\n",
+                                cj, span,
+                                last_use[ci] == (int) cj ? "   [LAST-USE]" : "");
+                    }
+                }
+                if (last_use[ci] < 0 && ci + 1 < C) {
+                    fprintf(stderr, "         (result never consumed inside the layer closure)\n");
+                }
+            }
+            fprintf(stderr, "  --- last-use (free moment, buffer reusable from this point) ---\n");
+            for (size_t ci = 0; ci < C; ++ci) {
+                fprintf(stderr, "    compute#%2zu last_use=%-3s max_span=%d\n", ci,
+                        last_use[ci] < 0 ? "-" : std::to_string(last_use[ci]).c_str(),
+                        last_use[ci] < 0 ? -1 : last_use[ci] - (int) ci);
+            }
+        }
+        fprintf(stderr, "\n[cap-dump] done - exiting (analysis only).\n");
+        fflush(stderr);
+        exit(0);
+    }
+#endif // STREAM_MOE_TEMP
 
     // ---- external-consumer check: no node OUTSIDE the chain may reference a
     // chain node except the moe_out end (which post-norm/dense legitimately

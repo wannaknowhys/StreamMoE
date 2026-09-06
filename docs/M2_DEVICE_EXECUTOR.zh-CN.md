@@ -6,6 +6,37 @@
 > `docs/ROUTE_B_GPU_PHASE.md`（整层自调度 §1/§3）与已落地 VRAM 数据层
 > （docs/WORK_IN_PROGRESS.md J：host-map 通道、专家真驻留 device、demote 回 RAM）。
 
+## 0. 2026-09-05 决策补充（用户）——布局由 verify 分析产出，而非执行路径拍脑袋；每设备整链到出口
+
+历史教训：当前结果缓冲是一堆补丁。`hide_burst` 强制每节点全分配；ping-pong 曾被
+"long-range dep: L0 compute#4 reads compute#1" 触发后直接关掉（`g_pingpong_ok=false`），
+变成全 full-alloc。那是**数值错乱下瞎改**的补丁，真正根因疑似别处（DIO bug）。所以
+缓冲布局问题必须靠**分析**回答，不在执行器里试补丁。
+
+用户目标形态：
+
+1. **布局分析放 build-time verify**（与已收集每层闭包 compute 序列同一次 pass）。对每个
+   compute 节点的**结果**，从最后一个节点**倒序**回扫消费者找它的 free 时刻 = 最后一个
+   还读它的节点（last-use）。得每个结果的活区间 `[produce, last_use]`。
+2. **闭包内跨节点依赖图**（不是跨层——层间独立，Check1 已验证）。两种形态：
+   - 链式/近邻（结果只被下一节点读）：乒乓（两块交替结果缓冲）够；
+   - 长距（产者隔很多节点才被读，如 compute#4 读 compute#1）：需更大缓冲组或 interval 分配。
+   先做 **DEBUG DUMP + exit 0**（打印每个结果的 free/last-use + 依赖图），再决定分配器。
+3. **每设备整链算到闭包出口**：持有激活专家的每个设备把自己专家的**列 mini graph 一路算到
+   per-expert 贡献/闭包出口**——不是"mm 在 GPU、再回读给 CPU 跑无权重链尾"。每设备算到最终出口。
+4. 缓冲尺寸 + 每步输入输出**相对偏移**由 verify 分析导出（执行期不猜）。产物 = `moe_node_plan`：
+   per-device arena 尺寸 + 每步 out_off / in(producer+offset)。
+5. build-time 为每层备一张**拓扑模板**（闭包形状静态）。执行入口从 verify 产物 + **本次实际
+   pin 到的专家分布**实例化（填 data 指针/ids/偏移，不改结构）。
+6. 执行：异步提交其它 device 的实例化 mini graph，调用线程跑本地路，然后**汇聚节点强制全等待**
+   （同步每 device）把各贡献汇总出闭包。
+
+保留理由：设备 mini graph 在设备上算 per-expert 列路径；只有（小的）贡献/merge 跨界。
+大中间量永不离开设备 arena。graph_compute 仅在层汇聚同步后才返回（§3.4）。
+
+构建顺序注意：**分析（倒序 last-use dump）是第 1 步且纯观测**——先做、dump、`exit 0`，
+用真实依赖数据决定分配器，再写任何执行器代码。
+
 ## 1. 目标
 
 私有化 MoE 层按**每设备专家列链**执行，从一开始就是最终形态（无 CPU-only 过渡执行器）。

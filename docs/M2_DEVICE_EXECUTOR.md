@@ -8,6 +8,55 @@
 > (docs/WORK_IN_PROGRESS.md J: host-map channel, experts resident on device,
 > demote-to-RAM).
 
+## 0. Decision supplement 2026-09-05 (user) - buffer layout via verify, not the
+##     execution path; whole-chain per device
+
+History lesson first: the current result-buffer scheme is a maze of band-aids.
+`hide_burst` forces a full-alloc per node and ping-pong was disabled
+(`g_pingpong_ok=false`) after a "long-range dep: L0 compute#4 reads compute#1"
+panic that was patched by turning EVERYTHING to full-alloc. That was a
+whack-a-mole fix under a wrong numeric result - the real root cause was
+suspected elsewhere (a DIO bug). So the buffer-layout question must be answered
+by ANALYSIS, not by trial patches in the executor.
+
+User's target shape:
+
+1. **Layout analysis lives in build-time verify** (the same pass that already
+   collects the per-layer closure `compute` sequence). For every compute-node
+   RESULT, walk consumers BACKWARD from the last node (reverse order) to find
+   its free moment = the last node that still reads it (last-use). This gives a
+   per-result live range `[produce, last_use]`.
+2. **Closure-internal cross-node dependency graph** (NOT cross-layer - layers are
+   independent, verified by Check1). Two shapes:
+   - chained/neighbour (result read only by the next node): ping-pong (two
+     alternating result buffers) is enough;
+   - long-range (a producer read many nodes later, e.g. compute#4 reads
+     compute#1): needs a larger set or an interval-allocated buffer.
+   The analysis must be a DEBUG DUMP + `exit 0` first (print each result's
+   free/last-use + the dependency graph), THEN decide the allocator.
+3. **Per-device whole chain to the closure exit**: each device that holds active
+   experts runs its OWN column mini-graph ALL THE WAY to the per-expert
+   contribution / closure output - not "mm on GPU, then read back for the
+   weightless tail on CPU". Each device computes to the final exit.
+4. Buffer sizing + per-step input/output RELATIVE offsets are derived from the
+   verify analysis (not guessed at exec time). Result: `moe_node_plan` with
+   per-device arena size and each step's out_off / in(producer+offset).
+5. Build-time: one topology TEMPLATE per layer (closure shape is static). At
+   exec entry, INSTANTIATE it from the verify product + THIS run's pinned expert
+   distribution (fill data pointers / ids / offsets, no structural rebuild).
+6. Exec: submit other devices' instantiated mini graphs ASYNC, run the local
+   path on the calling thread, then a CONVERGE point that forces a full wait
+   (sync every device) and folds all contributions back out of the closure.
+
+Rationale to keep: device mini graph computes the per-expert column path on the
+device; only the (small) contributions / merge cross the boundary. Big
+intermediates never leave the device arena. graph_compute returns only after the
+layer converge sync (§3.4).
+
+Build order note: the ANALYSIS (reverse last-use dump) is step 1 and is purely
+observational - do it, dump, `exit 0`, and decide the allocator from real
+dependency data before writing any executor code.
+
 ## 1. Goal
 
 Execute a privatised MoE layer as **per-device expert-column chains**, in the
