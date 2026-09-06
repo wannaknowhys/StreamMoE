@@ -711,6 +711,40 @@ static std::vector<tmp_blk_t> tmp_split_blocks(const char * which,
     return out;
 }
 
+// Turn a list of rectangular blocks (k0..k1 x t0..t1) into independent mix
+// rounds replacing a single full-width round. Every token in the t range of a
+// block contributes the k-slice [k0,k1) -> a legal compact mm round
+// [width=(k1-k0), n_active=(t1-t0)] with zero waste. ids (not consumed by the
+// exec loop, which rebuilds from scatter + ids_compact) mirror the scatter
+// order so the round is never seen as empty.
+static mix_plan_t tmp_plan_from_blocks(const mix_plan_t & base,
+                                       const std::vector<tmp_blk_t> & blocks,
+                                       uint32_t n_k,
+                                       const std::vector<int32_t>& ids_compact) {
+    mix_plan_t out;
+    out.n_expert_used = base.n_expert_used;
+    out.n_tokens      = base.n_tokens;
+    out.n_pools       = base.n_pools;
+    out.buckets       = base.buckets;
+    const uint32_t pool = base.rounds.empty() ? 0 : base.rounds[0].pool;
+    for (const auto & b : blocks) {
+        mix_round_t r;
+        r.pool     = pool;
+        r.width    = b.k1 - b.k0;
+        r.n_active = b.t1 - b.t0;
+        r.ids.reserve(static_cast<size_t>(r.width) * r.n_active);
+        r.scatter.reserve(static_cast<size_t>(r.width) * r.n_active);
+        for (uint32_t t = b.t0; t < b.t1; ++t) {
+            for (uint32_t k = b.k0; k < b.k1; ++k) {
+                r.scatter.push_back({ t, k });
+                r.ids.push_back(ids_compact[static_cast<size_t>(t) * n_k + k]);
+            }
+        }
+        if (!r.ids.empty()) out.rounds.push_back(std::move(r));
+    }
+    return out;
+}
+
 // Run one rectangular block as an independent compact mm round and scatter its
 // output into `dst` (caller zeroed). Mirrors the exec_mixed_mm round handling:
 // build pool-local slot ids, rebuild activation columns, compact mm on the CPU
@@ -982,6 +1016,31 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
 
     mix_plan_t plan = build_mix_plan(ids_compact.data(), n_k, n_t,
                                      expert_pool.data(), topo.n_expert, sched.n_pools());
+#ifdef STREAM_MOE_TEMP
+    // "Artificial multi-bucket" switch: when the natural plan is a SINGLE
+    // full-width round (one pool owns every column), optionally re-split the
+    // (k,t) column domain into multiple rectangular buckets and execute them
+    // as independent rounds - same exec loop, same scatter, same tail fold.
+    // This is the exec-layer stand-in for real multi-pool/multi-device buckets
+    // while debugging the bucket-chain executor (docs/M2_DEVICE_EXECUTOR.md
+    // SS7.3). Env STREAM_MOE_TMP_FORCE_BUCKETS selects the cut (a tmp_split_*
+    // family). Each bucket round still dumps via STREAM_MOE_TMP_BUCKET_DUMP, so
+    // per-bucket placement can be verified offline.
+    {
+        const bool single_full = plan.rounds.size() == 1 &&
+            plan.rounds[0].width == n_k && plan.rounds[0].n_active == n_t;
+        const char * fb = std::getenv("STREAM_MOE_TMP_FORCE_BUCKETS");
+        if (single_full && fb && fb[0] && std::string(fb) != "full") {
+            const auto blocks = tmp_split_blocks(fb, n_k, n_t);
+            if (blocks.size() > 1) {
+                mix_plan_t fp = tmp_plan_from_blocks(plan, blocks, n_k, ids_compact);
+                fprintf(stderr, "[force_buckets] L%d %s: 1 full round -> %zu buckets\n",
+                        layer, w->name ? w->name : "?", (size_t) fp.rounds.size());
+                plan = std::move(fp);
+            }
+        }
+    }
+#endif
     if (plan.rounds.empty()) return true;
 
     uint8_t * main_dst = static_cast<uint8_t*>(nd->data);
