@@ -639,6 +639,200 @@ static bool exec_round_vk(ggml_context * ctx, const ggml_tensor * w,
     return true;
 }
 
+#ifdef STREAM_MOE_TEMP
+// ---- column-split self-test (temporary diagnostic) ------------------------
+// Validates that an arbitrary rectangular partition of the (k,t) column domain
+// recomputed as independent compact mm rounds + scatter reproduces the single
+// full-width mm result byte-for-byte. Bucket geometry and the scatter map are
+// the same machinery a future per-device/bucket executor relies on, so this is
+// the correctness base for the whole bucket design (docs/M2_DEVICE_EXECUTOR.md
+// SS7.3). Controlled by env STREAM_MOE_TMP_SPLIT (values: vertical, vertical_
+// asym, horizontal, horizontal_asym, mixed2x2 - or "all"). Runs only on a
+// single-pool full-width plan (plan.rounds has one round covering all columns).
+// Layout note: llama dst is [d_out, n_k, n_t]; a round's compact mm computes a
+// width-column slice of every active token; scatter writes each (a*width+s)
+// output column back to main-dst column (k + t*n_k). A block is a rectangle
+// over k-slot ranges and token ranges. Within a single pool every token routes
+// all n_k slots to that pool, so any rectangle (k0..k1, t0..t1) is a uniform
+// full rectangle with zero waste.
+
+struct tmp_blk_t {
+    uint32_t k0 = 0, k1 = 0;   // k-slot half-open range
+    uint32_t t0 = 0, t1 = 0;   // token half-open range
+};
+
+static std::vector<tmp_blk_t> tmp_split_blocks(const char * which,
+                                               uint32_t n_k, uint32_t n_t) {
+    std::vector<tmp_blk_t> out;
+    const bool all = std::string(which) == "all";
+    const auto add = [&](uint32_t k0, uint32_t k1, uint32_t t0, uint32_t t1) {
+        k1 = std::min(k1, n_k); t1 = std::min(t1, n_t);
+        if (k0 < k1 && t0 < t1) out.push_back({ k0, k1, t0, t1 });
+    };
+    if (std::string(which) == "full") {
+        // Full domain as the reference sanity check (single block == full round).
+        add(0, n_k, 0, n_t);
+        return out;
+    }
+    if (all || std::string(which) == "vertical") {
+        // vertical cut: split k slots (equal halves)
+        const uint32_t h = n_k / 2;
+        add(0, h, 0, n_t);
+        add(h, n_k, 0, n_t);
+    }
+    if (all || std::string(which) == "vertical_asym") {
+        // asymmetric expert counts: 2 + 3 + rest
+        const uint32_t a = std::min(2u, n_k), b = std::min(5u, n_k);
+        add(0, a, 0, n_t);
+        add(a, b, 0, n_t);
+        add(b, n_k, 0, n_t);
+    }
+    if (all || std::string(which) == "horizontal") {
+        // horizontal cut: split token range (equal halves)
+        const uint32_t h = n_t / 2;
+        add(0, n_k, 0, h);
+        add(0, n_k, h, n_t);
+    }
+    if (all || std::string(which) == "horizontal_asym") {
+        // asymmetric token cut: 1/3 + 1/3 + rest
+        const uint32_t a = n_t / 3, b = 2 * n_t / 3;
+        add(0, n_k, 0, a);
+        add(0, n_k, a, b);
+        add(0, n_k, b, n_t);
+    }
+    if (all || std::string(which) == "mixed2x2") {
+        // one vertical x one horizontal cut = four quadrants
+        const uint32_t hk = n_k / 2, ht = n_t / 2;
+        add(0, hk, 0, ht);
+        add(0, hk, ht, n_t);
+        add(hk, n_k, 0, ht);
+        add(hk, n_k, ht, n_t);
+    }
+    return out;
+}
+
+// Run one rectangular block as an independent compact mm round and scatter its
+// output into `dst` (caller zeroed). Mirrors the exec_mixed_mm round handling:
+// build pool-local slot ids, rebuild activation columns, compact mm on the CPU
+// backend, scatter back at each (t,k). Returns false on any setup failure.
+static bool tmp_run_block(ggml_context * ctx, ggml_backend_t cpu,
+                          expert_scheduler & sched, ggml_tensor * nd,
+                          uint32_t layer, const std::vector<expert_handle_t>& pins,
+                          const std::vector<int32_t>& ids_compact,
+                          const std::vector<int32_t>& expert_pool,
+                          const moe_model_topology_t & topo,
+                          uint32_t n_k, const tmp_blk_t & blk,
+                          uint8_t * dst, size_t dst_nk, size_t d_out) {
+    ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+    ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+    const uint32_t width   = blk.k1 - blk.k0;
+    const uint32_t n_tok   = blk.t1 - blk.t0;
+    // Block columns in (t asc, k asc) = llama layout rows (t in block), k fastest.
+    std::vector<mix_scatter_t> scatter;
+    scatter.reserve(static_cast<size_t>(width) * n_tok);
+    for (uint32_t t = blk.t0; t < blk.t1; ++t)
+        for (uint32_t k = blk.k0; k < blk.k1; ++k)
+            scatter.push_back({ t, k });
+    // Resolve the pool/subpool + column layout from the block's first expert.
+    const mix_scatter_t & sc0 = scatter[0];
+    const int32_t e0 = ids_compact[static_cast<size_t>(sc0.t) * n_k + sc0.k];
+    if (e0 < 0) return false;
+    const int32_t slot0 = pin_slot(pins, layer, static_cast<uint32_t>(e0));
+    if (slot0 < 0) return false;
+    const expert_scheduler::subpool_t * sp = sched.subpool_of_slot(slot0);
+    if (!sp) return false;
+    size_t col_off = 0, col_stride = 0;
+    uint32_t col_index = 0;
+    if (!sched.column_layout(*sp, w->name, col_off, col_stride, col_index)) return false;
+    // Pool-local slot ids for the block columns.
+    std::vector<int32_t> ids_sub(scatter.size());
+    for (size_t idx = 0; idx < scatter.size(); ++idx) {
+        const int32_t e = ids_compact[static_cast<size_t>(scatter[idx].t) * n_k + scatter[idx].k];
+        const int32_t slot = pin_slot(pins, layer, static_cast<uint32_t>(e));
+        if (slot < 0 || sched.subpool_of_slot(slot) != sp) return false;  // mixed subpool: abort this block
+        ids_sub[idx] = slot - static_cast<int32_t>(sp->slot_begin);
+    }
+    std::vector<float> cur_sub;
+    size_t d_in = 0;
+    if (!build_cur_sub(cur, scatter, width, n_tok, cur_sub, d_in)) return false;
+    std::vector<float> out;
+    if (!exec_round_cpu(ctx, cpu, w, *sp, col_off, col_stride, ids_sub, width,
+                        n_tok, cur_sub, d_in, nd, out)) {
+        return false;
+    }
+    scatter_sub_dst(dst, dst_nk, scatter, width, n_tok, out.data(), d_out, sizeof(float));
+    return true;
+}
+
+// Compare the full-width result (`ref`, main dst) against a block re-run that
+// scatters every block into `dst` (zeroed first). Byte-exact required; the
+// compact mm is the same CPU kernel as the full round, just split by columns,
+// so the per-column result must be bit-identical.
+static bool tmp_split_verify(ggml_context * ctx, ggml_backend_t cpu,
+                             expert_scheduler & sched, ggml_tensor * nd,
+                             uint32_t layer, const std::vector<expert_handle_t>& pins,
+                             const std::vector<int32_t>& ids_compact,
+                             const std::vector<int32_t>& expert_pool,
+                             const moe_model_topology_t & topo,
+                             uint32_t n_k, uint32_t n_t,
+                             const uint8_t * ref, const char * which) {
+    const size_t d_out = static_cast<size_t>(nd->ne[0]);
+    const size_t dst_bytes = ggml_nbytes(nd);
+    std::vector<uint8_t> dst(dst_bytes, 0);
+    const auto blocks = tmp_split_blocks(which, n_k, n_t);
+    size_t cols = 0;
+    for (const auto & b : blocks) {
+        if (!tmp_run_block(ctx, cpu, sched, nd, layer, pins, ids_compact, expert_pool,
+                           topo, n_k, b, dst.data(), n_k, d_out)) {
+            fprintf(stderr, "[split] %-14s block [k %u..%u) x [t %u..%u) SKIPPED (setup)\n",
+                    which, b.k0, b.k1, b.t0, b.t1);
+            return false;
+        }
+        cols += (size_t)(b.k1 - b.k0) * (b.t1 - b.t0);
+    }
+    // A valid partition covers every (k,t) exactly once.
+    if (cols != (size_t) n_k * n_t) {
+        fprintf(stderr, "[split] %-14s block coverage %zu != %u x %u\n", which, cols, n_k, n_t);
+        return false;
+    }
+    const size_t nf = dst_bytes / sizeof(float);
+    const float * a = (const float *) ref;
+    const float * b = (const float *) dst.data();
+    size_t first = nf;
+    for (size_t i = 0; i < nf; ++i) {
+        if (a[i] != b[i]) { first = i; break; }
+    }
+    const bool ok = first == nf;
+    fprintf(stderr, "[split] %-14s blocks=%zu cols=%zu bytes=%zu %s",
+            which, blocks.size(), cols, dst_bytes, ok ? "PASS (byte-identical)" : "FAIL");
+    if (!ok) fprintf(stderr, " (first diff @ elem %zu)", first);
+    fprintf(stderr, "\n");
+    return ok;
+}
+
+// Entry gate for the split self-test; runs the requested cut families against
+// the just-computed full-width main dst.
+static void tmp_split_test(const char * which, ggml_context * ctx, ggml_backend_t cpu,
+                           expert_scheduler & sched, ggml_tensor * nd, uint32_t layer,
+                           const std::vector<expert_handle_t>& pins,
+                           const std::vector<int32_t>& ids_compact,
+                           const std::vector<int32_t>& expert_pool,
+                           const moe_model_topology_t & topo,
+                           uint32_t n_k, uint32_t n_t, uint8_t * main_dst) {
+    std::vector<std::string> families;
+    if (std::string(which) == "all") {
+        families = { "full", "vertical", "vertical_asym", "horizontal",
+                     "horizontal_asym", "mixed2x2" };
+    } else {
+        families = { which };
+    }
+    for (const auto & f : families) {
+        tmp_split_verify(ctx, cpu, sched, nd, layer, pins, ids_compact, expert_pool,
+                         topo, n_k, n_t, main_dst, f.c_str());
+    }
+}
+#endif // STREAM_MOE_TEMP
+
 // Execute one mixed MUL_MAT_ID node: run each pool's peel rounds on that pool's
 // backend, scatter each round's compact output into the (hide_burst'd) main dst.
 // `ids_compact` = llama-layout expert ids [n_k, n_t] (k fastest) compacted from
@@ -716,6 +910,19 @@ static bool exec_mixed_mm(ggml_context * ctx, ggml_backend_t cpu,
         if (!ok) return false;
         scatter_sub_dst(main_dst, n_k, r.scatter, r.width, r.n_active, out.data(), d_out, esize);
     }
+#ifdef STREAM_MOE_TEMP
+    // Column-split self-test: single full-width round (all columns to one pool)
+    // is the baseline - recompute the same mm as arbitrary rectangular column
+    // buckets and require a byte-identical main dst. Env STREAM_MOE_TMP_SPLIT
+    // selects the cut families ("all" runs every one).
+    if (plan.rounds.size() == 1) {
+        const char * sp_name = std::getenv("STREAM_MOE_TMP_SPLIT");
+        if (sp_name && sp_name[0]) {
+            tmp_split_test(sp_name, ctx, cpu, sched, nd, static_cast<uint32_t>(layer),
+                           pins, ids_compact, expert_pool, topo, n_k, n_t, main_dst);
+        }
+    }
+#endif
     return true;
 }
 
