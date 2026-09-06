@@ -327,3 +327,35 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
    并行执行 / 多 device）下才不安全，本直接 graph_compute 路径从不发生。
 4. "shell mm 在图 + 原 weightless 节点"的混合形态被 (1)+(2) 打破：weightless 引用主图张量，ggml
    无法 plan；全克隆干净消除歧义。
+
+## 7.5 用户决策 2026-09-06：多 device 形态（compact 每桶链 + per-device 累加器 +
+##    DMA contribution 写回）
+
+多 device / 多桶阶段的目标形态，直接建在 §7.4 clone builder + 已验"interval 布局在单 cgraph 可用"
+之上：
+
+对**每个有桶的 device**：
+- **cur 拷贝上传到 device**——CPU "引用 llama 激活"的技巧只在 llama 同步 graph_compute 帧内、对
+  单个本地 device 安全。多 device / async 使该窗口失效，所以每个 device 在自己的 staging buffer
+  上拿一份 cur。CPU 阶段保持引用形态不变。
+- **中间结果区用 verify 布局**：每 device 一整层结果块（result_bytes，§7.2）——interval 布局已验
+  在单 cgraph 路径可复用为 arena 字节映射，无需单独 per-device 布局。device 的桶链把自己的 compact
+  列写进自己的块。
+- **每桶是 compact 降维链**（用户决策）：mm→weightless→...→weighted 全程在该桶的 compact 列集
+  `[d, w_b, n_active]` 上算，**不在满宽几何**。这是真 GPU mini-graph 形态；§7.4 的满宽单桶 clone
+  是单 device 特例（一个满宽 round == 一个 device == 全部列）。中间量留在 device 端且小。
+- **每 device 一张大 cgraph，每桶 clone 一遍链**，然后折进 device 自己的累加器（§7.3 per-device
+  输出区）。
+
+跨 device 最终折叠（对 k 求 weighted 和）用**独立累加器**（用户决策）：每 device 贡献自己的列，
+出口一次对各累加器行求和。per-device 累加器避免跨 device 写竞争（每个 (k,t) 列唯一归属一个
+device）。
+
+**contribution 写回必须 device DMA 异步写 host RAM，不是 host 逐列 memcpy 读**（用户决策，v2r
+教训：host memcpy 专家数据 ~158 ms/专家 vs 经 cached staging 的 transfer-queue DMA ~1 ms——见
+VRAM_DMA_MOVE.md）。设计推论：跨边界的是 device 的**连续 contribution 块**（DMA 友好批量），折进
+累加器在 host RAM 做（快）；DMA **不能**尝试把单列 scatter 进累加器行（会退回逐列慢路径）。传输用
+v2r cached-staging DMA 通道。
+
+CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器折叠的**数值**（对 dump/基线）；DMA
+传输本身只属 GPU 阶段。

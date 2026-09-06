@@ -551,3 +551,47 @@ Key gotchas learned (why the earlier hide+append attempts failed):
 4. The mixed "shell mm in graph + original weightless nodes" shape is broken by
    (1)+(2): the weightless nodes reference main-graph tensors that ggml cannot
    plan; cloning everything cleanly removes the ambiguity.
+
+## 7.5 User decision 2026-09-06: multi-device shape (compact per-bucket chains +
+##     per-device accumulator + DMA contribution writeback)
+
+Target shape for the multi-device / multi-bucket phase, building directly on the
+SS7.4 clone builder and the verified interval-layout-in-one-cgraph result:
+
+For EVERY device that has buckets:
+- **cur is copied (uploaded) to the device** - the CPU "reference llama's
+  activation" trick is only safe inside llama's synchronous graph_compute frame
+  for the single local device. Multi-device / async invalidates that window, so
+  each device gets its own cur copy on its staging buffer. CPU phase keeps the
+  reference form unchanged.
+- **Intermediate result region follows the verify layout**: per device, one
+  whole-layer result block (result_bytes, SS7.2) - the interval layout was
+  verified reusable as an arena byte map in the one-cgraph path, so no separate
+  per-device layout is needed. The device's bucket chains write their compact
+  columns into their own block.
+- **Each bucket is a COMPACT reduced-dimension chain** (user decision): the
+  mm->weightless->...->weighted tail runs entirely on the bucket's compact
+  column set `[d, w_b, n_active]`, NOT on the full-width geometry. This is the
+  true GPU-mini-graph shape; the SS7.4 full-width single-bucket clone was the
+  single-device special case (one full round == one device == all columns).
+  Intermediates stay device-resident and small.
+- **One big cgraph per device clones the chain once per bucket**, then folds
+  into the device's own accumulator (SS7.3 per-device output region).
+
+Cross-device final fold (sum over k of weighted) uses an **independent
+accumulator** (user decision): each device contributes its own columns, the
+accumulator rows are summed once at the exit. Per-device accumulators avoid
+cross-device write races (each (k,t) column belongs to exactly one device).
+
+**Contribution writeback MUST be device DMA async to host RAM, not host
+per-column memcpy reads** (user decision, v2r lesson: host memcpy of expert
+data was ~158 ms/expert vs ~1 ms via transfer-queue DMA through cached staging
+- see VRAM_DMA_MOVE.md). Design consequence: what crosses the boundary is the
+device's CONTIGUOUS contribution block (DMA-friendly bulk), and the fold into
+the accumulator happens on host RAM (fast) - DMA must not try to scatter single
+columns into accumulator rows (that would regress to the per-column slow path).
+The v2r cached-staging DMA channel is the transport.
+
+CPU phase cannot fake the DMA (principle 11): it validates the NUMERICS of
+compact bucket chains + accumulator folding against dumps/baselines; the DMA
+transport itself is GPU-phase work only.
