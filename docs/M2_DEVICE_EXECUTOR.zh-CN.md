@@ -306,10 +306,13 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
   隐藏 producer = 位置映射）。因此 clone 图**没有外部 op 节点**；ggml plan 无条件执行每个 clone。
   节点间数据流经共享 arena 区按层序传递：producer clone 写它自己的区，consumer clone 经 src leaf
   读同一区。
-- **缓冲**：中间/输出区这里**不用 verify interval 布局**——chain 模式调 `hide_output`（per-node
-  full-alloc bump，每节点独立区），因为单 cgraph 内所有输出共存到结束；`out_off` 的区间共享假设逐
-  节点顺序执行。moe_out 写 llama 的 dst（不 hide）。view 在图跑前 refresh 到隐藏 producer。这是当前
-  CPU 事实；verify 布局定 per-device arena 尺寸仍是 GPU 阶段工作。
+- **缓冲**：chain 路径与逐节点路径**用同一 verify interval 布局**（`hide_burst` -> `out_off`，
+  字节区按 last-use 共享）。2026-09-06 实测 IDENTICAL：CPU backend **严格按 `gf->nodes` 顺序执行、
+  无跨节点并发**，所以 last-use 推理传递成立——后节点复用一个早结果的区时，该结果的所有 reader
+  （在其 last-use 索引前）都已消费完。早先的 `hide_output` per-node full-alloc bump 是保守选择，
+  **此处并非必需**。推论：verify 的 `out_off` 布局可直接作为 per-device arena 字节偏移（§7.2"每
+  device 整层块"无需单独布局）。moe_out 写 llama 的 dst（不 hide）。view 在图跑前 refresh 到隐藏
+  producer。
 - **分桶**：此路径**还没跑多桶**。当前 chain 模式要求每个 mm 单满宽 round（单一 subpool 拥有全部
   列）= 单 device 情形。真多桶 / 多 device（每 device 自己列的子图、`build_mix_plan` peel 喂每
   device 列集）是在此 builder 之上的下一步。
@@ -318,6 +321,9 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
 1. `ggml_build_forward_expand` 会追 src op 节点——主图 src 必须先变成 data leaf 才能进我们的图。
 2. 手动塞 `gf->nodes[]` 不 expand 会让 mm dst 没被写（全 0）；节点必须经 build_forward_expand
    （或等价）注册 CPU plan 才执行。
-3. 单 cgraph 不能用 interval 共享布局（同时存活）；per-device arena 落地前需要 per-node full-alloc。
+3. ~~单 cgraph 不能用 interval 共享布局（同时存活）；per-device arena 落地前需要 per-node
+   full-alloc。~~ **已推翻**：verify interval 布局在单 cgraph 路径下也正确——CPU backend 严格按序
+   执行节点，last-use 共享成立（实测 IDENTICAL）。interval 共享只在真实跨节点并发（backend_sched
+   并行执行 / 多 device）下才不安全，本直接 graph_compute 路径从不发生。
 4. "shell mm 在图 + 原 weightless 节点"的混合形态被 (1)+(2) 打破：weightless 引用主图张量，ggml
    无法 plan；全克隆干净消除歧义。

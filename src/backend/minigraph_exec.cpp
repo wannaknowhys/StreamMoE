@@ -1616,13 +1616,24 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // the end. mm dsts and weightless dsts land in distinct regions; views are
     // refreshed to those hidden producers before the graph runs.
     if (std::getenv("STREAM_MOE_TMP_CHAIN_GRAPH")) {
-        moe_chain_set_full_alloc(lsum);
+        // EXPERIMENT (2026-09-06): does the verify INTERVAL layout (hide_burst
+        // -> out_off, shared byte regions by last-use) hold for the one-cgraph
+        // path too? The CPU backend executes gf->nodes in order (no cross-node
+        // concurrency), so the per-node last-use reasoning should transfer: a
+        // later node reusing an earlier result's region only runs after every
+        // reader of that earlier result (last-use < the reuse index). If this
+        // stays IDENTICAL the verify out_off layout is directly reusable as the
+        // per-device arena offset - no separate per-device layout needed. The
+        // prior hide_output full-alloc bump was a conservative choice, never
+        // proven necessary against the interval layout in this path.
+        const moe_layer_exec_t * exl = moe_chain_layer_exec(layer);
+        moe_chain_set_full_alloc((exl && exl->layout_ok) ? exl->result_bytes : lsum);
         reset_layer(layer);
         for (const auto * cn : ex->compute) {
             ggml_tensor * m = const_cast<ggml_tensor*>(cn);
             if (is_view_op(m)) continue;
             if (m->name && strstr(m->name, "ffn_moe_out")) continue;  // llama dst
-            if (!hide_output(m, layer)) {
+            if (!hide_burst(m, layer)) {
                 LOG_ERROR("stream_moe: chain hide failed L" << layer);
                 for (const auto & h : pins) sched.unpin(h);
                 return GGML_STATUS_FAILED;

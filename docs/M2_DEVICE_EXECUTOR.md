@@ -518,13 +518,17 @@ How it works (implementation details):
   clone unconditionally. Inter-node data flows through the shared arena regions
   in layer order: producer clone writes its region, consumer clone reads the
   same region via its src leaf.
-- **Buffers**: intermediate/output regions are NOT the verify interval layout
-  here - chain mode calls `hide_output` (per-node full-alloc bump, each node its
-  own region) because in ONE cgraph all outputs coexist until the end; the
-  interval sharing of `out_off` assumes per-node sequential execution. moe_out
-  writes llama's dst (not hidden). Views are refreshed to hidden producers
-  before the graph runs. This is the current CPU truth; per-device arena sizing
-  from the verify layout remains GPU-phase work.
+- **Buffers**: the chain path uses the SAME verify interval layout as the per-
+  node path (`hide_burst` -> `out_off`, byte regions shared by last-use). This
+  was verified IDENTICAL (2026-09-06): the CPU backend executes `gf->nodes` in
+  order with NO cross-node concurrency, so the last-use reasoning transfers - a
+  later node reusing an earlier result's region only runs after every reader of
+  that result (its last-use index) has consumed it. The earlier `hide_output`
+  per-node full-alloc bump was a conservative choice and is NOT required here.
+  Consequence: the verify `out_off` layout is directly reusable as the per-device
+  arena byte offset (SS7.2 "whole-layer block per device" needs no separate
+  layout). moe_out writes llama's dst (not hidden). Views are refreshed to
+  hidden producers before the graph runs.
 - **Bucketing**: NOT yet run as multi-bucket on this path. Current chain mode
   requires ONE full-width round per mm (single subpool owns every column) - the
   single-device case. Real multi-bucket / multi-device execution (each device a
@@ -537,8 +541,13 @@ Key gotchas learned (why the earlier hide+append attempts failed):
 2. Manually stuffing `gf->nodes[]` without expand left the mm dst unwritten
    (0s); nodes must be registered via build_forward_expand (or equivalent) for
    the CPU plan to execute them.
-3. One cgraph cannot use the interval-shared layout (simultaneous liveness);
-   full-alloc per-node regions are required until per-device arenas land.
+3. ~~One cgraph cannot use the interval-shared layout (simultaneous liveness);
+   full-alloc per-node regions are required until per-device arenas land.~~
+   SUPERSEDED: the verify interval layout IS correct under the one-cgraph path
+   too - the CPU backend executes nodes strictly in order, so last-use sharing
+   holds (verified IDENTICAL). Interval sharing would only be unsafe under real
+   cross-node concurrency (backend_sched parallel execution or multi-device),
+   which this direct graph_compute path never does.
 4. The mixed "shell mm in graph + original weightless nodes" shape is broken by
    (1)+(2): the weightless nodes reference main-graph tensors that ggml cannot
    plan; cloning everything cleanly removes the ambiguity.
