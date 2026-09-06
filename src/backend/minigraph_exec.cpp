@@ -1402,6 +1402,137 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
     return true;
 }
 
+// Whole-layer clone-graph executor (GPU mini-graph shape on CPU, env
+// STREAM_MOE_TMP_CHAIN_GRAPH). Rebuild EVERY compute node of a layer as a fresh
+// ggml op tensor in the exec scratch ctx and run the whole layer as ONE cgraph
+// / one graph_compute - the CPU twin of the per-device mini-graph builder
+// (docs/M2_DEVICE_EXECUTOR.md SS2). On GPU each device rebuilds its column
+// chain the same way: mm = shell mul_mat_id over the pool weight column, every
+// weightless op cloned with identical op/params/ne/nb. Intermediates stay in
+// the arena block (hide_output's per-node regions); only moe_out touches the
+// llama dst.
+//
+// Clone srcs are wrapped as LEAVES carrying the main-graph data pointer (already
+// positioned by the hide/refresh flow) so the clone graph has NO external op
+// nodes; nodes are added with ggml_build_forward_expand, executed in the layer
+// order, and inter-node data flow happens through the shared arena regions
+// (producer clone writes its hide region, consumer clone reads the same region
+// via its src leaf). This is why mm standalone (its own single-node graph) was
+// verified IDENTICAL, and why chain = the same nodes in one graph.
+static enum ggml_status exec_layer_burst_chain(int32_t layer, ggml_context * ctx,
+                                               ggml_backend_t cpu,
+                                               expert_scheduler & sched,
+                                               const moe_layer_exec_t * ex,
+                                               const std::vector<expert_handle_t>& pins) {
+    const moe_model_topology_t& topo = sched.topology();
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    std::vector<int32_t> mm_ids;   // slot-local ids per mm, lives until compute
+
+    for (const auto * cn : ex->compute) {
+        ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
+        if (is_view_op(nd)) continue;   // views handled via view_aliases refresh
+        const bool is_mm = nd->op == GGML_OP_MUL_MAT_ID;
+        const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+
+        if (is_mm) {
+            ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+            ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+            ggml_tensor * ids = const_cast<ggml_tensor*>(nd->src[2]);
+            if (!ids->data || !cur->data) return GGML_STATUS_FAILED;
+            parsed_node_t pn = parse_weight_name(w->name);
+            if (!pn.ok) return GGML_STATUS_FAILED;
+            uint32_t gidx = sched.group_of(pn.layer);
+            if (gidx == static_cast<uint32_t>(-1)) return GGML_STATUS_FAILED;
+
+            // Full-width round: every (k,t) expert in ONE subpool.
+            const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+            int32_t slot_begin = -1;
+            mm_ids.assign(n_ids, 0);
+            for (size_t i = 0; i < n_ids; ++i) {
+                const int32_t e = MOE_ID_AT(ids, (int)(i / (size_t)ids->ne[0]), (int)(i % (size_t)ids->ne[0]));
+                if (e < 0 || e >= static_cast<int32_t>(topo.n_expert)) return GGML_STATUS_FAILED;
+                const int32_t slot = pin_slot(pins, pn.layer, static_cast<uint32_t>(e));
+                if (slot < 0) return GGML_STATUS_FAILED;
+                const expert_scheduler::subpool_t * osp = sched.subpool_of_slot(slot);
+                if (!osp) return GGML_STATUS_FAILED;
+                if (slot_begin < 0) slot_begin = static_cast<int32_t>(osp->slot_begin);
+                if (static_cast<int32_t>(osp->slot_begin) != slot_begin) {
+                    LOG_ERROR("stream_moe: chain mode needs a single subpool per mm");
+                    return GGML_STATUS_FAILED;
+                }
+                mm_ids[i] = slot - static_cast<int32_t>(osp->slot_begin);
+            }
+            const int32_t se0 = MOE_ID_AT(ids, 0, 0);
+            const expert_scheduler::subpool_t * sp = se0 < 0 ? nullptr
+                : sched.subpool_of_slot(pin_slot(pins, pn.layer, static_cast<uint32_t>(se0)));
+            if (!sp) return GGML_STATUS_FAILED;
+            size_t col_off = 0, col_stride = 0; uint32_t col_index = 0;
+            if (!sched.column_layout(*sp, w->name, col_off, col_stride, col_index)) return GGML_STATUS_FAILED;
+
+            ggml_tensor * w3d = ggml_new_tensor_3d(ctx, w->type, w->ne[0], w->ne[1], 1);
+            w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
+            w3d->nb[2] = col_stride;
+            w3d->nb[3] = col_stride * sp->n_slots;
+            w3d->data  = sp->base + col_off;
+
+            ggml_tensor * ids_leaf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+            ids_leaf->data = mm_ids.data();
+
+            // Wrap cur as a leaf too: build_forward_expand must not drag the
+            // main-graph cur chain (norm/upstream) into this graph. The leaf
+            // carries cur->data (positioned by llama/hide) and its ne/nb.
+            ggml_tensor * cur_leaf = ggml_new_tensor_4d(ctx, cur->type,
+                                                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+            cur_leaf->nb[0] = cur->nb[0]; cur_leaf->nb[1] = cur->nb[1];
+            cur_leaf->nb[2] = cur->nb[2]; cur_leaf->nb[3] = cur->nb[3];
+            cur_leaf->data = cur->data;
+
+            ggml_tensor * mm = ggml_mul_mat_id(ctx, w3d, cur_leaf, ids_leaf);
+            mm->data = nd->data;   // shell mm writes the hidden dst directly
+            ggml_build_forward_expand(gf, mm);
+        } else {
+            // Clone the main-graph op tensor; every src becomes a leaf with the
+            // main-graph data pointer (already positioned by hide/refresh), so
+            // ggml's plan sees only op-NONE srcs and executes this clone.
+            ggml_tensor * c = ggml_new_tensor_4d(ctx, nd->type,
+                                                 nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
+            c->nb[0] = nd->nb[0]; c->nb[1] = nd->nb[1];
+            c->nb[2] = nd->nb[2]; c->nb[3] = nd->nb[3];
+            c->op = nd->op;
+            for (size_t i = 0; i < GGML_MAX_OP_PARAMS; ++i) c->op_params[i] = nd->op_params[i];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                ggml_tensor * src = nd->src[s];
+                if (!src) continue;
+                ggml_tensor * sv = ggml_new_tensor_4d(ctx, src->type,
+                                                      src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+                sv->nb[0] = src->nb[0]; sv->nb[1] = src->nb[1];
+                sv->nb[2] = src->nb[2]; sv->nb[3] = src->nb[3];
+                sv->data = src->data;
+                c->src[s] = sv;
+                if (!sv->data) return GGML_STATUS_FAILED;
+            }
+            c->data = nd->data;   // out = llama dst (not hidden); else hide position
+            ggml_build_forward_expand(gf, c);
+        }
+    }
+
+    if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: chain graph compute failed for layer " << layer);
+        return GGML_STATUS_FAILED;
+    }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DUMP")) {
+        size_t seq = 0;
+        for (const auto * cn : ex->compute) {
+            tmp_dump_node(sched, topo, pins, layer, seq, const_cast<ggml_tensor*>(cn));
+            ++seq;
+        }
+    }
+#endif
+    reset_layer(layer);
+    return GGML_STATUS_SUCCESS;
+}
+
 // Burst one whole layer from its captured sequence.
 static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                                          ggml_backend_t cpu, expert_scheduler& sched,
@@ -1478,6 +1609,31 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         moe_chain_set_full_alloc(need);
     }
     reset_layer(layer);
+#ifdef STREAM_MOE_TEMP
+    // Whole-layer single-graph path (GPU mini-graph shape on CPU). The shared
+    // interval layout is NOT used: every node gets its own arena region (per-
+    // node bump via hide_output), because in ONE cgraph all outputs coexist to
+    // the end. mm dsts and weightless dsts land in distinct regions; views are
+    // refreshed to those hidden producers before the graph runs.
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_GRAPH")) {
+        moe_chain_set_full_alloc(lsum);
+        reset_layer(layer);
+        for (const auto * cn : ex->compute) {
+            ggml_tensor * m = const_cast<ggml_tensor*>(cn);
+            if (is_view_op(m)) continue;
+            if (m->name && strstr(m->name, "ffn_moe_out")) continue;  // llama dst
+            if (!hide_output(m, layer)) {
+                LOG_ERROR("stream_moe: chain hide failed L" << layer);
+                for (const auto & h : pins) sched.unpin(h);
+                return GGML_STATUS_FAILED;
+            }
+        }
+        for (const auto & va : ex->view_aliases) refresh_aliases(layer, va.prod);
+        const enum ggml_status st = exec_layer_burst_chain(layer, ctx, cpu, sched, ex, pins);
+        for (const auto & h : pins) sched.unpin(h);
+        return st;
+    }
+#endif
 #ifdef STREAM_MOE_TEMP
     {
         // TEMP M-diagnostic: where does this layer's pinned active set live?
