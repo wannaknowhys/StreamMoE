@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 // Transfer-queue DMA download of a VRAM buffer slice to a host pointer
 // (defined in the route-B vk_dma frag, vendored ggml-vulkan.cpp). 0.02 GB/s
@@ -27,6 +28,13 @@ namespace stream_moe {
 
 expert_scheduler::~expert_scheduler() {
     stop();
+#ifdef STREAM_MOE_TEMP
+    // Exit-time slot leak audit: after stop() the scheduler thread is gone and
+    // llama contexts (which hold the exec pins) are already destroyed, so every
+    // slot refcount should be 0. Any residual pin or abnormal leftover state is
+    // a bug (double-pin, missed unpin, aborted move) worth reporting on stdout.
+    debug_dump_exit_slots();
+#endif
     if (pool_base_) {
         async_dio_engine::free_aligned(pool_base_);
         pool_base_ = nullptr;
@@ -1017,6 +1025,65 @@ void global_expert_scheduler::unregister_scheduler(expert_scheduler* s) {
     std::lock_guard<std::mutex> lk(mtx_);
     schedulers_.erase(std::remove(schedulers_.begin(), schedulers_.end(), s), schedulers_.end());
     // worker keeps running (idle when no pools are registered) until process exit.
+}
+
+void expert_scheduler::debug_dump_exit_slots() const {
+    // Audit every slot after stop(). Normal end state: EMPTY (never used) or
+    // READY with refcount 0 (resident expert, evictable). Anything else is a
+    // leak / abort residue: refcount > 0 (a pin never released) or a non-READY
+    // non-EMPTY state (EVICTING / IO_INFLIGHT / FAILED from an aborted move or
+    // failed load). Reverse-map the slot to (L,E) by scanning the directory.
+    if (!topo_ || !dir_ || !slots_) return;
+    const uint32_t n_slots = num_slots_;
+    uint32_t n_used = 0, n_bad = 0;
+    struct bad_t { uint32_t slot; uint32_t ref; uint32_t state; };
+    std::vector<bad_t> bad;
+    for (uint32_t s = 0; s < n_slots; ++s) {
+        const uint64_t w = slots_[s].load();
+        const uint32_t st = slot_word_state(w);
+        const uint32_t rc = slot_word_refcount(w);
+        if (st == SLOT_EMPTY) continue;
+        ++n_used;
+        const bool leak = rc > 0;
+        const bool residue = st == SLOT_EVICTING || st == SLOT_IO_INFLIGHT || st == SLOT_FAILED;
+        if (leak || residue) {
+            bad.push_back({ s, rc, st });
+            ++n_bad;
+        }
+    }
+    if (n_bad == 0) {
+        std::fprintf(stdout, "[stream_moe] exit: pool ok - %u/%u slots used, all refcount 0\n",
+                     n_used, n_slots);
+        std::fflush(stdout);
+        return;
+    }
+    std::fprintf(stdout, "[stream_moe] exit: %u slot(s) with residual refcount/state (used %u/%u):\n",
+                 n_bad, n_used, n_slots);
+    // Reverse-map each bad slot: find every (L,E,pool) whose dir entry points at
+    // it. Exit-time only; cost is one full directory scan per bad slot.
+    for (const auto& b : bad) {
+        std::vector<std::string> owners;
+        for (uint32_t L = 0; L < topo_->n_layer; ++L) {
+            for (uint32_t e = 0; e < topo_->n_expert; ++e) {
+                for (uint32_t p = 0; p < dir_->n_pools(); ++p) {
+                    const expert_state es = dir_->state(L, e, p);
+                    if (es == EXPERT_ABSENT) continue;
+                    if (dir_->slot(L, e, p) == b.slot) {
+                        char buf[64];
+                        std::snprintf(buf, sizeof buf, "L%uE%u%s", L, e,
+                                      p == 0 ? "" : ("@" + std::to_string(p)).c_str());
+                        owners.emplace_back(buf);
+                    }
+                }
+            }
+        }
+        std::fprintf(stdout, "  slot %u Ref%u state=%u (", b.slot, b.ref, b.state);
+        for (size_t i = 0; i < owners.size(); ++i) {
+            std::fprintf(stdout, "%s%s", i ? " " : "", owners[i].c_str());
+        }
+        std::fprintf(stdout, ")\n");
+    }
+    std::fflush(stdout);
 }
 
 void global_expert_scheduler::worker_loop() {

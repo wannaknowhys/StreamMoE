@@ -317,6 +317,14 @@ private:
     // Clear the active-slot bookkeeping (shared tail of active_finish/active_fail).
     void active_clear_state();
 
+    // ---- exit-time leak check (STREAM_MOE_TEMP / dbg tag only) ----
+    // Called from ~expert_scheduler (after stop(), before pool free) to audit
+    // every slot's refcount + state. Any slot with refcount > 0 or an abnormal
+    // leftover state (EVICTING / IO_INFLIGHT / FAILED) is printed to stdout as
+    // "slot <s> L<layer>E<expert> Ref<N> state=<S>" (reverse-mapping (L,E) by
+    // scanning the directory); a clean pool prints one confirmation line.
+    void debug_dump_exit_slots() const;
+
     // ---- move worker thread (M4) ----
     void move_worker_main();      // runs on the move worker thread
     std::thread  move_thread_;
