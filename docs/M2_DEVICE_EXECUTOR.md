@@ -231,12 +231,15 @@ struct moe_node_plan {
 - mm / moe_out are special-cased by op in the builder: mm src[0] is the weight
   shell (pool device buffer + branch offset, not the arena) and ids need slot
   localisation; moe_out owns an arena region plus the exit-readback flag.
-- **Now**: `out_off` is a fixed full-alloc bump over the compute sequence (each
-  node its own region; the layer's whole arena+stage is reserved once up front -
-  growing the arena mid-layer frees already-hidden outputs, b4-2 lesson).
-- **Future**: verify runs a live-range / interval reuse analysis and fills the
-  same `out_off` array (per-device ping-pong pairs are a special case of the
-  interval layout). Builder consumes it unchanged.
+- **Now**: `out_off` is filled by the landed node-level BEST-FIT-DECREASING
+  layout (compute in `moe_chain_assign_backend`, diagnostics/layout_sim):
+  one per-layer result block reused across layers, per-compute absolute
+  offsets reaching the peak-simultaneous-live lower bound (gemma ~180KB/layer,
+  deepseek ~197KB/layer @1 token; auto-scales with ubatch on graph rebuild).
+- **Future**: this layout extends from "whole-layer one block" to per-device
+  slices (each device's arena only holds the columns it computes); per-device
+  ping-pong pairs are a special case of the interval layout. Builder consumes
+  it unchanged.
 
 ## 5. Exit merge and scatter (generalised)
 
@@ -283,3 +286,59 @@ struct moe_node_plan {
    device completion timestamps.
 
 Design questions that come up during implementation are asked before coding.
+
+## 7.1 Gap analysis vs current code -> actionable roadmap (2026-09-05)
+
+Current code (landed): `exec_layer_burst` runs one layer synchronously on the
+main thread, node by node. `MUL_MAT_ID` goes through `exec_mixed_mm`
+(per-pool peel rounds - CPU or Vulkan, each round a SYNC graph_compute + read
+back); weightless chain nodes run as manual 1-node CPU graphs. Result buffer =
+the §4.1 best-fit layout as ONE whole-layer block. No async, no per-device
+arena, no device-side whole chain.
+
+Gap to the final design (per-device expert-column mini graphs, §1-§7). Items
+below, roughly in dependency order:
+
+**Analysis layer (verify/assign) - mostly landed, needs device-ization**
+- [x] closure collection + internal dependency/last-use + layout
+      (best-fit out_off / result_bytes) - done (e6995dd, 488930f).
+- [ ] `moe_node_plan` (per-step in[prod+off] relative offsets) - layout covers
+      per-node out offsets; inputs are still resolved ad-hoc in the executor.
+- [ ] **device column plan**: which (k,t) contribution columns each device
+      owns, and where its slice sits inside each node output. Current
+      `scatter_sub_dst` / `build_mix_plan` do this transiently at exec; the
+      per-device mini graph needs it as a build-time product.
+- [ ] **per-device arena sizing**: extend the whole-layer best-fit layout so
+      each device's arena holds only the columns it computes (layout reused,
+      sized per device; ping-pong pairs are the special interval case).
+
+**Executor resources**
+- [ ] per-device ping-pong / event tracking (async GPU must not let the next
+      layer overwrite in-flight results - §3 sync discipline).
+- [ ] template instantiation at exec entry from verify product + THIS run's
+      pinned expert distribution (fill data / ids / offsets, no rebuild).
+
+**Async execution skeleton**
+- [ ] `exec_round_vk` -> async submit (`graph_compute_async`) + completion
+      tracking instead of per-round sync + read back.
+- [ ] CPU/VK overlap: submit device graphs async, continue CPU columns on the
+      calling thread, converge at layer end.
+- [ ] converge point: force-sync every device, read back contributions via host
+      map, fold into moe_out (generalised exit merge/scatter, §5).
+- [ ] separate per-device result blocks (device-ized §4.1 layout).
+
+**Verification gates**
+- [ ] pure-device numeric gate once device execution lands (K6 shape; note GPU
+      has no absolute fidelity vs CPU - validate structural equivalence, not
+      byte identity, per BACKEND_DIVERGENCE_ANALYSIS.md §6).
+- [ ] M8 UTs (layout self-check, device plan, merge) - test link fix is the
+      blocker (stmoe_vk_* symbols need ggml-vulkan at link, B33).
+
+**Profile (deferred, §6)**
+- [ ] profile ring + per-device completion timestamps; slot_request_t already
+      carries total_tokens / start_rdtsc fields.
+
+Suggested next step: extend the layout from whole-layer single block to
+per-device column slices + a build-time device column plan (analysis layer
+first - pure add, no executor change, verifiable via CAP_DUMP/CSV + sim.js),
+then the async skeleton on top.

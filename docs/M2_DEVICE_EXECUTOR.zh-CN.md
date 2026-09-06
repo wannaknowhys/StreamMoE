@@ -155,3 +155,43 @@ vulkan 提交设备队列即返回；CPU 同步算完（自身图调用内多线
 6. **profile 埋管**：ctx 聚合 + profile ring + 事件 struct + IO/设备完成时间戳。
 
 实现中遇到设计问题先问再写。
+
+## 7.1 现状差距分析 -> 可执行 roadmap（2026-09-05）
+
+现状代码：`exec_layer_burst` 每层在主线程**逐节点同步**跑。`MUL_MAT_ID` 经 `exec_mixed_mm`
+（per-pool peel round——CPU 或 Vulkan，每 round 一次**同步** graph_compute + 回读）；weightless
+链节点是 CPU 手动 1-node graph。结果缓冲 = §4.1 best-fit 布局的**整层一块**。无 async、无
+per-device arena、无设备侧整链。
+
+与最终设计（每设备专家列 mini graph，§1-§7）的差距，按依赖序列出：
+
+**分析层（verify/assign）——大多已落地，需设备化**
+- [x] 闭包收集 + 链内依赖/last-use + 布局（best-fit out_off/result_bytes）——完成（e6995dd, 488930f）。
+- [ ] `moe_node_plan`（每步 in[prod+off] 相对偏移）——布局只覆盖每节点 out 偏移；输入仍由执行器临时解析。
+- [ ] **设备列规划**：每设备拥有哪些 (k,t) contribution 列、在每节点输出里占哪段。现
+      `scatter_sub_dst`/`build_mix_plan` 执行期临时算；per-device mini graph 需 build-time 产物。
+- [ ] **per-device arena 定尺寸**：把整层 best-fit 布局扩展为每设备只装自己算的列（布局复用、
+      按设备定尺寸；ping-pong 对是 interval 布局特例）。
+
+**执行器资源**
+- [ ] per-device ping-pong / 事件跟踪（async GPU 不能让下一层覆写在飞结果，§3 同步纪律）。
+- [ ] 执行入口从 verify 产物 + 本次 pin 分布**实例化模板**（填 data/ids/偏移，不改结构）。
+
+**异步执行骨架**
+- [ ] `exec_round_vk` → 异步提交（`graph_compute_async`）+ 完成跟踪，取代每 round 同步+回读。
+- [ ] CPU/VK 重叠：设备图异步提交后主线继续算 CPU 列，层尾 converge。
+- [ ] converge 点：强制同步每设备，经 host map 读回 contribution，折进 moe_out（通用出口
+      merge/scatter，§5）。
+- [ ] 独立 per-device 结果块（设备化 §4.1 布局）。
+
+**验证门**
+- [ ] 设备执行落地后纯设备数值门（K6 形态；注意 GPU 对 CPU 无绝对还原——验证结构等价而非字节
+      一致，见 BACKEND_DIVERGENCE_ANALYSIS.md §6）。
+- [ ] M8 UT（布局自检、设备规划、merge）——test 链接问题是 blocker（stmoe_vk_* 符号需
+      ggml-vulkan 链接，B33）。
+
+**profile（延后，§6）**
+- [ ] profile ring + 每设备完成时间戳；slot_request_t 已带 total_tokens/start_rdtsc 字段。
+
+建议下一步：先把布局从"整层单块"扩展为"per-device 列切片 + build-time 设备列规划"
+（分析层先行——纯新增不动执行器，CAP_DUMP/CSV + sim.js 可验证），再在其上加异步骨架。
