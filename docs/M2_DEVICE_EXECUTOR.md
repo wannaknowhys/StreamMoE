@@ -304,19 +304,31 @@ below, roughly in dependency order:
       (best-fit out_off / result_bytes) - done (e6995dd, 488930f).
 - [ ] `moe_node_plan` (per-step in[prod+off] relative offsets) - layout covers
       per-node out offsets; inputs are still resolved ad-hoc in the executor.
-- [ ] **device column plan**: which (k,t) contribution columns each device
-      owns, and where its slice sits inside each node output. Current
-      `scatter_sub_dst` / `build_mix_plan` do this transiently at exec; the
-      per-device mini graph needs it as a build-time product.
-- [ ] **per-device arena sizing**: extend the whole-layer best-fit layout so
-      each device's arena holds only the columns it computes (layout reused,
-      sized per device; ping-pong pairs are the special interval case).
+- [ ] **per-device whole-chain execution plan**: which experts / contribution
+      columns each device owns (the mix_plan pool partition), expressed per
+      compute node (which slice of a node's output a device produces and which
+      of its inputs it must have). Every device runs the FULL node chain over
+      ITS OWN columns (whole chain to the contribution), not just the mm.
+
+**Per-device arena (user decision 2026-09-05): NO per-device shrinking**
+- [ ] each device that participates in a layer allocates a FULL whole-layer
+      result block (result_bytes from the existing best-fit layout) - NOT a
+      per-device column-sliced arena. Reason: keep layout identical across
+      devices (same out_off[]), simple and uniform; per-device columns are a
+      runtime partition that only affects which slice each device actually
+      fills, never the block geometry. Buffer cost is one layer's best-fit
+      block per participating device (small; arena reused across layers).
+- [ ] bucket execution: within its block, a device computes only its own
+      buckets (columns), leaving other slices untouched (see executor items).
 
 **Executor resources**
 - [ ] per-device ping-pong / event tracking (async GPU must not let the next
       layer overwrite in-flight results - §3 sync discipline).
 - [ ] template instantiation at exec entry from verify product + THIS run's
       pinned expert distribution (fill data / ids / offsets, no rebuild).
+- [ ] per-device column execution: a device walks its own slice of every
+      compute node in the layer (same node chain, restricted to its columns),
+      so the device reaches its contribution without host round-trips.
 
 **Async execution skeleton**
 - [ ] `exec_round_vk` -> async submit (`graph_compute_async`) + completion
@@ -325,7 +337,8 @@ below, roughly in dependency order:
       calling thread, converge at layer end.
 - [ ] converge point: force-sync every device, read back contributions via host
       map, fold into moe_out (generalised exit merge/scatter, §5).
-- [ ] separate per-device result blocks (device-ized §4.1 layout).
+- [ ] each participating device holds its OWN full whole-layer result block
+      (same §4.1 geometry, one block per device, not column-sliced).
 
 **Verification gates**
 - [ ] pure-device numeric gate once device execution lands (K6 shape; note GPU
@@ -338,7 +351,11 @@ below, roughly in dependency order:
 - [ ] profile ring + per-device completion timestamps; slot_request_t already
       carries total_tokens / start_rdtsc fields.
 
-Suggested next step: extend the layout from whole-layer single block to
-per-device column slices + a build-time device column plan (analysis layer
-first - pure add, no executor change, verifiable via CAP_DUMP/CSV + sim.js),
+Suggested next step: make each participating device run the whole node chain
+over ITS OWN buckets (columns) into a full per-device result block (same
+best-fit layout, one block per device). Build-time: express the device column
+partition (which experts/columns per device, per node slice) so the executor
+can instantiate the per-device whole-chain template; exec-time: async submit
+per device, run the CPU bucket on the calling thread, converge at layer end.
+Pure analysis-layer addition first (verifiable via CAP_DUMP/CSV + sim.js),
 then the async skeleton on top.
