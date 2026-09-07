@@ -295,6 +295,13 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   - `cut3`（[0,3)+[3,8) 两桶）L0 maxAbs 7.6e-6 ≤ 1e-5（唯一同输入可比层）；L1+ 因折序 ULP 经层间残差放大 + L3+ argsort 专家翻转发散（已归档噪声类，非 bug）。
 - 待做：逆序桶序看 ULP 上限；token 子集 scatter-add（mock 挡）；deepseek 的 clamp/swiglu 紧凑克隆；把紧凑孪生孪生键从"per-bucket 重建"提升到跨桶复用（REPEAT/外部 scale 表与桶无关）。
 
+**scatter_plan 设计（2026-09-07，docs/SCATTER_PLAN.md 双语文档已落，等用户）**：
+- 语义确认：tight 重排（如桶 token {0,2,3,4} → {0,2,4,3}）+ acc 等差段（src 连续 len 列 → dst 等差 base/Δ）。
+- **ggml_acc 支持 dst 等差间隔（Δ≠1）**：CPU 核 dst[offset+i1*nb1]+=src1[...]，nb1=Δ*d_out*4、offset=base*d_out*4，中间 dst 列不动（ops.cpp:1215-1233 验证）。
+- 重排消费在 **cur 拷贝层**（首 mm 前按 tight 序收集 cur → 链列序继承 → per_token 天然分段）。
+- per-token 受影响输入盘点：cur / ids / weights_norm（per-slot 路由权重，slot 切片+token 重排）；专家权重与 scale REPEAT 表不受影响。
+- 待做：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp。
+
 ### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）
 
 - **槽维 = 链内所有张量的 ne1**（= 该层 n_k，gemma L0 8 / deepseek 6），贯穿 mm→weightless：
