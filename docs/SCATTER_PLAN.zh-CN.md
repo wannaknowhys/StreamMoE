@@ -35,19 +35,32 @@ peel 序下不存在这种连续性。`scatter_plan` 决定 **tight 序**：对�
 down mm dst、down_scaled、weighted，直到折叠——都免费继承 tight 序，`per_token` 出来时
 已经按 run 分组。末尾无需二次 gather。
 
-第一个路由 mm 读 `cur`（norm 输出，每个原 token 一列）。对全 token 桶可以直接引用
-`cur`；对 token 子集 / tight 重排，必须先把 `cur` **按 tight token 序拷贝进紧凑 staging
-缓冲**，mm 再读它（这就是"强制 cur 拷贝"）。重排正是在这次拷贝中物理落地。
+第一个路由 mm 读 `cur`（norm 输出）。`cur` 分两种角色，拷贝语义不同：
+
+- **外部共享 cur**（gate_up / up mm 的 src1）：dense norm 输出 reshaped `[d,1,n_t]`，
+  `ne11 == 1`。mul_mat_id 内核按 `slot % ne11` 选 src1 列，所以所有 slot 都读第 0 列——
+  每 token 一列共享激活。桶切割只影响其 **token 轴**，与 slot 轴无关。对 token 子集 /
+  tight 重排，须按 tight 序 gather 进 staging `cur_tight[d,1,n_active]`（第 i 列 = 原
+  token `t[order[i]]` 的列），mm 再读。全 token 恒等序桶可原地引用。
+- **链内 per-slot cur**（down mm 的 src1）：gated 输出（geglu/swiglu）`[d,n_k,n_t]`，
+  `ne11 == n_k`。它是链内中间量——已由链按桶的 slot 子集 + tight token 序紧凑化，无需
+  单独拷贝。
+
+所以"强制 cur 拷贝"精确指外部共享 cur，其 staging 形状恒为 `[d,1,n_active]`
+（不是 `[d,w_b,n_active]`）。
 
 ### 受桶切割影响的 per-token 输入（盘点）
 
-| 数据 | 角色 | 形状 | 桶影响 |
+外部 per-token 输入只有三个需要处理，且全部是同一操作——**tight-gather**（把主图
+per-token 数据按 `order` 拷进 tight staging）。一个通用 tight-gather 助手即可服务三者。
+
+| 数据 | 角色 | per-token 布局 | 桶影响 |
 |---|---|---|---|
-| `cur`（norm 输出） | mm src1 | `[d,1,n_t]`（共享）/ `[d,n_k,n_t]`（per-slot） | token 轴必须按 tight 序拷贝 → `[d,..,n_active]` |
-| 路由 `ids` | mm src2、GET_ROWS src1 | `[n_k,n_t]` | token 子集 + slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块需按 tight 重排 |
-| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | `[1,n_k,n_t]` | slot 切片 `[k_lo..k_hi)` **且** token 轴按 tight 序 |
+| `cur`（dense norm 输出） | gate/up mm src1 | 每 token 一共享列 `[d,1,n_t]` | token tight-gather → `[d,1,n_active]`（与 slot 无关）|
+| 路由 `ids` | mm src2、GET_ROWS src1 | per-(token,slot) `[n_k,n_t]` | slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块按 tight 重排 |
+| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | slot 切片 `[k_lo..k_hi)` **且** token tight-gather |
 | 专家权重、per-expert scale（REPEAT 表） | mm src0 / GET_ROWS src0 | per-expert | 与 token 无关——不动 |
-| 链内张量（GLU/down/weighted） | - | `[d,w_b,n_t]` | 继承首次 cur 拷贝定下的顺序 |
+| 链内张量（GLU/down/weighted） | - | `[d,w_b,n_t]` | 继承首次 tight-gather 定下的顺序 |
 
 ## 3. 模块接口（纯计算，无 ggml/llama 依赖）
 
@@ -123,13 +136,16 @@ O(delta_range * n_active) 扫描、n_active 最多几百，没问题。模块按
 
 ## 5. 执行器消费点（设计草稿，未实现）
 
-- **cur 拷贝**（紧凑链里 `build_cur_sub` 的对应物）：分配 staging `cur_tight[d, 1|w_b?,
-  n_active]`，把主图 `cur` 的第 `t[order[i]]` 列拷到 staging 第 `i` 列。第一个路由 mm 读
-  staging。（全 token 桶、无重排：order 为恒等，原地引用。）
+一个**通用 tight-gather 助手**服务三个外部 per-token 输入（CPU 原型：纯 host memcpy
+循环；GPU 阶段：ggml 节点）。它把主图 per-token 数据按 `order` 拷进 tight staging：
+`staging[d, .., i] <- main[d, .., t[order[i]]]`，各输入提供自己的 per-token 步长：
+
+- **cur**：`cur_tight[d, 1, n_active]`，gather 主图共享 cur 的第 `t[order[i]]` 列。首个路由
+  mm 读 staging。（全 token 桶、无重排：order 恒等，原地引用。）
 - **ids**：把已暂存的 `ids_exp`/`ids_slot` token 块按 `order` 重排（块 = 该 token 的 slot
   切片）。
-- **per-slot 权重**（`weights_norm`）：切 slot `[k_lo..k_hi)` 并把 token 轴按 `order`
-  重排。
+- **weights_norm**：切 slot `[k_lo..k_hi)` 并把 token 轴按 `order` gather →
+  `[1, w_b, n_active]`。
 - **acc 循环**（取代 `exec_layer_burst_chain_buckets` 里的 offset-0 单次 acc）：对每个
   seg 做一次 `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
   offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。
