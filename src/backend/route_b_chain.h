@@ -35,20 +35,12 @@ bool moe_chain_node_is_privatizable(const ggml_tensor * node);
 bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sched,
                               ggml_backend_t our_backend);
 
-// Ping-pong private intermediate buffer (M1 privatisation). Two persistent
-// aligned buffers (parity 0/1) shared across graph_compute calls - the whole
-// MoE chain writes its hidden intermediates here instead of the main-graph dst
-// (odd/even compute nodes alternate buffers, so a write never clobbers an
-// input still being read one step away). Grows on demand; process-lifetime.
-void * moe_chain_pingpong_buffer(int parity, size_t need_bytes);
-
-// Full-allocation fallback mode (used when verify finds a long-range dependency
-// that ping-pong would clobber): ONE fixed buffer sized to a single layer's
-// hidden-intermediate sum, allocated once (never re-grown - a grow would
-// invalidate already-pointed nd->data). Each hidden compute node gets its own
-// byte range inside it; the executor tracks per-layer offsets and resets them
-// at the layer end (moe_out). ping_pong_ok() = false in this mode.
-bool   moe_chain_pingpong_ok();
+// Full-allocation mode for the layer hidden intermediates (the compact
+// bucket engine allocates every twin output inside this): ONE fixed buffer
+// sized to a single layer's hidden-intermediate sum, allocated once (never
+// re-grown - a grow would invalidate already-pointed nd->data). Each hidden
+// compute node gets its own byte range inside it; the executor tracks
+// per-layer offsets and resets them at the layer end (moe_out).
 void   moe_chain_set_full_alloc(size_t layer_sum_bytes);
 void * moe_chain_fullalloc_buffer(size_t need_bytes);
 

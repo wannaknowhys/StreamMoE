@@ -15,7 +15,6 @@
 namespace stream_moe {
 
 namespace {
-bool g_pingpong_ok = true;
 void * g_fullalloc_buf = nullptr;
 size_t g_fullalloc_cap = 0;
 
@@ -24,10 +23,7 @@ size_t g_fullalloc_cap = 0;
 std::map<int, moe_layer_exec_t> g_layer_exec;
 }
 
-bool moe_chain_pingpong_ok() { return g_pingpong_ok; }
-
 void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
-    g_pingpong_ok = false;
     if (layer_sum_bytes > g_fullalloc_cap) {
         aligned_free_ptr(g_fullalloc_buf);
         g_fullalloc_buf = aligned_alloc_ptr(layer_sum_bytes, 64);
@@ -42,18 +38,6 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes) {
         return nullptr;
     }
     return g_fullalloc_buf;
-}
-
-void * moe_chain_pingpong_buffer(int parity, size_t need_bytes) {
-    static void * buf[2] = {nullptr, nullptr};
-    static size_t sz[2] = {0, 0};
-    const int p = parity & 1;
-    if (need_bytes > sz[p]) {
-        aligned_free_ptr(buf[p]);
-        buf[p] = aligned_alloc_ptr(need_bytes, 64);
-        sz[p] = buf[p] ? need_bytes : 0;
-    }
-    return buf[p];
 }
 
 namespace {

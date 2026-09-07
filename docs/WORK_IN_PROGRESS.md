@@ -313,6 +313,25 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - 用户拍板记录：只留 buckets 多桶引擎（删 exec_layer_burst_chain/append_mm_shell/append_op_clone/
   append_bucket_chain 单桶参考，buckets 自吞单桶）；legacy 分支也删（非捕获报错）；B 移出 TEMP。
 
+**✅ 删 A 收敛完成（2026-09-07 落地）**：minigraph_exec.cpp 2490 → 1119 行。
+- 桶引擎 + tmp_split_blocks/tmp_blk_t + tmp_dump_node dump 族全部移出 `#ifdef STREAM_MOE_TEMP`
+  无条件编译（内部 debug/dump 子块保留，env 门控）；删 B 单桶参考（append_mm_shell/append_op_clone/
+  append_bucket_chain/append_scatter_to_fullwidth/exec_layer_burst_chain）；exec_layer_burst 只留
+  ex + lsum + input_layouts 修复 + pin + set_full_alloc + **无条件调 exec_layer_burst_chain_buckets**
+  （无 env/full/one = 单全宽桶）；moe_exec_mul_mat_id layer<0 = 硬错误；删 A 全族 + pin_state 系 +
+  tmp_plan/tmp_run/tmp_split/tmp_bucket 自测 + s_hide_flip/s_layer_* 死状态；route_b_chain 删
+  pingpong_ok/pingpong_buffer/g_pingpong_ok（fullalloc/set_full_alloc 保留，B 的 twin_out 用）。
+- **关键修复（运行时才发现）**：`moe_exec_mul_mat_id` 会收到捕获 producer 的 **view/layout split**
+  （如 `ffn_moe_gate-0` VIEW，producer = gate_up mm 输出），改造前由 legacy 兜底指 data；删 legacy 后
+  变 un-captured 硬错误 → 加 `is_view_op(first) → SUCCESS`（view 无执行内容，layer burst 已修 data 指针）。
+- 验证（StreamMoE_dump_dbg，gemma 129）：cut3 prefill_export（hidden）+ 默认单桶 L0 moe_out 均
+  **逐字节一致** vs 删 A 前 arena 版本；kv_cos vs moe_129_8192_vk 全 ~1.0；`build.bat test main` 6/6。
+- 遗留（本手术范围外，agent 在纯净 HEAD 复现）：`build.bat llamalibs main`（GGML_VULKAN=OFF）最终 exe
+  链接失败 —— 预存在 `stmoe_vk_buffer_host_ptr/stmoe_vk_dma_read` 未定义（moe_backend/route_b_inject
+  引用，非 vulkan 构建无 frag）。`StreamMoE_dump_dbg`（VULKAN=ON）链接正常。
+- 仍待办（收敛前置）：deepseek clamp/swiglu 紧凑克隆、token 子集 scatter-add（scatter_plan 接入）、
+  multi-pool。buckets 引擎现在仅验证过 gemma 全 token 垂直切。
+
 **out_off arena 改造（2026-09-07 落地，M2 §7.2.1 手动 arena 串行复用）**：
 - 孪生输出 data 从"每桶独立 fold_buf heap"改为钉 `fullalloc arena + ex->out_off[闭包索引]`
   （bucket_build_t.twin_out；compact [d,w_b,n_t] ≤ 满宽 [d,n_k,n_t] 同 out_off 区不冲突；
