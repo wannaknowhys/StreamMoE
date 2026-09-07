@@ -262,3 +262,23 @@
 - [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
 
+### M2-5 桶化 append 链 + per-device acc + 最终 host fold（2026-09-06，设计定稿 §7.8）
+
+设计：§7.8 三段。三个 append 函数**一律按当前桶构建**（用户强令，绝不在设计上退让），
+紧凑链重建（weightless 吃紧凑前驱，非主图满宽）：
+
+- f1 append_bucket_chain / append_mm_shell / append_op_clone：窄桶列 `[d_out, w_b, n_active]`，
+  mm 用桶 ids 子集 + build_cur_sub，输出紧凑 dst（不复用满宽 nd->data）；
+- f2 append_expert_fold：折专家 → `[d_out, 1, n_active]`（每 token 专家宽 1）；
+- f3 append_scatter_to_fullwidth：**一律**累加进 acc_d（`ggml_acc`，全 token stride=1 同位 add；
+  token 子集 = scatter-add）；mock：全宽静默，非全宽 log+exit(1)——mock 不是 no-op，全宽也要真加；
+- acc_d：每 device 一个常驻 device buffer `[d_out, n_t]`（build 时随 device 建），跨层复用，
+  **层首 `ggml_backend_buffer_clear(acc_d, 0)`**（同步，vulkan 走 vk_buffer_memset + waitFence，
+  host 侧 graph_compute 前调用）→ 图内 f3 自然读到清零后 acc_d，无需 GPU 事件节点；
+- 最终：acc_d → add_in[k]（§7.8 stage2，GPU = ggml_backend_tensor_copy）→ host fold device_used 槽 → moe_out；
+- 单 CPU 模拟多桶：按专家（k 槽）分两桶验证数值。
+
+当前代码：79d0f7c 函数拆分（fold off 全铺 = IDENTICAL 回归基线，保留）；
+09c0c52 §7.8 单 device 三段（acc_d→add_in→host fold，device_used=1，数值 = 预期 ulp 分布）。
+待做：三函数真桶化（紧凑链重建）+ 桶循环 + 逐层 dump 宽松 gate。
+
