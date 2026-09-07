@@ -1846,6 +1846,12 @@ struct bucket_build_t {
     const moe_layer_exec_t* ex = nullptr;
     // current bucket: expert-slot range over ids rows (all tokens)
     int64_t k_lo = 0, k_hi = 0, w_b = 0, n_active = 0;
+    // index of the closure node currently being cloned (== its out_off slot).
+    // Twins write their compact output at the SAME out_off region as the main
+    // full-width node (compact [d, w_b, n_t] <= full [d, n_k, n_t], so it stays
+    // inside the verify-allocated byte range); the one-cgraph serial execution
+    // makes bucket N+1's chain reuse bucket N's dead regions (M2 §7.2.1).
+    int64_t seq = -1;
     // routing ids (expert ids) for the bucket rows [w_b, n_active], t-major,
     // and slot-local translation [w_b, n_active]
     std::vector<int32_t>   ids_exp;     // kept alive (leaf data ptr)
@@ -1853,10 +1859,24 @@ struct bucket_build_t {
     const ggml_tensor *    ids = nullptr;     // main routing ids (read-only, full)
     const ggml_tensor *    ids_data = nullptr;   // full main ids data (read-only)
     int64_t ids_ne0 = 0, ids_ne1 = 0;
-    // main node -> compact twin (op built at w_b width, data in c->fold_buf)
+    // main node -> compact twin (op built at w_b width, data pinned into the
+    // layer result arena when the closure has a layout, else c->fold_buf)
     std::unordered_map<const ggml_tensor*, ggml_tensor*> twin;
+    // diagnostics: how many twin outputs landed in the arena vs heap fallback
+    int64_t n_arena = 0, n_heap = 0;
     // small helper: fresh float buffer kept alive until graph_compute
     float * buf(size_t n) { c->fold_buf.emplace_back(n, 0.0f); return c->fold_buf.back().data(); }
+    // Output region for the twin of the current closure node (b.seq). When the
+    // layer has a verify layout the twin lands at arena + out_off[seq]; returns
+    // nullptr if the layout is unavailable or the node has no slot -> caller
+    // falls back to its own heap buffer.
+    void * twin_out(size_t nbytes) {
+        if (!ex || !ex->layout_ok || seq < 0 || seq >= (int64_t) ex->out_off.size() ||
+            ex->out_off[(size_t) seq] < 0) return nullptr;
+        const size_t need = (size_t) ex->out_off[(size_t) seq] + nbytes;
+        void * base = moe_chain_fullalloc_buffer(need);
+        return base ? static_cast<char*>(base) + ex->out_off[(size_t) seq] : nullptr;
+    }
 };
 
 // Make a plain NONE leaf with the given geometry/data (helper to avoid repeated
@@ -1981,9 +2001,15 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
         if (!cur_leaf) return nullptr;
     }
     ggml_tensor * mm = ggml_mul_mat_id(c.ctx, w3d, cur_leaf, ids_leaf);
-    // compact dst region (heap float buffer): [d_out, w_b, n_active]
+    // compact dst [d_out, w_b, n_active]: pinned into the layer result arena at
+    // this closure node's out_off (full-width region; compact is smaller so it
+    // stays inside). Falls back to a per-bucket heap buffer when the layer has
+    // no verify layout (then every bucket keeps its own copies - safe, just no
+    // serial reuse).
     const size_t nf = (size_t)(w->ne[1] * b.w_b * b.n_active);
-    mm->data = b.buf(nf);
+    void * dst_arena = b.twin_out(nf * sizeof(float));
+    if (dst_arena) ++b.n_arena; else ++b.n_heap;
+    mm->data = dst_arena ? dst_arena : (void*) b.buf(nf);
     // nb: contiguous compact layout (ggml_new_tensor_4d would not apply to an op)
     mm->nb[0] = 4;
     mm->nb[1] = (size_t)(w->ne[1]) * 4;
@@ -2066,7 +2092,9 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
         if (!lf) return nullptr;
         cl->src[s] = lf;
     }
-    cl->data = b.buf(nf);
+    void * dst_arena = b.twin_out(nf * sizeof(float));
+    if (dst_arena) ++b.n_arena; else ++b.n_heap;
+    cl->data = dst_arena ? dst_arena : (void*) b.buf(nf);
     ggml_build_forward_expand(c.gf, cl);
     b.twin[nd] = cl;
     return cl;
@@ -2074,11 +2102,16 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
 
 // Build one bucket: walk the closure and produce the compact chain; returns the
 // final (weighted) twin (the last before the anonymous fold when fold_repl).
+// Each closure node's twin writes its compact output at arena + out_off[i]
+// (same byte region the main full-width node occupies; compact is smaller, so
+// it stays inside). In one serial cgraph bucket N+1's chain then reuses bucket
+// N's dead regions (M2 §7.2.1) - no per-bucket heap intermediates.
 static ggml_tensor * append_bucket_chain_compact(bucket_build_t & b) {
     ggml_tensor * last = nullptr;
-    for (const auto * cn : b.ex->compute) {
-        ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
+    for (size_t i = 0; i < b.ex->compute.size(); ++i) {
+        ggml_tensor * nd = const_cast<ggml_tensor*>(b.ex->compute[i]);
         if (is_view_op(nd)) continue;
+        b.seq = (int64_t) i;   // twin output slot == closure node's out_off
         ggml_tensor * t = nd->op == GGML_OP_MUL_MAT_ID ? append_mm_bucket(b, nd)
                                                        : append_op_bucket(b, nd);
         if (!t) continue;   // fold_repl: fold/moe_out return nullptr -> keep last
@@ -2198,8 +2231,15 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         b.ids_exp  = c.mm_ids_pool[c.mm_ids_pool.size() - 2];
         b.ids_slot = c.mm_ids_pool[c.mm_ids_pool.size() - 1];
         b.twin.clear();
+        b.n_arena = 0; b.n_heap = 0;
         ggml_tensor * last = append_bucket_chain_compact(b);
         if (!last) { LOG_ERROR("stream_moe: chain_buckets append failed L" << layer); return GGML_STATUS_FAILED; }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
+            fprintf(stderr, "[chain_buckets]   b%zu: arena=%lld heap=%lld\n",
+                    bi, (long long) b.n_arena, (long long) b.n_heap);
+        }
+#endif
         // fold the bucket's w_b experts -> [d_out, n_active]; (re)use fold_buf
         ggml_tensor * per_token = append_expert_fold(c, last);
         if (!per_token) return GGML_STATUS_FAILED;

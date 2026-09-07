@@ -302,6 +302,25 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - per-token 受影响输入盘点：cur / ids / weights_norm（per-slot 路由权重，slot 切片+token 重排）；专家权重与 scale REPEAT 表不受影响。
 - 待做：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp。
 
+**收敛计划（2026-09-07 冻结，未执行——先做 out_off buffer 改造）**：
+- 目标：唯一执行引擎 = 紧凑链 buckets 引擎；删 A 全族（exec_split_legacy_impl / exec_mixed_mm /
+  exec_one_burst / hide_output / hide_burst / refresh_aliases / tmp_split_* 自测 / exec_round_cpu|vk /
+  build_cur_sub / scatter_sub_dst）；B（`exec_layer_burst_chain_buckets` + append_*_bucket 全族 +
+  append_expert_fold + chain_exit）移出 `#ifdef STREAM_MOE_TEMP` 无条件编译；exec_layer_burst 只留
+  ex 闭包 + input_layouts 指针修复 + pin 段，之后无条件调 buckets（默认单全宽桶 = cut=one 语义，env
+  `STREAM_MOE_TMP_CHAIN_BUCKETS` 仍可切多桶）；`moe_exec_mul_mat_id` 非捕获（layer<0）直接报错。
+- 前置待解决：deepseek clamp/swiglu 紧凑克隆、token 子集 scatter-add（scatter_plan 接入）、multi-pool。
+- 用户拍板记录：只留 buckets 多桶引擎（删 exec_layer_burst_chain/append_mm_shell/append_op_clone/
+  append_bucket_chain 单桶参考，buckets 自吞单桶）；legacy 分支也删（非捕获报错）；B 移出 TEMP。
+
+**out_off arena 改造（2026-09-07 落地，M2 §7.2.1 手动 arena 串行复用）**：
+- 孪生输出 data 从"每桶独立 fold_buf heap"改为钉 `fullalloc arena + ex->out_off[闭包索引]`
+  （bucket_build_t.twin_out；compact [d,w_b,n_t] ≤ 满宽 [d,n_k,n_t] 同 out_off 区不冲突；
+  无 verify 布局时 fallback heap）。多桶在同一 cgraph 按序串行，后桶自动复用前桶 dead 区。
+- 验证（StreamMoE_dump_dbg，gemma 129）：`one`/`cut3` L0 moe_out + cut3 全层 prefill_export
+  （hidden）**逐字节一致** vs 改造前；CHAIN_DEBUG 计数确认每桶 7 孪生全 arena 命中、0 heap。
+- acc_d 即累加器（chain_ctx 持），层首 fill 0 = reset（既有）。fold 中间仍走 fold_buf。
+
 **test 修复（2026-09-07）**：
 - **scheduler 后端解耦**（per-pool DMA reader）：scheduler.cpp 删除 `stmoe_vk_dma_read` 前置声明/直调，改 `expert_scheduler::set_pool_dma_read(pool, fn)` + 私有表 `pool_dma_read_[MAX_DEVICE_POOLS=8]`（pool-1 索引）；move_worker 按 `t.src_pool` 查表，未注册回退 host memcpy。route_b_inject 在 vram_seg 注册时按 seg.dev 前缀（Vulkan）`set_pool_dma_read`；CUDA 落地时同点注册 cuda 壳。**test_scheduler 不再需链 vulkan**。
 - **test_moe_loader 修复**：CMake 源补 model_builder.cpp/topo_builder.cpp（缺 parse_model_path/build_topology/parse_model）；断言从废弃 `expert_slot_size/staging_size` 改验 `groups[].columns[].per_expert`（SoA 真载体）。deepseek 实模型跑通。
