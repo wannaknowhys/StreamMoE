@@ -6,10 +6,12 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef STREAM_MOE_TEMP
@@ -686,6 +688,33 @@ static std::vector<tmp_blk_t> tmp_split_blocks(const char * which,
         add(0, a, 0, n_t);
         add(a, b, 0, n_t);
         add(b, n_k, 0, n_t);
+    }
+    // "cut<N>" (or comma list "cut3,cut5"): split k slots at explicit cut
+    // points -> buckets [0,c1) [c1,c2) ... [cM,n_k). E.g. cut3 => [0,3)+[3,n_k)
+    // = the CPU two-bucket test (3 experts in one bucket, rest in the other).
+    // A value like "cut3,cut6" gives three buckets.
+    if (which && strncmp(which, "cut", 3) == 0 && std::isdigit((unsigned char)which[3])) {
+        const char * p = which + 3;
+        uint32_t prev = 0;
+        bool ok = true;
+        while (*p && ok) {
+            char * end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p || v <= (long) prev || v >= (long) n_k) { ok = false; break; }
+            add(prev, (uint32_t) v, 0, n_t);
+            prev = (uint32_t) v;
+            p = end;
+            while (*p == ',') ++p;
+        }
+        if (ok && prev < n_k) {
+            add(prev, n_k, 0, n_t);
+            return out;
+        }
+    }
+    // "head<N>": single PREFIX bucket [0, N) (debugging; not a partition).
+    if (which && strncmp(which, "head", 4) == 0 && std::isdigit((unsigned char)which[4])) {
+        const long v = strtol(which + 4, nullptr, 10);
+        if (v > 0 && v < (long) n_k) { add(0, (uint32_t) v, 0, n_t); return out; }
     }
     if (all || std::string(which) == "horizontal") {
         // horizontal cut: split token range (equal halves)
@@ -1408,9 +1437,28 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
 // (mm shell + weightless clones), fold the bucket's experts (sum over w) into
 // per-token columns, scatter into the full-width accumulator, then the exit
 // writes moe_out's dst. This is the CPU twin of the per-device mini-graph
-// builder (docs/M2_DEVICE_EXECUTOR.md SS2/SS7.7). Currently ONE full-width
-// bucket per layer (single device / all columns); the append_scatter step is a
-// WIDTH-CHECK mock until multi-bucket token subsets land.
+// builder (docs/M2_DEVICE_EXECUTOR.md SS2/SS7.7). CPU phase: ONE device (RAM),
+// the layer's routed ids k-slot axis is split into buckets (see
+// tmp_split_blocks "cut<N>" families); each bucket appends its compact chain,
+// folds its w_b expert columns, and ggml_acc_inplace's the per-token partial
+// into the device's acc_d. Non-CPU writeback + per-device concurrency are the
+// GPU phase (SS7.8 stage 2/3 structure is kept: acc_d -> add_in[k] -> host
+// fold -> moe_out; device_used == 1 makes the fold a memcpy).
+//
+// Compact bucket chains (TEMP): a bucket = contiguous k-slot range [k_lo,k_hi)
+// over ALL tokens (vertical cut). The mm shell keeps the full pool weight
+// column but restricts its ids to the bucket rows; the weightless ops between
+// mm and the fold are column-wise in (k,t) (gate_up mm, GLU, down mm, scale,
+// weighted all operate per slot column), so the compact chain runs them at
+// [d, w_b, n_t] over the bucket's own compact producer twins instead of the
+// full-width hidden dst. Scale REPEAT (per-expert table) is bucket-independent
+// (full expert width); GET_ROWS re-gathers with the bucket ids subset. The
+// anonymous fold + moe_out are not cloned (fold_repl replaces them with the
+// per-bucket expert fold + acc_d accumulation).
+//
+// Reference path (no bucket split): the OLD single full-width bucket clone is
+// kept verbatim below as the numeric bring-up gate (IDENTICAL). New code is
+// additive under STREAM_MOE_TEMP + env STREAM_MOE_TMP_CHAIN_BUCKETS.
 //
 // Clone srcs are wrapped as LEAVES carrying the main-graph data pointer (already
 // positioned by the hide/refresh flow) so the graph has NO external op nodes;
@@ -1418,6 +1466,66 @@ static bool exec_one_burst(ggml_context * ctx, ggml_backend_t cpu, expert_schedu
 // inter-node data flows through the shared arena regions (producer clone writes
 // its hide region, consumer clone reads it via its src leaf).
 
+#ifdef STREAM_MOE_TEMP
+// ---- closure structure dump (TEMP diagnostics) ----------------------------
+// Prints the whole-layer closure as the chain path sees it (ex->compute: op /
+// name / ne / nbytes / src role) plus the external leaves and view aliases that
+// feed it, so the compact twin engine is written against the REAL captured
+// graph rather than assumed topology. Env STREAM_MOE_TMP_CHAIN_DUMP_STRUCT=1,
+// optional STREAM_MOE_TMP_CHAIN_DUMP_LAYER=<N> (default 0).
+static void tmp_dump_chain_struct(const moe_layer_exec_t * ex) {
+    if (!ex) return;
+    fprintf(stderr, "[chain_struct] L%d closure: %zu compute nodes\n",
+            ex->layer, ex->compute.size());
+    for (size_t i = 0; i < ex->compute.size(); ++i) {
+        const ggml_tensor * nd = ex->compute[i];
+        if (!nd) { fprintf(stderr, "  [%zu] (null)\n", i); continue; }
+        fprintf(stderr, "  [%zu] op=%-12s name=%-28s ne=[%lld,%lld,%lld,%lld] nb=%zu data=%p\n",
+                i, ggml_op_name(nd->op),
+                nd->name ? nd->name : "(anon)",
+                (long long) nd->ne[0], (long long) nd->ne[1],
+                (long long) nd->ne[2], (long long) nd->ne[3],
+                ggml_nbytes(nd), (void*) nd->data);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            // role: is the src produced inside this closure (chain-internal) or
+            // an external leaf (weight/cur/ids/scale from llama's side)?
+            const char * role = "EXTERN";
+            for (const auto * cn : ex->compute) if (cn == src) { role = "CHAIN"; break; }
+            fprintf(stderr, "        s%d[%s] op=%-12s name=%-30s ne=[%lld,%lld,%lld,%lld] nb=%zu data=%p\n",
+                    s, role, ggml_op_name(src->op),
+                    src->name ? src->name : "(anon)",
+                    (long long) src->ne[0], (long long) src->ne[1],
+                    (long long) src->ne[2], (long long) src->ne[3],
+                    ggml_nbytes(src), (void*) src->data);
+        }
+    }
+    if (!ex->external_leaves.empty()) {
+        fprintf(stderr, "  external leaves (%zu):\n", ex->external_leaves.size());
+        for (const auto & el : ex->external_leaves) {
+            fprintf(stderr, "    [%s] role=%-6s used by %-30s ne=[%lld,%lld,%lld] nb=%zu\n",
+                    el.tensor && el.tensor->name ? el.tensor->name : "?",
+                    el.role ? el.role : "?",
+                    el.user ? el.user : "?",
+                    (long long)(el.tensor ? el.tensor->ne[0] : 0),
+                    (long long)(el.tensor ? el.tensor->ne[1] : 0),
+                    (long long)(el.tensor ? el.tensor->ne[2] : 0),
+                    el.tensor ? ggml_nbytes(el.tensor) : 0);
+        }
+    }
+    if (!ex->view_aliases.empty()) {
+        fprintf(stderr, "  view aliases (%zu):\n", ex->view_aliases.size());
+        for (const auto & va : ex->view_aliases) {
+            fprintf(stderr, "    view %-30s <- prod %-30s off=%lld\n",
+                    va.view && va.view->name ? va.view->name : "(anon)",
+                    va.prod && va.prod->name ? va.prod->name : "(anon)",
+                    (long long) va.off);
+        }
+    }
+    fflush(stderr);
+}
+#endif
 struct chain_ctx_t {
     ggml_context *             ctx  = nullptr;
     ggml_backend_t             cpu  = nullptr;
@@ -1446,6 +1554,16 @@ struct chain_ctx_t {
     int64_t                 d_out = 0;
     int64_t                 device_used = 0;
     std::vector<float>      add_in;     // host mirror of the RAM [device_used, d_out, n_t]
+    // Current bucket = an expert-slot range [k_lo, k_hi) over the routed ids'
+    // per-token slot axis (ne0 of the ids tensor). The three append_* builders
+    // must restrict to THIS bucket only: mm ids/leafs over k_lo..k_hi, weightless
+    // clones shrinking the slot axis to w_b, the expert fold over w_b columns.
+    int64_t                 k_lo = 0, k_hi = 0;   // current bucket slot half-open range
+    int64_t                 n_slots = 0;          // full routed slot count (ids ne0)
+    // acc_d: the device's expert-folded accumulator [d_out, n_t] (bucketized
+    // path only; single full-width bucket fold goes through fold_buf + exit).
+    // Process-lifetime grow-only, zeroed per layer before the bucket loop.
+    std::vector<float>      acc_d;
 };
 
 // Append a routed mm as a shell mul_mat_id writing straight into the hidden dst
@@ -1706,6 +1824,428 @@ static enum ggml_status exec_layer_burst_chain(int32_t layer, ggml_context * ctx
     return GGML_STATUS_SUCCESS;
 }
 
+#ifdef STREAM_MOE_TEMP
+// ================= CPU two-bucket compact chain (M2-5, dbg only) ==========
+// Whole-layer single graph where the routed k-slot axis is split into buckets
+// (env STREAM_MOE_TMP_CHAIN_BUCKETS = a tmp_split_* cut name, e.g. "cut3").
+// For each bucket the chain is rebuilt COMPACT ([d, w_b, n_t]) - mm shell over
+// the bucket's ids subset writing a compact dst, weightless twins narrowed to
+// w_b - then folded over w_b and ggml_acc_inplace'd into acc_d. The reference
+// (no env) single full-width bucket path above is untouched.
+//
+// Closure facts this relies on (gemma L0, verified by STREAM_MOE_TMP_CHAIN_DUMP_STRUCT):
+//   chain tensors [d, n_k, n_t]; slot axis = ne1 (per-token routed slot); fold
+//   ADD tree sums ne1 -> [d_out, n_t]; scale REPEAT node_56 [1,128,T] is full
+//   (per-expert), GET_ROWS node_57 [1,w_b,T] gathers per (slot,token) by the
+//   bucket expert ids; down mm cur = the bucket's own compact GLU twin (kernel
+//   reads src1 col = slot % ne11 with ne11 = w_b).
+
+// --- per-bucket compact state -----------------------------------------------
+struct bucket_build_t {
+    chain_ctx_t *          c = nullptr;
+    const moe_layer_exec_t* ex = nullptr;
+    // current bucket: expert-slot range over ids rows (all tokens)
+    int64_t k_lo = 0, k_hi = 0, w_b = 0, n_active = 0;
+    // routing ids (expert ids) for the bucket rows [w_b, n_active], t-major,
+    // and slot-local translation [w_b, n_active]
+    std::vector<int32_t>   ids_exp;     // kept alive (leaf data ptr)
+    std::vector<int32_t>   ids_slot;    // kept alive (mm leaf data ptr)
+    const ggml_tensor *    ids = nullptr;     // main routing ids (read-only, full)
+    const ggml_tensor *    ids_data = nullptr;   // full main ids data (read-only)
+    int64_t ids_ne0 = 0, ids_ne1 = 0;
+    // main node -> compact twin (op built at w_b width, data in c->fold_buf)
+    std::unordered_map<const ggml_tensor*, ggml_tensor*> twin;
+    // small helper: fresh float buffer kept alive until graph_compute
+    float * buf(size_t n) { c->fold_buf.emplace_back(n, 0.0f); return c->fold_buf.back().data(); }
+};
+
+// Make a plain NONE leaf with the given geometry/data (helper to avoid repeated
+// ggml_new_tensor_4d + nb-copy boilerplate).
+static ggml_tensor * bucket_mk_leaf(chain_ctx_t & c, enum ggml_type type,
+                                    const int64_t ne[4], const size_t nb[4], void * data) {
+    ggml_tensor * l = ggml_new_tensor_4d(c.ctx, type, ne[0], ne[1], ne[2], ne[3]);
+    for (int i = 0; i < 4; ++i) l->nb[i] = nb[i];
+    l->data = data;
+    return l;
+}
+
+// Compact leaf over main tensor `m` (external: cur / scale table / weights):
+// same geometry, slot axis (extent == n_k) narrowed to w_b. The slot axis is
+// ne1 (per-token routed slot, ne0==1 for [1,n_k,T] leaves). The token axis and
+// d axis stay untouched (a bucket covers every token in this prototype). For a
+// per-slot external leaf ([1,n_k,T], e.g. the weighted norm gather) the w_b
+// rows are strided within the main buffer: data advanced by k_lo along the slot
+// axis (nb1), token stride nb2 unchanged.
+static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) {
+    chain_ctx_t & c = *b.c;
+    int64_t ne[4]; size_t nb[4];
+    for (int i = 0; i < 4; ++i) { ne[i] = m->ne[i]; nb[i] = m->nb[i]; }
+    const char * data = static_cast<const char*>(m->data);
+    const int64_t n_k = b.ids_ne0;
+    // Per-slot external leaf: ne0 == 1 and ne1 == n_k (rows are one value per
+    // (slot, token), like [1, n_k, n_t]). Nothing else is a slot-axis leaf.
+    if (m->ne[0] == 1 && m->ne[1] == n_k) {
+        ne[1] = b.w_b;
+        data += (size_t)(b.k_lo) * nb[1];   // slice slots [k_lo, k_hi)
+    }
+    return bucket_mk_leaf(c, m->type, ne, nb, const_cast<char*>(data));
+}
+
+// Leaf twin of a chain producer `p` (already built) narrowed to the bucket.
+static ggml_tensor * bucket_twin_leaf(bucket_build_t & b, const ggml_tensor * p) {
+    auto it = b.twin.find(p);
+    if (it == b.twin.end()) return nullptr;
+    const ggml_tensor * t = it->second;
+    int64_t ne[4]; size_t nb[4];
+    for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
+    return bucket_mk_leaf(*b.c, t->type, ne, nb, t->data);
+}
+
+// Resolve a weightless clone's src[s]: a chain producer twin leaf, a view of a
+// chain producer (data = producer twin + view byte offset along d), or an
+// external data leaf (cur/ids/scale table). Views over hidden producers only
+// slice along d (ne0) in this gemma closure (gate/up halves at view_offs 0 /
+// n_ff*esize), so the twin view keeps the twin's ne[1..3]/nb and only slices d.
+static ggml_tensor * bucket_src_leaf(bucket_build_t & b, const ggml_tensor * src) {
+    // unwrap view/layout chain to the producer root, tracking byte offset
+    const ggml_tensor * root = src;
+    int64_t off = 0;
+    while (root && (root->op == GGML_OP_VIEW || root->op == GGML_OP_RESHAPE ||
+                    root->op == GGML_OP_TRANSPOSE || root->op == GGML_OP_PERMUTE ||
+                    root->op == GGML_OP_CONT)) {
+        if (root->op == GGML_OP_VIEW) off += root->view_offs;
+        root = root->src[0];
+    }
+    if (root) {
+        auto it = b.twin.find(root);
+        if (it != b.twin.end()) {
+            const ggml_tensor * t = it->second;
+            int64_t ne[4]; size_t nb[4];
+            for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
+            // apply the outermost view's d-slice: ne0 (d rows) from the src view
+            ne[0] = src->ne[0];
+            return bucket_mk_leaf(*b.c, t->type, ne, nb,
+                                  static_cast<char*>(t->data) + off);
+        }
+    }
+    // external leaf: cur (shared per token) / ids / scale table / weights
+    return bucket_ext_leaf(b, src);
+}
+
+// Compact mm shell for the current bucket. `nd` is the main MUL_MAT_ID node.
+// ids = the bucket's slot-local subset [w_b, n_active]; cur = chain twin leaf
+// (down: the bucket's own compact GLU) or external shared cur (gate_up). dst =
+// compact [d_out, w_b, n_active] region (NOT nd->data).
+static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
+    chain_ctx_t & c = *b.c;
+    ggml_tensor * w   = const_cast<ggml_tensor*>(nd->src[0]);
+    ggml_tensor * cur = const_cast<ggml_tensor*>(nd->src[1]);
+    if (!b.ids_data) return nullptr;
+    parsed_node_t pn = parse_weight_name(w->name);
+    if (!pn.ok) return nullptr;
+    uint32_t gidx = c.sched->group_of(pn.layer);
+    if (gidx == static_cast<uint32_t>(-1)) return nullptr;
+
+    // slot-local ids for the bucket rows (all tokens): reuse pool-region index.
+    const int32_t se0 = (int32_t) b.ids_exp[0];
+    const int32_t slot0 = pin_slot(*c.pins, pn.layer, (uint32_t) se0);
+    if (slot0 < 0) return nullptr;
+    const expert_scheduler::subpool_t * sp = c.sched->subpool_of_slot(slot0);
+    if (!sp) return nullptr;
+    size_t col_off = 0, col_stride = 0; uint32_t col_index = 0;
+    if (!c.sched->column_layout(*sp, w->name, col_off, col_stride, col_index)) return nullptr;
+
+    // ids leaf data already staged in b.ids_slot (slot - slot_begin), t-major
+    // [w_b, n_active]; feed with the leaf's shape.
+    c.mm_ids_pool.push_back(b.ids_slot);
+    int64_t ne_ids[4] = { b.w_b, b.n_active, 1, 1 };
+    size_t nb_ids[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, 0 };
+    nb_ids[3] = nb_ids[2];
+    ggml_tensor * ids_leaf = bucket_mk_leaf(c, GGML_TYPE_I32, ne_ids, nb_ids,
+                                            c.mm_ids_pool.back().data());
+
+    ggml_tensor * w3d = ggml_new_tensor_3d(c.ctx, w->type, w->ne[0], w->ne[1], 1);
+    w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
+    w3d->nb[2] = col_stride;
+    w3d->nb[3] = col_stride * sp->n_slots;
+    w3d->data  = sp->base + col_off;
+
+    // cur: chain twin (down mm reads the bucket's own compact GLU) or external
+    // shared cur leaf (gate_up, ne11 == 1 -> every bucket slot reads col 0).
+    ggml_tensor * cur_leaf = nullptr;
+    if (cur->op != GGML_OP_NONE) {
+        cur_leaf = bucket_twin_leaf(b, cur);
+    }
+    if (!cur_leaf) {
+        cur_leaf = bucket_ext_leaf(b, cur);
+        if (!cur_leaf) return nullptr;
+    }
+    ggml_tensor * mm = ggml_mul_mat_id(c.ctx, w3d, cur_leaf, ids_leaf);
+    // compact dst region (heap float buffer): [d_out, w_b, n_active]
+    const size_t nf = (size_t)(w->ne[1] * b.w_b * b.n_active);
+    mm->data = b.buf(nf);
+    // nb: contiguous compact layout (ggml_new_tensor_4d would not apply to an op)
+    mm->nb[0] = 4;
+    mm->nb[1] = (size_t)(w->ne[1]) * 4;
+    mm->nb[2] = (size_t)(w->ne[1] * b.w_b) * 4;
+    mm->nb[3] = mm->nb[2] * (size_t) b.n_active;
+    ggml_build_forward_expand(c.gf, mm);
+    b.twin[nd] = mm;
+    return mm;
+}
+
+// Compact weightless clone for the current bucket: same op/op_params as `nd`,
+// slot axis narrowed to w_b, srcs resolved to bucket twins / compact leaves.
+// fold_repl skips the anonymous fold + moe_out. REPEAT (per-expert scale) is
+// full-width; GET_ROWS takes the bucket ids_exp subset (expert ids, t-major).
+static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
+    chain_ctx_t & c = *b.c;
+    const bool is_out = nd->name && strstr(nd->name, "ffn_moe_out") != nullptr;
+    if (is_out || (nd->op == GGML_OP_ADD && !(nd->name && strstr(nd->name, "ffn_moe_"))))
+        return nullptr;   // fold_repl: replaced by append_expert_fold / acc
+    if (nd->op == GGML_OP_MUL_MAT_ID) return append_mm_bucket(b, nd);
+
+    // GET_ROWS / REPEAT / MUL / GLU / ... : op clone with narrowed slot axis.
+    int64_t ne[4]; size_t nb[4];
+    for (int i = 0; i < 4; ++i) { ne[i] = nd->ne[i]; nb[i] = nd->nb[i]; }
+    // narrow the slot axis to w_b. In this closure every chain weightless output
+    // carries the per-token routed slot on ne1 ([d, n_k, n_t] or [1, n_k, n_t]);
+    // fold-ADD outputs (token axis on ne1) and moe_out never reach this branch
+    // (returned nullptr above). REPEAT node_56 is [1,128,n_t] (128 experts) and
+    // is bucket-independent - its ne1 != n_k so it stays full width.
+    const int64_t n_k = b.ids_ne0;
+    bool shrunk = false;
+    if (nd->ne[1] == n_k && nd->ne[0] != n_k) { ne[1] = b.w_b; shrunk = true; }
+    if (shrunk && nd->ne[2] == n_k) {
+        // token axis also happens to equal n_k (n_t == n_k decodes): ne1 was the
+        // slot axis (see above); leave ne2 (tokens) untouched.
+    }
+    // contiguous compact dst (op outputs in this closure are f32)
+    size_t nf = 1;
+    for (int i = 0; i < 4; ++i) nf *= (size_t) ne[i];
+    // rebuild contiguous nb for the compact dst
+    nb[0] = 4;
+    for (int i = 1; i < 4; ++i) nb[i] = nb[i-1] * (size_t) ne[i-1];
+
+    ggml_tensor * cl = ggml_new_tensor_4d(c.ctx, nd->type, ne[0], ne[1], ne[2], ne[3]);
+    for (int i = 0; i < 4; ++i) cl->nb[i] = nb[i];
+    cl->op = nd->op;
+    for (size_t i = 0; i < GGML_MAX_OP_PARAMS; ++i) cl->op_params[i] = nd->op_params[i];
+    // per-src resolution. GET_ROWS src1 = ids: replace with the bucket ids_exp
+    // subset (expert ids, i32, t-major [w_b, n_active]) - get_rows gathers rows
+    // of the REPEAT scale table by expert id.
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        ggml_tensor * src = nd->src[s];
+        if (!src) continue;
+        ggml_tensor * lf = nullptr;
+        if (nd->op == GGML_OP_GET_ROWS && s == 1 && src->type == GGML_TYPE_I32) {
+            // ids leaf must point at a buffer kept alive until graph_compute: the
+            // per-bucket member is overwritten by the next bucket's assign().
+            c.mm_ids_pool.push_back(b.ids_exp);
+            int64_t sne[4] = { b.w_b, b.n_active, 1, 1 };
+            size_t snb[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, (size_t)(b.w_b * b.n_active) * 4 };
+            lf = bucket_mk_leaf(c, GGML_TYPE_I32, sne, snb, c.mm_ids_pool.back().data());
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
+                int32_t mn = INT32_MAX, mx = INT32_MIN;
+                for (size_t q = 0; q < b.ids_exp.size(); ++q) { mn = std::min(mn, b.ids_exp[q]); mx = std::max(mx, b.ids_exp[q]); }
+                fprintf(stderr, "[chain_buckets] GET_ROWS ids_exp[%zu] range [%d,%d] src0=",
+                        b.ids_exp.size(), mn, mx);
+                fprintf(stderr, "%s", (nd->src[0] && nd->src[0]->name) ? nd->src[0]->name : "?");
+                fprintf(stderr, " s0ne=[%lld,%lld,%lld,%lld] out_ne=[%lld,%lld,%lld]\n",
+                        (long long) (nd->src[0] ? nd->src[0]->ne[0] : 0),
+                        (long long) (nd->src[0] ? nd->src[0]->ne[1] : 0),
+                        (long long) (nd->src[0] ? nd->src[0]->ne[2] : 0),
+                        (long long) (nd->src[0] ? nd->src[0]->ne[3] : 0),
+                        (long long) cl->ne[0], (long long) cl->ne[1], (long long) cl->ne[2]);
+            }
+#endif
+        } else {
+            lf = bucket_src_leaf(b, src);
+        }
+        if (!lf) return nullptr;
+        cl->src[s] = lf;
+    }
+    cl->data = b.buf(nf);
+    ggml_build_forward_expand(c.gf, cl);
+    b.twin[nd] = cl;
+    return cl;
+}
+
+// Build one bucket: walk the closure and produce the compact chain; returns the
+// final (weighted) twin (the last before the anonymous fold when fold_repl).
+static ggml_tensor * append_bucket_chain_compact(bucket_build_t & b) {
+    ggml_tensor * last = nullptr;
+    for (const auto * cn : b.ex->compute) {
+        ggml_tensor * nd = const_cast<ggml_tensor*>(cn);
+        if (is_view_op(nd)) continue;
+        ggml_tensor * t = nd->op == GGML_OP_MUL_MAT_ID ? append_mm_bucket(b, nd)
+                                                       : append_op_bucket(b, nd);
+        if (!t) continue;   // fold_repl: fold/moe_out return nullptr -> keep last
+        last = t;
+    }
+    return last;
+}
+
+// Whole-layer bucketed chain: split the routed k-slot axis into buckets (env
+// STREAM_MOE_TMP_CHAIN_BUCKETS = a tmp_split_* cut family, e.g. "cut3"), then
+// for each bucket build the compact chain + fold w_b -> per-token partial and
+// ggml_acc_inplace it into acc_d, and exit via chain_exit (acc_d -> add_in ->
+// moe_out). The single-bucket reference path is exec_layer_burst_chain.
+static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_context * ctx,
+                                                       ggml_backend_t cpu,
+                                                       expert_scheduler & sched,
+                                                       const moe_layer_exec_t * ex,
+                                                       const std::vector<expert_handle_t>& pins) {
+    const char * cut = std::getenv("STREAM_MOE_TMP_CHAIN_BUCKETS");
+    if (!cut || !cut[0] || std::string(cut) == "full") return GGML_STATUS_FAILED;
+    // geometry from the first routed mm's ids
+    const ggml_tensor * ids = nullptr;
+    for (const auto * cn : ex->compute) {
+        if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { ids = cn->src[2]; break; }
+    }
+    if (!ids || !ids->data) return GGML_STATUS_FAILED;
+    const uint32_t n_k = static_cast<uint32_t>(ids->ne[0]);
+    const uint32_t n_t = static_cast<uint32_t>(ids->ne[1]);
+    // bucket list = full-token k-slices (vertical cut over ALL tokens)
+    std::vector<std::pair<uint32_t,uint32_t>> bk;
+    if (std::string(cut) == "one") {
+        // single full-width bucket through the COMPACT builder (not the full
+        // reference path) - isolates compact-chain bugs from bucket-split bugs
+        bk.push_back({ 0, n_k });
+    } else {
+        const auto blocks = tmp_split_blocks(cut, n_k, n_t);
+        for (const auto & bl : blocks) {
+            if (bl.t0 != 0 || bl.t1 != n_t) {
+                fprintf(stderr, "[chain_buckets] L%d: non-full-token block (%u..%u) unsupported in CPU prototype\n",
+                        layer, bl.t0, bl.t1);
+                return GGML_STATUS_FAILED;
+            }
+            bk.push_back({ bl.k0, bl.k1 });
+        }
+    }
+    if (bk.empty() || (bk.size() == 1 && bk[0].first == 0 && bk[0].second == n_k && std::string(cut) != "one")) {
+        // "full" semantics: fall through to the reference single-bucket path
+        return GGML_STATUS_FAILED;
+    }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
+        fprintf(stderr, "[chain_buckets] L%d: n_k=%u n_t=%u -> %zu buckets\n",
+                layer, n_k, n_t, bk.size());
+    }
+#endif
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    chain_ctx_t c;
+    c.ctx   = ctx;   c.cpu   = cpu;   c.sched = &sched;
+    c.topo  = &sched.topology();
+    c.layer = layer; c.pins  = &pins; c.gf    = gf; c.ex    = ex;
+    c.fold_repl = true;
+    c.w_b = n_k; c.n_t = n_t; c.d_out = 0; c.device_used = 1;
+
+    bucket_build_t b;
+    b.c = &c; b.ex = ex; b.ids = ids; b.ids_data = ids;
+    b.ids_ne0 = n_k; b.ids_ne1 = n_t;
+
+    // acc_d: process-lifetime, sized to the fold output once known
+    int64_t d_out = 0;
+    for (const auto * cn : ex->compute) {
+        if (!cn) continue;
+        d_out = std::max(d_out, (int64_t)(cn->ne[0]));
+    }
+    if (d_out <= 0) return GGML_STATUS_FAILED;
+    c.d_out = d_out;
+    const size_t acc_sz = (size_t)(c.d_out * c.n_t);
+    if (c.acc_d.size() < acc_sz) c.acc_d.assign(acc_sz, 0.0f);
+    std::fill(c.acc_d.begin(), c.acc_d.end(), 0.0f);
+
+    // iterate buckets in execution order (natural = ascending k; the caller can
+    // reverse bk to exercise the relaxed ULP gate)
+    for (size_t bi = 0; bi < bk.size(); ++bi) {
+        b.k_lo = bk[bi].first; b.k_hi = bk[bi].second;
+        b.w_b  = b.k_hi - b.k_lo; b.n_active = n_t;
+        if (b.w_b <= 0) continue;
+        b.ids_exp.assign((size_t)(b.w_b * n_t), 0);
+        b.ids_slot.assign((size_t)(b.w_b * n_t), 0);
+        // build the bucket ids subsets from the full routing ids
+        bool ok = true;
+        for (uint32_t t = 0; t < n_t && ok; ++t) {
+            for (int64_t s = 0; s < b.w_b; ++s) {
+                const uint32_t k = (uint32_t)(b.k_lo + s);
+                const int32_t e = MOE_ID_AT(ids, (int) t, (int) k);
+                if (e < 0 || e >= static_cast<int32_t>(c.topo->n_expert)) { ok = false; break; }
+                const int32_t slot = pin_slot(pins, (uint32_t) layer, (uint32_t) e);
+                if (slot < 0) { ok = false; break; }
+                const expert_scheduler::subpool_t * osp = c.sched->subpool_of_slot(slot);
+                if (!osp) { ok = false; break; }
+                const size_t idx = (size_t) t * (size_t) b.w_b + (size_t) s;
+                b.ids_exp[idx]  = e;
+                b.ids_slot[idx] = slot - static_cast<int32_t>(osp->slot_begin);
+            }
+        }
+        if (!ok) { LOG_ERROR("stream_moe: chain_buckets ids staging failed L" << layer); return GGML_STATUS_FAILED; }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
+            fprintf(stderr, "[chain_buckets]   b%zu: k[%lld..%lld) w_b=%lld\n",
+                    bi, (long long) b.k_lo, (long long) b.k_hi, (long long) b.w_b);
+        }
+#endif
+        // Keep this bucket's ids copies alive until graph_compute: mm_ids_pool is
+        // append-only (each inner vector stable), the graph runs ONCE at exit so
+        // earlier buckets' leaf data pointers must stay valid.
+        c.mm_ids_pool.push_back(b.ids_exp);
+        c.mm_ids_pool.push_back(b.ids_slot);
+        b.ids_exp  = c.mm_ids_pool[c.mm_ids_pool.size() - 2];
+        b.ids_slot = c.mm_ids_pool[c.mm_ids_pool.size() - 1];
+        b.twin.clear();
+        ggml_tensor * last = append_bucket_chain_compact(b);
+        if (!last) { LOG_ERROR("stream_moe: chain_buckets append failed L" << layer); return GGML_STATUS_FAILED; }
+        // fold the bucket's w_b experts -> [d_out, n_active]; (re)use fold_buf
+        ggml_tensor * per_token = append_expert_fold(c, last);
+        if (!per_token) return GGML_STATUS_FAILED;
+        // real acc: acc_d[d_out, n_t] += per_token[d_out, n_active] at token
+        // positions. Full-token bucket (n_active == n_t): same-position add via
+        // ggml_acc_inplace offset 0. Token-subset buckets still mock-gated.
+        if (per_token->ne[1] != (int64_t) n_t) {
+            fprintf(stderr,
+                "[chain_buckets] b%zu: token-subset bucket (n_active %lld != n_t %u) "
+                "scatter-add not implemented yet.\n",
+                bi, (long long) per_token->ne[1], n_t);
+            return GGML_STATUS_FAILED;
+        }
+        ggml_tensor * acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
+        acc->data = c.acc_d.data();
+        acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
+        ggml_tensor * a = ggml_acc_inplace(c.ctx, acc, per_token, acc->nb[1], acc->nb[1]*acc->ne[1], 0, 0);
+        ggml_build_forward_expand(c.gf, a);
+    }
+    // exit: acc_d -> moe_out (device_used == 1 -> the anonymous cross-device fold
+    // is a plain copy). Reuse chain_exit's stage 2/3 with an acc tensor view of
+    // the persistent acc_d buffer.
+    {
+        ggml_tensor * acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
+        acc->data = c.acc_d.data();
+        acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
+        if (!chain_exit(c, acc)) return GGML_STATUS_FAILED;
+    }
+#ifdef STREAM_MOE_TEMP
+    // Numeric gate dump: moe_out per layer (same tmp_dump_node harness as the
+    // single-bucket path) so an offline diff gates acc_d results.
+    if (std::getenv("STREAM_MOE_TMP_DUMP")) {
+        size_t seq = 0;
+        for (const auto * cn : ex->compute) {
+            const ggml_tensor * m = cn;
+            if (m && m->name && strstr(m->name, "ffn_moe_out") != nullptr) {
+                tmp_dump_node(sched, *c.topo, pins, layer, seq, const_cast<ggml_tensor*>(cn));
+            }
+            ++seq;
+        }
+    }
+#endif
+    return GGML_STATUS_SUCCESS;
+}
+#endif
+
 // Burst one whole layer from its captured sequence.
 static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                                          ggml_backend_t cpu, expert_scheduler& sched,
@@ -1713,6 +2253,23 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
     const moe_model_topology_t& topo = sched.topology();
+#ifdef STREAM_MOE_TEMP
+    // Closure-structure dump (env STREAM_MOE_TMP_CHAIN_DUMP_STRUCT=1). Fire
+    // once per process on the layer selected by STREAM_MOE_TMP_CHAIN_DUMP_LAYER
+    // (default 0), before any exec, so the printed topology is the real
+    // captured graph.
+    {
+        static bool dumped = false;
+        const char * en = std::getenv("STREAM_MOE_TMP_CHAIN_DUMP_STRUCT");
+        int want = 0;
+        const char * wl = std::getenv("STREAM_MOE_TMP_CHAIN_DUMP_LAYER");
+        if (wl && *wl) want = atoi(wl);
+        if (en && std::string(en) == "1" && !dumped && layer == want) {
+            dumped = true;
+            tmp_dump_chain_struct(ex);
+        }
+    }
+#endif
 
     // Per-layer full-alloc capacity for the hidden intermediates.
     size_t lsum = 0;
@@ -1782,6 +2339,20 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         moe_chain_set_full_alloc(need);
     }
     reset_layer(layer);
+#ifdef STREAM_MOE_TEMP
+    // Two-bucket compact chain path (env STREAM_MOE_TMP_CHAIN_BUCKETS). Buckets
+    // run on their OWN compact twin buffers (mm shells write compact dsts, no
+    // main-graph hide_burst), so dispatch before the CHAIN_GRAPH hide block.
+    // "full" = fall back to the reference single-bucket path below.
+    {
+        const char * bk_env = std::getenv("STREAM_MOE_TMP_CHAIN_BUCKETS");
+        if (bk_env && bk_env[0] && std::string(bk_env) != "full") {
+            const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
+            for (const auto & h : pins) sched.unpin(h);
+            return st;
+        }
+    }
+#endif
 #ifdef STREAM_MOE_TEMP
     // Whole-layer single-graph path (GPU mini-graph shape on CPU). The shared
     // interval layout is NOT used: every node gets its own arena region (per-

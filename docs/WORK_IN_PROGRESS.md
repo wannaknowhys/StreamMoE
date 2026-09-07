@@ -282,3 +282,31 @@
 09c0c52 §7.8 单 device 三段（acc_d→add_in→host fold，device_used=1，数值 = 预期 ulp 分布）。
 待做：三函数真桶化（紧凑链重建）+ 桶循环 + 逐层 dump 宽松 gate。
 
+**落地（2026-09-07，STREAM_MOE_TEMP / dbg 构建 / env STREAM_MOE_TMP_CHAIN_BUCKETS）**：
+CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（minigraph_exec.cpp）：
+- 桶划分 = k-slot 连续段（`tmp_split_blocks` 家族，新增 `cut<N>`/`cutN,M`/`head<N>`；"one"= 单满宽桶走紧凑构建器用于隔离调试）；
+- 每桶：`append_mm_bucket`（壳 ids 用 `b.ids_slot` 子集、cur 取链内紧凑孪生/外部共享 leaf、写紧凑 `[d_out,w_b,n_t]` dst）→
+  `append_op_bucket`（weightless 紧凑孪生：槽轴只窄 ne1、REPEAT 满宽、GET_ROWS 换桶 ids_exp、外部 per-slot leaf 按 k_lo 推进）
+  → `append_expert_fold`（折 w_b）→ **真 acc**：`ggml_acc_inplace` 同位累进常驻 `acc_d`（offset 0；token 子桶仍 exit 1）
+  → `chain_exit`（acc_d→add_in→host fold→moe_out，device_used=1）。
+- 关键事实：① 槽轴=ne1 由"形状与 n_k 同值"推导不可靠（n_t==n_k 时撞 token 轴），改为**固定 ne1** 判断；② 每桶 ids/孪生缓冲必须 append 进 `mm_ids_pool`/`fold_buf` 保活（图末尾一次 graph_compute，跨桶 leaf 指针不能悬）。
+- 验证：129-token prefill-from（v2align，`temp/chain_buckets_gate.bat`）：
+  - `one`（紧凑构建器单满宽桶）vs `full`（旧满宽 clone fold 路径）**30 层 moe_out 逐字节一致** → 紧凑孪生引擎几何正确；
+  - `cut3`（[0,3)+[3,8) 两桶）L0 maxAbs 7.6e-6 ≤ 1e-5（唯一同输入可比层）；L1+ 因折序 ULP 经层间残差放大 + L3+ argsort 专家翻转发散（已归档噪声类，非 bug）。
+- 待做：逆序桶序看 ULP 上限；token 子集 scatter-add（mock 挡）；deepseek 的 clamp/swiglu 紧凑克隆；把紧凑孪生孪生键从"per-bucket 重建"提升到跨桶复用（REPEAT/外部 scale 表与桶无关）。
+
+### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）
+
+- **槽维 = 链内所有张量的 ne1**（= 该层 n_k，gemma L0 8 / deepseek 6），贯穿 mm→weightless：
+  gemma gate_up/geglu/down/weighted `[d0, 8, 129]`，deepseek gate/up/clamp/swiglu/down/weighted `[d0, 6, 4]`；
+- mm 节点走 device 时 dump 前缀 `gpu_i*`（vulkan），weightless 走 `cpu_i*`——当前执行模型 mm 在 device、
+  weightless 在 CPU host，形状不变；compact 规则两种 backend 相同；
+- 折叠产物（匿名 ADD 树 + moe_out）`[d_out, n_t, 1]` 天然无槽维（ne1 = token）；
+- **scale（gemma node_56/57，llama-graph.cpp build_lora_mm_id w_s 分支 1552-1555）**：
+  `reshape_3d(w_s,1,n_expert,1) → repeat_4d(…,1,n_expert,n_tokens,1)` = node_56 `[1,n_expert,n_t]` →
+  `get_rows(s, ids)` = node_57 `[1,n_k,n_t]`（按 ids 每槽取 scale）→ `mm * s`；
+  桶化：get_rows 用**桶 ids 子集** → `[1, w_b, n_t]`；repeat 输入照旧（覆盖桶 ids 引用的 expert rows）；
+- deepseek 无独立 scale 节点（scale 权重在 down_exps，weighted 前未展开成节点 dump）——需另查其
+  ffn_moe_down/weighted 的乘结构是否内嵌 scale（见 §7.8 外 leaf 表：down 壳 w 3 分片 + scale 合并？）。
+- 桶化待处理外部输入：scale（node_57 类）也按桶槽取，不是"链内收缩"。
+
