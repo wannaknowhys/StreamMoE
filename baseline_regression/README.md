@@ -17,6 +17,9 @@ baseline_regression/
     moe_129_8192/     known-good：moe(route-B, 8GB 池) 129-token 产物 —— CPU 基线
     moe_129_8192_vk/  known-good：同款产物 —— GGML_VULKAN=ON 构建基线
     upstream_129/     known-good：upstream(无 route-B) 129-token 产物（CPU 干净，固定参照）
+    gemma_129_l0/     known-good：A 引擎（默认 exec_one_burst，无 CHAIN env）L0 per-node
+                      MM_ONLY dump + 同源 tokens_id.bin —— 删 A 路径前冻结的每节点数值基准
+                      （来源 temp/dump_c129b，2026-09-07；用于唯一收敛引擎的宽松 gate）
   tools/              verify_prefill.js / verify_expert_history.js / kv_cos.js /
                       div_match.js / verify_kl.cpp（自编 C++ 工具，bat 自动编译出 exe）
   run_baseline.bat    全套：跑 moe+upstream prefill-from -> 对基线比较 -> 结论

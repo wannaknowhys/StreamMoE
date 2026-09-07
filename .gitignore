@@ -35,3 +35,6 @@ baseline_regression/baseline/*.bin
 baseline_regression/baseline/*.json
 baseline_regression/tools/*.exe
 baseline_regression/temp/
+
+# Per-node dump baseline dirs (large per-node L0 dumps + tokens - local only)
+baseline_regression/baseline/gemma_129_l0/
