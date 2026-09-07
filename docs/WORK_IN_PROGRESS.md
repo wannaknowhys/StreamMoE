@@ -332,6 +332,20 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - 仍待办（收敛前置）：deepseek clamp/swiglu 紧凑克隆、token 子集 scatter-add（scatter_plan 接入）、
   multi-pool。buckets 引擎现在仅验证过 gemma 全 token 垂直切。
 
+**DeepSeek 删 A 后验证 + 数值基准冻结（2026-09-07）**：
+- **能运行**：`upstream_dump`（纯上游 llama CPU）能跑 UD-00001（v2chunk 布局上游原生可读）；
+  删 A 后桶引擎 `-p hi -st` 跑通、无崩溃、泄漏审计 0、两次同参重跑逐字一致（确定性正常）。
+- **数值 gate（hidden cos 判据）**：upstream `-p hi -st --export-dir` 导出 96-token 生成流 →
+  同 tokens_id.bin 分别喂 upstream server 与桶引擎 server prefill-from → verify_prefill：
+  hidden cos ≈ **0.99999999**（层输出与上游一致）；embd token#0-2 cos 0.9999999、多数 >0.999；
+  expert_history 5958/73530 翻转（8%，gate 边界 expert-flip，累加结果不变 → hidden 仍 cos~1）；
+  KV 因布局不同（上游原生 vs 桶自定义）不做字节比。
+- **文本差异非 bug**：A 引擎 "Hello!" vs 桶引擎 "Hi there! 😊" = 8% 翻转在解码下游放大
+  （gemma 同类已知行为），非删 A 回归。
+- **基准冻结**：`baseline_regression/baseline/deepseek_hi_up`（upstream CPU 参照）+
+  `deepseek_hi_moe`（桶引擎产物，同 tokens），README 记 DeepSeek gate 判据（cos，非逐字节）。
+
+
 **out_off arena 改造（2026-09-07 落地，M2 §7.2.1 手动 arena 串行复用）**：
 - 孪生输出 data 从"每桶独立 fold_buf heap"改为钉 `fullalloc arena + ex->out_off[闭包索引]`
   （bucket_build_t.twin_out；compact [d,w_b,n_t] ≤ 满宽 [d,n_k,n_t] 同 out_off 区不冲突；

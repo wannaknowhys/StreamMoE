@@ -38,3 +38,7 @@ baseline_regression/temp/
 
 # Per-node dump baseline dirs (large per-node L0 dumps + tokens - local only)
 baseline_regression/baseline/gemma_129_l0/
+
+# DeepSeek prefill prefill-export baseline dirs (upstream CPU reference + moe bucket engine - local only)
+baseline_regression/baseline/deepseek_hi_up/
+baseline_regression/baseline/deepseek_hi_moe/

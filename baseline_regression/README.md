@@ -20,6 +20,10 @@ baseline_regression/
     gemma_129_l0/     known-good：A 引擎（默认 exec_one_burst，无 CHAIN env）L0 per-node
                       MM_ONLY dump + 同源 tokens_id.bin —— 删 A 路径前冻结的每节点数值基准
                       （来源 temp/dump_c129b，2026-09-07；用于唯一收敛引擎的宽松 gate）
+    deepseek_hi_up/   known-good：upstream（纯上游 llama CPU）deepseek UD-00001 `-p hi -st`
+                      prefill-export（hi 完整对话流 95 tokens，PREFEXP2）—— 上游 CPU 参照
+    deepseek_hi_moe/  known-good：同输入下桶引擎（唯一执行器，删 A 后）prefill-export
+                      —— 引擎数值 gate 参照（hidden cos≈1.0 判据，见下）
   tools/              verify_prefill.js / verify_expert_history.js / kv_cos.js /
                       div_match.js / verify_kl.cpp（自编 C++ 工具，bat 自动编译出 exe）
   run_baseline.bat    全套：跑 moe+upstream prefill-from -> 对基线比较 -> 结论
@@ -46,6 +50,20 @@ run_baseline.bat [baseline_moe_dir] [verify_dir]
 | 5 | kv_cos baseline moe vs new moe | 全 ~1.0（IDENTICAL 保证）|
 
 **PASS 判定 = 3a/3b/3c 全 IDENTICAL**；4/5 是报告参考。moe 与基线 flavor 不匹配时 3a/3b 会 DIVERGED（div_match 归因 0 unexplained）——选对基线即可。
+
+## DeepSeek gate（cos 判据，非逐字节）
+
+Gemma 的 run_baseline 是**逐字节 IDENTICAL**（同 flavor 下桶引擎与上游同序）。DeepSeek 因路由
+expert-flip 噪声（gate 边界专家序号翻转，~8% 条目，累加结果不变），只能 **cos gate**：
+- 参照 = `baseline/deepseek_hi_up`（upstream 纯 CPU llama，UD-00001，`-p hi -st` 生成流
+  95 tokens 导出 prefill_export_main.bin）。
+- 引擎产物放 `baseline/deepseek_hi_moe`，同 tokens_id.bin 喂入。
+- 判据：`verify_prefill up vs moe` 的 **hidden cos ≈ 1.0（近 0.9999999）** = 桶引擎层输出与
+  上游一致；embd 多数 >0.999；expert_history 允许翻转（div_match 归因 0 unexplained）；
+  KV 因布局不同不做字节比较。文本层若走 `-p hi` 解码，翻转在下游放大可能产生不同措辞
+  （"Hi there!" vs "Hello!"）——非引擎 bug，是 gate 噪声。
+- 构建：`deepseek_hi_up` 只可由 upstream_dump 填；`deepseek_hi_moe` 由当前引擎
+  （StreamMoE_dump_dbg 或唯一收敛引擎）填。两者必须用同 tokens_id.bin（来自 up_hi_prefill）。
 
 ## 重建基线（known-good 更新时）
 
