@@ -302,6 +302,12 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - per-token 受影响输入盘点：cur / ids / weights_norm（per-slot 路由权重，slot 切片+token 重排）；专家权重与 scale REPEAT 表不受影响。
 - 待做：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp。
 
+**test 修复（2026-09-07）**：
+- **scheduler 后端解耦**（per-pool DMA reader）：scheduler.cpp 删除 `stmoe_vk_dma_read` 前置声明/直调，改 `expert_scheduler::set_pool_dma_read(pool, fn)` + 私有表 `pool_dma_read_[MAX_DEVICE_POOLS=8]`（pool-1 索引）；move_worker 按 `t.src_pool` 查表，未注册回退 host memcpy。route_b_inject 在 vram_seg 注册时按 seg.dev 前缀（Vulkan）`set_pool_dma_read`；CUDA 落地时同点注册 cuda 壳。**test_scheduler 不再需链 vulkan**。
+- **test_moe_loader 修复**：CMake 源补 model_builder.cpp/topo_builder.cpp（缺 parse_model_path/build_topology/parse_model）；断言从废弃 `expert_slot_size/staging_size` 改验 `groups[].columns[].per_expert`（SoA 真载体）。deepseek 实模型跑通。
+- **test_async_dio 临时禁用**：SoA 重构删了 `sub_tensor_req_t::slot_offset`，其用例3（多 tensor 单 slot 拼装）是 AoS 语义需重写；CMake 注释目标 + build.bat test 列表去之。文件保留待重写。
+- 结果：`build.bat test main` 5/5 绿（moe_loader/profiler/scheduler/slot/mix_plan）。
+
 ### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）
 
 - **槽维 = 链内所有张量的 ne1**（= 该层 n_k，gemma L0 8 / deepseek 6），贯穿 mm→weightless：

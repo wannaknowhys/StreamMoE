@@ -72,10 +72,13 @@ struct move_task_t {
         size_t         bytes = 0;
         // v2r DMA: when the source lives on a device (vram) region, copying by
         // host memcpy reads the rebar map at ~0.02 GB/s (unusable). Instead the
-        // worker issues a transfer-queue DMA (stmoe_vk_dma_read) into the dst.
-        // `dev_buf` = the source region's device buffer (null => RAM src, plain
-        // memcpy); `dev_off` = byte offset inside that buffer (= src - region
-        // base, since a vram region's host map starts at buffer offset 0).
+        // worker dispatches to the source pool's registered DMA reader (see
+        // set_pool_dma_read; transfer-queue on vulkan, cudaMemcpyDtoH on cuda)
+        // into the dst. `dev_buf` = the source region's device buffer (null =>
+        // RAM src, plain memcpy); `dev_off` = byte offset inside that buffer (=
+        // src - region base, since a vram region's host map starts at buffer
+        // offset 0). A device pool without a registered reader falls back to
+        // the host-map memcpy.
         void*  dev_buf = nullptr;
         size_t dev_off = 0;
     };
@@ -175,6 +178,21 @@ public:
     // after the move worker reports completions. dst slot -> READY + dir READY;
     // src slot released for reuse. Single-threaded (global scheduler thread).
     void drain_moves();
+
+    // ---- device -> host column reader (multi-backend) ----------------------
+    // A device (vram) expert source is copied by the move worker through a
+    // per-pool DMA read callback, not a host memcpy of the rebar map (~0.02
+    // GB/s host read vs ~14 GB/s via the backend's transfer queue). The
+    // callback is registered by the pool owner (route_b_inject) at bind time:
+    // pool 0 (CPU RAM) never uses it, every non-RAM pool may have its own
+    // (vulkan and cuda each provide a read function; both can coexist). The
+    // scheduler stays backend-agnostic - it only dispatches (pool, dev_buf,
+    // off, dst, bytes) to the registered reader. A missing reader falls back
+    // to a plain host memcpy of `src` (the host map) so the pool still works.
+    using pool_dma_read_fn = void (*)(void* dev_buf, size_t off, void* dst, size_t bytes);
+    void set_pool_dma_read(uint32_t pool, pool_dma_read_fn fn) {
+        if (pool > 0 && pool <= MAX_DEVICE_POOLS) pool_dma_read_[pool - 1] = fn;
+    }
 
     // Bitmap helpers (bit e of a layer's expert bitmap).
     static bool bit_test(const uint64_t* bm, uint32_t e) { return (bm[e >> 6] >> (e & 63)) & 1ull; }
@@ -343,6 +361,13 @@ private:
     uint32_t n_pools_    = 1;   // device pools; multi-device (GPU) comes in Phase B
     uint8_t* pool_base_  = nullptr;
     std::vector<subpool_t> subpools_;
+
+    // Per-pool device->host DMA readers (pool 1..MAX_DEVICE_POOLS; index here =
+    // pool - 1). Registered by the pool owner (route_b_inject); a null entry
+    // makes the move worker fall back to a host memcpy. Multiple backends
+    // (vulkan + cuda) coexist as separate entries.
+    static constexpr uint32_t MAX_DEVICE_POOLS = 8;
+    pool_dma_read_fn pool_dma_read_[MAX_DEVICE_POOLS] = {};
 
     // Async-load ringbuffer pool: preallocated contiguous aligned block, element
     // stride = 4K-aligned header + 4K-aligned staging size. max_in_flight = pool

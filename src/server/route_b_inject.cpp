@@ -17,8 +17,11 @@
 #include <vector>
 #include <unordered_map>
 
-// ggml-vulkan route-B extension: host mapping of a host-visible buffer.
+// ggml-vulkan route-B extension: host mapping of a host-visible buffer, and the
+// transfer-queue DMA read used by the scheduler's v2r move worker (per-pool
+// device reader, see expert_scheduler::set_pool_dma_read).
 void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
+void  stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
 
 namespace stream_moe {
 
@@ -281,6 +284,24 @@ llama_model_tensor_buft_override* route_b_setup(
         if (!pool->sched->init(*pool->topo, *pool->dio, pool->shards, pool_bytes, vregions)) {
             std::fprintf(stderr, "route B: scheduler init failed\n");
             return nullptr;
+        }
+        // Register each device pool's DMA reader with the scheduler. The pool
+        // owner decides the reader by backend (vulkan transfer queue today; a
+        // cuda backend registers its own cudaMemcpyDtoH reader when it lands).
+        // Multiple device pools coexist as separate per-pool table entries.
+        for (const auto& seg : pool->vram_segs) {
+            int dev_idx = -1;
+            for (size_t bi = 0; bi < pool->vram_backends.size(); ++bi) {
+                if (pool->vram_backends[bi] == seg.be) { dev_idx = static_cast<int>(bi); break; }
+            }
+            if (dev_idx < 0) continue;
+            const uint32_t pid = static_cast<uint32_t>(dev_idx) + 1;
+            if (seg.dev.compare(0, 6, "Vulkan") == 0) {
+                pool->sched->set_pool_dma_read(pid, stmoe_vk_dma_read);
+            } else {
+                std::fprintf(stderr, "route B: no DMA reader for device pool '%s' (pool %u) - v2r falls back to host map\n",
+                             seg.dev.c_str(), pid);
+            }
         }
         pool->sched->start();
 

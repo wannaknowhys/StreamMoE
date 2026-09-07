@@ -49,9 +49,14 @@ bool test_real_moe_gguf_parsing() {
     TEST_ASSERT(!topo.arch_name.empty(), "arch_name should not be empty");
     TEST_ASSERT(topo.n_layer > 0, "n_layer should be > 0");
     TEST_ASSERT(topo.n_expert > 0, "MoE model must have n_expert > 0");
-    TEST_ASSERT(topo.expert_slot_size > 0, "expert_slot_size must be > 0");
-    TEST_ASSERT(is_aligned(topo.expert_slot_size, 4096), "expert_slot_size must be 4KB aligned");
-    TEST_ASSERT(topo.expert_dio_staging_size > 0, "expert_dio_staging_size must be > 0");
+    TEST_ASSERT(!topo.groups.empty(), "MoE model must have expert groups");
+    TEST_ASSERT(topo.groups[0].expert_size > 0, "group expert_size must be > 0");
+    TEST_ASSERT(!topo.groups[0].columns.empty(), "group must have SoA columns");
+    // SoA columns: every expert tensor of the group is one column with a
+    // positive compact per-expert stride (the DIO/vulkan slice unit).
+    for (const auto& c : topo.groups[0].columns) {
+        TEST_ASSERT(c.per_expert > 0, "column per_expert must be > 0");
+    }
 
     LOG_INFO("DeepSeek-V4 MoE Topology verified: "
              << "arch=" << topo.arch_name
@@ -59,8 +64,9 @@ bool test_real_moe_gguf_parsing() {
              << ", moe_layers=" << topo.moe_layers.size()
              << ", n_expert=" << topo.n_expert
              << ", n_expert_used=" << topo.n_expert_used
-             << ", slot_size=" << (topo.expert_slot_size / 1024) << " KB"
-             << ", staging_size=" << (topo.expert_dio_staging_size / 1024) << " KB");
+             << ", groups=" << topo.groups.size()
+             << ", group0_expert_size=" << (topo.groups[0].expert_size / 1024) << " KB"
+             << ", group0_columns=" << topo.groups[0].columns.size());
 
     // Inspect first MoE layer expert 0 read plan
     if (!topo.moe_layers.empty()) {

@@ -8,11 +8,6 @@
 #include <chrono>
 #include <cstdio>
 
-// Transfer-queue DMA download of a VRAM buffer slice to a host pointer
-// (defined in the route-B vk_dma frag, vendored ggml-vulkan.cpp). 0.02 GB/s
-// rebar host reads vs ~14 GB/s via the device transfer queue.
-void stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
-
 // Per-expert / per-event diagnostics (move, load, alloc, evict, pin ticks) are
 // temporary debug output: compiled only under STREAM_MOE_TEMP (the
 // StreamMoE_dump_dbg tag). Without the macro the argument expression is not
@@ -309,15 +304,18 @@ void expert_scheduler::move_worker_main() {
             t = std::move(move_submit_.front());
             move_submit_.pop_front();
         }
-        // per-column copy. Device (vram) sources go through the transfer-queue
-        // DMA download (stmoe_vk_dma_read); RAM sources are a plain memcpy.
+        // per-column copy. A device (vram) source goes through that pool's
+        // registered DMA reader (transfer queue / cuda DtoH); RAM sources (and
+        // device pools without a reader) are a plain memcpy of the host map.
         // Never touches the scheduler control plane.
         const uint64_t cp0 = tsc_now();
         uint64_t dma_ns = 0, mc_ns = 0;
+        const pool_dma_read_fn dma_read =
+            (t.src_pool > 0 && t.src_pool <= MAX_DEVICE_POOLS) ? pool_dma_read_[t.src_pool - 1] : nullptr;
         for (const auto& cp : t.cols) {
-            if (cp.dev_buf) {
+            if (cp.dev_buf && dma_read) {
                 const uint64_t d0 = tsc_now();
-                stmoe_vk_dma_read(cp.dev_buf, cp.dev_off, cp.dst, cp.bytes);
+                dma_read(cp.dev_buf, cp.dev_off, cp.dst, cp.bytes);
                 dma_ns += tsc_now() - d0;
             } else {
                 const uint64_t d0 = tsc_now();

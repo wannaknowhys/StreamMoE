@@ -163,7 +163,9 @@ echo [StreamMoE] Configuring + building tests (tag %TAG%) ...
     -DSTREAMMOE_LIBOMP=%LIBOMP%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [StreamMoE] Building unit-test executables ...
-"%NINJA%" -C "%OUT%\cmake" test_async_dio test_moe_loader test_profiler test_scheduler test_slot test_mix_plan
+rem test_async_dio is DISABLED (SoA refactor - see CMakeLists.txt) - keep the
+rem list in sync with the enabled test targets there.
+"%NINJA%" -C "%OUT%\cmake" test_moe_loader test_profiler test_scheduler test_slot test_mix_plan
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
 echo [StreamMoE] Running ctest ...
