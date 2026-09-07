@@ -2392,13 +2392,15 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
 #ifdef STREAM_MOE_TEMP
     {
         // TEMP M-diagnostic: where does this layer's pinned active set live?
+        // LOG_DEBUG: fires once per layer per decode - far too noisy at the
+        // default info threshold. STREAM_MOE_LOG=debug to see.
         uint32_t n_pool0 = 0, n_pool1 = 0;
         for (const auto & h : pins) {
             const auto * osp = sched.subpool_of_slot(h.slot);
             if (osp && osp->pool == 0) ++n_pool0; else if (osp) ++n_pool1;
         }
-        LOG_INFO("stream_moe: [tmp] burst L" << layer << " pins=" << pins.size()
-                 << " pool0=" << n_pool0 << " pool1=" << n_pool1);
+        LOG_DEBUG("stream_moe: [tmp] burst L" << layer << " pins=" << pins.size()
+                  << " pool0=" << n_pool0 << " pool1=" << n_pool1);
     }
 #endif
     size_t seq = 0;
