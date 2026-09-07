@@ -24,9 +24,15 @@ base+delta, ...`（已在 CPU 内核验证，ggml-cpu/ops.cpp `ggml_compute_forw
 `offset = base * d_out * esize`；中间的 dst 列不受影响）。所以每个 dst 列的**等差 run**
 只需一次 acc——前提是供给该 run 的 src 列在 `per_token` 里**连续**。
 
-peel 序下不存在这种连续性。`scatter_plan` 决定 **tight 序**：对桶的活跃 token 做一次重排，
-使重排后的 token→acc-dst 映射能分解成少数几个连续 src run，每个 run 是 dst 列的纯等差
-序列。这样每个 run 恰好需要一次 `ggml_acc_inplace`。
+peel 序下不存在这种连续性。`scatter_plan` 决定 **tight 序**（`order`）：对 per-token 列做
+一次置换，使重排后 token→acc-dst 映射能分解成少数几个连续 src run，每个 run 是 dst 列的纯
+等差序列。这样每个 run 恰好需要一次 `ggml_acc_inplace`。
+
+注意：`order` 重排的是 **per-token 列**（在 cur 拷贝层消费，让链产出的 per_token 天生就是
+tight 序），**不是**输入 `t` 序列。`t` 可能本来就是 token 升序（mix_split 按 t 升序收集
+活跃 token）；重排依然有用，因为等差子序列是**跨位置**抽取的（例 t = {2,4,5,6,9}：贪心
+先抽一个 len-3 run——按 §4 最小 delta 平局规则为 d=1 的 {4,5,6}——再加一对 {2,9} d=7，
+共 2 次 acc，胜过自然序切割的 3 次）。
 
 ## 2. 为什么重排必须在链之前消费（cur 拷贝）
 
@@ -152,13 +158,51 @@ O(delta_range * n_active) 扫描、n_active 最多几百，没问题。模块按
 
 ## 6. 单元测试（计划）
 
-`tests/test_scatter_plan.cpp`，加入 build.bat test 列表：
+`tests/test_scatter_plan.cpp`，加入 build.bat test 列表。
+
+### 配置网格（笛卡尔积）
+
+| n_t（全宽 token 数） | hit rate |
+| :-- | :-- |
+| 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
+
+共 30 个任务。每个任务在 `build_scatter_plan` 前后各一次 rdtsc（`tsc_now`），输出
+`tsc_delta_ns`；这个粒度下每任务测一次即可。
+
+### 每任务流程
+
+1. **构造虚拟全宽"真值"数组** `truth[0..n_t)`，固定 LCG 种子。逐位置按 hit rate 判定：
+   miss → 哨兵值；hit → 从 1 开始递增标号（命中位按扫描序标 1,2,...,k，k = 命中总数）。
+   例 n_t=4、命中 {1,3}：`[SENT, 1, SENT, 2]`。哨兵必须与任何标号可区分（用非零值如
+   `-1`/`0xDEAD`；0 是合法累加值，绝不能当"没专家"的标记）。
+2. **构造输入 `t`**：收集命中 token 的 id（标记非哨兵的位置）。扫描产出天然 token 升序
+   ——与真实生产者一致（mix_split 按 t 升序收集活跃 token）。此外补少量手工非升序 case
+   （如 `t = {2,0,4,7}`）覆盖升序输入永远触发不到的重排分支。
+3. **计时 + 呼叫**：rdtsc、`plan = build_scatter_plan(t, n_active, n_t)`、rdtsc。每任务打
+   一行摘要，含形状与结果：`total=.. active=.. segs=.. dt=..ns`，其中 total = n_t、
+   active = n_active = k（命中数，也是 truth 里的最大标号）、segs = plan.segs.size()。
+4. **校验 `order` 合法性**：每个 `order[i]` 在 `[0, n_active)`，无重复（是置换）。
+5. **按 `order` 生成紧凑数组**：`compact[i] = truth[t[order[i]]]`（原扫描位置的
+   `order[i]` 列的"桶内容"）。索引时对 `t[order[i]]`（< n_t）与 `order[i]` 做越界检查。
+6. **校验紧凑内容**：1..k 各出现恰好一次、无哨兵（收集没丢没重）。
+7. **scatter 写回**：新目标数组，每位置预填哨兵（表示"保留 acc 原值、本桶未碰"）。沿
+   `plan.segs` 走；对每 seg、i in [0,len)：`target[dst + i*delta] = compact[src + i]`。
+   越界检查 `dst + i*delta < n_t`、`src + i < n_active`。
+8. **全宽等价**：逐元素 `target[t] == truth[t]`——重排 + acc run 把每个值搬到了它该去的
+   列、且没碰别处（哨兵位保持哨兵）的决定性检查。
+
+网格编码的边界：hit rate 0 → 空 plan（n_active = 0、无 seg、无 order）须干净接受；
+hit rate 1 → n_t = n_active、t 连续 0..n_t-1、order 恒等、单个 delta 1 seg。
+
+### 固定 case（网格之外）
 
 1. 全 token 桶、token id 已连续 → 单个 delta 1 seg，order 恒等。
-2. `t = {0,2,3,4}`（动机例子）→ 一个 run {0,2,4} delta 2（len 3）+ 一个单例 {3}；
-   order 把 3 排到 4 之后。
+2. `t = {2,4,5,6,9}`（动机例子）：贪心先抽 len-3 run（d=1 `{4,5,6}` 或 d=2 `{2,4,6}`，
+   按 §4 最小 delta 平局规则为 d=1 的 `{4,5,6}`），剩一对（`{2,9}` d=7）→ 共 2 seg。
+   order 置换列使两个 run 连续。证明跨位置重排能胜过自然序切割（后者给 3 seg：
+   `{4,5,6}` + 两个单例）。
 3. 散落很远 token → 各为单例或小的等差组合；验证每个 seg 的 dst 等差落在 n_t 内、
    src 区间互斥且覆盖 [0,n_active)。
-4. 逆序输入 → 与升序得到相同计划（order 只依赖值）。
+4. 逆序 / 打乱输入 → 与升序得到相同计划（计划只依赖值，不依赖输入顺序）。
 5. 重复 / 越界 token id → 拒绝（返回空 plan / 标志位）。
 6. 一致性：把 `order` 应用到 `t` 后沿 `segs` 走，得到 seg 声称的确切 dst 序列。

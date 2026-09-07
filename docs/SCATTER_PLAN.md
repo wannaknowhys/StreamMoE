@@ -31,11 +31,19 @@ esize`; intermediate dst columns are untouched). So one acc per **arithmetic
 run** of dst columns is enough - provided the src columns feeding that run are
 **contiguous** in `per_token`.
 
-That contiguity does not exist in peel order. `scatter_plan` decides the
-**tight order**: a reordering of the bucket's active tokens such that after
-reordering, the token-to-acc-dst mapping decomposes into few contiguous src
-runs, each run a pure arithmetic progression of dst columns. Each run then
-needs exactly one `ggml_acc_inplace`.
+That contiguity does not exist in the chain's natural column order. `scatter_plan`
+decides the **tight order** (`order`): a permutation of the per-token columns so
+that after it is applied, the token-to-acc-dst mapping decomposes into few
+contiguous src runs, each run a pure arithmetic progression of dst columns.
+Each run then needs exactly one `ggml_acc_inplace`.
+
+Note: `order` reorders the **per-token columns** (consumed at the cur copy so
+the chain emits per_token already in tight order), NOT the input `t` sequence.
+`t` may already be token-ascending (rounds collect active tokens in t order,
+see mix_split); the reorder still helps because an arithmetic sub-sequence is
+extracted **across** positions (e.g. t = {2,4,5,6,9}: greedy extracts one
+len-3 run - d=1 {4,5,6} under the §4 smallest-delta tie-break - plus one pair
+{2,9} d=7, giving 2 accs instead of the natural-order cut's 3).
 
 ## 2. Why the reorder must be consumed before the chain (cur copy)
 
@@ -188,17 +196,74 @@ own per-token stride:
 
 ## 6. Unit tests (planned)
 
-`tests/test_scatter_plan.cpp`, added to the build.bat test list:
+`tests/test_scatter_plan.cpp`, added to the build.bat test list.
+
+### Config grid (cartesian product)
+
+| n_t (full-width tokens) | hit rate |
+| :-- | :-- |
+| 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
+
+30 tasks. One rdtsc timing per task around `build_scatter_plan`
+(`tsc_now` before/after, report `tsc_delta_ns`); a single measurement per task
+is enough at this granularity.
+
+### Per-task procedure
+
+1. **Build the virtual full-width "truth" array** `truth[0..n_t)` with a fixed
+   LCG seed. Each position rolls against hit rate: miss -> sentinel value;
+   hit -> mark with the next integer starting from 1 (so hits are stamped
+   1,2,...,k in scan order, k = number of hits). Example n_t=4, hits {1,3}:
+   `[SENT, 1, SENT, 2]`. Sentinel must be distinct from every mark (use a
+   non-zero value such as `-1`/`0xDEAD`; 0 is a legal accumulator value and
+   must not be the "no expert" marker).
+2. **Build the input `t`**: collect the hit token ids (positions whose mark is
+   not sentinel). `t` comes out token-ascending from the scan - this matches
+   the real producer (mix_split collects active tokens in t order). In
+   addition, a small set of hand-written non-ascending cases
+   (`t = {2,0,4,7}`) exercises the reorder branch that ascending input never
+   triggers.
+3. **Time + call**: rdtsc, `plan = build_scatter_plan(t, n_active, n_t)`,
+   rdtsc. Print one summary line per task with the shape and result:
+   `total=.. active=.. segs=.. dt=..ns`, where total = n_t, active =
+   n_active = k (the hit count, also the max mark in truth), segs =
+   plan.segs.size().
+4. **Check `order` validity**: every `order[i]` in `[0, n_active)`, no
+   duplicates (it is a permutation).
+5. **Build the compact array from `order`**: `compact[i] = truth[t[order[i]]]`
+   (column `order[i]` of the "bucket" in original scan position). While
+   indexing, bounds-check both `t[order[i]]` (< n_t) and `order[i]`.
+6. **Check compact contents**: it contains each of 1..k exactly once and no
+   sentinel (collection lost nobody, duplicated nobody).
+7. **Scatter back**: fresh target array, every position pre-filled with the
+   sentinel (stands for "kept original acc value, not touched by this
+   bucket"). Walk `plan.segs`; for each seg, for i in [0,len):
+   `target[dst + i*delta] = compact[src + i]`. Bounds-check
+   `dst + i*delta < n_t` and `src + i < n_active`.
+8. **Full-width equivalence**: `target[t] == truth[t]` elementwise - the
+   definitive check that the reorder + acc runs moved every value to exactly
+   the column it came from and touched nothing else (sentinel positions stay
+   sentinel).
+
+Edge cases encoded in the grid: hit rate 0 -> empty plan (n_active = 0, no
+segs, no order) must be accepted cleanly; hit rate 1 -> n_t = n_active, t is
+consecutive 0..n_t-1, order identity, single seg delta 1.
+
+### Fixed cases (beyond the grid)
 
 1. full-token bucket, token ids already consecutive -> one seg delta 1, order
    identity.
-2. `t = {0,2,3,4}` (the motivating example) -> one run {0,2,4} delta 2 (len 3)
-   + one singleton {3}; order reorders 3 after 4.
+2. `t = {2,4,5,6,9}` (the motivating example): greedy extracts a len-3 run
+   first (d=1 `{4,5,6}` or d=2 `{2,4,6}`, per the §4 smallest-delta tie-break
+   it is `{4,5,6}` d=1) leaving one pair (`{2,9}` d=7) -> 2 segs total. order
+   permutes columns so both runs are contiguous. Proves the cross-position
+   reorder can beat the natural-order cut, which would give 3 segs
+   (`{4,5,6}` + two singletons).
 3. scattered far-apart tokens -> each a singleton or a small arithmetic
    grouping; verify every seg's dst arithmetic fits n_t and src ranges are
    disjoint and cover [0,n_active).
-4. reverse order input -> identical plan to ascending (order only depends on
-   values).
+4. reverse / shuffled order input -> identical plan to ascending (plan depends
+   only on values, not input order).
 5. duplicate / out-of-range token ids -> rejected (returned plan empty / flag).
 6. consistency: applying `order` to `t` then walking `segs` yields the exact
    dst sequences the segs claim.
