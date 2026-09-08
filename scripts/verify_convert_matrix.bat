@@ -1,55 +1,57 @@
 @echo off
 rem ===========================================================================
-rem Converter matrix verification (v2-centric block abstraction, docs sec 9).
-rem original (N: source) -> v1/v2/v2chunk baseline, then each of v1/v2/v2chunk
-rem as source produces all three formats and is byte-compared to the baseline
-rem (tools/cmp_gguf.js streams both files). Stops on first mismatch.
+rem Converter matrix verification (C++ converter; v1 removed).
+rem Baselines: original -to- v2 / v3 / v3chunk. Then the format round-trips that
+rem must be byte-identical (v3 canonically reorders dense by category, so
+rem v3-to-v2 is NOT byte-identical to original-to-v2; the meaningful invariants
+rem are v2-to-v3 == v3, v3-to-v2-to-v3 == v3, v3chunk-to-v3 == v3, etc).
 rem
-rem usage: verify_convert_matrix.bat <workdir>   (workdir needs ~3x model free)
-rem   e.g. on a ramdisk: verify_convert_matrix.bat R:\conv
+rem usage: verify_convert_matrix.bat ^<workdir^> [model.gguf]
+rem   ^<workdir^> needs ~10x model free (baselines + round-trips)
+rem   model defaults to SM_GEMMA_ORIG from temp\sm_env.bat
 rem
-rem Requires: temp\sm_env.bat (SM_GEMMA_ORIG), temp\stream_moe_convertd.exe
-rem (build line in tools\stream_moe_convertd.cpp header).
+rem Requires: build.bat convert main (build\main\bin\stream_moe_convert.exe)
 rem ===========================================================================
 setlocal
 set DIR=%~1
-if "%DIR%"=="" ( echo usage: verify_convert_matrix.bat ^<workdir^> & exit /b 1 )
+if "%DIR%"=="" ( echo usage: verify_convert_matrix.bat ^<workdir^> [model.gguf] & exit /b 1 )
 mkdir "%DIR%" 2>nul
 if not exist "%DIR%" ( echo cannot create %DIR% & exit /b 1 )
 pushd "%~dp0.."
 call temp\sm_env.bat 2>nul
-if not exist "%SM_GEMMA_ORIG%" ( echo [verify] SM_GEMMA_ORIG not set/valid in temp\sm_env.bat & exit /b 1 )
-
-set ORIG=%SM_GEMMA_ORIG%
+set CONV=build\main\bin\stream_moe_convert.exe
+if not exist "%CONV%" ( echo [verify] build the converter first: build.bat convert main & exit /b 1 )
+set ORIG=%~2
+if "%ORIG%"=="" set ORIG=%SM_GEMMA_ORIG%
+if not exist "%ORIG%" ( echo [verify] model not found: %ORIG% & exit /b 1 )
 set RATIO=8:9:9:7:9
 set CH=5
 
-echo [step 1/4] original -^> v1/v2/v2chunk baseline
-node tools\stream_moe_convert.js -m "%ORIG%" -o "%DIR%\v1_base.gguf" --format v1 || goto fail
-node tools\stream_moe_convert.js -m "%ORIG%" -o "%DIR%\v2_base.gguf" --format v2 || goto fail
-node tools\stream_moe_convert.js -m "%ORIG%" -o "%DIR%\chunk_base" --format v2chunk --chunks %CH% --ratio %RATIO% || goto fail
+echo [step 1/4] baselines (original to v2 / v3 / v3chunk)
+"%CONV%" -m "%ORIG%" -o "%DIR%\v2_base.gguf" --format v2 || goto fail
+"%CONV%" -m "%ORIG%" -o "%DIR%\v3_base.gguf" --format v3 || goto fail
+"%CONV%" -m "%ORIG%" -o "%DIR%\v3c_base" --format v3chunk --chunks %CH% --ratio %RATIO% || goto fail
 
-echo [step 2/4] v1 source -^> v1/v2/v2chunk
-node tools\stream_moe_convert.js -m "%DIR%\v1_base.gguf" -o "%DIR%\t2_v1.gguf" --format v1 || goto fail
-call :cmp "%DIR%\v1_base.gguf" "%DIR%\t2_v1.gguf" "v1-to-v1" || goto fail
-node tools\stream_moe_convert.js -m "%DIR%\v1_base.gguf" -o "%DIR%\t2_v2.gguf" --format v2 || goto fail
-call :cmp "%DIR%\v2_base.gguf" "%DIR%\t2_v2.gguf" "v1-to-v2" || goto fail
-node tools\stream_moe_convert.js -m "%DIR%\v1_base.gguf" -o "%DIR%\t2_chunk" --format v2chunk --chunks %CH% --ratio %RATIO% || goto fail
-call :cmpdir "%DIR%\chunk_base" "%DIR%\t2_chunk" "v1-to-v2chunk" || goto fail
+echo [step 2/4] v2 source
+"%CONV%" -m "%DIR%\v2_base.gguf" -o "%DIR%\t_v2.gguf" --format v2 || goto fail
+call :cmp "%DIR%\v2_base.gguf" "%DIR%\t_v2.gguf" "v2-to-v2" || goto fail
+"%CONV%" -m "%DIR%\v2_base.gguf" -o "%DIR%\t_v3.gguf" --format v3 || goto fail
+call :cmp "%DIR%\v3_base.gguf" "%DIR%\t_v3.gguf" "v2-to-v3" || goto fail
 
-echo [step 3/4] v2 source -^> v1/v2/v2chunk
-node tools\stream_moe_convert.js -m "%DIR%\v2_base.gguf" -o "%DIR%\t3_v1.gguf" --format v1 || goto fail
-call :cmp "%DIR%\v1_base.gguf" "%DIR%\t3_v1.gguf" "v2-to-v1" || goto fail
-node tools\stream_moe_convert.js -m "%DIR%\v2_base.gguf" -o "%DIR%\t3_chunk" --format v2chunk --chunks %CH% --ratio %RATIO% || goto fail
-call :cmpdir "%DIR%\chunk_base" "%DIR%\t3_chunk" "v2-to-v2chunk" || goto fail
+echo [step 3/4] v3 source
+"%CONV%" -m "%DIR%\v3_base.gguf" -o "%DIR%\t2_v3.gguf" --format v3 || goto fail
+call :cmp "%DIR%\v3_base.gguf" "%DIR%\t2_v3.gguf" "v3-to-v3" || goto fail
+"%CONV%" -m "%DIR%\v3_base.gguf" -o "%DIR%\t2_v2.gguf" --format v2 || goto fail
+"%CONV%" -m "%DIR%\t2_v2.gguf" -o "%DIR%\t2_v3b.gguf" --format v3 || goto fail
+call :cmp "%DIR%\v3_base.gguf" "%DIR%\t2_v3b.gguf" "v3-to-v2-to-v3" || goto fail
 
-echo [step 4/4] v2chunk source -^> v1/v2/v2chunk
-node tools\stream_moe_convert.js -m "%DIR%\chunk_base\c1.gguf;%DIR%\chunk_base\c2.gguf;%DIR%\chunk_base\c3.gguf;%DIR%\chunk_base\c4.gguf;%DIR%\chunk_base\c5.gguf" -o "%DIR%\t4_v2.gguf" --format v2 || goto fail
-node tools\stream_moe_convert.js -m "%DIR%\t4_v2.gguf" -o "%DIR%\t4_v1.gguf" --format v1 || goto fail
-call :cmp "%DIR%\v1_base.gguf" "%DIR%\t4_v1.gguf" "v2chunk-to-v1" || goto fail
-node tools\stream_moe_convert.js -m "%DIR%\t4_v2.gguf" -o "%DIR%\t4_chunk" --format v2chunk --chunks %CH% --ratio %RATIO% || goto fail
-call :cmpdir "%DIR%\chunk_base" "%DIR%\t4_chunk" "v2chunk-to-v2chunk" || goto fail
-call :cmp "%DIR%\v2_base.gguf" "%DIR%\t4_v2.gguf" "v2chunk-to-v2" || goto fail
+echo [step 4/4] v3chunk source
+set CHUNKS=%DIR%\v3c_base\c1.gguf;%DIR%\v3c_base\c2.gguf;%DIR%\v3c_base\c3.gguf;%DIR%\v3c_base\c4.gguf;%DIR%\v3c_base\c5.gguf
+"%CONV%" -m "%CHUNKS%" -o "%DIR%\t3_v3.gguf" --format v3 || goto fail
+call :cmp "%DIR%\v3_base.gguf" "%DIR%\t3_v3.gguf" "v3chunk-to-v3" || goto fail
+"%CONV%" -m "%CHUNKS%" -o "%DIR%\t3_v2.gguf" --format v2 || goto fail
+"%CONV%" -m "%DIR%\t3_v2.gguf" -o "%DIR%\t3_v3b.gguf" --format v3 || goto fail
+call :cmp "%DIR%\v3_base.gguf" "%DIR%\t3_v3b.gguf" "v3chunk-to-v2-to-v3" || goto fail
 
 echo.
 echo [PASS] all matrix conversions byte-identical
@@ -61,13 +63,6 @@ node tools\cmp_gguf.js "%~1" "%~2"
 if errorlevel 1 ( echo   [FAIL] %~3 : %~1  vs  %~2 & exit /b 1 )
 echo   [OK] %~3
 del /q "%~2" 2>nul
-exit /b 0
-
-:cmpdir
-rem %1 = baseline dir, %2 = candidate dir, %3 label; deletes candidate dir
-for %%f in ("%~2\*.gguf") do call :cmp "%~1\%%~nxf" "%%f" "%~3"
-if errorlevel 1 ( exit /b 1 )
-rd /s /q "%~2" 2>nul
 exit /b 0
 
 :fail

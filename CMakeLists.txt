@@ -115,4 +115,12 @@ add_executable(test_scatter_plan src/backend/scatter_plan.cpp tests/test_scatter
 streammoe_inc(test_scatter_plan)
 add_test(NAME test_scatter_plan COMMAND test_scatter_plan WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ---- converter (pure C++; replaces tools/stream_moe_layout.js + convertd) ----
+add_executable(stream_moe_convert
+    src/convert/main.cpp
+    src/convert/writer.cpp
+    src/loader/model_builder.cpp)
+streammoe_target(stream_moe_convert)
+
+
 

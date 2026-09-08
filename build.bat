@@ -5,7 +5,7 @@ rem  StreamMoE Build Utility (thin dispatcher)
 rem  Build rules live in CMakeLists.txt; this file only forwards to
 rem  cmake + ninja (Windows). On POSIX use `make` (Makefile dispatches the
 rem  same cmake rules).
-rem  Usage: build.bat [build|llamalibs|test|clean] [tag]
+rem  Usage: build.bat [build|llamalibs|test|convert|clean] [tag]
 rem    tag   = build flavor sub-path under build\, default = main
 rem  Artifacts per tag: bin\ (exe + libomp.dll), llama-build\ (vendored libllama),
 rem                      cmake\ (cmake cache / intermediates).
@@ -31,7 +31,7 @@ if "%CMD%"=="llamalibs" goto llamalibs
 if "%CMD%"=="build" goto build
 if "%CMD%"=="test" goto test
 if "%CMD%"=="clean" goto clean
-if "%CMD%"=="convertd" goto convertd
+if "%CMD%"=="convert" goto convert
 if "%CMD%"=="asan" goto asan
 echo Unknown command: %CMD%
 goto help
@@ -212,34 +212,25 @@ if errorlevel 1 (
 echo [+] ASan llama-server built: build\asan\llama-build\bin\llama-server.exe
 exit /b 0
 
-:convertd
-echo [StreamMoE] Building convertd (dumb GGUF TCP service) -> build\convertd\convertd.exe ...
-if exist build\convertd\ggml-build\build.ninja goto convertd_build
-echo [StreamMoE] Configuring macro-enabled ggml (STREAM_MOE_GGUF_ALIGN) for convertd...
-"%CMAKE%" -S third_party/llama.cpp -B build/convertd/ggml-build -G Ninja ^
+:convert
+echo [StreamMoE] Building C++ converter (tag %TAG%) into %OUT%\bin\stream_moe_convert.exe ...
+if not exist "%LLAMA_BUILD%\src\llama.lib" (
+    echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
+    exit /b 1
+)
+"%CMAKE%" -S . -B "%OUT%\cmake" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^
     -DCMAKE_C_COMPILER=%CLANG% ^
     -DCMAKE_CXX_COMPILER=%CLANGXX% ^
     -DCMAKE_RC_COMPILER=%RC% ^
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ^
-    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
-    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF ^
-    -DLLAMA_ALL_WARNINGS=OFF -DLLAMA_CURL=OFF -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF ^
-    -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_METAL=OFF -DGGML_SYCL=OFF ^
-    -DCMAKE_C_FLAGS="-Wno-cast-qual -DSTREAM_MOE_GGUF_ALIGN" ^
-    -DCMAKE_CXX_FLAGS="-Wno-cast-qual /EHsc -DSTREAM_MOE_GGUF_ALIGN"
-if errorlevel 1 exit /b 1
-:convertd_build
-"%NINJA%" -C build/convertd/ggml-build ggml-base
-if errorlevel 1 exit /b 1
-if not exist build\convertd mkdir build\convertd
-"%CLANG%" /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT -DSTREAM_MOE_GGUF_ALIGN ^
-    -I%CD:\=/%/third_party/llama.cpp/ggml/include ^
-    -I%CD:\=/%/third_party/llama.cpp/ggml/src ^
-    %CD:\=/%/build/convertd/ggml-build/ggml/src/ggml-base.lib ^
-    ws2_32.lib /Fe:build\convertd\convertd.exe
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DLLAMA_BUILD_DIR="%CD%\%LLAMA_BUILD%" ^
+    -DSTREAMMOE_LIBOMP=%LIBOMP%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-echo [+] convertd built: build\convertd\convertd.exe
+"%NINJA%" -C "%OUT%\cmake" stream_moe_convert
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
+echo [+] converter built: %OUT%\bin\stream_moe_convert.exe
 exit /b 0
 
 :clean
@@ -262,7 +253,7 @@ echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)
 echo   llamalibs StreamMoE_dump - route-B + prefill export (build\StreamMoE_dump)
 echo   llamalibs StreamMoE_dump_dbg - StreamMoE_dump + STREAM_MOE_TEMP diagnostic
 echo                                code (build\StreamMoE_dump_dbg; debug only)
-echo   build.bat convertd       - build converter TCP service (build\convertd)
+echo   build.bat convert        - build C++ converter (build^<tag^>\bin\stream_moe_convert.exe)
 echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0

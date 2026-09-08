@@ -43,9 +43,9 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
     topo.shard_paths = m.files;
 
     switch (m.layout) {
-        case model_layout_t::V1_SECTIONS:      topo.layout = gguf_layout_t::V1_SECTIONS; break;
         case model_layout_t::V2_EXPERT_BLOCKS:
-        case model_layout_t::V2_CHUNK:         topo.layout = gguf_layout_t::V2_EXPERT_BLOCKS; break;
+        case model_layout_t::V2_CHUNK:
+        case model_layout_t::V3:               topo.layout = gguf_layout_t::V2_EXPERT_BLOCKS; break;
         default:                               topo.layout = gguf_layout_t::ORIGINAL; break;
     }
     topo.incomplete = m.incomplete; // v2 chunk: dense tensors need route_b takeover

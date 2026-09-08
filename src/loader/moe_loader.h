@@ -28,13 +28,12 @@ struct expert_info_t {
 };
 
 // GGUF layout of the expert storage (drives whether DIO needs a staging buffer).
-// ORIGINAL / v1: expert slices are 32B-aligned -> stage + memcpy into the slot.
-// V2 (expert-blocks): per-expert compact 4K-aligned blocks -> DIO straight into
-// the slot (zero staging, zero copy). Known at load time per model (the draft
-// and main models may use different layouts).
+// ORIGINAL: expert slices are 32B-aligned -> stage + memcpy into the slot.
+// V2/V3 (expert-blocks): per-expert compact 4K-aligned blocks -> DIO straight
+// into the slot (zero staging, zero copy). Known at load time per model (the
+// draft and main models may use different layouts).
 enum class gguf_layout_t : uint8_t {
     ORIGINAL          = 0,
-    V1_SECTIONS       = 1,
     V2_EXPERT_BLOCKS  = 2,
 };
 

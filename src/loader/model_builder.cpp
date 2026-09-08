@@ -1,4 +1,5 @@
 #include "loader/model_builder.h"
+#include "loader/layout_math.h"
 #include "common/logger.h"
 
 #include "gguf.h"
@@ -111,7 +112,7 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
     return shards;
 }
 
-// --- v2 / v2-chunk helpers (mirror layout.js buildBlocks/buildLayerBranches) ---
+// --- v2 / v3 block helpers (mirror the converter writer) ---
 
 struct block_t { uint64_t off = 0, size = 0; uint32_t nsub = 0; };
 struct branch_t { std::string name; std::string tag; uint64_t per_expert = 0; uint64_t branch_off = 0; };
@@ -142,14 +143,8 @@ std::vector<std::vector<branch_t>> build_layer_branches(
             branch_t b;
             b.name = bnames[ni++];
             b.per_expert = bsizes[si++];
-            b.tag = "?";
-            if (b.name.find("gate_up") != std::string::npos) b.tag = "gate_up";
-            else if (b.name.find("ffn_gate_exps") != std::string::npos) b.tag = "gate";
-            else if (b.name.find("ffn_up_exps") != std::string::npos) b.tag = "up";
-            else if (b.name.find("down_exps") != std::string::npos) b.tag = "down";
+            b.tag = sm_branch_of(b.name);
             b.branch_off = off;
-            // branch_align=1: each branch slice starts 4K-aligned (mirror
-            // layout.js computeV2Layout); legacy compact otherwise.
             off = branch_align ? align_up(off + b.per_expert, ALIGN) : off + b.per_expert;
             layers[l].push_back(b);
         }
@@ -157,33 +152,36 @@ std::vector<std::vector<branch_t>> build_layer_branches(
     return layers;
 }
 
-// Map a logical interval [rel, rel+len) of a v2-chunk strip layout into source
-// segments (mirror layout.js rangeToSegs). rel is relative to the block strip
-// area (dense section is excluded: base starts after per-file dense strips).
-// kind='dense' or 'block'. Output offsets are ABSOLUTE file offsets.
-std::vector<src_seg_t> range_to_segs(
-        const model_t& model, bool is_block, uint32_t blk_index,
-        uint64_t rel, uint64_t len) {
+// v3 chunk unit geometry: units are [C2 global] + [C1 layers] + [C4 layers] +
+// [expert blocks], all in file order (mirror the writer).
+struct v3_units_t {
+    uint32_t n_c1 = 0, n_c4 = 0;
+    uint32_t c1_unit(uint32_t li)    const { return 1 + li; }
+    uint32_t c4_unit(uint32_t mi)    const { return 1 + n_c1 + mi; }
+    uint32_t block_unit(uint32_t bi) const { return 1 + n_c1 + n_c4 + bi; }
+};
+
+v3_units_t v3_units_of(const model_t& model) {
+    v3_units_t u;
+    u.n_c1 = static_cast<uint32_t>(model.dense_layer_sections.size() / 3);
+    u.n_c4 = static_cast<uint32_t>(model.expert_meta_sections.size() / 3);
+    return u;
+}
+
+// Map a logical interval [rel, rel+len) inside chunk unit `unit` to source
+// segments across the N strip files (mirror the converter strip writer).
+// rel is relative to the unit start; output offsets are ABSOLUTE file offsets.
+std::vector<src_seg_t> strip_range_to_segs(
+        const model_t& model, uint32_t unit, uint64_t rel, uint64_t len) {
     std::vector<src_seg_t> segs;
-    if (!model.incomplete) {
-        segs.push_back({ 0, model.data_offs.empty() ? rel : model.data_offs[0] + rel, len, 0 });
-        return segs;
-    }
-    // v2 chunk: strip layout across N files
     const size_t N = model.chunk_slices.size();
-    std::vector<uint64_t> counts(N), base(N, 0);
-    if (!is_block) {
-        for (size_t i = 0; i < N; ++i) counts[i] = model.chunk_slices[i].empty() ? 0 : model.chunk_slices[i][0];
-    } else {
-        for (size_t i = 0; i < N; ++i) {
-            counts[i] = (model.chunk_slices[i].size() > 1 + blk_index) ? model.chunk_slices[i][1 + blk_index] : 0;
-            uint64_t s = 0;
-            for (uint64_t k = 0; k < blk_index; ++k) {
-                s += (model.chunk_slices[i].size() > 1 + k) ? model.chunk_slices[i][1 + k] : 0;
-            }
-            // per-file block-strip base = this file's dense strip + prefix blocks
-            base[i] = (model.chunk_slices[i].empty() ? 0 : model.chunk_slices[i][0]) + s;
-        }
+    std::vector<uint64_t> counts(N, 0), base(N, 0);
+    for (size_t i = 0; i < N; ++i) {
+        const auto& cs = model.chunk_slices[i];
+        counts[i] = unit < cs.size() ? cs[unit] : 0;
+        uint64_t s = 0;
+        for (uint32_t k = 0; k < unit && k < cs.size(); ++k) s += cs[k];
+        base[i] = s;
     }
     std::vector<uint64_t> cum(N);
     { uint64_t c = 0; for (size_t i = 0; i < N; ++i) { cum[i] = c; c += counts[i]; } }
@@ -194,9 +192,7 @@ std::vector<src_seg_t> range_to_segs(
         while (fi + 1 < N && cur >= cum[fi] + counts[fi]) fi++;
         const uint64_t local = cur - cum[fi];
         const uint64_t avail = std::min(counts[fi] - local, end - cur);
-        if (avail == 0) {
-            throw std::runtime_error("range_to_segs: interval past strip coverage");
-        }
+        if (avail == 0) throw std::runtime_error("strip_range_to_segs: interval past strip coverage");
         const uint64_t seg_start = std::max(rel, cur * ALIGN);
         const uint64_t seg_end   = std::min(rel + len, (cur + avail) * ALIGN);
         if (seg_end > seg_start) {
@@ -210,6 +206,14 @@ std::vector<src_seg_t> range_to_segs(
         cur += avail;
     }
     return segs;
+}
+
+// Find a layer's [index, base] in a flat [layer, off, size, ...] section table.
+bool find_section(const std::vector<uint64_t>& secs, uint64_t layer, uint64_t& index, uint64_t& base) {
+    for (size_t k = 0, idx = 0; k + 3 <= secs.size(); k += 3, ++idx) {
+        if (secs[k] == layer) { index = idx; base = secs[k + 1]; return true; }
+    }
+    return false;
 }
 
 } // namespace
@@ -230,8 +234,8 @@ model_t parse_model(const std::vector<std::string>& paths) {
 
     if (layout == "expert-blocks-v2") {
         model.layout = incomplete ? model_layout_t::V2_CHUNK : model_layout_t::V2_EXPERT_BLOCKS;
-    } else if (layout == "sections-v1") {
-        model.layout = model_layout_t::V1_SECTIONS;
+    } else if (layout == "v3") {
+        model.layout = model_layout_t::V3;
     } else {
         model.layout = model_layout_t::ORIGINAL;
     }
@@ -243,7 +247,7 @@ model_t parse_model(const std::vector<std::string>& paths) {
     model.n_expert_used = static_cast<uint32_t>(kv_int(ctx0, (model.arch + ".expert_used_count").c_str(), 0));
 
     // Source file list. Original multi-shard is discovered from paths[0];
-    // v2 chunk passes all strip files explicitly.
+    // chunk passes all strip files explicitly.
     if (model.layout == model_layout_t::ORIGINAL) {
         model.files = discover_shards(paths[0], ctx0);
     } else {
@@ -258,8 +262,7 @@ model_t parse_model(const std::vector<std::string>& paths) {
         gguf_free(fc);
     }
 
-    // v2 / v2-chunk layout KV
-    if (model.is_v2_blocks()) {
+    if (model.is_blocks()) {
         kv_u64_arr(ctx0, "stream_moe.expert_sections", model.expert_sections);
         std::vector<std::string> bnames;
         std::vector<uint64_t> bsizes, bcounts;
@@ -269,12 +272,18 @@ model_t parse_model(const std::vector<std::string>& paths) {
         model.branch_align = kv_int(ctx0, "stream_moe.branch_align") == 1;
         const std::vector<block_t> blocks = build_blocks(model.expert_sections);
         const auto layers = build_layer_branches(bnames, bsizes, bcounts, model.n_layer, model.branch_align);
+
         model.dense_section = { 0, 0 };
+        if (model.is_v3()) {
+            kv_u64_arr(ctx0, "stream_moe.dense_global_section", model.dense_section);
+            kv_u64_arr(ctx0, "stream_moe.dense_layer_sections", model.dense_layer_sections);
+            kv_u64_arr(ctx0, "stream_moe.expert_meta_sections", model.expert_meta_sections);
+        }
         for (size_t i = 0; i < model.files.size(); ++i) model.chunk_slices.emplace_back();
         if (model.incomplete) {
             // dense section end = first block start (single-file) or file0 denseEnd
             const uint64_t dense_end = blocks.empty() ? 0 : blocks[0].off;
-            model.dense_section = { 0, dense_end };
+            model.dense_section = model.is_v3() ? model.dense_section : std::vector<uint64_t>{ 0, dense_end };
             for (size_t i = 0; i < model.files.size(); ++i) {
                 gguf_context* fc = gguf_init_from_file(model.files[i].c_str(), params);
                 if (!fc) throw std::runtime_error("cannot open chunk " + model.files[i]);
@@ -282,84 +291,92 @@ model_t parse_model(const std::vector<std::string>& paths) {
                 gguf_free(fc);
             }
         }
+        const v3_units_t vu = v3_units_of(model);
 
-        // Tensor metadata comes from file 0 (v2-chunk files each carry the full
+        // Tensor metadata comes from file 0 (chunk files each carry the full
         // tensor_info table). Classify dense vs expert, map per-expert slices.
         gguf_context* tf = gguf_init_from_file(model.files[0].c_str(), params);
         if (!tf) throw std::runtime_error("cannot open " + model.files[0]);
         const uint64_t data_off = gguf_get_data_offset(tf);
-        // whole-block source segments: v2 single-file = 1 seg; v2 chunk = N file
-        // strip segments (in_off = segment offset inside the block).
+
         model.block_srcs.resize(blocks.size());
         for (size_t bi = 0; bi < blocks.size(); ++bi) {
             if (model.incomplete) {
-                model.block_srcs[bi] = range_to_segs(model, true, static_cast<uint32_t>(bi), 0, blocks[bi].size);
+                model.block_srcs[bi] = strip_range_to_segs(model, vu.block_unit(static_cast<uint32_t>(bi)), 0, blocks[bi].size);
             } else {
                 model.block_srcs[bi].push_back({ 0, data_off + blocks[bi].off, blocks[bi].size, 0 });
             }
         }
+
         const int n_t = gguf_get_n_tensors(tf);
         for (int i = 0; i < n_t; ++i) {
-            const char* tname = gguf_get_tensor_name(tf, i);
-            const std::string name(tname);
-            const bool is_scale = name.find(".scale") != std::string::npos;
-            const bool is_exp = name.find("_exps") != std::string::npos && !is_scale;
+            const std::string name(gguf_get_tensor_name(tf, i));
             const uint64_t toff = data_off + static_cast<uint64_t>(gguf_get_tensor_offset(tf, i));
             const uint64_t tsize = gguf_get_tensor_size(tf, i);
             const int32_t ttype = static_cast<int32_t>(gguf_get_tensor_type(tf, i));
             const int64_t* ne = gguf_get_tensor_ne(tf, i);
+            const tensor_category_t cat = sm_classify(name, ne, model.n_expert);
 
-            if (is_exp) {
+            if (cat == tensor_category_t::EXPERT) {
                 const uint64_t per_expert = model.n_expert ? tsize / model.n_expert : 0;
-                // layer + branch from name
-                int32_t layer = -1;
-                const size_t p = name.find("blk.");
-                if (p != std::string::npos) layer = std::atoi(name.c_str() + p + 4);
-                std::string branch = "?";
-                if (name.find("gate_up") != std::string::npos) branch = "gate_up";
-                else if (name.find("ffn_gate_exps") != std::string::npos) branch = "gate";
-                else if (name.find("ffn_up_exps") != std::string::npos) branch = "up";
-                else if (name.find("down_exps") != std::string::npos) branch = "down";
+                const int32_t layer = sm_layer_of(name);
+                const std::string branch = sm_branch_of(name);
 
                 expert_tensor_t et;
                 et.name = name; et.type = ttype; et.size = tsize; et.per_expert = per_expert;
                 et.branch = branch; et.layer = layer;
                 for (int d = 0; d < 4; ++d) et.ne[d] = ne[d];
-                et.per_expert_srcs.resize(model.n_expert);
-                // branch offset inside the (layer,e) block (v2 / v2-chunk)
                 uint64_t branch_off = 0;
-                if (model.is_v2_blocks()) {
-                    const auto& bl = layers[layer];
-                    for (const auto& b : bl) { if (b.tag == branch) { branch_off = b.branch_off; break; } }
-                }
-
-                for (uint32_t e = 0; e < model.n_expert; ++e) {
-                    if (model.layout == model_layout_t::V2_EXPERT_BLOCKS) {
-                        // branch sits at branchOff inside the (layer,e) block
-                        const uint32_t blk_idx = static_cast<uint32_t>(layer) * model.n_expert + e;
-                        et.per_expert_srcs[e].push_back({ 0, data_off + blocks[blk_idx].off + branch_off, per_expert, 0 });
-                    } else {
-                        // V2_CHUNK: block strip scattered across N files
-                        et.per_expert_srcs[e] = range_to_segs(model, true,
-                                                              static_cast<uint32_t>(layer) * model.n_expert + e,
-                                                              branch_off, per_expert);
-                    }
+                if (layer >= 0 && static_cast<size_t>(layer) < layers.size()) {
+                    for (const auto& b : layers[layer]) { if (b.tag == branch) { branch_off = b.branch_off; break; } }
                 }
                 et.branch_off = branch_off;
+                et.per_expert_srcs.resize(model.n_expert);
+                for (uint32_t e = 0; e < model.n_expert; ++e) {
+                    const uint32_t blk_idx = static_cast<uint32_t>(layer) * model.n_expert + e;
+                    if (model.incomplete) {
+                        et.per_expert_srcs[e] = strip_range_to_segs(model, vu.block_unit(blk_idx), branch_off, per_expert);
+                    } else {
+                        et.per_expert_srcs[e].push_back({ 0, data_off + blocks[blk_idx].off + branch_off, per_expert, 0 });
+                    }
+                }
                 model.expert.push_back(et);
             } else {
                 dense_tensor_t dt;
-                dt.name = name; dt.type = ttype; dt.size = tsize;
+                dt.name = name; dt.type = ttype; dt.size = tsize; dt.category = cat;
                 for (int d = 0; d < 4; ++d) dt.ne[d] = ne[d];
-                dt.srcs = model.incomplete ? range_to_segs(model, false, 0, toff - data_off, tsize)
-                                           : std::vector<src_seg_t>{ { 0, toff, tsize, 0 } };
+                if (cat == tensor_category_t::DENSE_LAYER || cat == tensor_category_t::EXPERT_META) {
+                    dt.layer = sm_layer_of(name);
+                }
+                if (!model.incomplete) {
+                    dt.srcs.push_back({ 0, toff, tsize, 0 });
+                } else if (model.is_v3()) {
+                    // map the tensor into its v3 chunk unit
+                    uint32_t unit = 0; uint64_t base = 0, idx = 0;
+                    if (cat == tensor_category_t::DENSE_GLOBAL) {
+                        base = model.dense_section.empty() ? 0 : model.dense_section[0];
+                    } else if (cat == tensor_category_t::DENSE_LAYER) {
+                        if (!find_section(model.dense_layer_sections, static_cast<uint64_t>(dt.layer), idx, base)) {
+                            throw std::runtime_error("v3 chunk: no dense-layer section for " + name);
+                        }
+                        unit = vu.c1_unit(static_cast<uint32_t>(idx));
+                    } else { // EXPERT_META
+                        if (!find_section(model.expert_meta_sections, static_cast<uint64_t>(dt.layer), idx, base)) {
+                            throw std::runtime_error("v3 chunk: no expert-meta section for " + name);
+                        }
+                        unit = vu.c4_unit(static_cast<uint32_t>(idx));
+                    }
+                    dt.srcs = strip_range_to_segs(model, unit, (toff - data_off) - base, tsize);
+                } else {
+                    // v2 chunk: single merged dense section
+                    dt.srcs = strip_range_to_segs(model, 0, toff - data_off, tsize);
+                }
                 model.dense.push_back(dt);
             }
         }
         gguf_free(tf);
     } else {
-        // ORIGINAL / V1: per-tensor contiguous across (possibly multiple) shards.
-        // Aggregate tensor metadata from every shard, then slice per expert.
+        // ORIGINAL: per-tensor contiguous across (possibly multiple) shards.
         struct tentry { uint32_t shard; uint64_t off; uint64_t size; int32_t type; int64_t ne[4]; };
         std::vector<std::pair<std::string, tentry>> tensors;
         const uint32_t n_files = static_cast<uint32_t>(model.files.size());
@@ -383,49 +400,33 @@ model_t parse_model(const std::vector<std::string>& paths) {
         }
 
         for (auto& [name, e] : tensors) {
-            const bool is_scale = name.find(".scale") != std::string::npos;
-            const bool is_exp = name.find("_exps") != std::string::npos && !is_scale;
-            if (is_exp) {
+            const tensor_category_t cat = sm_classify(name, e.ne, model.n_expert);
+            if (cat == tensor_category_t::EXPERT) {
                 const uint64_t per_expert = model.n_expert ? e.size / model.n_expert : 0;
-                // v1 target layout pads each per-expert slice to 4K; ORIGINAL does not.
-                const uint64_t stride = model.layout == model_layout_t::V1_SECTIONS ? align_up(per_expert, ALIGN) : per_expert;
-                int32_t layer = -1;
-                const size_t p = name.find("blk.");
-                if (p != std::string::npos) layer = std::atoi(name.c_str() + p + 4);
-                std::string branch = "?";
-                if (name.find("gate_up") != std::string::npos) branch = "gate_up";
-                else if (name.find("ffn_gate_exps") != std::string::npos) branch = "gate";
-                else if (name.find("ffn_up_exps") != std::string::npos) branch = "up";
-                else if (name.find("down_exps") != std::string::npos) branch = "down";
-
                 expert_tensor_t et;
                 et.name = name; et.type = e.type; et.size = e.size; et.per_expert = per_expert;
-                et.branch = branch; et.layer = layer;
+                et.branch = sm_branch_of(name); et.layer = sm_layer_of(name);
                 for (int d = 0; d < 4; ++d) et.ne[d] = e.ne[d];
                 et.per_expert_srcs.resize(model.n_expert);
                 for (uint32_t x = 0; x < model.n_expert; ++x) {
-                    et.per_expert_srcs[x].push_back({ e.shard, e.off + static_cast<uint64_t>(x) * stride, per_expert, 0 });
+                    et.per_expert_srcs[x].push_back({ e.shard, e.off + static_cast<uint64_t>(x) * per_expert, per_expert, 0 });
                 }
                 model.expert.push_back(et);
             } else {
                 dense_tensor_t dt;
-                dt.name = name; dt.type = e.type; dt.size = e.size;
+                dt.name = name; dt.type = e.type; dt.size = e.size; dt.category = cat;
                 for (int d = 0; d < 4; ++d) dt.ne[d] = e.ne[d];
+                if (cat != tensor_category_t::DENSE_GLOBAL) dt.layer = sm_layer_of(name);
                 dt.srcs.push_back({ e.shard, e.off, e.size, 0 });
                 model.dense.push_back(dt);
             }
         }
     }
 
-    // Sort experts by (layer, branch ORDER) like layout.js.
-    auto order_of = [](const std::string& b) {
-        for (int i = 0; i < EXPERT_BRANCH_ORDER_LEN; ++i)
-            if (b == EXPERT_BRANCH_ORDER[i]) return i;
-        return EXPERT_BRANCH_ORDER_LEN;
-    };
+    // Sort experts by (layer, branch ORDER) like the writer.
     std::sort(model.expert.begin(), model.expert.end(),
-              [&](const expert_tensor_t& a, const expert_tensor_t& b) {
-                  return a.layer != b.layer ? a.layer < b.layer : order_of(a.branch) < order_of(b.branch);
+              [](const expert_tensor_t& a, const expert_tensor_t& b) {
+                  return a.layer != b.layer ? a.layer < b.layer : sm_branch_order(a.branch) < sm_branch_order(b.branch);
               });
 
     gguf_free(ctx0);
