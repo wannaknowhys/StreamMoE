@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-05（NO_VICTIM 驱逐死锁 5d08bb3；M5 active-slot + exec 单程 f03e6a4 + 文档 5fa2ce1；dbg 退出泄漏审计 98f4d6d/8ab6f2a；deepseek 70G 池验证）。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-08（token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e —— per-device 整链 GPU 执行 + async/CPU 重叠，RAM-only IDENTICAL、RAM8G+VRAM256M 设备混跑 cos 0.982）。维护者每阶段收尾更新"当前状态"与"下一步"。
 
 ---
 
@@ -48,6 +48,14 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **mixed 执行落地（2026-09）**：所有 MUL_MAT_ID 统一走 per-pool peel rounds（exec_mixed_mm），单池/混合通吃；scratch arena no_alloc（大 batch ctx 不爆）；删老单池快路径（exec_mm_vk/exec_device_chain）。129-token mixed 列级 0 BAD。
 - **v2r demote DMA 提速（2026-09，docs/VRAM_DMA_MOVE.md）**：RX590 rebar host **读 0.02 GB/s**（158ms/专家）是 demote 卡死根因；transfer-queue DMA（ggml_vk_buffer_read + cached staging）**~1ms/专家**（快 100-150×）。r2v 无需改（rebar **写 8 GB/s**）。实测 4-token 64MB（238 demote）内容 0 BAD；129-token 64MB 跑通（DIO/计算主导）。
 - 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map + dma frag（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J/M 节。
+
+### 唯一执行器：紧凑桶引擎 + token-subset + 设备执行（2026-09-07/08）
+
+- **唯一执行器** = `exec_layer_burst_chain_buckets`（`src/backend/minigraph_exec.cpp`）。A 全族已删（edba2d2）；bucket 源 = `build_mix_plan` 真 token 子集 round（`[w_b,n_active]`，单 RAM 池退化为一个满 round）。`tmp_split_blocks` 已删。
+- **通用 index-gather**：cur 用 `[d,1,n_t]` reshape `[d,n_t]` + `get_rows`；任意 (t,k) 的 per-slot 路由权重用 flat `[1,n_k*n_t]` + `get_rows`。均图内节点（非 host staging）。
+- **scatter_plan**：tight 序在 cur 拷贝处消费；累加用 `ggml_acc_inplace` 的等差 run（每 seg 一次）。强制测试分桶 = `STREAM_MOE_TMP_BUCKET_ROUNDS`（k 奇偶 × t 奇偶 = 4 round，非连续 k，`STREAM_MOE_TEMP` 门控）。
+- **设备执行（M2-2 全并行骨架，docs/M2_DEVICE_EXECUTOR.md §7.9，cae652b/6723f4e）**：round 按 pool 分区 → pool 0 一个 CPU 图、每个 device pool 一个整链设备图（mm→weightless→fold→acc_d 全在 Vulkan；device shell `t->buffer=sp.dev_buf; t->data=host_offset(sp.dev_buf,col_off)` + staging 上传）→ 设备图 async 提交、CPU 图并发跑（overlap 已验证 = 串行，逐层 acc IDENTICAL）→ 层尾 sync + `tensor_get` 回读 acc_d → host fold → moe_out。踩坑：`acc.comp` 的 nb2/nb3 必须传全张量步长（不能 0，否则除零 acc 归零）；合成图 view 需 `fix_view_buffers` 补 `buffer`。
+- **回归口径**：纯 RAM 默认对当前 HEAD 干净构建 **IDENTICAL**；RAM8G+VRAM256M 设备混跑对同分区 CPU **cos 0.982**（与已知 0.986 冻结基线 flip 噪声同量级；**用户 2026-09-08 决定不追这个差距**）。诊断 env 见 WIP O。
 
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
 
@@ -115,25 +123,22 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 ## 4. 下一步（TODO）
 
-**主线方向（2026-09 决策：vulkan 兼容布局改造 = v2 块内张量对齐 + SoA pool）**
-0. **b4-3 实验线已归档**（HEAD 回退 860f9f4，存档 debug_patch/b4-3-arena-clone/）——arena-clone 整层 GPU 执行是死路：ggml-vulkan MUL_MAT_ID 专家步长硬编码 `ne0*ne1`、忽略 `nb[2]`，任何槽 stride=expert_size 的伪 3D 壳 vulkan 都不认（CPU 读 nb02 才正确）。
-1. **v2 文件布局改造（核心，替代 b4-3）**：vulkan 只认"每张量一个连续区、区内专家 stride=单张量紧凑大小"。两步：
-   - **文件侧（v2 转换器）**：保留 expert-blocks 块架构，但**块内每张量切片独立 4K 对齐**（gate_up 段、down 段各自起点 4K；原紧凑拼接 down 起点非 4K）。块内 offset 计算对齐到 4096；pad 空洞由 fill 补。所有专家切片源 offset 均 4K 对齐 → DIO 源对齐成立。
-   - **pool 侧（SoA）**：subpool 内按张量分成列（gate_up 列、down 列……每列是某张量的专家切片序列，stride = 单张量紧凑 perExpert）。槽 = (列, 专家切片)。vulkan mm 以单张量为权重单位（列基址 + e×stride，nb[2]=perExpert）→ 天然匹配。
-   - **装载**：专家 e 的 gate_up 切片 = 文件 gate_up 段 offset 一次 DIO → 池 gate_up 列。perExpert 是 4K 倍数 → DIO 直写；非 4K → DIO 读 4K 窗口 + staging move。每专家 N 次 DIO（每张量一次）。
-   - 数值门：改后 w3d 壳 stride=perExpert → CPU/vulkan 同读同构造逐字节验证。
-2. deepseek `--prefill-from` KV 预构建实测（gemma 非 dsv4 无 KV；deepseek 才有，验证 KV 导出 + 预构建价值）。
-3. **vulkan 作为 backend dll**（`GGML_BACKEND_DL` + `BUILD_SHARED_LIBS=ON`）——**需与 moe 适配商议**。
+**主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线**
+
+1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
+2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
+3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。
+4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 并发验收 UT（test_scheduler 链接问题需先修）。
+5. **H 长线**：消灭 phase2a/2b patch（vendored 改动全经 phase1 打桩 + 主仓库内容）。
+6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
 
 **顺手**
-4. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）。
-5. 3 个 direct_fill task spec（`tools/run_specs/tasks/direct_fill_cn_txt/en_txt/10000_txt.json`，引用同名 txt）。
-6. **OpenSSL**（build 报 "OpenSSL not found, HTTPS support disabled"）——需要 `OPENSSL_ROOT_DIR` 提供 `libcrypto` 才能编入 HTTPS；不急但看着烦。
+
+7. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）；3 个 direct_fill task spec；OpenSSL（`OPENSSL_ROOT_DIR`）。
 
 **明确不做**（用户决策）
-- deepseek prefill 追 bit 级（A1）。
-- prefill 全 token 层状态验证（B5）。
-- v1 张量级分片（C6）。
+- deepseek prefill 追 bit 级（A1）；prefill 全 token 层状态验证（B5）；v1 张量级分片（C6）。
+- 设备混跑 vs CPU 的 cos 0.982 差距（2026-09-08，与已知 0.986 冻结基线同量级，不追）。
 
 ---
 
