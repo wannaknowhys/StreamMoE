@@ -1,17 +1,20 @@
 # StreamMoE 自有 GGUF 格式设计 (STREAMMOE_GGUF_FORMAT.md)
 
-> 状态：**设计（v1/v2 定稿）**。目标：让 MoE 模型加载/装载全面走 DIO 且免 staging。
+> 状态：**设计（v1/v2/v3 定稿；v3 为目标格式，2026-09）**。目标：让 MoE 模型加载/装载全面走 DIO 且免 staging。
+> v3 = 按**是否被 MoE 闭包消费**把张量分四类、各一个物理 section（见 §3）；v2 保留为旧格式（只写单文件）。
+> **2026-09 决策**：转换器转**纯 C++**（复用 `model_t`，删 JS/convertd），**v1 彻底删除**（见 §3.5）。
 > 依据：ggml-org/ggml `docs/gguf.md`（`general.alignment` 可设 4096；`tensor_data` 是 arbitrary binary data、tensor 由显式 offset 定位、offset 必须 ALIGNMENT 倍数；社区 KV namespaced）。
 >
-> **关键结论**：GGUF 张量没有 stride/切片语义（`gguf_tensor_info_t` 只有 name/ne/type/offset，数据必须连续）——"专家物理连续"与"原版可读"**不可兼得**。因此两个版本：
-> - **v1 = GGUF 超集（兼容，原版可读）**：每分支张量连续，dense/expert 分区。
-> - **v2 = expert-blocks（自有格式，原版不可读）**：每专家一个紧凑块，一次 DIO 装载。
+> **关键结论**：GGUF 张量没有 stride/切片语义（`gguf_tensor_info_t` 只有 name/ne/type/offset，数据必须连续）——"专家物理连续"与"原版可读"**不可兼得**。因此：
+> - **v1 = GGUF 超集（兼容，原版可读）**：每分支张量连续，dense/expert 分区。**已废弃**（见下）。
+> - **v2 = expert-blocks（自有格式，原版不可读）**：每专家一个紧凑块，一次 DIO 装载。旧格式。
+> - **v3 = 按闭包四分类（目标格式，2026-09）**：C1 dense 按层 / C2 dense 与层无关 / C3 每专家 / C4 专家小表，各占一个 section（见 §3）。
 >
 > **2026-09 修正**：v1（sections-v1）因 GGUF tensor offset 必须紧凑单调（gguf reader 校验
 > `ti.offset == 累计 padded size`，ggml gguf.cpp:774-794）而否决——无法在单张量内做 4K 专家切片
-> stride（writeV1 的 per-expert reflow 产出非法 GGUF，llama 加载报 offset 不匹配）。**v2 为唯一
-> 布局**；v2 块内进一步改为"每张量切片独立 4K 对齐"（供推理引擎按张量 DIO + SoA 槽执行，见
-> §2.6），此变体原版同样不可读。
+> stride（writeV1 的 per-expert reflow 产出非法 GGUF，llama 加载报 offset 不匹配）。v2 块内进一步
+> 改为"每张量切片独立 4K 对齐"（供推理引擎按张量 DIO + SoA 槽执行，见 §2.6），此变体原版同样不可读；
+> v3 在 v2 之上把 dense 段按闭包拆成三段（见 §3）。
 
 ---
 
@@ -134,44 +137,156 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 
 ---
 
-## 3. 分片（shard）下的转换
+## 3. v3：按闭包四分类（2026-09 定稿，目标格式）
 
-- 输入分片（`-00001-of-00005`）：转换器读全部 `splits`，合并张量视图，重排到目标（v1/v2）。
-- 输出：单文件（或同样分片——v1 可分片，v2 专家块分片可选）。
+> 动机：v2 只有 `dense` / `expert` 两桶，把两种完全不同的生命周期混在 `dense` 里（`token_embd`/`output`
+> 每 token 必用、应永久常驻；逐层 `attn`/`norm` 是流式），并且把专家域的非每专家张量（router / shexp /
+> scale）含混地塞进 dense。v3 以**是否被 MoE 闭包消费**为判据把张量分成四类，各占一个物理 section，
+> 让 loader/executor 分别施加驻留与 DIO 策略。
+
+### 3.1 四类定义
+
+判据以运行期闭包为准（`src/backend/route_b_chain.cpp` 的 `collect_chain`：从 routed `MUL_MAT_ID`
+锚点（权重名含 `_exps` 且不含 `_shexp`）沿消费者前向 BFS 到 `ffn_moe_out`；gating 段
+`ffn_moe_logits`/`probs`/`argsort`/`topk`/`weights` 留在 dense 侧，不进闭包）。
+
+| 类 | 名称 | 判据 | 基数 | 跨设备策略 |
+| :-- | :-- | :-- | :-- | :-- |
+| C1 | dense 按层 | 不被闭包消费 + `blk.N.*` | 每层一组 | 按层 DIO/预取，层后驱逐 |
+| C2 | dense 与层无关 | 不被闭包消费 + 非 `blk.*` | 全局一个 | 一次载入，永久常驻 |
+| C3 | 每专家独立 | 被闭包消费 + 按专家切片（`_exps.weight`，`ne[2] == n_expert`） | 每专家一块 | 专家池（SoA 列），跨设备分片读取 |
+| C4 | 专家不按每专家 | 被闭包消费 + 非按专家切片（小表） | 每层一组 | 每设备复制一份（广播） |
+
+**实测归属**（gemma4 / deepseek4）：
+
+| 张量 | 类 | 说明 |
+| :-- | :-- | :-- |
+| `token_embd` / `output` / `output_norm` / `rope_freqs` / `output_hc_*` | C2 | 每 token 必用，常驻 |
+| `attn_*` / `ffn_norm` / dense `ffn_gate/up/down` / `hc_*` / `indexer*` | C1 | 逐层 |
+| `ffn_gate_inp`（router） | C1 | 每层一个；输出 `ffn_moe_logits` 属 gating 段，不在闭包 |
+| `ffn_{gate,up,down}_shexp` | C1 | 每层一个；普通 `MUL_MAT`（`_shexp` 不含 `_exps`），不在闭包 |
+| `ffn_*_exps.weight` | C3 | 专家池 |
+| `ffn_down_exps.scale`（gemma） | C4 | 闭包 REPEAT/GET_ROWS 消费，512 B/层 |
+| deepseek | C4 = 空 | 无 `_exps.scale`；`exp_probs_b` / `tid2eid` 属 gating，归 C1 |
+
+> 关键结论：**两个模型都不存在"大的、被闭包消费、但非每专家"的张量**。大的要么是 C3（专家池），
+> 要么不被闭包消费（C1/C2）。C4 只有"闭包消费的、按专家索引的小表"，目前仅 gemma 的 scale
+> （512 B/层，30 层共 15 KB）。实测体积见下表。
+
+| 类 | gemma4（30 层 / 128 专家） | deepseek4（43 层 / 256 专家） |
+| :-- | :-- | :-- |
+| C2 全局 | 748.0 MB | 2020.3 MB |
+| C1 按层（含 router） | 1711.2 MB（54.6~69.2 MB/层） | 9920.6 MB（209.0~245.6 MB/层） |
+| C3 每专家 | 3.5 MB/专家（末层 4.1），总 13.4 GB | 12.8 MB/专家，总 137.1 GB |
+| C4 专家小表 | 15 KB | 空 |
+
+### 3.2 物理布局
+
+```text
+GGUF v3
+├─ metadata
+│   general.alignment = 4096
+│   stream_moe.layout = "v3"
+│   stream_moe.dense_global_section = [off, size]
+│   stream_moe.dense_layer_sections = [layer, off, size, ...]   # 每层一条
+│   stream_moe.expert_meta_sections = [layer, off, size, ...]   # 每层一条（可空）
+│   stream_moe.expert_sections      = [off, size, nsub, ...]    # 每 (layer,expert) 一块
+│   stream_moe.expert_branch_names / expert_branch_sizes / expert_branch_counts
+│   stream_moe.branch_align = 1
+├─ tensor_infos（含 `_exps.weight` 占位，route B 不读其数据）
+└─ tensor_data
+   ├─ C2 GLOBAL-DENSE
+   ├─ C1 LAYER-DENSE（按层）
+   ├─ C4 EXPERT-META（按层）
+   └─ C3 EXPERT-BLOCKS（每专家紧凑块，块内分支 4K 对齐，见 §2.6）
+```
+
+- section 顺序固定；GGUF tensor offset 必须单调（v1 栽在这），按 C2→C1→C4→C3 顺序写即可。
+- **4K 对齐硬不变量**：每个 section 内每个张量起点、每个 (expert,tensor) 切片起点、每个 chunk unit
+  边界都 4K 对齐。
+  - C2/C1/C4 张量整体读入 4K 对齐的 RAM/VRAM buffer（读 `align_up(size)`），**免 staging**。
+  - C3 免 staging 额外要求 `perExpert % 4096 == 0`（目标槽 stride 被 ggml-vulkan 硬编码 = perExpert，
+    不能补齐）。实测：deepseek 全命中（4456448）；gemma `gate_up` 2230272 = 544.5×4096 不命中
+    （每专家尾 2 KB 仍需 staging），`down` 命中。故 C3 免 staging 是"条件成立时"，不是普遍保证。
+- `_exps.weight` 的 tensor_info 仍写占位 offset（图构建要名字/ne/type；route B 从 `expert_sections`
+  读数据），与 v2 同。
+- C3 块布局 = v2（`branch_align=1`，SoA 列 stride = perExpert）。
+
+### 3.3 分类规则（转换器，名字/结构代理）
+
+转换器不能跑图，用与闭包一致的名字/结构规则代理：
+
+| 类 | 规则 |
+| :-- | :-- |
+| C2 | 名字不以 `blk.` 开头 |
+| C3 | `blk.*_exps.weight` 且 `ne[2] == n_expert`（否则报错，不静默切片） |
+| C4 | `blk.*_exps.*` 非 `.weight`（专家索引小表，如 `.scale`） |
+| C1 | 其余 `blk.*` |
+
+> 注意：router（`ffn_gate_inp`）与 shexp（`ffn_*_shexp`）都不含 `_exps`，天然落 C1；`_shexp` 的
+> 子串是 `_shexp` 而非 `_exps`，不会被误判进 C3/C4。
+
+### 3.4 与 v2 的关系
+
+v3 = v2 的 dense 段拆成 C2/C1/C4 三段（各自 offset 表），C3 不变。v2 → v3 是纯重排，可逆；
+v3 → v2 把三段合回一段。
+
+### 3.5 实现决策（2026-09）
+
+1. **纯 C++ 转换器，消灭 JS/convertd/TCP**：复用 `src/loader/model.h` 的 `model_t` + `parse_model`
+   （`model.h:9` 已为此预留），布局数学沉到共享模块，loader 与 writer 唯一一份。
+2. **v1 彻底删除**：`V1_SECTIONS`、v1 writer、convertd v1 reflow、`scripts/convert_v1.bat`、矩阵 v1 列，
+   以及 **`patches/gguf-alignment.patch` 整个删除**（`STREAM_MOE_GGUF_ALIGN` 只服务 v1 reflow）。
+3. **v2 只保留单文件写入**（v2chunk 写删除）；v2 / v2chunk 的**读**保留到 v2 退役，现有源仍可转 v3。
+4. **v3chunk 全切**：统一入口——每个 section = 一串 unit（C2 整段一个、C1/C4 每层一个、C3 每专家块一个），
+   每个 unit 按同一条 4K base/rem 规则切 N 份，读侧按 unit 合并段。N 可按 section 配置（默认同一 N）。
+
+### 3.6 仍待定（open）
+
+1. **C4 复制策略**：加载时每设备各留一份，还是每设备图引用同一 host 副本（设备 staging）？
+2. **per-layer 边界表格式**：`[layer, off, size]` 扁平，还是按层索引的边界数组（缺层用 -1）？
+3. **是否把 C4 并入 C1 段**（都按层、都小），只靠 category KV 区分，省一个 section？
 
 ---
 
-## 4. 转换器（stream_moe_convert）
+## 4. 分片（shard）下的转换
 
-- 输入：`-m <model.gguf>`（多分片自动合并）。
-- 输出：`-o <out.gguf>` + `--format v1|v2`（默认 v1）。
+- 输入分片（`-00001-of-00005`）：转换器读全部 `splits`，合并张量视图，重排到目标（v2/v3）。
+- 输出：单文件（v3 专家块分片 = v3chunk 可选）。
+
+---
+
+## 5. 转换器（stream_moe_convert）
+
+- 输入：`-m <model.gguf>`（多分片自动合并；chunk 源用 `;` 分隔全部文件）。
+- 输出：`-o <out.gguf>` + `--format v2|v3`（默认 v3）；`--format v3chunk --chunks N [--ratio a:b:c]`。
 - 流程：
-  1. 解析 GGUF（header/KV/tensor_info，张量 offset/size/type/ne）。
-  2. 分类张量（dense / `_exps`）。
-  3. 重排写入目标（v1：dense 段 + 分支张量段；v2：dense 段 + 专家紧凑块）。
+  1. `parse_model` 解析 GGUF（header/KV/tensor_info，张量 offset/size/type/ne）→ `model_t`。
+  2. 分类张量（C1/C2/C3/C4，见 §3.3）。
+  3. 重排写入目标（v2：源顺序 dense + 专家紧凑块；v3：C2/C1/C4/C3 四段；v3chunk：按 unit 切条带）。
   4. 写 `general.alignment=4096` + `stream_moe.*` 分区/块表。
-  5. 校验：转换后原版（v1）加载输出与转换前一致；v2 用我们 loader 数值等价回归。
+  5. 校验：v2 对旧 JS 输出逐字节一致；v3/v3chunk 用矩阵不变量 + loader 数值回归（见 §10.4）。
 
-## 5. 收益与代价
+## 6. 收益与代价
 
-|  | v1（超集） | v2（expert-blocks） |
+|  | v2（expert-blocks） | v3（四类 section） |
 | :--- | :--- | :--- |
-| 原版可读 | ✅ | ❌ |
-| dense 整段读 | ✅ | ✅ |
-| 专家 DIO | 3 次/专家（分支分散） | **1 次/专家**（紧凑块） |
-| 异构支持 | ✅（分支张量独立） | ✅（块大小独立） |
-| 生态 | GGUF 兼容 | 自研 |
+| 原版可读 | ❌ | ❌ |
+| dense 整段读 | ✅ | ✅（C2/C1/C4 三段，各按策略） |
+| 专家 DIO | 1 次/专家（紧凑块） | 1 次/专家（同 v2） |
+| 异构支持 | ✅（块大小独立） | ✅ |
+| 生态 | 自研 | 自研 |
 
 ---
 
-## 6. 多文件：v1 合分片/分片，v2 RAID0 切分
+## 7. 多文件：合分片，v3chunk RAID0 切分
 
-### 6.1 v1：合分片与张量级分片
+> v1 张量级分片已随 v1 删除。合分片（`-00001-of-00005` → 单文件）由 `parse_model`
+> 自动完成（读全部 `splits`，重排到目标）。
 
-- **合分片**（`-00001-of-00005` → 单文件）：读全部 `splits` 张量，重写为单文件（张量连续）。流式（`gguf_init_from_callback` 读 + 边写边拷，162GB 不全量进内存）。**无本质困难**。
-- **分片**（单文件 → 文件系列）：**张量级**分片（文件1 含张量 0..k，文件2 含 k+1..m）——每个文件是完整可读 GGUF（类似原版 split），原版 `splits` 机制可合并。
+### 7.1 v3chunk：全 section unit RAID0 切分（跨盘）
 
-### 6.2 v2：专家块 RAID0 切分（跨盘）
+- **unit**：每个 section = 一串 unit（C2 整段一个、C1/C4 每层一个、C3 每专家块一个）；每个 unit 独立用下面同一条规则切 N 份。v2chunk 同理（unit = [合并 dense] + [每专家块]）。
 
 - **切分规则（固定，统一适用于所有专家，含异构）**：专家块**字节级**跨文件切（不考虑专家内三张量结构），按 4K 块**均匀分配余数**——每个专家块独立用同一条规则：
   - 块总数 `B`（每专家块自己的 4K 块数），N 个文件 → `base = B/N`（整除），`rem = B%N`；
@@ -187,113 +302,93 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 - **文件大小不要求相等**：每个文件 = 各专家在该文件片段的累积字节，天然不同——不影响（切分规则固定）。
 - **装载**：专家 e = **N 次并发 DIO 直读**各文件片段（4K 对齐 start + 4K 对齐 len）→ 合并到槽。比非对齐 + staging 更简单。
 - **文件结构**：**每个文件都是完整 GGUF**（header/KV/tensor_info），但含：
-  - `stream_moe.format = "expert-blocks-v2"`
-  - `stream_moe.chunk = <no>/<total>`（自编号）
+  - `stream_moe.layout = "v3"`（或 `"expert-blocks-v2"`）
+  - `stream_moe.chunk_no` / `chunk_total`（自编号）
   - `stream_moe.incomplete = 1`（**注明无法被原版单独读取**——张量被切分、文件内不完整，原版读会错）
-  - metadata（KV）主要在第 1 个文件；后续文件含最小 header + 编号 KV + 数据段。
-- **loader（common 侧）**：接受多文件输入（`--model` 主文件 + 按 `stream_moe.chunk`/`split.*` 自动发现兄弟文件），v2 下按固定切分规则合并装载专家。
+  - `stream_moe.chunk_slices`（每文件每个 unit 的 4K 块数）
+  - metadata（KV）每个文件都有（含完整 tensor_info 表）；数据段按 unit 条带分布。
+- **loader（common 侧）**：`parse_model` 接受多文件输入（`;` 分隔或按 chunk 编号），按 `chunk_slices` 合并各 unit 条带为多段 `src`。
 
 ---
 
-## 7. 转换器架构（JS 逻辑单点 + convertd 哑物理服务，裸 TCP）
+## 8. 转换器架构（纯 C++，2026-09 落地）
 
-- **JS（`tools/stream_moe_layout.js`）= 唯一逻辑实现**：
-  - `buildModel(files)`：任意源（官方分片 / 原版 / v1 / v2 / v2 切）→ 统一 Model 描述（`dense[]` srcs 多段 + `expert[]` perExpertSrcs 每专家段列表；v2 切源的块条带跨 N 文件 → 段拼接）。
-  - 写入器 `writeV1/writeV2/writeV2chunk`：Model + 落地参数 → `write_meta/copy/fill/close` 指令流。
-- **convertd（`tools/stream_moe_convertd.cpp`）= 哑物理服务**：裸 TCP（`127.0.0.1`，JSON-lines，每行一命令/一响应，单客户端，启动打印 `PORT n` 到 stderr），5 原语：
-  - `open {in:[...]}` → 每文件 metadata JSON。
-  - `write_meta {out, in, skip_kv, set_kv, tensors, alignment}` → 写头（KV 从源复制、按 `skip_kv` 前缀过滤、`set_kv` 覆盖；`tensors` 由 JS 定序）→ `dataOffset` + 张量 `offsets`。
-  - `copy {src, dst, ops}` / `fill {dst, ops}` → 流式搬字节 / 写零（dstOff 相对 dataOffset）。
-  - `close {dst}` → 关输出。
-- **数据不跨进程**：JS 从 `open` 元数据构建描述，发给 convertd 的是小的 copy 指令流（16GB 数据 = 几百条大区间指令）。
-- **`write_meta` 的 KV 消毒**：只复制模型信息 KV（跳过 `stream_moe.*`/`split.*`/`general.alignment`），目标格式的布局 KV 全部由 JS 经 `set_kv` 全新生成——v1 遗留 KV 永不泄漏进 v2/v2 切。
-- 复用：vendored `ggml/src/gguf.cpp`（llama.cpp 已编译进 ggml 库，wrapper 链接 ggml-base.lib）。
+- **读**（`src/loader/model_builder.cpp`）：`parse_model(paths)` → `model_t`（§10）。任意源：官方分片 /
+  原版 / v2 / v2chunk / v3 / v3chunk。与 loader 同一解析器（单一事实来源）。
+- **写**（`src/convert/writer.cpp`）：`convert_model(model_t, opts, out)`：
+  - **v2**：dense 源顺序 + 每专家块（`branch_align=1`）。
+  - **v3**：C2/C1/C4/C3 四段（§3）。
+  - **v3chunk**：统一 unit 切分（每段 = 一串 unit，同一条 4K base/rem 规则切 N 份）+ 逐条带 copy/fill。
+  - **4K 对齐**：从内存 seed 上下文（含 `general.alignment=4096` 的最小 GGUF）初始化 `gguf_context`，
+    `gguf_add_tensor` 即按 4K 布局——**不需要 vendored `gguf_set_alignment`**（`gguf-alignment.patch` 已删）。
+- **CLI**（`src/convert/main.cpp`）：`stream_moe_convert -m <model> -o <out> [--format v2|v3|v3chunk] [--chunks N] [--ratio a:b:c]`。
+- **构建**：`build.bat convert <tag>`（CMake target `stream_moe_convert`，链 ggml-base + `model_builder.cpp`）。
+- **已删除**：`tools/stream_moe_layout.js` / `stream_moe_convert.js` / `stream_moe_convertd.cpp` /
+  `stream_moe_model.js` / `convertd_call.js`、`scripts/convert_v1.bat`、`patches/gguf-alignment.patch`。
 
-### wrapper 编译（Windows，clang-cl + vendored ggml，含 ws2_32.lib）
+---
 
-```bat
-rem tools/stream_moe_convertd.cpp：裸 TCP server（JSON-lines）
-F:\Dev\LLVM\bin\clang-cl.exe /std:c++17 tools\stream_moe_convertd.cpp /EHsc /MT ^
-    "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/include" ^
-    "/IF:/Dev/StreamMoE/third_party/llama.cpp/ggml/src" ^
-    F:/Dev/StreamMoE/build/main/llama-build/ggml/src/ggml-base.lib ^
-    F:/Dev/LLVM/lib/libomp.lib ws2_32.lib /Fe:temp/stream_moe_convertd.exe
-rem 测试 open（读 GGUF metadata -> JSON）：
-node tools\convertd_call.js '{"cmd":"open","in":["N:\\AI_LLM\\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf"]}'
+## 9. 转换器功能清单【2026-09：目标态 = 纯 C++，v1 删除】
+
+- [x] **读：任意源 → `model_t`**（官方分片 / 原版 / v2 / v2chunk / v3 / v3chunk）——复用 `src/loader/model_builder.cpp`。
+- [x] **v2 expert-blocks 单文件写入**（分支 4K 对齐 + 块尾 0 填充）；C++ 与旧 JS 输出**逐字节一致**（gemma 实测）。
+- [x] **C++ writer**（`model_t` → GGUF 直写，`src/convert/writer.cpp`）。
+- [x] **v3 四类 section**（C2/C1/C4/C3 + category KV + 4K 对齐，见 §3）；v3→v3 逐字节幂等。
+- [x] **v3chunk 全切**（统一 unit 切分/合并，见 §3.5）；v3chunk→v3 逐字节等于单文件 v3。
+- [x] **KV 消毒**（只复制模型信息 KV，布局 KV 全新生成）。
+- [x] **矩阵回归**（`scripts/verify_convert_matrix.bat`，C++ 转换器 + v3 不变量）——待整轮跑。
+- [删除] **v1 sections / v1 张量级分片 / `gguf-alignment.patch` / JS+convertd**。
+
+**结论**：转换器收敛为「读 = `parse_model` → `model_t`，写 = `model_t` + 落地参数 → 文件」，读写同一份
+`model_t` 与布局数学；原版 / v2 / v2chunk 任意源 → v2 / v3 任意目标全部字节可复现。
+
+---
+
+## 10. 转换器中间格式（C++ `model_t`，读写共用）
+
+> 目标：所有格式（原版 / v2 / v2chunk / v3 / v3chunk）都解析到同一个 C++ `model_t`，再从它写出任意目标
+> （v2 / v3 / v3chunk）——矩阵全通。**v3 按 category 重排 dense**，所以 v3→v2 与 原版→v2 不是逐字节相同
+> （dense 顺序不同）；可逆性判据是 `v3→v2→v3 == v3`、`原版→v2→v3 == 原版→v3`。
+
+### 10.1 中间格式（`src/loader/model.h::model_t`）
+
+```cpp
+struct model_t {
+    arch; layout; n_layer; n_expert; n_expert_used; incomplete; files; data_offs;
+    dense:  [ { name, ne[4], type, size, category, layer, srcs:[src_seg_t] } ],  // 源顺序
+    expert: [ { name, ne[4], type, size, per_expert, branch, layer, branch_off,
+                per_expert_srcs:[ [src_seg_t] x n_expert ] } ],                   // 按 (layer, ORDER) 排序
+    // v2/v3 布局 KV 原样：dense_section / expert_sections / branch_* / chunk_slices /
+    //                    dense_layer_sections / expert_meta_sections / branch_align
+};
+struct src_seg_t { uint32_t file; uint64_t off, len, in_off; };
 ```
 
-### wrapper 命令
+- `srcs` / `per_expert_srcs` 是段列表：单文件 = 1 段；chunk 源 = N 段（条带跨 N 文件）。
+- `category`（C1/C2/C3/C4，见 §3.3）由 `sm_classify`（`src/loader/layout_math.h`）按名字/结构判定。
+- `dense` 保持源顺序；写 v3 时按 category 排序（C2→C1→C4），写 v2 时保持源顺序。
 
-- `open` → metadata JSON —— ✅ 已实现。
-- `write_meta` / `copy` / `fill` / `close` —— ✅ 已实现（布局指令流由 JS 生成）。
-
----
-
-## 8. 转换器功能清单【2026-08-30 更新为实际状态】
-
-`tools/stream_moe_convertd.cpp`（裸 TCP 哑物理服务）+ `tools/stream_moe_layout.js`（逻辑单点）+ `tools/stream_moe_convert.js`（CLI 前端）：
-
-- [x] **v1 sections**（`alignment=4096` + dense/expert 分区，原版可读）——`--format v1`。
-- [x] **v2 expert-blocks**（专家紧凑块，每专家一块：分支拼接 + 块尾 0 填充，自有 loader）——`--format v2`。
-- [x] **v2 RAID0 切分**（dense 段 + 每专家块按 4K 块切 N 份，均匀 base/rem 或 `--ratio` largest-remainder）——`--format v2chunk --chunks N [--ratio a:b:c]`；每文件完整 header + `chunk_no/total/incomplete=1` + `chunk_slices`（各文件条带布局）。
-- [x] **任意源 → 统一 Model**（官方分片 / 原版 / v1 / v2 / v2 切），v2 切源 = 多段 src（块条带跨 N 文件）。
-- [x] **v2 → v1 拆块还原**、**v2 切 → v2/v1/v2 切 合并还原**。
-- [x] **scale 统一归 dense**（v1/v2 分类一致，消灭布局随源变）。
-- [x] **KV 消毒**（write_meta 只复制模型信息 KV，布局 KV 全新生成——v1 单数 `expert_section` 不再泄漏）。
-- [x] **5 源 × 3 目标矩阵逐字节一致**——`scripts/verify_convert_matrix.bat <workdir>`（N 盘原版源 → R 盘 ramdisk 工作区）全 PASS。
-- [ ] **v1 张量级分片**（单文件 → 文件系列，原版可合并）——未实现。
-
-**结论**：转换器重构为「读 = 构建统一 Model 描述，写 = 描述 + 落地参数 → 文件」；原版/v1/v2/v2 切 任意源 → v1/v2/v2 切 任意目标全部字节可复现。
-
----
-
-## 9. 转换器中间格式（统一模型抽象）【2026-08-30 已实现】
-
-> 目标：让**所有格式**（原版 / v1 / v2 / v2 切）都能解析到同一个内存中的模型抽象，再从该抽象写出任意目标（v1 / v2 / v2 切）——矩阵全通、单向可逆（v2 只是"打乱"而非"丢失"，可拆回）。这样**任意多方向转换可互相验证转换器无 bug**。
-
-### 9.1 中间格式（`tools/stream_moe_layout.js` 的 Model，内存抽象，不是文件）
-
-```js
-{
-  arch, layout, nLayer, nExpert, nExpertUsed, incomplete, files,
-  dense:  [ { name, ne, type, size, srcs:[{fi,off,len,inOff}] } ],   // 源顺序
-  expert: [ { name, ne, type, size, perExpert, branch, layer,
-              perExpertSrcs:[ [{fi,off,len,inOff}] x nExpert ] } ],  // 按 (layer, ORDER) 排序
-}
-```
-
-- **srcs / perExpertSrcs 是段列表**：原版/v1/v2 = 单段；**v2 切源 = 多段**（块条带跨 N 文件，区间与各文件条带求交 → 段序列）。
-- `inOff` = 段在张量/专家切片内的偏移（多段拼接恢复原区间）。
-- **scale 归 dense**（`_exps && !.scale` → expert；`.scale` → dense），v1/v2 一致。
-- **dense 保持源顺序**；expert 按 (layer, `[gate_up,gate,up,down]`) 排序——写出的张量序与源无关。
-
-### 9.2 解析器（各格式 → Model，`buildModel`）
+### 10.2 解析器（各格式 → `model_t`，`parse_model`）
 
 | 源格式 | 解析 |
 | :--- | :--- |
-| 官方分片 / 原版 | 张量列表 → dense/expert（`_exps` 且非 `.scale`）→ `src` = file+off+size；`split.count>1` 自动合并分片 |
-| v1 | 同原版 + `dense_section` 标记 |
-| v2 | `expert_sections`（块 off/size）+ `expert_branch_names/sizes/counts`（块内布局）→ 每专家块拆出各分支区间（**可逆关键**） |
-| v2 切 | `chunk_slices`（每文件条带布局）→ 区间 × 各文件条带求交 → 多段 `src`（全部 N 文件必须同时传入） |
+| 官方分片 / 原版 | 张量列表 → dense/expert（`_exps.weight` 且 `ne[2]==n_expert`）→ `src` = file+off+size；`split.count>1` 自动合并分片 |
+| v2 | `expert_sections` + `expert_branch_*` → 每专家块拆出分支区间 |
+| v2chunk | `chunk_slices` → 区间 × 各文件条带求交 → 多段 `src`（全部 N 文件同时传入） |
+| v3 | 同 v2 + `dense_global_section` / `dense_layer_sections` / `expert_meta_sections`；dense 按 category 分类 |
+| v3chunk | 同 v3 + `chunk_slices`（unit = [global] + [C1 层] + [C4 层] + [block]）→ 多段 `src` |
 
-### 9.3 写入器（Model → 各格式，`writeV1/writeV2/writeV2chunk`）
+### 10.3 写入器（`model_t` → 各格式，`src/convert/writer.cpp`）
 
 | 目标 | 写入 |
 | :--- | :--- |
-| v1 | `write_meta`（dense 前 expert 后定序）→ `copy` 每段 → `close` |
-| v2 | `write_meta`（含 `dense_section`/`expert_sections`/`branch_*` 布局 KV）→ `copy` dense + 每专家块（分支拼接）→ `fill` 块尾零 → `close` |
-| v2 切 | 按 N 份切 4K 块（均匀或 ratio）→ 每文件 `write_meta`（含 chunk KV + `chunk_slices`）→ `copy` 各条带 + `fill` 条带尾 → `close` |
+| v2 | 源顺序 dense + 每专家块（`branch_align=1`）→ 分支间/块尾 0 填充 |
+| v3 | C2/C1/C4/C3 四段 + 各自 offset 表 |
+| v3chunk | 每 unit 按 4K base/rem 切 N 份 → 逐条带 copy + 补零 |
 
-转换 = `buildModel(源) → 布局计划 → write_meta/copy/fill/close 指令流`；convertd 只做"按指令读区间 + 写"。
+### 10.4 矩阵不变量（`scripts/verify_convert_matrix.bat`）
 
-### 9.4 矩阵（经中间格式全通，2026-08-30 验证 PASS）
-
-| 源 \ 目标 | v1 | v2 | v2 切 |
-| :--- | :--- | :--- | :--- |
-| 原版 | ✓ | ✓ | ✓ |
-| v1 | ✓ | ✓ | ✓ |
-| v2 | ✓（拆块还原） | ✓ | ✓ |
-| v2 切 | ✓（合并还原） | ✓ | 重切 |
-
-- 验证：`scripts/verify_convert_matrix.bat <workdir>`——N 盘原版源 → R 盘 ramdisk：基准（原版→v1/v2/v2chunk）+ 各源互转，`tools/cmp_gguf.js` 逐字节比较，**全部 identical**。
-- 可逆性：v2 专家数据是"重排"（块），张量 name/ne/type + branch 布局都在 KV/tensor_info——可拆回；真正丢失的只有多分片结构（`split.*`）与对齐 padding。
+- `v2→v2 == 原版→v2`；`v2→v3 == 原版→v3`。
+- `v3→v3 == v3`；`v3→v2→v3 == v3`；`v3chunk→v3 == v3`；`v3chunk→v2→v3 == v3`。
+- **不变量**：`v3→v2 ≠ 原版→v2`（v3 重排 dense）——设计如此，不是 bug。
+- 验证工具：`tools/cmp_gguf.js` 逐字节比较。

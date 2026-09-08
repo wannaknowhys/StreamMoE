@@ -75,8 +75,9 @@ StreamMoE/
 src/
 ├── common/                types.h（对齐/内存发现）、logger.h、crash.cpp
 ├── backend/               route B：moe_backend（buft/backend 注册）、minigraph_exec（MUL_MAT_ID 委托）、scheduler（槽控制面/DIO/EST1）
+├── convert/               C++ 转换器：writer.cpp（model_t → v2/v3/v3chunk GGUF）、main.cpp（CLI）
 ├── io/                    async_dio（Win IOCP 真异步）、staging_reader（扇区对齐读计划）
-├── loader/                moe_loader（GGUF 拓扑 + 专家 read plan）
+├── loader/                model.h/model_builder（统一 model_t 解析，读写共用）、layout_math.h（分类/切分/对齐）、moe_loader（GGUF 拓扑 + 专家 read plan）
 ├── pool/                  expert_stats（EST1 热度）
 ├── profile/               profiler（RDTSCP + JSONL）
 └── server/                route_b_inject（route B 接线：tensor_buft_overrides + backend 注册）

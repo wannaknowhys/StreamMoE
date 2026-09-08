@@ -46,22 +46,20 @@
 - `src/llama-kv-cache.cpp` / `src/llama-kv-cache.h`
 - `tools/server/server.cpp`（/shutdown 端点）
 
-### 独立 gguf-alignment.patch（转换器工具）
-- `ggml/include/gguf.h` + `ggml/src/gguf.cpp`（`gguf_set_alignment`——convertd 需要；与推理构建无关，任意时 apply）
-
 > 注意：route-b / prefill **不含任何 frag new-file**（frag 在主仓库常驻）；**不含 server-context**
-> 专属改动（锚点全在 phase1 macros）。
+> 专属改动（锚点全在 phase1 macros）。转换器不再需要 gguf patch（4K 对齐经内存 seed 上下文实现，
+> 见 `src/convert/writer.cpp`）。
 
 ## 应用顺序与验证
 
 ```
 git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_timer.patch \
-    patches\route-b-inject.patch patches\gguf-alignment.patch patches\prefill-export-llama.patch
+    patches\route-b-inject.patch patches\prefill-export-llama.patch
 ```
 
-- Phase 1 必选（顺序可互换）；2a/2b 可选组合；gguf-alignment 独立。
-- 验证（A4 做过）：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（22 文件 hash；
-  2026-09 hostmap 并入 macros 后 +1 文件 = ggml-vulkan.cpp）。
+- Phase 1 必选（顺序可互换）；2a/2b 可选组合。
+- 验证（A4 做过）：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（2026-09 去
+  gguf-alignment 后 20 文件）。
 - 叠加纪律（README 旧版铁律沿用）：在已有 patch 基础上改代码前先 commit 父仓库 + 快照
   `git -C third_party/llama.cpp diff > temp/patch_backup_<date>/working-tree-full.patch`。
 - 每次 vendored 改动收尾：重生成受影响 patch → 临时 worktree apply 验证逐字节一致 → commit。
@@ -76,7 +74,6 @@ git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_ti
 | `upstream_vulkan_dump` | prefill_export | STREAM_MOE_PREFILL_EXPORT | 同 + vulkan（Vulkan0 对比）|
 | `StreamMoE_dump` | route_b,prefill_export | 两者 | 完整 StreamMoE 导出 |
 | `asan` | route_b | STREAM_MOE_ROUTE_B | ASan（MSVC cl，build.bat asan）|
-| convertd | （无 features）| STREAM_MOE_GGUF_ALIGN（独立）| 转换器 |
 
 - 变体隔离：每 tag 独立 `build/<tag>/llama-build`，features 固化在各自 CMakeCache。
 - vulkan 构建修复无 patch：`build.bat` 经上游 `VULKAN_SHADER_GEN_CMAKE_ARGS` hook 传工具链。

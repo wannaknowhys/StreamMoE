@@ -151,5 +151,5 @@ freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1    // lambda ~ 0.95
 | v2 RAID0 分片 | N 个文件片段直读槽不同偏移（4K 对齐） | N | 免 | 免 |
 
 - **IOCP 无"逻辑任务全完成"聚合**：每个 `aio_req_t` 独立完成、乱序；聚合靠头里 `pending` 计数（每 req 完成递减，`pending==0` → `mark_ready` + dir set + wake）。调度线程单线程收割，`pending--` 非原子。
-- **per-model layout 标记**：loader 解析 `stream_moe.layout`（无 = 原版 / `sections-v1` / `expert-blocks-v2`）→ 决定 staging 有无。**草稿与主体独立判断**（可能一个原版一个 v2，甚至结构大小差一个 staging 段）。
+- **per-model layout 标记**：loader 解析 `stream_moe.layout`（无 = 原版 / `expert-blocks-v2` / `v3`）→ 决定 staging 有无。**草稿与主体独立判断**（可能一个原版一个 v3，甚至结构大小差一个 staging 段）。
 - **ringbuffer 池**：每模型一个，元素大小 = `sizeof(async_load_t)` + (v1/原版 ? 组内 max staging : 0)；元素数 = 事实并发数（大规模 prefill 开大，如 64~128）。ringbuffer 满时调度线程**继续轮询完成**腾槽（不阻塞），"无完成可收割 + 满"才真正背压（IO 满载信号）；饱和报告用宏包裹（`STREAM_MOE_LOAD_SAT`，限频日志 + 屏幕）。

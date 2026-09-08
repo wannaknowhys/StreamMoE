@@ -16,7 +16,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ### M4 收编：自研主项目删除（2026-08-31）
 
 - 删除 `src/main.cpp`、`src/server_main.cpp`、`src/engine/llama_engine.*`、`src/server/http_server.*`、`patches/prefill-export-streammoe.patch`（见 docs/UPSTREAM_TOOLS_MIGRATION.md）。
-- CMakeLists 去 `stream_moe`/`stream_moe_server` 目标（保留 test_*）；build.bat/Makefile 去 `build` 子命令（保留 llamalibs/test/convertd/clean）。
+- CMakeLists 去 `stream_moe`/`stream_moe_server` 目标（保留 test_* + `stream_moe_convert`）；build.bat/Makefile 去 `build` 子命令（保留 llamalibs/test/convert/clean）。
 - 推理/导出全走 vendored `llama-server`/`llama-cli`（route B 插件经 `src/server/route_b_inject.*` 注入）。
 
 ### vendored patch 体系（2026-09-03 重构：frag 全主仓库 + features 宏机制）
@@ -24,12 +24,11 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
 - **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b / prefill_export / route_b,prefill_export）→ vendored 根 `CMakeLists.txt` features 块全局 `add_compile_definitions` + `include_directories`（主仓库 frag 目录）。**宏不拼 CXX_FLAGS**。宏对当次构建全部 target 生效（防静默丢弃）。
 - **frag 全在主仓库**（随主仓库 commit）：`patches/route-b/common/`、`patches/prefill-export/common/`、`patches/prefill-export/include/`——vendored `include/` 已清空。
-- **5 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
+- **4 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
   - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（根 CMakeLists features 块 + 共享文件 include 锚点：arg/common.cpp/h/llama.h/server-context 3 锚点）+ `tsc_timer.patch`（[TMR] `sm_tmr`，`STREAM_MOE_TMR` env 门控）
   - **Phase 2a（可选）**：`route-b-inject.patch`（route-b 专属：common/CMakeLists STREAM_MOE_SRC + speculative + llama-model-loader.cpp/h + llama-model.cpp + llama.cpp）——**无 frag new-file、无 server-context 段**
   - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 专属：llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）——**无 frag new-file**
-  - **`gguf-alignment.patch`**（独立）：ggml gguf.h/cpp（convertd 工具用）
-- **应用顺序**：macros → tsc_timer → route-b-inject → gguf-alignment → prefill-export-llama（临时 worktree 逐字节一致验证过，21 文件）。
+- **应用顺序**：macros → tsc_timer → route-b-inject → prefill-export-llama（临时 worktree 逐字节一致验证过）。
 - **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`StreamMoE`→route_b（无导出代码的旗舰对话 build，见下）；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`StreamMoE` + `upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；`--expert-backend` **隐含 no-op-offload**，见下）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖。
 - **op_offload 与数值形态**：llama 默认 `op_offload=true`（把 host 计算自动 offload 到 device，-ngl 0 也占 Vulkan0 compute buffer ~1.3G）。`--expert-backend` 在 frag 里隐含 `--no-op-offload`（route B 拥有专家放置权，3932d33）——Vulkan0 splits=0 实测。但 **GGML_VULKAN=ON 编译本身改变数值**（CPU buft 换 Vulkan0 host buft 等 host 内存形态，gate 边界 expert-flip 级噪声）——回归按构建形态选基线：CPU-only 编对 `baseline_regression\baseline\moe_129_8192`，默认 vulkan 编对 `moe_129_8192_vk`（run_baseline.bat 首参，见该 README）。
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
@@ -71,11 +70,12 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - `--export-dir` 目录不存在自动 `create_directories`。
 - 调试开关：`STREAM_MOE_DBG=1` env 打印导出诊断（门控）。
 
-### 转换器（2026-08-30 完成）
+### 转换器：纯 C++ + v3（2026-09 落地）
 
-- **统一抽象**：`tools/stream_moe_layout.js`（buildModel 任意源 → Model 描述 + 写 v1/v2/v2chunk）→ convertd 哑物理服务（裸 TCP：open/write_meta/copy/fill/close）。
-- **5 源 × 3 目标矩阵逐字节一致**（`scripts/verify_convert_matrix.bat <workdir>` 全 PASS；N 原版源 → R 盘）。
-- 文档：`docs/STREAMMOE_GGUF_FORMAT.md` §7-9。
+- **单一事实来源**：`src/loader/model.h::model_t` + `parse_model`（读）+ `src/convert/writer.cpp`（写，v2/v3/v3chunk）+ `src/convert/main.cpp`（CLI，`build.bat convert`）。JS/convertd/TCP 全删。
+- **v3** = 按闭包四分类（C1 dense 按层 / C2 dense 与层无关 / C3 每专家 / C4 专家小表）四段 + 4K 对齐（`docs/STREAMMOE_GGUF_FORMAT.md` §3）；**v1 彻底删除**（含 `patches/gguf-alignment.patch`，4K 对齐改内存 seed 上下文）。
+- **验证**：C++ v2 与旧 JS v2 **逐字节一致**（gemma）；v3→v3 / v3chunk→v3 / v3→v2→v3 均逐字节幂等（gemma+olmoe）。矩阵脚本 `scripts/verify_convert_matrix.bat` 已改 C++ 转换器 + v3 不变量。
+- 文档：`docs/STREAMMOE_GGUF_FORMAT.md` §3/§8-10。
 
 ### repack 实证（2026-08-30，原版行为）
 
@@ -104,8 +104,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 | route-b 完整推理 | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe` |  |
 | prefill 导出（上游基准） | `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe` |  |
 | 完整栈导出 | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2） |  |
-| 转换器服务 | `build.bat convertd` → `build\convertd\convertd.exe` |  |
-| 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（N 原版源 → R 盘） |  |
+| 转换器（C++） | `build.bat convert main` → `build\main\bin\stream_moe_convert.exe -m <model> -o <out> --format v3` |  |
+| 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（C++ 转换器；源默认 `SM_GEMMA_ORIG`） |  |
 | gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |  |
 | prefill 导出（--export-dir） | `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |  |
 | prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt | tokens.bin> --export-dir <dir> -c 1024 -t 8` |
@@ -153,7 +153,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 - **prefill10000 产物勿清**（回归基准）：`O:\1\deepseek\*`。
 - 模型盘 N: = USB 转接 NVMe（冷盘慢）；GPU = RX 590 8GB（Vulkan only）；RAM 128GB。
 - OpenMP：`F:\Dev\LLVM\lib\libomp.lib` + `-Xclang -fopenmp`（clang-cl）。
-- 编译器：clang-cl + VS2026 MSVC STL；convertd 编译需 `ws2_32.lib`。
+- 编译器：clang-cl + VS2026 MSVC STL。
 - 中文文档编码：只用 write/edit；PowerShell `Set-Content` 写 BOM/乱码。
 - **patch 纪律**：改 vendored 前备份（`git -C third_party/llama.cpp branch backup`）；生成 patch 用 `cmd /c "git diff -- <文件列表> > patches\x.patch"`（PS `>` 写 UTF-16）。
 - **临时调试**：`STREAM_MOE_DBG=1` env 开导出诊断；临时脚本进 temp/（gitignored）。
