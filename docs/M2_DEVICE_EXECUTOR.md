@@ -798,6 +798,10 @@ Landed in `minigraph_exec.cpp`: `device_target_t` + `chain_ctx.dev`; target-awar
 cgraph; `layer_fold`. Verified: RAM-only default byte-IDENTICAL to HEAD; RAM8G +
 Vulkan0:256M -> VRAM rounds execute on the device (`dev=1`), result cos 0.982 vs
 the same-partition CPU run (same ballpark as the known 0.986 baseline flip noise).
+DeepSeek (3 w-shells + clamp/swiglu, 6 external leaves/layer) verified with
+RAM:71680 + Vulkan0:1024 (80 slots), 95-token prefill-from: device rounds run on
+the GPU, embd cos 0.9999998 / hidden cos 0.99999997 vs both the CPU bucket-engine
+and the upstream reference, 0 leaks.
 
 Two hazards found (details in WORK_IN_PROGRESS O):
 - **vulkan ACC nb2/nb3 must not be 0.** `acc.comp` decomposes the src1 index via

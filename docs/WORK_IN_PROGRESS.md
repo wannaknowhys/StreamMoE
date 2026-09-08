@@ -465,3 +465,8 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   `STREAM_MOE_TMP_NO_OVERLAP`（串行对拍）。
 - 设备多 round 几何本身已验证：512M 全设备 one-round vs k/t 奇偶 split-4-round **IDENTICAL**
   （ACC 跨 round 累加无问题）。
+- **deepseek 设备实测（2026-09-08）**：`RAM:71680 + Vulkan0:1024`（80 槽），`--prefill-from` 95
+  token（`deepseek_hi_up/tokens_id.bin`），设备 round `dev=1` 真在 Vulkan 上跑（3 w-shell +
+  clamp/swiglu + 6 外 leaf/层）。对 CPU 桶引擎基线 `deepseek_hi_moe` 与上游 `deepseek_hi_up` 均
+  **embd cos 0.9999998 / hidden cos 0.99999997**（cos gate 内）；expert_history 6297/73530
+  （8.6%）flip（允许，gate 边界）；退出 0 泄漏、无错误。→ 设备路径对 deepseek 闭包成立。
