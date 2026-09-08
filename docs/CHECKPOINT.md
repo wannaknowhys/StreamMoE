@@ -75,6 +75,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **单一事实来源**：`src/loader/model.h::model_t` + `parse_model`（读）+ `src/convert/writer.cpp`（写，v2/v3/v3chunk）+ `src/convert/main.cpp`（CLI，`build.bat convert`）。JS/convertd/TCP 全删。
 - **v3** = 按闭包四分类（C1 dense 按层 / C2 dense 与层无关 / C3 每专家 / C4 专家小表）四段 + 4K 对齐（`docs/STREAMMOE_GGUF_FORMAT.md` §3）；**v1 彻底删除**（含 `patches/gguf-alignment.patch`，4K 对齐改内存 seed 上下文）。
 - **验证**：C++ v2 与旧 JS v2 **逐字节一致**（gemma）；v3→v3 / v3chunk→v3 / v3→v2→v3 均逐字节幂等（gemma+olmoe）。矩阵脚本 `scripts/verify_convert_matrix.bat` 已改 C++ 转换器 + v3 不变量。
+- **已知问题（B37）**：v3chunk 的**引擎读取**未通——每专家切片跨 N>1 文件时，多段并发 DIO 非确定性损坏专家权重（`--chunks 1` 逐字节正确；plan 正确；详见 `docs/BUG_TRACKER.md` B37）。v3chunk 的**转换/合并**本身正确（v3chunk→v3 逐字节一致）。
 - 文档：`docs/STREAMMOE_GGUF_FORMAT.md` §3/§8-10。
 
 ### repack 实证（2026-08-30，原版行为）

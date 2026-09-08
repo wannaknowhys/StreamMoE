@@ -49,10 +49,11 @@ Written by `src/convert/writer.cpp`, read by `parse_model` (`src/loader/model_bu
 
 ## 3. Current gaps (loader vs converter)
 
-1. **v2/v3 chunk read.** `parse_model` maps chunk strips to multi-segment `src`
-   lists (v3 unit = [global] + [C1 layer] + [C4 layer] + [block]); the
-   scheduler/DIO path must consume the multi-segment plan (`moe_loader.cpp`
-   historically hardcoded `shard_idx = 0`).
+1. **v2/v3 chunk read (B37).** `parse_model` now auto-discovers chunk siblings
+   and maps strips to multi-segment `src` lists; the converter round-trips them
+   byte-identically. The **engine** multi-segment concurrent DIO still corrupts
+   expert weights non-deterministically for N>1 chunks (1-chunk is byte-exact;
+   plan is correct; staging/batch does not help). See `BUG_TRACKER.md` B37.
 
 2. **Heterogeneous experts.** Per-expert size groups exist (`topo.groups`,
    `MULTI_SUBPOOL.md`); read plans are built per-group.

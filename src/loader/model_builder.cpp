@@ -5,6 +5,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -110,6 +111,30 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
         }
     }
     return shards;
+}
+
+// Discover chunk siblings from a main strip file (writer names them
+// <prefix><i>.<ext>, e.g. c1.gguf .. cN.gguf; chunk_total in the header).
+std::vector<std::string> discover_chunk_files(const std::string& main_path, uint32_t total) {
+    const std::filesystem::path p(main_path);
+    const std::string stem = p.stem().string();
+    const std::string ext  = p.extension().string();
+    const std::string dir  = p.parent_path().string();
+    size_t e = stem.size();
+    while (e > 0 && std::isdigit(static_cast<unsigned char>(stem[e - 1]))) --e;
+    if (e == stem.size()) {
+        throw std::runtime_error("chunk source needs a trailing index in the filename (e.g. c1.gguf): " + main_path);
+    }
+    const std::string prefix = stem.substr(0, e);
+    std::vector<std::string> out;
+    out.reserve(total);
+    for (uint32_t i = 1; i <= total; ++i) {
+        const std::string name = prefix + std::to_string(i) + ext;
+        const std::string full = dir.empty() ? name : (std::filesystem::path(dir) / name).string();
+        if (!std::filesystem::exists(full)) throw std::runtime_error("missing chunk file: " + full);
+        out.push_back(full);
+    }
+    return out;
 }
 
 // --- v2 / v3 block helpers (mirror the converter writer) ---
@@ -246,10 +271,14 @@ model_t parse_model(const std::vector<std::string>& paths) {
                                          kv_int(ctx0, "expert_count", 0)));
     model.n_expert_used = static_cast<uint32_t>(kv_int(ctx0, (model.arch + ".expert_used_count").c_str(), 0));
 
-    // Source file list. Original multi-shard is discovered from paths[0];
-    // chunk passes all strip files explicitly.
+    // Source file list. Original multi-shard is discovered from paths[0]; a
+    // single chunk main file discovers its siblings (c1..cN) from chunk_total;
+    // an explicit multi-path list (converter merge) is used as given.
     if (model.layout == model_layout_t::ORIGINAL) {
         model.files = discover_shards(paths[0], ctx0);
+    } else if (incomplete && paths.size() == 1) {
+        const uint32_t chunk_total = static_cast<uint32_t>(kv_int(ctx0, "stream_moe.chunk_total", 1));
+        model.files = chunk_total > 1 ? discover_chunk_files(paths[0], chunk_total) : paths;
     } else {
         model.files = paths;
     }

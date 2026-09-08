@@ -38,7 +38,7 @@
 
 ## 3. 当前差距（加载器 vs 转换器）
 
-1. **v2/v3 chunk 读取。** `parse_model` 将分片条带映射为多段 `src`（v3 unit = [global] + [C1 层] + [C4 层] + [block]）；调度/DIO 路径需消费多段计划（`moe_loader.cpp` 历史上硬编码 `shard_idx = 0`）。
+1. **v2/v3 chunk 读取（B37）。** `parse_model` 现已自动发现分片兄弟文件并把条带映射为多段 `src`；转换器往返逐字节一致。**引擎**的多段并发 DIO 在 N>1 分片时仍会非确定性损坏专家权重（1-chunk 逐字节正确；plan 正确；staging/批量提交无效）。见 `BUG_TRACKER.md` B37。
 
 2. **异构专家。** 存在按专家大小分组（`topo.groups`，参见 `MULTI_SUBPOOL.md`）；读取计划按组构建。
 

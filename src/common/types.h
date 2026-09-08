@@ -15,7 +15,10 @@ namespace stream_moe {
 
 constexpr size_t DIO_SECTOR_SIZE = 4096;
 constexpr size_t DIO_ALIGN_MASK  = DIO_SECTOR_SIZE - 1;
-constexpr size_t MAX_SUB_TENSORS_PER_EXPERT = 8;
+// Max source segments per expert read plan = branches * chunk files. v3chunk
+// splits every (branch, expert) slice across N strip files, so this must cover
+// N*branches (e.g. 5 files x 4 branches = 20). Keep headroom for larger N.
+constexpr size_t MAX_SUB_TENSORS_PER_EXPERT = 64;
 
 // Round down value to alignment multiple
 template <typename T>
