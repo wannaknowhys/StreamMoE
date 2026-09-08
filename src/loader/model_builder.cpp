@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <regex>
 #include <stdexcept>
 
@@ -113,11 +114,14 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
     return shards;
 }
 
-// Discover chunk siblings from the main strip file: parse its trailing number
-// `k` and find `k, k+1, ...` (the writer names them <prefix><n>.<ext>), matching
-// `chunk_total` from the header. Only used when no explicit file list
-// (--moe-expert-files / ';'-joined paths) was given.
-std::vector<std::string> discover_chunk_files(const std::string& main_path, uint32_t total) {
+// Discover the chunk set from any one strip file. Each chunk file carries
+// stream_moe.chunk_no (0-based, its own position) + chunk_total, so the given
+// file's metadata anchors the set; the filename supplies the prefix/ext and
+// numbering. A directory scan matches by PARSED number, so zero-padded and
+// unpadded names both work (on a number collision, prefer the given file's
+// digit width). Only used when no explicit file list was given.
+std::vector<std::string> discover_chunk_files(const std::string& main_path,
+                                              uint32_t chunk_no, uint32_t chunk_total) {
     const std::filesystem::path p(main_path);
     const std::string stem = p.stem().string();
     const std::string ext  = p.extension().string();
@@ -128,14 +132,35 @@ std::vector<std::string> discover_chunk_files(const std::string& main_path, uint
         throw std::runtime_error("chunk source needs a trailing index in the filename (e.g. c1.gguf): " + main_path);
     }
     const std::string prefix = stem.substr(0, e);
-    const long start = std::stol(stem.substr(e));
+    const std::string given_digits = stem.substr(e);
+    const long given_num = std::stol(given_digits);
+    const size_t given_width = given_digits.size();
+
+    std::map<long, std::string> by_num;
+    const std::string scan_dir = dir.empty() ? std::string(".") : dir;
+    for (const auto& entry : std::filesystem::directory_iterator(scan_dir)) {
+        const std::string fn = entry.path().filename().string();
+        if (fn.size() <= prefix.size() + ext.size()) continue;
+        if (fn.compare(0, prefix.size(), prefix) != 0) continue;
+        if (fn.compare(fn.size() - ext.size(), ext.size(), ext) != 0) continue;
+        const std::string mid = fn.substr(prefix.size(), fn.size() - prefix.size() - ext.size());
+        if (mid.empty() || mid.find_first_not_of("0123456789") != std::string::npos) continue;
+        const long num = std::stol(mid);
+        auto it = by_num.find(num);
+        if (it == by_num.end() || mid.size() == given_width) by_num[num] = entry.path().string();
+    }
+
+    const long start = given_num - static_cast<long>(chunk_no);
     std::vector<std::string> out;
-    out.reserve(total);
-    for (uint32_t i = 0; i < total; ++i) {
-        const std::string name = prefix + std::to_string(start + static_cast<long>(i)) + ext;
-        const std::string full = dir.empty() ? name : (std::filesystem::path(dir) / name).string();
-        if (!std::filesystem::exists(full)) throw std::runtime_error("missing chunk file: " + full);
-        out.push_back(full);
+    out.reserve(chunk_total);
+    for (uint32_t i = 0; i < chunk_total; ++i) {
+        const long target = start + static_cast<long>(i);
+        auto it = by_num.find(target);
+        if (it == by_num.end()) {
+            throw std::runtime_error("missing chunk file #" + std::to_string(target) +
+                                     " (prefix '" + prefix + "', ext '" + ext + "') in " + scan_dir);
+        }
+        out.push_back(it->second);
     }
     return out;
 }
@@ -281,7 +306,8 @@ model_t parse_model(const std::vector<std::string>& paths) {
         model.files = discover_shards(paths[0], ctx0);
     } else if (incomplete && paths.size() == 1) {
         const uint32_t chunk_total = static_cast<uint32_t>(kv_int(ctx0, "stream_moe.chunk_total", 1));
-        model.files = chunk_total > 1 ? discover_chunk_files(paths[0], chunk_total) : paths;
+        const uint32_t chunk_no    = static_cast<uint32_t>(kv_int(ctx0, "stream_moe.chunk_no", 0));
+        model.files = chunk_total > 1 ? discover_chunk_files(paths[0], chunk_no, chunk_total) : paths;
     } else {
         model.files = paths;
     }
