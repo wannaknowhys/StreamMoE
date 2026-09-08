@@ -394,7 +394,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   - [x] scatter_plan acc 写回（每 seg 一次 `ggml_acc_inplace`）
   - [x] 宏包裹测试强制分桶 + 删 tmp_split_blocks
   - [x] 回归：默认单 round vs **当前 HEAD 干净构建**（StreamMoE_dump，同 v2align 输入）**IDENTICAL**（embd/hidden/KV + expert_history 全同）；`STREAM_MOE_TMP_BUCKET_ROUNDS=1` 强制 k 奇偶 × t 奇偶 = 4 round（w_b=4，n_active=65/64，非连续 k）L0 moe_out vs 默认 **maxAbs=3.8e-6 ≤ 1e-5 / cos=1.0**（宽松 gate，31.6% 元素差 1 ulp）。
-- **注意（回归基线陈旧，非本次改动）**：`baseline_regression/baseline/moe_129_8192_vk` 与当前 HEAD（及 2026-09-06 的旧 binary）均已 DIVERGED（embd token#0 cos≈0.986）——该冻结基线早于 K5/删 A，`run_baseline.bat` 当前对它报 DIVERGED。本次改动经"HEAD 干净构建"对拍确认数值零影响（IDENTICAL）。基线是否重建/何时重建待用户定。
+- **回归对拍口径（2026-09-08）**：冻结基线 `moe_129_8192_vk` 与当前 HEAD 的 embd/hidden 有**部分 token 不一致**（如 token#0 cos≈0.986）——**已知现象**（K5/删 A 之后引擎与旧冻结基线本就存在 token 级差异，非本次改动引入；用户决定不重建）。因此本次回归改为**对拍当前 HEAD 干净构建**（同输入同 flavor）：默认单 round IDENTICAL，强制分桶 L0 宽松 gate。`run_baseline.bat` 对旧基线的 DIVERGED 属已知，不作本次判据。
 - vendored 改动：`common/CMakeLists.txt` STREAM_MOE_SRC 加 `backend/scatter_plan.cpp`（route-b-inject.patch 已重生成 + 反向 check 通过）。
 
 ### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）

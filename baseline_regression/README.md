@@ -65,6 +65,16 @@ expert-flip 噪声（gate 边界专家序号翻转，~8% 条目，累加结果�
 - 构建：`deepseek_hi_up` 只可由 upstream_dump 填；`deepseek_hi_moe` 由当前引擎
   （StreamMoE_dump_dbg 或唯一收敛引擎）填。两者必须用同 tokens_id.bin（来自 up_hi_prefill）。
 
+## 已知现象：冻结 moe 基线与当前引擎的部分 token 差异（2026-09-08）
+
+`baseline/moe_129_8192_vk`（及 CPU 版 `moe_129_8192`）与当前 HEAD 引擎的 embd/hidden 存在
+**部分 token 不一致**（如 token#0 cos≈0.986）——这是 K5（SoA 池）/删 A 之后引擎与旧冻结基线
+之间的既有 token 级差异，**非单次改动引入**；用户已知，不重建该基线。
+
+因此验证"某次改动是否影响数值"时，口径应为**对拍当前 HEAD 的干净构建**（同输入、同 flavor），
+而不是直接对旧冻结基线；`run_baseline.bat` 对旧基线报 DIVERGED 属已知，不作该改动的回归判据。
+（upstream 固定参照 `upstream_129` 与 DeepSeek 的 cos gate 判据不受影响。）
+
 ## 重建基线（known-good 更新时）
 
 ```bat
