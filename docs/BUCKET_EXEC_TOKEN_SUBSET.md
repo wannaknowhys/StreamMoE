@@ -12,6 +12,11 @@
 > (docs/SCATTER_PLAN.md) as the accumulator writeback. Companion:
 > docs/M2_DEVICE_EXECUTOR.md SS7.5/SS7.6/SS7.7 (per-device accumulator, compact
 > per-bucket chains, ggml_acc as the fold writeback).
+>
+> **2026-09-08 revision (user):** cur gather = 2D reshape + get_rows (SS2.1);
+> arbitrary (t,k) weights = general flat index-gather node (SS2.1a); the test
+> split is a macro-gated throwaway helper inside minigraph_exec.cpp, not a module
+> (SS3); `tmp_split_blocks` is deleted (SS4).
 
 ## 1. Current engine shape (what we change)
 
@@ -55,12 +60,31 @@ one-cgraph CPU engine the same node is appended at the head of each bucket
 chain (before the first routed mm of that bucket). Every downstream chain tensor
 then inherits the tight order for free (SCATTER_PLAN SS2).
 
-ggml-native gather: `ggml_get_rows(cur, col_ids)` where `col_ids` is an i32 leaf
-of the tight-order token ids (`[1, n_active]`). This is the chosen CPU-phase
-implementation (user decision 2026-09-07) - the gather is an in-graph node, not
-a host memcpy. Requires the CPU kernel to gather over cur's token axis (ne2 of
-`[d,1,n_t]`), not only the leading dim - verified before use. The cur copy node
-writes `[d,1,n_active]` into the arena (its own out_off region or fold_buf).
+ggml-native gather (decided 2026-09-08): `ggml_get_rows` gathers the ROW axis
+(ne1), never ne2, so `[d,1,n_t]` cannot be gathered directly. Instead reshape the
+(contiguous, ne1 == 1) cur to 2D `[d, n_t]` and `get_rows` with an i32 leaf of the
+tight token ids `[n_active]` -> `[d, n_active]`, then reshape back to
+`[d,1,n_active]`. Free reshape, standard kernel, in-graph node (not a host
+memcpy). The copy node writes `[d,1,n_active]` into the arena (its own out_off
+region or fold_buf).
+
+### 2.1a General index-gather node (arbitrary (t,k))
+
+A `mix_plan` round selects, per token, an ARBITRARY subset of its k slots
+(`ks_of[t][vprev..vj)`, mix_split.cpp) - not a contiguous k range. So the per-slot
+routing weight `weights_norm[0,k,t]` (`[1, n_k, n_t]`) cannot be expressed as an
+affine leaf slice (`bucket_ext_leaf`'s current `data += k_lo*nb1`). One general
+**flat index-gather** node covers it (user decision 2026-09-08):
+
+- reshape the contiguous `[1, n_k, n_t]` to 2D `[1, n_k*n_t]` (free);
+- build an i32 leaf `idx[width*n_active]` of FLAT element offsets in tight order:
+  `idx[i*width + s] = k + t*n_k` for `(t,k) = scatter[order[i]*width + s]`;
+- `ggml_get_rows(flat, idx)` -> `[1, width*n_active]`, reshape `[1, width, n_active]`.
+
+The cur gather (SS2.1) is the same helper with row_size = d instead of 1. This is
+the node that replaces the contiguous-k `bucket_ext_leaf` slice for weights_norm;
+the forced test split (SS3) deliberately selects non-contiguous k so it is
+exercised on CPU before real multi-pool exists.
 
 ### 2.2 Chain geometry on the round
 
@@ -90,67 +114,68 @@ copy, `segs` feeds the acc loop.
 incremental per-bucket in-place adds, zeroed per layer before the round loop
 (existing). Exit = `chain_exit` (acc_d -> add_in -> moe_out) unchanged.
 
-## 3. Bucket split function (one bucket -> two, for validation)
+## 3. Test-only forced-split function (validation harness)
 
 A single-pool `build_mix_plan` produces exactly ONE round (all tokens, full k),
-which would not exercise the token-subset path. A deterministic **split
-function** turns that one round into two SCATTERED token-subset buckets so the
-subset path (cur copy + scatter_plan reorder) is validated on the CPU engine
-before real multi-pool exists.
+which would not exercise the token-subset / arbitrary-(t,k) path. A test-only
+**forced-split function** turns that one round into several SCATTERED token-subset
+rounds so the subset path (cur gather + index-gather weights + scatter_plan
+reorder) is validated on the CPU engine before real multi-pool exists.
 
-`src/backend/bucket_split.h/.cpp` (pure, no llama dep, offline unit-testable):
+Placement and gating (decided 2026-09-08): a `static` helper in
+`minigraph_exec.cpp`; BOTH its definition and its call site are wrapped in
+`#ifdef STREAM_MOE_TEMP` (the only tag defining that macro is
+`StreamMoE_dump_dbg`, build.bat). It is throwaway validation code - delete it once
+the subset path is verified. No separate `bucket_split.h/.cpp`, no offline UT.
 
-```cpp
-// Split one full round into two SCATTERED token-subset rounds.
-// Round 0 = tokens {0, 2, 4, ...} (even), round 1 = {1, 3, 5, ...} (odd);
-// each keeps full k (width = n_k). The interleaved token ids give scatter_plan
-// arithmetic runs with delta > 1 and a real reorder - the subset path's order
-// machinery is what we validate.
-std::vector<mix_round_t> split_round_tokens_parity(const int32_t* ids, uint32_t n_k,
-                                                   uint32_t n_t,
-                                                   const int32_t* expert_pool,
-                                                   uint32_t n_expert, uint32_t pool);
-```
+Split shape: split BOTH axes so arbitrary (t,k) is exercised:
+- k axis by parity -> rounds with non-contiguous k (a valid rectangle when n_k is
+  even: each token contributes n_k/2);
+- token axis by parity -> token subset + scatter delta > 1;
+- combined -> 4 rounds, each `width = n_k/2, n_active = n_t/2`, `(t,k)` arbitrary.
 
-The executor accepts either the real `build_mix_plan` rounds or the split
-function's output as its round list; both are `mix_round_t`. Validation: the two
-parity buckets accumulated into acc_d must equal the single full round (relaxed
-ULP gate; both sides already differ from llama's k-order fold).
+`r.scatter` records the original (t,k); `r.pool` = the source round's pool.
 
 ## 4. Executor change sketch (exec_layer_burst_chain_buckets)
 
-- build the round list from `build_mix_plan` by default (single pool = one
-  full round, degenerate; multi-pool = true per-pool rounds). Validation split
-  (env `STREAM_MOE_TMP_BUCKET_ROUNDS=parity`) replaces that list with the split
-  function's two scattered buckets.
+- default round list = `build_mix_plan(ids, n_k, n_t, expert_pool, n_expert,
+  n_pools).rounds`, with `expert_pool[e] = handle.pool` filled from the pinned
+  handles (`pin_layer` already returns per-expert pool). Single RAM pool = one
+  full round (degenerate, byte-identical to today's default single bucket).
+- the macro-gated forced split replaces that list with the split rounds.
+- delete `tmp_split_blocks` / `tmp_blk_t` (the old test cut family, currently
+  compiled unconditionally) - two bucket sources must not coexist.
 - loop rounds; per round set `b.w_b = r.width`, `b.n_active = r.n_active`,
   `b.ids_exp/ids_slot` from `r.ids` + pin, `b.t` from `r.scatter`.
-- prepend the cur copy node (`ggml_get_rows`, tight-gather) to the chain.
+- prepend the cur copy node (2D reshape + get_rows, SS2.1).
+- per-slot routing weights via the general index-gather node (SS2.1a).
 - `append_expert_fold` -> tight `[d_out, n_active]`.
-- acc via `build_scatter_plan` order/segs (multiple `ggml_acc_inplace`, one per
-  seg, chained in place on `acc_d`).
+- acc via `build_scatter_plan` order/segs (one `ggml_acc_inplace` per seg on
+  `acc_d`, chained in place).
 - keep arena out_off pinning; compact `[d, w_b, n_active]` fits the full-width
   out_off region because `w_b <= n_k && n_active <= n_t`.
 
 ## 5. Open questions / risks
 
-1. ggml_get_rows over cur's token axis (ne2 of `[d,1,n_t]`) must be verified
-   before use; if the CPU kernel only gathers the leading dim, the cur copy
-   falls back to a reshape to `[d*n_t]`-style 2D + leading-dim get_rows + reshape
-   (still an in-graph node, not host staging).
-2. The existing single-pool full-round numeric baselines (gemma_129_l0,
-   deepseek_hi) must stay byte-identical with the degenerate single-round path
-   (default = build_mix_plan single pool = one round, no split env).
-3. `scatter_plan` currently rejects duplicate token ids in a round - rectangle
-   peel never produces them; the split function must keep each token in exactly
-   one bucket.
+1. RESOLVED (2026-09-08): `ggml_get_rows` gathers ne1 only; cur is gathered via a
+   free 2D reshape to `[d, n_t]` + get_rows + reshape back (SS2.1). No kernel
+   change, no host staging.
+2. Arbitrary (t,k) weights use the flat index-gather node (SS2.1a), not an affine
+   slice; the forced test split exercises it.
+3. The single-pool full-round numeric baselines (gemma_129_l0, deepseek_hi) must
+   stay byte-identical under the degenerate single-round default (build_mix_plan
+   single pool = one round, no split macro).
+4. `scatter_plan` rejects duplicate token ids in a round - rectangle peel never
+   produces them; the forced-split function must keep each token in exactly one
+   bucket.
 
 ## 6. TODO
 
-1. `bucket_split.h/.cpp` split function (parity -> 2 scattered rounds) + test.
-2. Verify ggml_get_rows gathers cur's token axis on CPU (or the 2D-reshape
-   fallback works).
-3. Executor round loop: accept mix_round_t list; cur copy node prepend;
-   per-round tight ids; fold -> tight per_token; acc via scatter_plan.
-4. Validate: default single round unchanged vs baselines; `parity` split ->
-   relaxed gate vs single round.
+1. General index-gather helper (SS2.1a): flat reshape + get_rows for arbitrary
+   (t,k) weights; the cur gather (SS2.1) is the row_size = d instance.
+2. Executor round loop over `mix_round_t`: expert_pool from pins, default
+   build_mix_plan rounds, per-round tight ids, fold -> tight per_token, acc via
+   scatter_plan; delete tmp_split_blocks.
+3. Macro-wrapped test-only forced split (k-parity x t-parity = 4 rounds) + call.
+4. Verify: default single round unchanged vs baselines; forced split -> relaxed
+   gate (maxAbs <= 1e-5 / cos ~= 1.0).

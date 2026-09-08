@@ -9,6 +9,10 @@
 > 子集，每 token 持有其 n_k slot 中的 w_b 个），并把 `scatter_plan` 模块
 > （docs/SCATTER_PLAN.md）接为累加器写回。配套：docs/M2_DEVICE_EXECUTOR.md
 > §7.5/§7.6/§7.7（per-device 累加器、每桶紧凑链、ggml_acc 做 fold 写回）。
+>
+> **2026-09-08 修订（用户）**：cur gather = 2D reshape + get_rows（§2.1）；任意 (t,k)
+> 权重 = 通用 flat index-gather 节点（§2.1a）；测试分桶 = minigraph_exec.cpp 内宏包裹的
+> 一次性助手，不是模块（§3）；删 `tmp_split_blocks`（§4）。
 
 ## 1. 当前引擎形态（要改什么）
 
@@ -47,11 +51,28 @@ M2 §7.5：每 device 拥有一份 cur 拷贝；每桶 mini-graph 在**最前面
 `t[order[i]]`）。CPU 单图引擎里同一节点 append 到每桶链头（该桶首个路由 mm 之前）。
 下游所有链张量免费继承 tight 序（SCATTER_PLAN §2）。
 
-ggml 原生 gather：`ggml_get_rows(cur, col_ids)`，col_ids 是 tight 序 token id 的 i32
-leaf（`[1, n_active]`）。这是已定的 CPU 阶段实现（用户决策 2026-09-07）——gather 是图内
-节点，非 host memcpy。要求 CPU 内核能对 cur 的 token 轴（`[d,1,n_t]` 的 ne2）gather，
-不只前导维——使用前先验证。cur 拷贝节点写 `[d,1,n_active]` 进 arena（自己的 out_off 区
-或 fold_buf）。
+ggml 原生 gather（2026-09-08 定）：`ggml_get_rows` 只 gather 行轴（ne1）、永不
+gather ne2，所以 `[d,1,n_t]` 不能直接 gather。改法：把（连续、ne1 == 1 的）cur reshape
+成二维 `[d, n_t]`，用 tight token id 的 i32 leaf `[n_active]` 做 get_rows →
+`[d, n_active]`，再 reshape 回 `[d,1,n_active]`。reshape 免费、标准内核、图内节点
+（非 host memcpy）。拷贝节点写 `[d,1,n_active]` 进 arena（自己的 out_off 区或 fold_buf）。
+
+### 2.1a 通用 index-gather 节点（任意 (t,k)）
+
+一个 `mix_plan` round 给每个 token 选的是它 k 个 slot 的**任意子集**
+（`ks_of[t][vprev..vj)`，mix_split.cpp）——不是连续 k 区间。所以 per-slot 路由权重
+`weights_norm[0,k,t]`（`[1, n_k, n_t]`）无法用 affine leaf 切片
+（`bucket_ext_leaf` 现在的 `data += k_lo*nb1`）表达。一个通用 **flat index-gather**
+节点解决（用户决策 2026-09-08）：
+
+- 把连续的 `[1, n_k, n_t]` reshape 成二维 `[1, n_k*n_t]`（免费）；
+- 构造 i32 leaf `idx[width*n_active]`，内容为 tight 序的**扁平元素偏移**：
+  `idx[i*width + s] = k + t*n_k`，其中 `(t,k) = scatter[order[i]*width + s]`；
+- `ggml_get_rows(flat, idx)` → `[1, width*n_active]`，reshape `[1, width, n_active]`。
+
+cur gather（§2.1）是同一助手的 row_size = d 特例。这个节点取代 weights_norm 的连续-k
+`bucket_ext_leaf` 切片；强制测试分桶（§3）刻意选非连续 k，让它在真 multi-pool 之前
+就在 CPU 上被打到。
 
 ### 2.2 round 上的链几何
 
@@ -79,37 +100,38 @@ plan 在 host 算（纯函数、便宜）；`order` 喂 cur 拷贝，`segs` 喂 
 `c.acc_d`（chain_ctx，`[d_out,n_t]`）即 device 累加器（M2 §7.6.1）：每桶就地增量加，
 层首（round 循环前）清零（已有）。出口 = `chain_exit`（acc_d → add_in → moe_out）不变。
 
-## 3. 分桶函数（一桶变两桶，用于验证）
+## 3. 测试专用强制分桶函数（验证脚手架）
 
-单 pool 的 `build_mix_plan` 只产一个 round（全 token 全 k），测不到 token 子集路径。
-需要一个确定性**分桶函数**把那个 round 切成两个**散落** token 子集桶，让子集路径
-（cur 拷贝 + scatter_plan 重排）在真 multi-pool 之前就能在 CPU 引擎上被验证。
+单 pool 的 `build_mix_plan` 只产一个 round（全 token 全 k），测不到 token 子集 / 任意
+(t,k) 路径。一个测试专用**强制分桶函数**把那个 round 切成若干**散落** token 子集桶，
+让子集路径（cur gather + index-gather 权重 + scatter_plan 重排）在真 multi-pool 之前
+就能在 CPU 引擎上被验证。
 
-`src/backend/bucket_split.h/.cpp`（纯、无 llama 依赖、可离线单测）：
+放置与门控（2026-09-08 定）：`minigraph_exec.cpp` 里的 `static` 助手；**函数定义和调用点
+都用 `#ifdef STREAM_MOE_TEMP` 包裹**（唯一定义该宏的 tag 是 `StreamMoE_dump_dbg`，
+build.bat）。它是一次性验证码——子集路径验证完即删。不新建 `bucket_split.h/.cpp`，不写
+离线 UT。
 
-```cpp
-// 把一个满 round 切成两个散落 token 子集 round。
-// round0 = tokens {0, 2, 4, ...}（偶），round1 = {1, 3, 5, ...}（奇）；
-// 各保持满 k（width = n_k）。交错 token id 让 scatter_plan 产生 delta>1 的等差段
-// 与真重排——我们要验证的正是子集路径的 order 机制。
-std::vector<mix_round_t> split_round_tokens_parity(const int32_t* ids, uint32_t n_k,
-                                                   uint32_t n_t,
-                                                   const int32_t* expert_pool,
-                                                   uint32_t n_expert, uint32_t pool);
-```
+分桶形状：两轴都切，才能打到任意 (t,k)：
+- k 轴按奇偶 → 非连续 k 的 round（n_k 为偶数时是合法矩形：每 token 贡献 n_k/2）；
+- token 轴按奇偶 → token 子集 + scatter delta > 1；
+- 叠加 → 4 个 round，每个 `width = n_k/2, n_active = n_t/2`，`(t,k)` 任意。
 
-执行器接受 `build_mix_plan` 真 rounds 或分桶函数输出作为 round 列表，两者都是
-`mix_round_t`。验证：两个奇偶桶累进 acc_d 必须等于单满 round（宽松 ULP gate——两边
-本就与 llama 的 k 序 fold 不同）。
+`r.scatter` 记原始 (t,k)；`r.pool` = 源 round 的 pool。
 
 ## 4. 执行器改动草图（exec_layer_burst_chain_buckets）
 
-- 默认从 `build_mix_plan` 建 round 列表（单 pool = 单满 round 退化；multi-pool = 真
-  per-pool rounds）。验证分桶（env `STREAM_MOE_TMP_BUCKET_ROUNDS=parity`）用分桶函数的
-  两个散落桶替换该列表。
+- 默认 round 列表 = `build_mix_plan(ids, n_k, n_t, expert_pool, n_expert,
+  n_pools).rounds`，`expert_pool[e] = handle.pool` 由已 pin 的 handle 填
+  （`pin_layer` 本就返回 per-expert pool）。单 RAM 池 = 一个满 round（退化，与今天默认
+  单桶逐字节一致）。
+- 宏门控的强制分桶替换该列表。
+- 删 `tmp_split_blocks` / `tmp_blk_t`（旧测试 cut 族，现在还是无条件编译）——两套分桶源
+  不能并存。
 - 循环 rounds；每 round 设 `b.w_b = r.width`、`b.n_active = r.n_active`、
   `b.ids_exp/ids_slot` 来自 `r.ids` + pin、`b.t` 来自 `r.scatter`。
-- 链头 prepend cur 拷贝节点（`ggml_get_rows`，tight-gather）。
+- 链头 prepend cur 拷贝节点（2D reshape + get_rows，§2.1）。
+- per-slot 路由权重走通用 index-gather 节点（§2.1a）。
 - `append_expert_fold` → tight `[d_out, n_active]`。
 - acc 走 `build_scatter_plan` order/segs（每个 seg 一次 `ggml_acc_inplace`，在 `acc_d`
   上就地链式）。
@@ -118,18 +140,20 @@ std::vector<mix_round_t> split_round_tokens_parity(const int32_t* ids, uint32_t 
 
 ## 5. 未决问题 / 风险
 
-1. `ggml_get_rows` 对 cur token 轴（`[d,1,n_t]` 的 ne2）gather 需先验证；若 CPU 内核只
-   支持前导维 gather，cur 拷贝退化为 reshape 成 `[d*n_t]` 式 2D + 前导维 get_rows +
-   reshape 回来（仍是图内节点，非 host staging）。
-2. 现有单 pool 满 round 数值基线（gemma_129_l0、deepseek_hi）必须在退化单 round 路径
-   （默认 = build_mix_plan 单 pool = 1 round、无分桶 env）下保持逐字节一致。
-3. `scatter_plan` 目前拒绝 round 内重复 token id——矩形 peel 不会产生；分桶函数须保证
+1. 已解决（2026-09-08）：`ggml_get_rows` 只 gather ne1；cur 用免费的 2D reshape 成
+   `[d, n_t]` + get_rows + reshape 回来（§2.1）。不改内核、不做 host staging。
+2. 任意 (t,k) 权重走通用 flat index-gather 节点（§2.1a），不是 affine 切片；强制测试
+   分桶会打到它。
+3. 单 pool 满 round 数值基线（gemma_129_l0、deepseek_hi）必须在退化单 round 默认路径
+   （build_mix_plan 单 pool = 1 round、无分桶宏）下保持逐字节一致。
+4. `scatter_plan` 拒绝 round 内重复 token id——矩形 peel 不会产生；强制分桶函数须保证
    每 token 只在一个桶。
 
 ## 6. TODO
 
-1. `bucket_split.h/.cpp` 分桶函数（parity → 2 散落 round）+ 测试。
-2. 验证 ggml_get_rows 能在 CPU 上 gather cur 的 token 轴（或 2D-reshape 兜底可行）。
-3. 执行器 round 循环：接受 mix_round_t 列表；cur 拷贝节点 prepend；每 round tight ids；
-   fold → tight per_token；acc 走 scatter_plan。
-4. 验证：默认单 round 对基线不变；`parity` 分桶 → 对单 round 宽松 gate。
+1. 通用 index-gather 助手（§2.1a）：任意 (t,k) 权重用 flat reshape + get_rows；cur
+   gather（§2.1）是 row_size = d 的特例。
+2. 执行器 round 循环：expert_pool 从 pins 取、默认 build_mix_plan rounds、每 round
+   tight ids、fold → tight per_token、acc 走 scatter_plan；删 tmp_split_blocks。
+3. 宏包裹的测试专用强制分桶（k 奇偶 × t 奇偶 = 4 round）+ 调用。
+4. 验证：默认单 round 对基线不变；强制分桶 → 宽松 gate（maxAbs <= 1e-5 / cos ~= 1.0）。

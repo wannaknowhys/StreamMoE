@@ -64,7 +64,7 @@ per-token 数据按 `order` 拷进 tight staging）。一个通用 tight-gather 
 | :--- | :--- | :--- | :--- |
 | `cur`（dense norm 输出） | gate/up mm src1 | 每 token 一共享列 `[d,1,n_t]` | token tight-gather → `[d,1,n_active]`（与 slot 无关） |
 | 路由 `ids` | mm src2、GET_ROWS src1 | per-(token,slot) `[n_k,n_t]` | slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块按 tight 重排 |
-| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | slot 切片 `[k_lo..k_hi)` **且** token tight-gather |
+| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | 任意 (t,k) index-gather → `[1,w_b,n_active]`（flat get_rows；BUCKET_EXEC_TOKEN_SUBSET §2.1a） |
 | 专家权重、per-expert scale（REPEAT 表） | mm src0 / GET_ROWS src0 | per-expert | 与 token 无关——不动 |
 | 链内张量（GLU/down/weighted） | - | `[d,w_b,n_t]` | 继承首次 tight-gather 定下的顺序 |
 
@@ -142,16 +142,19 @@ O(delta_range * n_active) 扫描、n_active 最多几百，没问题。模块按
 
 ## 5. 执行器消费点（设计草稿，未实现）
 
-一个**通用 tight-gather 助手**服务三个外部 per-token 输入（CPU 原型：纯 host memcpy
-循环；GPU 阶段：ggml 节点）。它把主图 per-token 数据按 `order` 拷进 tight staging：
-`staging[d, .., i] <- main[d, .., t[order[i]]]`，各输入提供自己的 per-token 步长：
+三个外部 per-token 输入一律用 **ggml 原生节点** gather（principle 11——GPU 等价，不做
+host staging）。一个通用 **index-gather** 助手服务三者：把连续源 reshape 成二维、用 tight
+序的 i32 index leaf 做 `ggml_get_rows`（沿行轴）。
 
-- **cur**：`cur_tight[d, 1, n_active]`，gather 主图共享 cur 的第 `t[order[i]]` 列。首个路由
-  mm 读 staging。（全 token 桶、无重排：order 恒等，原地引用。）
-- **ids**：把已暂存的 `ids_exp`/`ids_slot` token 块按 `order` 重排（块 = 该 token 的 slot
-  切片）。
-- **weights_norm**：切 slot `[k_lo..k_hi)` 并把 token 轴按 `order` gather →
-  `[1, w_b, n_active]`。
+- **cur**：把 `[d,1,n_t]`（ne1 == 1，免费）reshape 成 `[d, n_t]`；用 tight token id
+  `[n_active]` 做 get_rows → `[d, n_active]`；reshape `[d,1,n_active]`。首个路由 mm 读
+  staging。（全 token 桶、恒等序：原地引用。）
+- **ids**：把已暂存的 `ids_exp`/`ids_slot` token 块按 `order` 重排（块 = 该 token 的
+  slot 切片）。
+- **weights_norm**：`[1, n_k, n_t]` 是**任意** (t,k) 子集，不是连续 k 切片。免费 reshape
+  成 `[1, n_k*n_t]`；用 flat index leaf `idx[i*width+s] = k + t*n_k`（其中
+  `(t,k) = scatter[order[i]*width+s]`）做 get_rows → `[1, width*n_active]`；reshape
+  `[1, width, n_active]`。这就是通用 index-gather 节点（BUCKET_EXEC_TOKEN_SUBSET §2.1a）。
 - **acc 循环**（取代 `exec_layer_burst_chain_buckets` 里的 offset-0 单次 acc）：对每个
   seg 做一次 `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
   offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。

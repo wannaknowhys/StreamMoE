@@ -373,6 +373,28 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - **test_async_dio 临时禁用**：SoA 重构删了 `sub_tensor_req_t::slot_offset`，其用例3（多 tensor 单 slot 拼装）是 AoS 语义需重写；CMake 注释目标 + build.bat test 列表去之。文件保留待重写。
 - 结果：`build.bat test main` 5/5 绿（moe_loader/profiler/scheduler/slot/mix_plan）。
 
+**token-subset round（2026-09-08 定案，docs/BUCKET_EXEC_TOKEN_SUBSET.md + SCATTER_PLAN.md 已同步）**：
+- 目标：桶源从"全 token k-slice（`tmp_split_blocks`）"换成 `build_mix_plan` 的**真 token
+  子集 round**（`[w_b, n_active]`），接 `scatter_plan` 做累加器写回。`expert_pool[e] =
+  handle.pool` 直接从 pin 返回的 handle 取（`pin_layer` 本就 per-expert 带 pool），不需要
+  新 scheduler 查询；单 RAM 池退化为一个满 round（默认路径必须逐字节 IDENTICAL）。
+- 关键修正：
+  1. cur gather = 把 `[d,1,n_t]`（ne1==1）**reshape 成 `[d,n_t]` + get_rows + reshape 回**
+     （get_rows 只 gather ne1，不 gather ne2）。
+  2. 任意 (t,k) 权重（`weights_norm`）= **通用 flat index-gather 节点**：`[1,n_k,n_t]`
+     reshape `[1,n_k*n_t]`，i32 leaf `idx[i*w+s]=k+t*n_k`，get_rows，reshape
+     `[1,w,n_active]`。取代 `bucket_ext_leaf` 的连续-k 切片。
+  3. 测试分桶 = `minigraph_exec.cpp` 内 `static` 助手，**定义 + 调用点都 `#ifdef
+     STREAM_MOE_TEMP`**（只有 `StreamMoE_dump_dbg` 带宏）；k 奇偶 × t 奇偶 = 4 round
+     （刻意非连续 k），验证完即删。不建 `bucket_split.h/.cpp`、不写离线 UT。
+  4. 删 `tmp_split_blocks`/`tmp_blk_t`（旧测试 cut 族，现无条件编译）。
+- 任务（实施中，principle 14：全写完再统一回归）：
+  - [ ] 通用 index-gather 助手（cur row_size=d / weights row_size=1）
+  - [ ] 执行器 round loop 接 `mix_round_t`（expert_pool 从 pins；tight ids；fold→tight per_token）
+  - [ ] scatter_plan acc 写回（每 seg 一次 `ggml_acc_inplace`）
+  - [ ] 宏包裹测试强制分桶 + 删 tmp_split_blocks
+  - [ ] 回归：默认单 round IDENTICAL；强制分桶宽松 gate（maxAbs ≤ 1e-5 / cos ≈ 1.0）
+
 ### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）
 
 - **槽维 = 链内所有张量的 ne1**（= 该层 n_k，gemma L0 8 / deepseek 6），贯穿 mm→weightless：

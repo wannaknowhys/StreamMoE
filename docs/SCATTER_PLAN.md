@@ -83,7 +83,7 @@ in `order`). A single generic tight-gather helper serves all three.
 | :--- | :--- | :--- | :--- |
 | `cur` (dense norm out) | gate/up mm src1 | one shared column per token `[d,1,n_t]` | token tight-gather -> `[d,1,n_active]` (slot-independent) |
 | routing `ids` | mm src2, GET_ROWS src1 | per (token, slot) `[n_k,n_t]` | slot subset staged (`ids_exp`/`ids_slot`); token blocks reordered to tight order |
-| per-slot routing weights (`ffn_moe_weights_norm`) | weighted mul src1 | one scalar per (slot, token) `[1,n_k,n_t]` = softmax weight of the routed expert; produced dense-side after topk, leaf into the chain | slot slice `[k_lo..k_hi)` AND token tight-gather |
+| per-slot routing weights (`ffn_moe_weights_norm`) | weighted mul src1 | one scalar per (slot, token) `[1,n_k,n_t]` = softmax weight of the routed expert; produced dense-side after topk, leaf into the chain | arbitrary (t,k) index-gather -> `[1,w_b,n_active]` (flat get_rows; BUCKET_EXEC_TOKEN_SUBSET SS2.1a) |
 | expert weights, per-expert scale (REPEAT table) | mm src0 / GET_ROWS src0 | per-expert | token-independent - untouched |
 | chain-internal tensors (GLU/down/weighted) | - | `[d,w_b,n_t]` | inherit the order fixed at the first tight gather |
 
@@ -175,19 +175,21 @@ quality goal, not a guarantee.
 
 ## 5. Executor consumption (design sketch, not implemented yet)
 
-One generic **tight-gather** helper serves all three external per-token
-inputs (CPU prototype: plain host memcpy loops; GPU phase: ggml nodes). It
-copies main-graph per-token data into tight staging in `order`:
-`staging[d, .., i] <- main[d, .., t[order[i]]]`, where each input names its
-own per-token stride:
+All external per-token inputs are gathered by **ggml-native nodes** from the start
+(principle 11 - GPU-equivalent, no host staging). One generic **index-gather**
+helper serves all three: reshape a contiguous source to 2D and `ggml_get_rows`
+along its row axis with an i32 index leaf built in tight order.
 
-- **cur**: `cur_tight[d, 1, n_active]`, gather column `t[order[i]]` of the
-  main shared cur. First routed mm reads staging. (Full-token bucket, no
-  reorder: order is identity, reference in place.)
-- **ids**: reorder the already-staged `ids_exp`/`ids_slot` token blocks by
-  `order` (block = the token's slot slice).
-- **weights_norm**: slice slots `[k_lo..k_hi)` and gather the token axis by
-  `order` -> `[1, w_b, n_active]`.
+- **cur**: reshape `[d,1,n_t]` (ne1 == 1, free) to `[d, n_t]`; get_rows with the
+  tight token ids `[n_active]` -> `[d, n_active]`; reshape `[d,1,n_active]`. First
+  routed mm reads staging. (Full-token bucket, identity order: reference in place.)
+- **ids**: reorder the already-staged `ids_exp`/`ids_slot` token blocks by `order`
+  (block = the token's slot slice).
+- **weights_norm**: `[1, n_k, n_t]` is an ARBITRARY (t,k) subset, not a contiguous
+  k-slice. Reshape (free) to `[1, n_k*n_t]`; get_rows with a flat index leaf
+  `idx[i*width+s] = k + t*n_k` for `(t,k) = scatter[order[i]*width+s]` ->
+  `[1, width*n_active]`; reshape `[1, width, n_active]`. This is the general
+  index-gather node (BUCKET_EXEC_TOKEN_SUBSET SS2.1a).
 - **acc loop** (replaces the offset-0 single acc in
   `exec_layer_burst_chain_buckets`): for each seg, one
   `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
