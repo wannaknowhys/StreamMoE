@@ -175,29 +175,36 @@ moe_model_topology_t build_topology(const model_t& m, const std::string& main_gg
     // merged across the group's layers where the layout matches.
     for (auto& g : topo.groups) {
         if (g.layers.empty()) continue;
-        const expert_info_t& probe = topo.experts[(size_t) g.layers[0] * topo.n_expert];
+        // One column per BRANCH of the group's first layer. A branch may be
+        // split into several chunk segments, so probe.sub_tensors has one entry
+        // PER SEGMENT; grouping by segment size would create bogus columns with
+        // the wrong stride (they overlap the next slot) - B37. Use m.expert's
+        // branch per_expert (the whole per-expert slice) as the column stride.
+        std::vector<const expert_tensor_t*> probe_branches;
+        for (const auto& et : m.expert)
+            if (et.layer == (int32_t) g.layers[0]) probe_branches.push_back(&et);
         auto& cols = g.columns;
         cols.clear();
-        for (const auto& st : probe.sub_tensors) {
+        for (const auto* b : probe_branches) {
             const std::string tag = [&]() -> std::string {
-                if (st.name.find("gate_up") != std::string::npos) return "gate_up";
-                if (st.name.find("ffn_gate_exps") != std::string::npos) return "gate";
-                if (st.name.find("ffn_up_exps") != std::string::npos) return "up";
-                if (st.name.find("down_exps") != std::string::npos) return "down";
+                if (b->name.find("gate_up") != std::string::npos) return "gate_up";
+                if (b->name.find("ffn_gate_exps") != std::string::npos) return "gate";
+                if (b->name.find("ffn_up_exps") != std::string::npos) return "up";
+                if (b->name.find("down_exps") != std::string::npos) return "down";
                 return "?";
             }();
             // merge with an existing column when the slice layout matches
             auto it = std::find_if(cols.begin(), cols.end(), [&](const auto& c) {
-                return c.tag == tag && c.ggml_type == st.ggml_type && c.per_expert == st.byte_size;
+                return c.tag == tag && c.ggml_type == b->type && c.per_expert == b->per_expert;
             });
             if (it != cols.end()) continue;
             moe_model_topology_t::expert_group_t::column_t c;
             c.col_index = static_cast<uint32_t>(cols.size());
-            c.name = st.name;
+            c.name = b->name;
             c.tag = tag;
-            c.ggml_type = st.ggml_type;
-            for (int d = 0; d < 4; ++d) c.ne[d] = st.ne[d];
-            c.per_expert = st.byte_size;
+            c.ggml_type = b->type;
+            for (int d = 0; d < 4; ++d) c.ne[d] = b->ne[d];
+            c.per_expert = b->per_expert;
             cols.push_back(c);
         }
     }

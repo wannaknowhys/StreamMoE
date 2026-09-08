@@ -64,7 +64,7 @@
 | B24 | SUPERSEDED | scheduler 单 worker，expert 间串行 | 已删（原 src/scheduler/moe_scheduler.cpp） | Backend.md 调度线程替代 |
 | B25 | FIXED | compute/IO 重叠未接入主路径 | src/main.cpp | ✅ 真实引擎替换 mock 主路径；双池并发由 Backend.md 阶段实现 |
 | B26 | FIXED | `-ngl/--gpu-layers`/`--moe-vram-pool` 未接线 | src/main.cpp:34-35 | ✅ -ngl/offload_kqv/load_mode 已映射；--moe-vram-pool 待 GPU 池 |
-| B37 | OPEN | **v3chunk 多段专家 DIO 读取非确定性损坏**：每个专家切片跨 N 个分片文件（N>1）时，专家列数据时对时错（`up` 列第 2 段最明显）；`--chunks 1` 逐字节正确，plan（file/off/len/column/col_off）正确，强制 staging / 批量提交均无效，dense 多段（顺序、独立引擎）正常 | src/backend/scheduler.cpp `start_async_load` / src/io/staging_reader.cpp | 只记录。v3chunk 读的 parse + 兄弟文件自动发现已落地（`model_builder.cpp`）；引擎并发多段读待修。候选：粗粒度条带（整专家块不跨文件）避开多段 |
+| B37 | FIXED | **v3chunk 多段专家读取损坏**：多段时 `topo_builder` 按 `probe.sub_tensors` 的**每段**（而非每分支）建列，列 stride 变成段长（up 段0=180224）而非分支 perExpert（1179648）→ 相邻槽的列区重叠、互相覆盖（`up`/`down` 列第 2 段错乱）。根因是列派生误用 segment 长度 | src/loader/topo_builder.cpp:176-203（SoA 列派生） | ✅ 改为按**分支**建列（用 `m.expert` 的 `perExpert` 作 stride）；olmoe 1/2/3/5-chunk 对原版逐字节一致（`prefill_export`+`expert_history`）|
 
 ## P2 统计与测试可信度
 
