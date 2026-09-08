@@ -389,11 +389,13 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
      （刻意非连续 k），验证完即删。不建 `bucket_split.h/.cpp`、不写离线 UT。
   4. 删 `tmp_split_blocks`/`tmp_blk_t`（旧测试 cut 族，现无条件编译）。
 - 任务（实施中，principle 14：全写完再统一回归）：
-  - [ ] 通用 index-gather 助手（cur row_size=d / weights row_size=1）
-  - [ ] 执行器 round loop 接 `mix_round_t`（expert_pool 从 pins；tight ids；fold→tight per_token）
-  - [ ] scatter_plan acc 写回（每 seg 一次 `ggml_acc_inplace`）
-  - [ ] 宏包裹测试强制分桶 + 删 tmp_split_blocks
-  - [ ] 回归：默认单 round IDENTICAL；强制分桶宽松 gate（maxAbs ≤ 1e-5 / cos ≈ 1.0）
+  - [x] 通用 index-gather 助手（cur row_size=d / weights row_size=1）
+  - [x] 执行器 round loop 接 `mix_round_t`（expert_pool 从 pins；tight ids；fold→tight per_token）
+  - [x] scatter_plan acc 写回（每 seg 一次 `ggml_acc_inplace`）
+  - [x] 宏包裹测试强制分桶 + 删 tmp_split_blocks
+  - [x] 回归：默认单 round vs **当前 HEAD 干净构建**（StreamMoE_dump，同 v2align 输入）**IDENTICAL**（embd/hidden/KV + expert_history 全同）；`STREAM_MOE_TMP_BUCKET_ROUNDS=1` 强制 k 奇偶 × t 奇偶 = 4 round（w_b=4，n_active=65/64，非连续 k）L0 moe_out vs 默认 **maxAbs=3.8e-6 ≤ 1e-5 / cos=1.0**（宽松 gate，31.6% 元素差 1 ulp）。
+- **注意（回归基线陈旧，非本次改动）**：`baseline_regression/baseline/moe_129_8192_vk` 与当前 HEAD（及 2026-09-06 的旧 binary）均已 DIVERGED（embd token#0 cos≈0.986）——该冻结基线早于 K5/删 A，`run_baseline.bat` 当前对它报 DIVERGED。本次改动经"HEAD 干净构建"对拍确认数值零影响（IDENTICAL）。基线是否重建/何时重建待用户定。
+- vendored 改动：`common/CMakeLists.txt` STREAM_MOE_SRC 加 `backend/scatter_plan.cpp`（route-b-inject.patch 已重生成 + 反向 check 通过）。
 
 ### dump 确认的槽维事实（2026-09-06，CPU 与 Vulkan 一致，见 tmp_dump_l0_vk / tmp_ds_l0）
 
