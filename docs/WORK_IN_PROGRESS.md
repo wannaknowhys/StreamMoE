@@ -101,7 +101,7 @@
 - [x] J3 **vram 区并入槽空间（7f33b00）**：`subpool_t` → per-(group,pool) 区（pool 0=RAM，1+=device）；`init` 收 `vram_region_t{pool,group,base(n=host map),n_slots}`；槽号全局连续、`slot_mem` 覆盖 vram map；RAM carve/驱逐不变；`ram_subpool`/`subpool_of_slot` API。RAM-only 与 RAM+Vulkan0 均 IDENTICAL
 - [x] J4 **read_to_vram + CPU 从 vram 读权重执行（b691c90）**：`alloc_or_evict` pool 感知；`accept_requests` 优先该 group 的 device 区（RAM fallback）；DIO（v2 direct）/staging 写进 vram slot（slot_mem = vram map）；目录记 pool 1；minigraph_exec **激活集动态单区**（w3d/ids 区局部化；mixed RAM/VRAM active set 报错 = J6）。实测全 vram "reads pool 1" + IDENTICAL
 - [x] J5 **device 驱逐 demote 回 RAM（77b0bbe）**：vram victim（READY+ref0）内容 memcpy 进 group 的 RAM 区（RAM 先丢最冷腾位），目录迁移 pool；RAM victim 仍丢弃（盘为下一层）。Vulkan0:1024（139 槽 group0）129-token 触发 **1987 次 demote 仍 IDENTICAL**——move 数据路径正确
-- [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
+- [x] J6 **mixed 分区执行**（已随唯一桶引擎 + 设备执行落地，2026-09-08）：`build_mix_plan` 按 pool 产出 RAM round + device round，每 round 单独子 mul_mat_id 并折进各自 acc，最后 host fold（WIP O / M2 §7.9）。原"同层激活集跨 RAM/vram 分区"由 per-pool round 天然覆盖。
 
 ### K. v2 块内张量对齐 + SoA pool 布局改造（2026-09 定案，替代 b4-3/v1 路线）
 
@@ -139,9 +139,9 @@
 - [x] **K5 minigraph_exec（w3d 单张量壳）**——4604e1c：
   1. legacy + burst + exec_mm_vk 三处：resolve 后 `column_layout` 取 (col_off, col_stride)，w3d data = 区域基址+col_off、nb[2]=col_stride（= vulkan 硬编码紧凑步长，天然命中）、ne[2]=n_slots
   2. CPU/vk 同构造；单区限制（mixed RAM/VRAM 激活集报错 J6）沿用
-- [ ] **K6 数值门**：
+- [x] **K6 数值门**：
   - [x] **CPU/RAM 路径 IDENTICAL**（v2align prefill-from vs moe_129_8192_vk 基线逐字节一致，129-token 全对齐）——SoA 装载/列寻址/分列 staging/direct 全部正确
-  - [ ] **全 vram vulkan 单设备执行逐字节（替代 b4-3 数值目标）**——**被既有 demote 风暴阻塞**：Vulkan0:2048 + RAM:1024~8192 下 129/15-token prefill 触发 ~1300/277 次 device→RAM demote（每层新活跃集驱逐上层的 J 节既有行为，旧 v2 文件同样卡超时，非 SoA 回归），激活集未稳定驻留 vram → exec 走 CPU、未触发 exec_mm_vk。待办：独立验证 device 触发路径（如大 vram 池容纳整模型 / 缩小到单层活跃集 / 修正 accept 放置），确认 vulkan 吃 SoA 列后数值正确
+  - [x] **vulkan 吃 SoA 列**（2026-09-08，WIP O）：设备执行落地后 VRAM round 真在 Vulkan 上跑整链；RAM8G+VRAM256M 设备混跑对同分区 CPU **cos 0.982**（与已知 0.986 冻结基线同量级，**用户决定不追**）。原 demote 风暴由环形驱逐 + DMA 缓解，不再阻塞。
 - [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
 
 ### L. 批量 pin：bitmap 层请求 + MPSC 就绪位（2026-09 定案）
@@ -180,8 +180,8 @@
 > - [x] L4 minigraph_exec：burst 整层一次 pin_layer；legacy 角色 split 批量 pin 到 pin_state、down 只确认 pinned——0518153
 > - [x] L5 测试：test_scheduler/test_slot 适配新 API + 4-producer mpsc 测试；**5/5 ctest 过**——0518153
 > - [x] L6 编译 + 回归：gemma v2align prefill-from vs moe_129_8192_vk **IDENTICAL**；**wall time 几十秒 → 0.11s**（DIO 并发化 + 消乒乓）——0518153
-> - [ ] **L6b vram GPU 触发（K6 阻塞延续）**：批量 pin 后纯 RAM 无 demote、极快；但 vram 池场景仍触发 ~918 次 device→RAM demote 且 129-token 超时（1-token 0 demote 但无 MoE 前向不触发 GPU；15-token 277 demote）。demote 风暴是 J 节既有容量/放置语义（vram 428 槽 < 逐层累积驻留），非批量 pin 引入。需独立处理：放置策略（当前层优先驻留 vram / 防跨层驱逐）或足够大 vram。1-token 单层解码可能是不触发 GPU 的正确复现入口（需确认 prefill 首 token 是否真过 MoE）。
-> - [ ] L7 文档同步（WIP L 节已写；补 CHECKPOINT 一行引用）
+> - [x] **L6b vram GPU 触发**（2026-09-08 解决，见 WIP O / M2 §7.9）：设备执行落地——VRAM round 的整链真在 Vulkan 上跑（device shell + async 提交 + acc_d 回读）。demote 风暴由环形驱逐 + DMA 缓解；RAM8G+VRAM256M 跑通。
+> - [x] L7 文档同步（WIP L 节；CHECKPOINT 已引用）
 
 ### N. NO_VICTIM 驱逐死锁修复 + 无进展 stall 兜底（2026-09 落地 5d08bb3）
 
@@ -272,8 +272,8 @@
 > - [ ] M8 UT：M5 §7.4 四个并发验收用例（登记前 settle / B 含 ABSENT / B 中途失败回滚 / 单活跃）——
 >       test_scheduler 目前因 stmoe_vk_dma_read 链接问题不编（既有），M8 需先修 test 链接或改独立测试
 
-- [ ] M2-2 真并行骨架：CPU worker + vulkan async 双通道分派，graph_compute 全同步收尾 → IDENTICAL
-- [ ] M2-3 出口 scatter 通用化：外部数据位置参数 + 列映射 scatter（mixed 激活集 J6 由此落地）
+- [x] M2-2 真并行骨架：per-device 整链 cgraph + async 提交 + CPU/VK 重叠 + acc_d 回读 + host fold（WIP O / M2 §7.9；overlap 已验证 = 串行，逐层 acc IDENTICAL）
+- [x] M2-3 出口 scatter 通用化（随 per-pool round + `layer_fold` 落地）：每 pool 一个 round，折进各自 acc，host 端按参与集 fold；设备 acc 走 `tensor_get` DMA 回读
 - [ ] M2-4 profile 埋管：ctx 聚合 + profile ring + 事件 struct + io/device 完成时间戳（消费策略后置）
 
 ### M2-5 桶化 append 链 + per-device acc + 最终 host fold（2026-09-06，设计定稿 §7.8）
