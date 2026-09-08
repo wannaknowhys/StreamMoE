@@ -23,7 +23,7 @@
 ## 1. Input formats
 
 | format | `stream_moe.layout` | `incomplete` | expert layout | alignment | read plan |
-|---|---|---|---|---|---|
+| :--- | :--- | :--- | :--- | :--- | :--- |
 | **original GGUF** (single or `-00001-of-N.gguf`) | absent / `"original"` | - | per-tensor contiguous: expert slice = `tensor.offset + e*perExpert`; 3 sub-tensors (gate/up/down or gate_up/down) per expert | GGUF default (32B / quant block) | 3 sector-aligned reads into staging buffer + memcpy to slot (needs staging) |
 | **v1 sections-v1** | `"sections-v1"` | - | same per-tensor slices, but tensors 4K-aligned by the converter | 4096 | **intended**: 3 async DIO straight into slot (no staging). **Not implemented** - falls through to the original staging path |
 | **v2 expert-blocks-v2** | `"expert-blocks-v2"` | - | per-(layer,expert) block; branches (gate_up/gate/up/down) concatenated at `branchOff` inside the block; block size = alignUp(sum(branch perExpert), 4096) | 4096 blocks | 1 async DIO whole-block straight into slot (block layout == slot layout) |
@@ -35,7 +35,7 @@ Written by `writeV2` / `writeV2chunk` in `stream_moe_layout.js`, read by
 `build_v2_experts` in `moe_loader.cpp`:
 
 | KV | meaning |
-|---|---|
+| :--- | :--- |
 | `stream_moe.layout` | `"original"` / `"sections-v1"` / `"expert-blocks-v2"` |
 | `stream_moe.incomplete` | `1` = v2 chunk (strip files); `0`/absent = single file |
 | `stream_moe.dense_section` | `[0, denseEnd]` - dense tensor area (before blocks) |

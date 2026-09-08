@@ -80,7 +80,7 @@ operation - a tight-gather (copy main-graph per-token data into tight staging
 in `order`). A single generic tight-gather helper serves all three.
 
 | data | role | per-token layout | bucket effect |
-|---|---|---|---|
+| :--- | :--- | :--- | :--- |
 | `cur` (dense norm out) | gate/up mm src1 | one shared column per token `[d,1,n_t]` | token tight-gather -> `[d,1,n_active]` (slot-independent) |
 | routing `ids` | mm src2, GET_ROWS src1 | per (token, slot) `[n_k,n_t]` | slot subset staged (`ids_exp`/`ids_slot`); token blocks reordered to tight order |
 | per-slot routing weights (`ffn_moe_weights_norm`) | weighted mul src1 | one scalar per (slot, token) `[1,n_k,n_t]` = softmax weight of the routed expert; produced dense-side after topk, leaf into the chain | slot slice `[k_lo..k_hi)` AND token tight-gather |
@@ -201,7 +201,7 @@ own per-token stride:
 ### Config grid (cartesian product)
 
 | n_t (full-width tokens) | hit rate |
-| :-- | :-- |
+| :--- | :--- |
 | 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
 
 30 tasks. One rdtsc timing per task around `build_scatter_plan`

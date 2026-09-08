@@ -46,12 +46,12 @@ scripts\run_long_horizon_test.bat zh memwatch  rem 指定 build tag
 ## 4. 产物与日志位置速查
 
 | 产物 | 路径 |
-|---|---|
+| :--- | :--- |
 | 单 prompt 输出 | 直接终端 |
 | server 运行日志 | `build\<btag>\server_<tag>.log` |
 | 逐轮遥测 JSONL | `benchmark\results\profile_real_<tag>.jsonl` |
 | 完整对话转写 | `benchmark\results\conversation_real_<tag>.txt` |
-| memwatch 哨兵日志 | `%TEMP%\memwatch_<pid>.log`（memwatch 版构建）|
+| memwatch 哨兵日志 | `%TEMP%\memwatch_<pid>.log`（memwatch 版构建） |
 
 ## 5. 已知坑
 

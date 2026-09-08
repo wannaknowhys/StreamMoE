@@ -23,13 +23,13 @@
 用 verify/关联分析（temp/analyze_div.js）对比同输入（129-token prefill-from）的 moe 与 upstream 产物：
 
 | 指标 | 值 |
-|---|---|
-| 专家历史条目分歧 | 3344/61920（5.4%）|
+| :--- | :--- |
+| 专家历史条目分歧 | 3344/61920（5.4%） |
 | 路由集合一致的 token | 25/129 |
-| 路由一致 token 的 hidden cos | mean **0.9996**（min 0.9987）|
+| 路由一致 token 的 hidden cos | mean **0.9996**（min 0.9987） |
 | 路由分歧 token 的 hidden cos | 低至 0.975 |
 | 最早路由分歧位置 | 全部在 layer > 1 |
-| KV cos（kv_cos.js）| mean 0.9998（数值级一致；verify_prefill 字节 diff 是 f16 表示微小差）|
+| KV cos（kv_cos.js） | mean 0.9998（数值级一致；verify_prefill 字节 diff 是 f16 表示微小差） |
 
 **机制链**：同路由下 moe 与 upstream 就有微小浮点差（cos 0.9996，非 repack 0.508 级严重分歧）
 → 门控概率近等处在较深层发生 top-k rank 翻转/选相邻专家（路由分叉）→ 后续 hidden/KV 分歧放大。
@@ -40,7 +40,7 @@
 同输入跑 upstream_dump（CPU）vs upstream_vulkan_dump（`-ngl 2`，GPU offload 2 层）——**两个纯上游原版之间**：
 
 | 指标 | moe vs CPU | CPU vs Vulkan |
-|---|---|---|
+| :--- | :--- | :--- |
 | 专家历史分歧 | 5.4% | 5.5% |
 | 路由一致 hidden cos | mean 0.9996 | mean 0.9996 |
 | 路由分歧 cos 下限 | 0.975 | 0.960 |

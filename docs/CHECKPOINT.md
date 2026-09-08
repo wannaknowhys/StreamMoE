@@ -14,11 +14,13 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ## 2. 当前状态（✅ 已完成）
 
 ### M4 收编：自研主项目删除（2026-08-31）
+
 - 删除 `src/main.cpp`、`src/server_main.cpp`、`src/engine/llama_engine.*`、`src/server/http_server.*`、`patches/prefill-export-streammoe.patch`（见 docs/UPSTREAM_TOOLS_MIGRATION.md）。
 - CMakeLists 去 `stream_moe`/`stream_moe_server` 目标（保留 test_*）；build.bat/Makefile 去 `build` 子命令（保留 llamalibs/test/convertd/clean）。
 - 推理/导出全走 vendored `llama-server`/`llama-cli`（route B 插件经 `src/server/route_b_inject.*` 注入）。
 
 ### vendored patch 体系（2026-09-03 重构：frag 全主仓库 + features 宏机制）
+
 - **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
 - **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b / prefill_export / route_b,prefill_export）→ vendored 根 `CMakeLists.txt` features 块全局 `add_compile_definitions` + `include_directories`（主仓库 frag 目录）。**宏不拼 CXX_FLAGS**。宏对当次构建全部 target 生效（防静默丢弃）。
 - **frag 全在主仓库**（随主仓库 commit）：`patches/route-b/common/`、`patches/prefill-export/common/`、`patches/prefill-export/include/`——vendored `include/` 已清空。
@@ -37,6 +39,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - vendored 子模块有 `backup-20260830` 分支（整理前状态，保险）。
 
 ### VRAM 数据层（2026-09，路线 A：数据层先行）
+
 - **vram 池真驻留 + CPU 从 vram 读权重执行**（`--moe-expert-pools RAM:N,Vulkan0:N`）：分配（slot 对齐降档，seg 登记）→ host map 通道（ggml-vulkan.cpp 在 **phase1 macros.patch 的 `STREAM_MOE_ROUTE_B` 锚点** include `stmoe_routeb_vk_hostmap.frag`（函数体在主仓库）导出 `stmoe_vk_buffer_host_ptr` 返回真 vkMapMemory ptr；`get_base` 仍是假 base `0x1000` 不改）→ scheduler 槽空间并入 vram 区（subpool 变 per-(group,pool)）→ 请求优先装 vram → CPU 执行从 vram map 读权重（"reads pool 1"，IDENTICAL）→ **vram 驱逐 demote 回 RAM**（Vulkan0:1024 触发 1987 demote 仍 IDENTICAL）。
 - 开发模型 = **v2 chunk**（专家独立化 direct，moe(v2) 与 v1 基线 IDENTICAL）；upstream 对照仍 v1（不认识 v2）。
 - **v2 布局改造定案（2026-09，见 §4 下一步）**：v2 expert-blocks 整专家紧凑块是 vulkan 不兼容槽布局（专家 stride=expert_size）的源头。解法 = **v2 文件块内每个张量切片独立 4K 对齐** + **pool 改张量列区（struct-of-array）**。文件侧 DIO 源对齐，pool 侧槽 stride=单张量紧凑大小（vulkan 硬编码步长）。v1 sections-v1（张量分散 GGUF 原生可读）已否决——GGUF tensor offset 须紧凑单调，无法在张量内做 4K 切片 stride，writeV1 的 per-expert reflow 产出非法 GGUF（llama 加载 offset 校验失败）。
@@ -47,6 +50,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map + dma frag（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J/M 节。
 
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
+
 - **机制**：`--export-dir <dir>` 参数替代 `LLM_EXPORT_DIR` env（llama_context_params.export_dir，`common_context_params_to_llama` 传递；`run_export.js` 已适配传参）。
 - **抓取**：llama.cpp 现成的 `cparams.cb_eval` 评估回调（每个图节点算完触发）——图内抓 embd（result_norm）/ hidden（t_h_nextn）/ **top-4 logits + logsumexp**（t_logits）/ 路由 ids（MUL_MAT_ID src[2]）。**不依赖强制输出 + ids 时机在 compute 流内**（根治 sched 回收）。
 - **关键**：`export_t_embd/hidden/logits` 在 **build_graph 后、compute 前**发布（回调比对）——设在 compute 后会抓不到。
@@ -59,41 +63,45 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - 调试开关：`STREAM_MOE_DBG=1` env 打印导出诊断（门控）。
 
 ### 转换器（2026-08-30 完成）
+
 - **统一抽象**：`tools/stream_moe_layout.js`（buildModel 任意源 → Model 描述 + 写 v1/v2/v2chunk）→ convertd 哑物理服务（裸 TCP：open/write_meta/copy/fill/close）。
 - **5 源 × 3 目标矩阵逐字节一致**（`scripts/verify_convert_matrix.bat <workdir>` 全 PASS；N 原版源 → R 盘）。
 - 文档：`docs/STREAMMOE_GGUF_FORMAT.md` §7-9。
 
 ### repack 实证（2026-08-30，原版行为）
+
 - 原版加载时对匹配 repack 的权重（gemma gate_up：Q4_K 3D）**全量 repack 成重排布局常驻**（285MB/层，内存 dump vs GGUF 原始 **99.4% 字节不同**）；**替换 mmap 驻留 → 净零额外内存**（WS ≈ 模型大小）。
 - 触发靠 **buft 身份**（`buft == repack_buffer_type()`），数据布局 8x8 交错。route B 槽（原始字节 + plain buft）不匹配 → 普通内核。
 - **gemma gate_up 走 repack 内核 vs route B 普通内核 → 单层 ulp、累积后 logits cos 0.508**（REPACK_DIVERGENCE_DEBUG.md 已验证补 repack 可 bit 一致，但生产未落地）。
 - **结论**：这是"浮点累加路径差异 + 逐层放大"，非正确性 bug；deepseek Q8 不匹配 repack → 两边同内核 → 仅 ulp。
 
 ### deepseek prefill 交叉验证（2026-08-30）
+
 - **prefill 数值一致**（token#0 hidden/embd cos≈1，4e-9 ulp），非 bit 级。
 - KV（f16 默认）逐层 cos ~0.98（f16 精度 + 生成部分）。
 - **prefill10000 产物保留为回归基准**（upstream 跑太慢）：`O:\1\deepseek\upstream|moe\prefill10000\`。
 - **专家历史 upstream 导出（2026-08-31 修复）**：VULKAN=ON 时 prefill 大图（如 119-token）的 MUL_MAT_ID 被 sched 分配到 Vulkan0，权重名带 `Vulkan0#` 前缀，旧的 `name[0]=='b'` / `strncmp("blk.",4)` 检查失败 + `ids->data` 不可直接读（GPU 内存）→ 中间 token 专家路由全缺。**修复（3 处，已并入 prefill-export-llama.patch）**：① 条件改 `strstr(name, "_exps")` 容忍前缀；② 层号用 `strstr("blk.")` 定位；③ ids 读取改 sched `get_async`（Vulkan0 GPU 内存不可直接 ids->data）。验证：131-token prefill + 16 decode = 148 token 专家历史完整（n=71040 = 148x30x16，ids 0-127 合法），与 VULKAN=OFF 一致。
 
 ### 引擎 spec（2026-08-30）
+
 - `moe.json`/`upstream.json`：`--temp 1.0`；`moe-temp0`/`upstream-temp0`：测试专用（temp 0 + top-k 1）。KV 无显式 cache-type（默认 f16）。`temp/gen_engines.js` 生成。
 
 ---
 
 ## 3. 你可以跑的验证
 
-| 动作 | 命令 |
-|---|---|
-| route-b 完整推理 | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe` |
-| prefill 导出（上游基准）| `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe` |
-| 完整栈导出 | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2）|
-| 转换器服务 | `build.bat convertd` → `build\convertd\convertd.exe` |
-| 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（N 原版源 → R 盘）|
-| gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |
-| prefill 导出（--export-dir）| `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |
-| prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt|tokens.bin> --export-dir <dir> -c 1024 -t 8` |
-| **基线回归** | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；CPU 编对 `moe_129_8192`、默认 vulkan 编对 `moe_129_8192_vk`，见其 README）|
-| vram 池驻留 | `llama-server -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <dir> -c 2048 -t 16 --expert-backend --moe-expert-pools RAM:8192,Vulkan0:4096 --fit off --no-warmup`（全量专家进 vram；池 1024 触发 demote）→ 产物对 `moe_129_8192_vk` IDENTICAL |
+| 动作 | 命令 |  |
+| :--- | :--- | :--- |
+| route-b 完整推理 | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe` |  |
+| prefill 导出（上游基准） | `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe` |  |
+| 完整栈导出 | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2） |  |
+| 转换器服务 | `build.bat convertd` → `build\convertd\convertd.exe` |  |
+| 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（N 原版源 → R 盘） |  |
+| gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |  |
+| prefill 导出（--export-dir） | `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |  |
+| prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt | tokens.bin> --export-dir <dir> -c 1024 -t 8` |
+| **基线回归** | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；CPU 编对 `moe_129_8192`、默认 vulkan 编对 `moe_129_8192_vk`，见其 README） |  |
+| vram 池驻留 | `llama-server -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <dir> -c 2048 -t 16 --expert-backend --moe-expert-pools RAM:8192,Vulkan0:4096 --fit off --no-warmup`（全量专家进 vram；池 1024 触发 demote）→ 产物对 `moe_129_8192_vk` IDENTICAL |  |
 
 **run_export 前台窗口启动**（跑 cn/en/prefill10000 导出任务——脱离 opencode 管控但用户可见）：
 ```bat

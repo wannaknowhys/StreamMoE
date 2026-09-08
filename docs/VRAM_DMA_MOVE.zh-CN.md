@@ -18,7 +18,7 @@ demote。
 按内存类型实测 host 读带宽（直连 vulkan 测试）：
 
 | 内存类型 | heap | host 读 | 备注 |
-|---|---|---|---|
+| :--- | :--- | :--- | :--- |
 | DEVICE_LOCAL \| HOST_VISIBLE (rebar) | vram 8 GB | **0.02 GB/s** | 现 move 源——不可用 |
 | HOST_VISIBLE \| COHERENT | 系统 RAM 64 GB | 0.27 GB/s | 非 cached |
 | HOST_VISIBLE \| COHERENT \| **CACHED** | 系统 RAM 64 GB | **21-27 GB/s** | ggml sync_staging heap |
@@ -29,11 +29,11 @@ demote。
 把 vram 拷到 host buffer **~14 GB/s**，随后 CPU 以 cached 速度读该 host buffer：
 
 | 路径 | 3.63 MB 专家 |
-|---|---|
-| 从 vram rebar map CPU memcpy（现状）| ~158 ms |
+| :--- | :--- |
+| 从 vram rebar map CPU memcpy（现状） | ~158 ms |
 | `vkCmdCopyBuffer` vram → CACHED staging | ~0.38 ms |
 | + memcpy CACHED staging → RAM 槽 | ~0.17 ms |
-| 总计（DMA + memcpy）| **~0.5 ms（快 ~300×）** |
+| 总计（DMA + memcpy） | **~0.5 ms（快 ~300×）** |
 
 一块固定 staging buffer 上 10 专家并发**无带宽损失**：逐专家顺序提交 9.5
 GB/s、10 条 copy 一次提交 10.7 GB/s、流水 10 次提交 10.2 GB/s（都 ~0.35-0.39

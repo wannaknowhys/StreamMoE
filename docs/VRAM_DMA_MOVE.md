@@ -20,7 +20,7 @@ a prefill/decode pass with vram pressure does hundreds of demotes.
 Measured host-read bandwidth by memory type (direct vulkan test):
 
 | memory type | heap | host read | note |
-|---|---|---|---|
+| :--- | :--- | :--- | :--- |
 | DEVICE_LOCAL \| HOST_VISIBLE (rebar) | vram 8 GB | **0.02 GB/s** | current move source - unusable |
 | HOST_VISIBLE \| COHERENT | sys-ram 64 GB | 0.27 GB/s | uncached |
 | HOST_VISIBLE \| COHERENT \| **CACHED** | sys-ram 64 GB | **21-27 GB/s** | ggml sync_staging heap |
@@ -32,7 +32,7 @@ family) copies VRAM -> a host buffer at **~14 GB/s**, and the CPU can then read
 that host buffer at cached speed:
 
 | path | 3.63 MB expert |
-|---|---|
+| :--- | :--- |
 | CPU memcpy from VRAM rebar map (current) | ~158 ms |
 | `vkCmdCopyBuffer` VRAM -> CACHED staging | ~0.38 ms |
 | + memcpy CACHED staging -> RAM slot | ~0.17 ms |

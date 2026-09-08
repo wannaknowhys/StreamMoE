@@ -9,7 +9,8 @@
 > demote-to-RAM).
 
 ## 0. Decision supplement 2026-09-05 (user) - buffer layout via verify, not the
-##     execution path; whole-chain per device
+
+## execution path; whole-chain per device
 
 History lesson first: the current result-buffer scheme is a maze of band-aids.
 `hide_burst` forces a full-alloc per node and ping-pong was disabled
@@ -361,7 +362,8 @@ Pure analysis-layer addition first (verifiable via CAP_DUMP/CSV + sim.js),
 then the async skeleton on top.
 
 ## 7.2 Bucket-chain serialization + per-device output region (design agreed
-##     2026-09-06, user)
+
+## 2026-09-06, user)
 
 Converged design for the multi-bucket concatenated mini graph (shape B). Three
 decisions, all confirmed:
@@ -416,7 +418,8 @@ Downstream implications:
   validates numerics).
 
 ## 7.3 CPU phase-1 prototype: whole-layer burst graph + per-device accumulator
-##     (user decision 2026-09-06)
+
+## (user decision 2026-09-06)
 
 SUPERSEDES the CPU-phase-1 remark in SS7.2 ("scatter re-materialises full k
 rows, let the captured anonymous ADD tree run unchanged"). The user wants the
@@ -553,7 +556,8 @@ Key gotchas learned (why the earlier hide+append attempts failed):
    plan; cloning everything cleanly removes the ambiguity.
 
 ## 7.5 User decision 2026-09-06: multi-device shape (compact per-bucket chains +
-##     per-device accumulator + DMA contribution writeback)
+
+## per-device accumulator + DMA contribution writeback)
 
 Target shape for the multi-device / multi-bucket phase, building directly on the
 SS7.4 clone builder and the verified interval-layout-in-one-cgraph result:
@@ -597,7 +601,8 @@ compact bucket chains + accumulator folding against dumps/baselines; the DMA
 transport itself is GPU-phase work only.
 
 ## 7.6 Clarifications after 7.5 (2026-09-06) - accumulator is ON DEVICE, and it
-##     IS the anonymous fold; external-leaf analysis needed
+
+## IS the anonymous fold; external-leaf analysis needed
 
 1. **The per-device accumulator lives on the DEVICE, not in host RAM.** This
    corrects the SS7.5 wording ("fold into the accumulator happens on host RAM").

@@ -7,17 +7,18 @@
 ## 修改文件总览（6 个）
 
 | 文件 | 改动 | 用途 |
-|---|---|---|
-| `common/common.h` | `common_params` 加 6 字段 | route B 参数载体（主池 2 + 草稿池 2 + flag + prompt-log）|
+| :--- | :--- | :--- |
+| `common/common.h` | `common_params` 加 6 字段 | route B 参数载体（主池 2 + 草稿池 2 + flag + prompt-log） |
 | `common/arg.cpp` | 注册 6 个 CLI 参数 | `--expert-backend/--moe-ram-pool/--moe-vram-pool/--moe-draft-ram-pool/--moe-draft-vram-pool/--prompt-log` |
 | `common/common.cpp` | `common_init_from_params` 注入 route_b_setup | 主模型加载前初始化专家池 + 挂 tensor_buft_overrides |
-| `common/speculative.cpp` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型）|
+| `common/speculative.cpp` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型） |
 | `common/CMakeLists.txt` | `llama-common` 加父仓库 route B 源 + include + Windows 库 | 把 src/server/route_b_inject + backend/io/loader/pool 编译进 llama-server/cli |
 | `tools/server/server-context.cpp` | `llama-ext.h` include + 加载后打印 KV 内存 + 析构打印 spec 统计 | 实际 KV 尺寸 + draft 统计 |
 
 ## 逐文件明细
 
 ### common/common.h
+
 `common_params` 结构体 `n_predict` 后新增：
 ```cpp
 bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
@@ -29,6 +30,7 @@ std::string prompt_log_path;      // append /v1/chat/completions bodies
 ```
 
 ### common/arg.cpp
+
 `--swa-full` 后新增 6 个 `add_opt(common_arg(...))`：
 - `--expert-backend`（flag）
 - `--moe-ram-pool <MB>` / `--moe-vram-pool <MB>`（主池）
@@ -36,6 +38,7 @@ std::string prompt_log_path;      // append /v1/chat/completions bodies
 - `--prompt-log <PATH>`（lambda 用 `const std::string &`）
 
 ### common/common.cpp
+
 `common_model_params_to_llama`（mparams 构造，`no_host` 后）注入：
 ```cpp
 if (params.expert_backend) {
@@ -50,6 +53,7 @@ if (params.expert_backend) {
 （`route_b_setup` 幂等：按模型路径去重，draft/MTP 二次上下文不复用主池。）
 
 ### common/speculative.cpp
+
 `common_speculative_init_result` ctor 加载 draft 模型前注入（多模型池）：
 ```cpp
 // draft gets its own pool + buft; NEVER reuse the main-model overrides.
@@ -63,6 +67,7 @@ if (params.expert_backend) {
 ```
 
 ### common/CMakeLists.txt
+
 `llama-common` 目标末尾追加：
 ```cmake
 set(STREAM_MOE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../../src)
@@ -82,6 +87,7 @@ endif()
 ```
 
 ### tools/server/server-context.cpp
+
 1. include `"../src/llama-ext.h"`（拿 `llama_get_memory_breakdown`）。
 2. `load_model()` 里 `vocab = llama_model_get_vocab(model_tgt)` 后：
 ```cpp

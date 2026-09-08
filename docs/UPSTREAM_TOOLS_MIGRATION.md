@@ -8,7 +8,7 @@
 ## 1. 背景与动机
 
 | 现状 | 问题 |
-|---|---|
+| :--- | :--- |
 | 自研 `src/server/http_server.*` | 手写 HTTP/SSE，功能少：单槽、无 tools/函数调用、无 /v1/completions、无 API key、无 metrics/日志体系、无 context-shift/slot 管理 |
 | 自研 `src/server_main.cpp` / `src/main.cpp` | 参数解析手写；`--cache-type`/`--no-swa-full` 与上游参数冲突 |
 | vendored `common/`（28 文件）编译了但**未链接** | 浪费；且原版已实现全部推理/采样/对话/参数基建 |
@@ -34,23 +34,23 @@ stream_moe_server.exe   = llama-server（原版）+ route B 插件
 ## 3. 参数对比与去留（我们现有选项 → 原版）
 
 | 我们的参数 | 原版 llama-cli/server | 处置 |
-|---|---|---|
+| :--- | :--- | :--- |
 | `-m/--model` | `--model` | ✅ 用原版 |
-| `--host/--port` | `--host/--port`（server）| ✅ 用原版 |
+| `--host/--port` | `--host/--port`（server） | ✅ 用原版 |
 | `-c/--ctx-size` | `--ctx-size` | ✅ 用原版 |
 | `-ngl/--gpu-layers` | `--n-gpu-layers` | ✅ 用原版 |
 | `-t/--threads` | `--threads` | ✅ 用原版 |
 | `-n/--n-predict` | `--n-predict` | ✅ 用原版 |
-| `--temp/--top-p/--top-k` | 同 | ✅ 用原版（还有 --samplers 等全链）|
+| `--temp/--top-p/--top-k` | 同 | ✅ 用原版（还有 --samplers 等全链） |
 | `--mlock` | `--mlock` | ✅ 用原版 |
 | `--kv-placement ram/vram` | `-ngl` + `--flash-attn` + `--cache-type-*` 组合 | ❌ **去掉**，用原版机制 |
-| `--cache-type`（合并）| `--cache-type-k` / `--cache-type-v`（-ctk/-ctv）| ❌ **去掉**，用原版 |
-| `--no-swa-full` | `--swa-full`（**默认 false=windowed**）| ❌ **去掉**，用原版 `--swa-full` |
+| `--cache-type`（合并） | `--cache-type-k` / `--cache-type-v`（-ctk/-ctv） | ❌ **去掉**，用原版 |
+| `--no-swa-full` | `--swa-full`（**默认 false=windowed**） | ❌ **去掉**，用原版 `--swa-full` |
 | `--expert-backend` | 无 | 🔧 小改：arg.cpp 加参数 + 注入 |
 | `--moe-ram-pool` | 无 | 🔧 小改：arg.cpp 加参数 |
-| `--moe-vram-pool` | 无 | 🔧 小改：arg.cpp 加参数（Phase B 用）|
+| `--moe-vram-pool` | 无 | 🔧 小改：arg.cpp 加参数（Phase B 用） |
 | `--profile-log` | server `--metrics`（Prometheus）+ `--log-*` | 🔧 映射或小改保留 JSONL |
-| `--prompt-log` | 无（server 有 `--prompt-cache` 缓存、`--log-prompt`）| 🔧 小改：arg.cpp 加参数 + server 钩子 |
+| `--prompt-log` | 无（server 有 `--prompt-cache` 缓存、`--log-prompt`） | 🔧 小改：arg.cpp 加参数 + server 钩子 |
 | `-i/-p` | `llama-cli` 原生 REPL / `-p` | ✅ 用原版 |
 
 > **重要发现**：原版 `common_params.swa_full` 默认 **false（windowed）**，`--swa-full` 显式开启（arg.cpp:1679）。我们自研 server 用 `llama_context_default_params()`（swa_full=true）**默认反而比原版大**。迁移后默认即回到原版 windowed 行为（KV 更小），无需 `--no-swa-full`。
@@ -62,29 +62,32 @@ stream_moe_server.exe   = llama-server（原版）+ route B 插件
 ## 4. llama.cpp 原版评估：能用 / 小改 / 替换
 
 ### 4.1 能用（零改动）✅
+
 - `llama-server`：HTTP/SSE/OpenAI API、`/v1/chat/completions`（stream、tools、json-schema、MCP、CORS）、`/v1/models`、`/v1/completions`、`/health`、`/metrics`、`/slots`、multi-slot（`--parallel --slots`）、context-shift、undo/reasoning、prompt-cache、`--draft/--model-draft`（**B11 投机解码直接白拿**）。
 - `llama-cli`：REPL/`-p`/`-f`、采样全链、grammar、`--mlock`、多轮缓存。
 - `common/`：arg.cpp 参数解析（含 `--swa-full`、`--cache-type-k/v`、`--ctx-checkpoints`）、chat template（Jinja）、sampling、speculative、json-schema→grammar、preset、log、console。
 - KV/上下文：`--cache-type-k/v`（量化）、`--swa-full`、`--ctx-size`、`--flash-attn`、`--offload-kqv`（若 CLI 存在）。
 
 ### 4.2 小改（加 route B 接线，不改上游语义）🔧
+
 | 改动点 | 内容 |
-|---|---|
+| :--- | :--- |
 | `common/arg.cpp` | 新增 4 个参数：`--expert-backend`、`--moe-ram-pool <MB>`、`--moe-vram-pool <MB>`、`--prompt-log <path>`；`common_params` 加对应字段 |
 | `common/common.h/cpp` | 字段 + 默认值 + 传给 model params 的映射 |
-| `tools/server/server-context.cpp` `load_model()`（:958）| model 加载前：`ggml_backend_reg` 注册 route B backend；`mparams.tensor_buft_overrides` 指向 route B weight buft（复用 `src/backend/moe_backend` 的注册逻辑）|
-| `tools/server/server-context.cpp` / `tools/server/server.cpp` | `--prompt-log`：在 `/v1/chat/completions` 入口追加请求体（~10 行，挂 server-http 回调）|
-| `common/arg.cpp`（可选）| `--profile-log`：若保留 JSONL，在 server task 完成处回调 `src/profile/profiler` |
+| `tools/server/server-context.cpp` `load_model()`（:958） | model 加载前：`ggml_backend_reg` 注册 route B backend；`mparams.tensor_buft_overrides` 指向 route B weight buft（复用 `src/backend/moe_backend` 的注册逻辑） |
+| `tools/server/server-context.cpp` / `tools/server/server.cpp` | `--prompt-log`：在 `/v1/chat/completions` 入口追加请求体（~10 行，挂 server-http 回调） |
+| `common/arg.cpp`（可选） | `--profile-log`：若保留 JSONL，在 server task 完成处回调 `src/profile/profiler` |
 | `CMakeLists.txt` / `build.bat` | 构建目标改为 `llama-cli llama-server` + 链接 route B 静态库 |
 
 ### 4.3 用我们的实现替换/补充
+
 | 对象 | 替换为 |
-|---|---|
-| `src/server/http_server.*` | 原版 `tools/server/server-http.*`（删）|
-| `src/server_main.cpp` / `src/main.cpp` | 原版 `tools/server/main.cpp` / `llama-cli`（删）|
-| `src/engine/llama_engine.*` | 原版推理循环 + route B backend 注入（删；如 trace/导出需要，迁 `diagnostics/`）|
-| `src/backend/*`、`src/io/*`、`src/pool/*`、`src/loader/*` | **保留**（route B 插件本体）|
-| `src/common/{types,logger,crash}` | 保留（crash 兜底可注入原版入口）|
+| :--- | :--- |
+| `src/server/http_server.*` | 原版 `tools/server/server-http.*`（删） |
+| `src/server_main.cpp` / `src/main.cpp` | 原版 `tools/server/main.cpp` / `llama-cli`（删） |
+| `src/engine/llama_engine.*` | 原版推理循环 + route B backend 注入（删；如 trace/导出需要，迁 `diagnostics/`） |
+| `src/backend/*`、`src/io/*`、`src/pool/*`、`src/loader/*` | **保留**（route B 插件本体） |
+| `src/common/{types,logger,crash}` | 保留（crash 兜底可注入原版入口） |
 | `--kv-placement`/`--cache-type`/`--no-swa-full` | 原版 `-ngl`/`--cache-type-k/-v`/`--swa-full` |
 
 ---

@@ -27,15 +27,15 @@ StreamMoE/
 ## 2. docs/（设计文档集中）
 
 | 文件 | 内容 |
-|---|---|
-| `Backend.md` | DeepSeek4 自定义 backend / expert pool 调度设计（用户原始架构文档）|
-| `LLAMA_MOE_NO_MMAP_RESEARCH.md` | MoE 去 mmap 可行性研究 + route B 实现要点（含 pin 生命周期 §4.8、shexp §4.9）|
-| `BUG_TRACKER.md` | bug 追踪清单（P0/P1/P2/P3 + INC 事故记录 + 修复批次）|
-| `TEST_FLOW.md` | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）|
+| :--- | :--- |
+| `Backend.md` | DeepSeek4 自定义 backend / expert pool 调度设计（用户原始架构文档） |
+| `LLAMA_MOE_NO_MMAP_RESEARCH.md` | MoE 去 mmap 可行性研究 + route B 实现要点（含 pin 生命周期 §4.8、shexp §4.9） |
+| `BUG_TRACKER.md` | bug 追踪清单（P0/P1/P2/P3 + INC 事故记录 + 修复批次） |
+| `TEST_FLOW.md` | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存） |
 | `PROJECT_STRUCTURE.md` | 本文件 |
 | `MULTI_MODEL_POOL.md` / `MULTI_SUBPOOL.md` | 多模型池 / 按专家种类分子池设计 |
-| `UPSTREAM_TOOLS_MIGRATION.md` | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入）|
-| `VENDORED_MODIFICATIONS.md` | 对 vendored llama.cpp 的改动汇总（route-b-inject patch）|
+| `UPSTREAM_TOOLS_MIGRATION.md` | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入） |
+| `VENDORED_MODIFICATIONS.md` | 对 vendored llama.cpp 的改动汇总（route-b-inject patch） |
 | `PREFILL_CROSS_VALIDATION.md` / `EXPERT_TRACE_SIMULATION.md` | prefill/专家历史交叉验证与命中率模拟 |
 | `SAMPLING.md` / `SAMPLING.zh-CN.md` | 采样参数推荐 |
 | `REVIEW_2026_08_28.md` / `DEBUG_DELEGATION.md` | 代码审查对照 / delegate 排查记录 |
@@ -47,11 +47,11 @@ StreamMoE/
 ## 3. scripts/（运行脚本）
 
 | 文件 | 用途 |
-|---|---|
+| :--- | :--- |
 | `start_server.bat` | 启动 API server（`--temp 1.0 --top-p 0.95 -n 384000 -c 1048576`，见 docs/SAMPLING.md），`--prompt-log temp\server_prompts.log` |
 | `run_long_horizon_test.bat` | 整轮 long-horizon 基准（en/zh），用户手动运行、盯内存 |
-| `run_prefill_verify.bat` | 批量 Prefill/专家历史验证（std → moe 连续跑 jsonl → verify_prefill → simulate_cache）|
-| `verify_prefill.bat` | 单 prompt 快速 Prefill 交叉验证（std vs moe 导出 + verify_prefill）|
+| `run_prefill_verify.bat` | 批量 Prefill/专家历史验证（std → moe 连续跑 jsonl → verify_prefill → simulate_cache） |
+| `verify_prefill.bat` | 单 prompt 快速 Prefill 交叉验证（std vs moe 导出 + verify_prefill） |
 
 其余 mock 时代 runner（run_benchmark_experiments / run_chinese_benchmark / run_pure_lru_benchmark）已删除——统一收敛为 `run_long_horizon_test.bat [en|zh] [build-tag]`。
 
@@ -97,8 +97,8 @@ src/
 **子路径模式**：`build\<tag>\`，`<tag>` 描述构建风味/版本，例如：
 
 | tag | 含义 |
-|---|---|
-| `main` | 主线默认构建（`build.bat build`）|
+| :--- | :--- |
+| `main` | 主线默认构建（`build.bat build`） |
 | `memwatch` | 应用了内存哨兵补丁的构建 |
 | `v0.2` / 任意名称 | 版本/实验标记 |
 

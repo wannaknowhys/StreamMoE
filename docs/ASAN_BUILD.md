@@ -15,6 +15,7 @@ build.bat asan
 - 手动等价命令（未走 bat 时）：见 `build.bat` 的 `:asan` 块（vcvars + cmake + ninja 三行本质）。
 
 ## 关键点
+
 - **必须 `/MD`（动态 CRT）**——ASan 需要动态 CRT 拦截分配。不要设 `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`。
 - **`CMAKE_TRY_COMPILE_CONFIGURATION=Release`**：避开 CMake ABI 检测用 Debug flags（/RTC1 与 ASan 冲突）。
 - **`GGML_OPENMP=OFF`**：libomp 与 ASan 兼容问题，排除噪音。
@@ -23,10 +24,12 @@ build.bat asan
 - **宏机制**：route-B 经根 CMakeLists features 块（`STREAM_MOE_FEATURES=route_b`）全局定义 `STREAM_MOE_ROUTE_B`——不拼 CXX_FLAGS。需要别的 features 组合就手动加 `-DSTREAM_MOE_FEATURES=...`。
 
 ## 运行
+
 ```bat
 build\asan\llama-build\bin\llama-server.exe -m <model> --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui
 ```
 ASan 报 `ERROR: AddressSanitizer: heap-buffer-overflow / WRITE of size N` 时带调用栈（帧 #N 符号）。
 
 ## 已知成功用例（2026-08-27）
+
 用它排除了"overrides 被 4096 pad 挡住 + 专家池张量读 dummy"问题（最终根因靠逐行 log 定位，ASan 在此例未直接报越界，但确认了不是越界写）。

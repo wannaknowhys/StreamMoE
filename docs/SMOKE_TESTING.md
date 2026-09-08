@@ -5,7 +5,7 @@
 ## 冒烟模型
 
 | 用途 | 模型 | 说明 |
-|---|---|---|
+| :--- | :--- | :--- |
 | **MoE** | `N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf` | Gemma 4 26B **A4B**（每 token 激活 4 个专家），验证 MoE 前向路径/路由 |
 | **Dense** | `F:\Dev\computer-use\Qwen3-VL-2B-Instruct-Q4_K_M.gguf` | 2B dense，快速验证基本链路（文本）；模型在快盘 |
 
@@ -67,9 +67,9 @@ build\main\llama-build\bin\llama-server.exe -m F:\Dev\computer-use\Qwen3-VL-2B-I
 
 | ctx | KV 内存 |
 | :--- | :--- |
-| 8192 | （待测）|
-| 100000 | （待测）|
-| 1048576 | （待测；预期 ~3GB）|
+| 8192 | （待测） |
+| 100000 | （待测） |
+| 1048576 | （待测；预期 ~3GB） |
 
 ## Qwen3-VL 视觉测试（mmproj + 图片）
 

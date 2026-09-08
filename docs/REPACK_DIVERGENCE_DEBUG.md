@@ -44,14 +44,17 @@ Conclusion: identical input (bit) + identical weight bytes + identical kernel pa
 ## How the Verification Was Implemented
 
 ### Idea 1: simulate the dispatch
+
 Build a one-expert `MUL_MAT_ID` whose src0 is a repacked copy of the slot weight and give it a repack `buffer->buft` + `extra`, so `ggml_backend_graph_compute` routes it through the repack extra buffer type.
 
 ### Idea 2 (used): drive the kernel directly
+
 Expose a helper in `repack.cpp` that:
 1. allocates a repack buffer (`ggml_backend_buft_alloc_buffer`), sets `t->buffer/data/extra`, repacks via `traits->repack(...)` (must match the kernel, see below);
 2. builds `ggml_tensor` structs on the stack (src0/src1/ids/op with explicit ne/nb/data), a `ggml_compute_params` (wdata/wsize, threadpool, ith=0, nth=1), then calls `((tensor_traits*)src0->extra)->compute_forward(&params, &op)`.
 
 ### Pitfalls hit (all resolved)
+
 - x86 AVX2 Q4_K repack kernel is **`q4_K_8x8_q8_K` (8x8 layout)**; `q4_K_16x1_q8_K` is RISC-V only. Using the wrong repack layout produces huge/NaN outputs.
 - Use the kernel's own `traits->repack()` instead of hard-coding a repack function.
 - `ggml_compute_params` has no `type` field.

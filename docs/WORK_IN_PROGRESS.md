@@ -4,6 +4,7 @@
 > **本轮（2026-09-04）**：v2 块内张量对齐 + SoA pool 布局改造定案并落地（K1-K5）；批量 pin（L1-L6，纯 RAM 0.11s IDENTICAL）；**M 节设计定稿**（驱逐 + move 管线，docs/EXPERT_MOVE_PIPELINE.md）。v1 sections-v1 否决。
 
 ## 背景状态（已落地，commit 403a5d2）
+
 - features 机制：build.bat 传 `-DSTREAM_MOE_FEATURES`，vendored 根 CMakeLists features 块全局 `add_compile_definitions` + `include_directories`（3 frag 目录，`../../patches/...` 两级）
 - frag 全主仓库：route-b/common、prefill-export/common、prefill-export/include（vendored include/ 已清空）
 - llama-common PUBLIC frag include 已撤（保留 STREAM_MOE_SRC）
@@ -13,6 +14,7 @@
 ## 任务清单
 
 ### A. patch 手术（patch 对齐工作区）
+
 - [x] A0 盘点：patch 落后清单已确认（macros 缺根 CMakeLists/server-context 锚点；route-b/prefill 含过时 frag new-file + route-b 含旧 server-context 段）
 - [x] A1 macros patch 重生成：`git diff HEAD -- CMakeLists.txt common/arg.cpp common/common.cpp common/common.h include/llama.h tools/server/server-context.cpp`（纯锚点/机制，无污染）
 - [x] A2 route-b patch 重生成：`git diff HEAD -- common/CMakeLists.txt common/speculative.cpp common/speculative.h src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model.cpp src/llama.cpp`（frag + server-context 自动消失；llama-model-loader.h 补入）
@@ -23,38 +25,43 @@
 - [x] A7 apply.bat —— 暂缓（update_routeb_patch.js 已能文件级更新；干净 apply 已由 A4 验证）
 
 ### B. ASan 子命令整合 build.bat
+
 - [x] B1 build.bat 加 asan 子命令（已验证构建成功 + dll copy）
 - [x] B2 ASAN_BUILD.md 修过时（build.bat asan + features 说明）
 
 ### C. 文档同步
+
 - [x] C1 patches/README.md 重写新体系（frag 主仓库 + features + apply 顺序 + 文件归属）
 - [x] C2 docs/CHECKPOINT.md 更新状态段（patch 体系 + features 机制）
 - [x] C3 Makefile 注明 Linux route-b 未支持（STREAM_MOE_SRC 硬编码 async_dio_win.cpp，需 posix 源选择后方可启用）
 
 ### D. Linux async DIO 真异步化（新开，评估待做）
+
 - [ ] D1 现状已确认：`src/io/async_dio_posix.cpp` 是同步 `pread` 套 async 接口壳（submit_batch 阻塞读；wait_events 无等待语义）——正确性可用、并发/吞吐不合格（对比 win IOCP 真异步）
 - [ ] D2 达标设计（按性能底线）：io_uring 主路径 → 探测失败 fallback io_submit/libaio → 再失败同步 pread（现实现降级为它）；需 sqe/cqe ring + O_DIRECT 4K 对齐（v2 直读 slot 已满足）
 - [ ] D3 决策点：Linux 是否已是/将成为生产目标（若非——维持占位，仅当 Linux 正经跑 route-b 大 prefill 前做）
 
 ### E. features 重构运行时验证（2026-09-03）
+
 - [x] E1 HTTP 推理冒烟（用户手动 curl hi）——OK（features 重构非运行时回归）
 - [x] E2 `node tools/run_export.js` hi（moe-temp0/StreamMoE_dump/gemma original）——rc=0，导出产物齐（chat/prefill_export/expert_history/tokens_id/text/meta）
 - [x] E3 **--prefill-from 卡死——已定位并修复（6111cc7）**：根因 = 组容量 < 单层专家数——129-token 单次 decode 在 layer 29（group1 仅 76 slots）活跃集超容量，compute 整层 pin（rc>0）不可驱逐 → worker NO_VICTIM 无限 requeue + compute 死等。验证：8192 池跑通（g1→128 slots，rc=0）、71680 池本就不卡、512 池 fail-fast（报 needs>=983MB）。修复 = 每组分池保底 = 一层全量专家 + 剩余按字节比例 + 预算不足 init 即报错退出
 
 ## 关键纪律
+
 - patch 生成用 `cmd /c "git -C third_party/llama.cpp diff HEAD -- <文件> > patches\x.patch"`（PS 重定向写 UTF-16，禁）
 - 手术前快照 + 主仓库 commit（README 叠加铁律）
 - vendored 永不 commit，改动靠 patch 记录
 
-
 ### F. prefill-from 死锁修复 + 分歧验证收尾（2026-09-03）
+
 - [x] F1 死锁修复验证：8192 vs 71680 IDENTICAL（6111cc7 零数值影响）；512 fail-fast
 - [x] F2 分歧调查 + CPU-vs-Vulkan 对照：分歧=任意后端固有噪声（同路由 0.9996/翻放大 0.96-0.98/~5% 专家条目）——moe 非分歧来源
 - [x] F3 verify_prefill.js KV ne/nb 修复（4bf25d3）；kv_cos.js 验证 OK（自洽全1）
 - [x] F4 结论文档 docs/BACKEND_DIVERGENCE_ANALYSIS.md
 
-
 ### G. GPU/Multi-device M1 - CPU-only private-chain skeleton (2026-09 开工)
+
 - [x] G1 调研完成：gemma4 门控自定义在 gemma4.cpp（attn_out 上 rms_norm+scale+gate_inp_s+mm，dense 域），probs_in 传入 build_moe_ffn；链 = softmax/topk/weights(norm_w) -> fused gate_up MUL_MAT_ID -> view gate/up -> geglu_split -> down MUL_MAT_ID -> mul weights -> 逐expert view/add -> moe_out；每层 2 个 MUL_MAT_ID；post_norm_2 在链外 dense 域（build_moe_ffn 实际调用参数：gate_up merged/up_down_mm_id/norm_w/gating/down 等）+ 现状 minigraph 接口
 - [x] G2 定案：执行形态 A = 逐节点 mini-graph + 数据私有（不建影子链/不重建拓扑，拓扑来自主图 -> 无 per-arch 重建器）；私有 arena 中间 / view 指针偏移 / moe_out 直写主图 dst；专家视图接口 = resolve(L,E)->{pool,slot 基址/stride}；mock 点清单见 docs/MOCK.md
 - [ ] G3 实现：graph_compute 收整层 -> 重建 -> 官方核执行（中间 arena 不写主图链中间）
@@ -71,9 +78,11 @@
 - [x] PATCH-DEBT-2：common/CMakeLists.txt 的 route_b_chain.cpp 源已补进 route-b patch（CMakeLists 段替换完成）
 
 ### H. 长线：消灭 phase2a/2b patch（2026-09 定，不立刻整理）
+
 - [ ] 目标：vendored 改动全经 phase1 打桩（include 锚点）+ 主仓库内容（frag / 独立 cpp via STREAM_MOE_SRC）表达，route-b-inject.patch / prefill-export-llama.patch 最终消失，只留 streammoe-macros.patch。纪律写入 patches/README：小插入→锚点+frag；大块→独立 cpp 或大 frag；不得不直接改 vendored→先问用户。
 
 ### I. GPU M1 过渡 - 参数 collection 化 + Vulkan 显存池真申请调查（2026-09）
+
 - [x] I1 pool collection 参数落地（cf0e61a）：`--moe-expert-pools <dev>:<MB>[,...]`（main/draft 统一）；route_b_setup 接 pool list；非 RAM 设备排队 lazy alloc（首次 graph_compute 触发——vulkan 注册晚）；回归 IDENTICAL
 - [x] I2 vulkan 注册机制查清：ggml_backend_registry **静态注册**（ggml-backend-reg.cpp:129-136，GGML_USE_VULKAN 编译期 + 无 GGML_DISABLE_VULKAN env），非 llama 初始化/惰性。之前拿不到 Vulkan0 = StreamMoE_dump 默认 CPU-only（build.bat:69 设计），需 `GGML_VULKAN=ON` env 重编
 - [x] I3 Vulkan0 真分配：2048MB 成功；3G/4G/5G/6G/7G 全 OOM。两层限制：① RX590 驱动 maxBufferSize 偏低（ggml-vulkan.cpp:6377，需 `GGML_VK_FORCE_MAX_BUFFER_SIZE` env 绕过）② 绕过后 vkAllocateMemory 真 OOM——8GB 卡实际空闲 ~2.5GB（-ngl 2 dense + vulkan 运行时 + 系统占用）。M2+ 分段分配规避，不依赖单 buffer
@@ -84,6 +93,7 @@
 - [x] I8 **vk 数值基线 + run_baseline 参数化（5db4a52）**：`baseline_regression/baseline/moe_129_8192_vk`（默认 GGML_VULKAN=ON 构建 + 自动 no-op-offload 产物）；`run_baseline.bat [baseline_moe_dir] [verify_dir]`——CPU 基线 moe_129_8192 / vulkan 基线 moe_129_8192_vk 按构建形态选；upstream 固定 upstream_129；`*_vk` 自动放宽 KL 阈值 1.0→4.5。README 同步。验证：vk 模式双 IDENTICAL PASS；默认（vulkan binary vs CPU 基线）正确报 DIVERGED + 0 unexplained
 
 ### J. VRAM 数据层 - 池真驻留 + CPU 读 vram 执行（2026-09）
+
 > 路线 A 落地（数据层先行，执行仍 CPU；为 GPU 阶段铺数据硬前置）。主仓代码直接 commit；唯一 vendored 改动 = ggml-vulkan host map 导出（patch）。
 
 - [x] J1 **host map 通道（ggml-vulkan.cpp phase1 锚点 → `stmoe_routeb_vk_hostmap.frag`，511cc7a 起）**：ggml-vulkan `get_base` 固定返回假 `vk_ptr_base=(void*)0x1000`（:2407）——vulkan 内部靠 `tensor->data - vk_ptr_base` 算偏移（:2411），**不能改**。经 frag 导出 `stmoe_vk_buffer_host_ptr(buffer)` 返回真 `vkMapMemory` ptr（HOST_VISIBLE buffer，:3548-3550）。RX590 分配即 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（rebar/BAR1，create_buffer_device :3597-3606）。实测 4MB pattern RW-OK。2026-09 由独立 patch 改造成 macros 锚点 + frag（见 patches/README）。
@@ -94,6 +104,7 @@
 - [ ] J6 **mixed 分区执行（T5b，待做）**：同层 MUL_MAT_ID 激活集跨 RAM/vram 时需按驻留区分区子 mul_mat_id + 结果列写回——当前 129-token 未触发同层 mixed（单区限制暂安全）；结构与 GPU 每-device 分区同构，M2/M3 复用
 
 ### K. v2 块内张量对齐 + SoA pool 布局改造（2026-09 定案，替代 b4-3/v1 路线）
+
 > 根因钉死：**ggml-vulkan MUL_MAT_ID 专家步长硬编码 = `ne0*ne1`（单张量紧凑大小），忽略 `nb[2]`**
 > （mul_mm.comp:253 batch_stride_a=ne00*ne01；ggml-vulkan.cpp:10385）。CPU mul_mat_id 读 `nb02`
 > （ggml-cpu.c:1654）正确。b4-3 arena-clone 已归档（debug_patch/b4-3-arena-clone/）。
@@ -134,6 +145,7 @@
 - [ ] K7 文档同步（GGUF_FORMAT / LOADER_FORMATS / MULTI_SUBPOOL / CHECKPOINT / VENDORED）
 
 ### L. 批量 pin：bitmap 层请求 + MPSC 就绪位（2026-09 定案）
+
 > **动机**：逐专家阻塞 pin（exec 每个 miss → push 单条 → `wait_version` 死等该专家 → 下一个才入队）
 > 使 DIO 全串行 + exec/scheduler 乒乓（scheduler 装完一个队列空、sleep 1ms）。vram 路径跑不起来
 > （demote 风暴 + 从不触发 GPU mm）。同时 M2_DEVICE_EXECUTOR §6 的 `total_tokens`+`start_rdtsc`
@@ -172,6 +184,7 @@
 > - [ ] L7 文档同步（WIP L 节已写；补 CHECKPOINT 一行引用）
 
 ### N. NO_VICTIM 驱逐死锁修复 + 无进展 stall 兜底（2026-09 落地 5d08bb3）
+
 > **根因（lldb 定位，进程 27544）**：`alloc_or_evict` 驱逐扫描是固定下窗 `delta 1..layer`——
 > **layer 0 候选集恒空**（delta 无负层），池满后任何新 layer-0 专家 miss 永远无法驱逐 →
 > `accept_requests` 收 leftover requeue + `worker_loop` 因 any=true 不 sleep → **单核 100% 自旋**
@@ -194,6 +207,7 @@
 > K6 "vulkan 吃 SoA 列数值正确" 的 device 触发路径值得按 L6b 待办重测。
 
 ### M. Expert Move Pipeline + (L,E)-Keyed Eviction（2026-09 设计定稿）
+
 > **完整设计见 `docs/EXPERT_MOVE_PIPELINE.md`（EN）/ `.zh-CN.md`** —— 一次工作会话
 > 敲定的下一轮 scheduler 重构，建在已落地 L 节批量 pin 之上。本文档含 open questions
 > 与构建顺序，改动面大，动码前以它为唯一设计依据。
@@ -345,7 +359,6 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - **基准冻结**：`baseline_regression/baseline/deepseek_hi_up`（upstream CPU 参照）+
   `deepseek_hi_moe`（桶引擎产物，同 tokens），README 记 DeepSeek gate 判据（cos，非逐字节）。
 
-
 **out_off arena 改造（2026-09-07 落地，M2 §7.2.1 手动 arena 串行复用）**：
 - 孪生输出 data 从"每桶独立 fold_buf heap"改为钉 `fullalloc arena + ex->out_off[闭包索引]`
   （bucket_build_t.twin_out；compact [d,w_b,n_t] ≤ 满宽 [d,n_k,n_t] 同 out_off 区不冲突；
@@ -374,4 +387,3 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - deepseek 无独立 scale 节点（scale 权重在 down_exps，weighted 前未展开成节点 dump）——需另查其
   ffn_moe_down/weighted 的乘结构是否内嵌 scale（见 §7.8 外 leaf 表：down 壳 w 3 分片 + scale 合并？）。
 - 桶化待处理外部输入：scale（node_57 类）也按桶槽取，不是"链内收缩"。
-

@@ -66,6 +66,9 @@
     - 像 REPL 写脚本一样：写一步看一步、接受中间态跑不对，按用户给的步骤逐行推进。
     - 只有用户自己叫停或要求修正时才停。
 
+14. **需求实现途中不搞中间回归验证，直奔终态实现，完工后再做回归（2026-09-08 用户立）**
+    - 实现需求途中不进行任何中间数值回归或过渡验证，代码不打折扣地直接按最终目标形态写到底；若实现过程中遇到做不到或不明确的问题直接停下问用户，禁止私自引入过渡妥协代码；全部需求代码写完闭环后再统一进行回归验证。
+
 ## 三、协作规则
 
 - 开始任务前：先读本文件 + `docs/CHECKPOINT.md`（当前状态）+ `docs/PROJECT_STRUCTURE.md`（结构）。
@@ -76,19 +79,21 @@
 ## 四、docs 文档地图（按需读取）
 
 ### 重要必读（会话开始 / 大改动前）
+
 | 文档 | 内容 |
 | :--- | :--- |
-| `docs/CHECKPOINT.md` | 当前状态、下一步、验证命令（会话恢复先读）|
+| `docs/CHECKPOINT.md` | 当前状态、下一步、验证命令（会话恢复先读） |
 | `docs/PROJECT_STRUCTURE.md` | 目录/产物/规范、vendored patch 纪律 |
-| `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` | route B 核心设计（第三路径：官方内核 + 均匀 stride 槽池）|
+| `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` | route B 核心设计（第三路径：官方内核 + 均匀 stride 槽池） |
 | `docs/Backend.md` | 自定义 backend / expert pool 调度设计 |
 | `docs/VENDORED_MODIFICATIONS.md` | vendored 改动汇总 + patch 记录 |
 
 ### 按场景读取
+
 | 场景 | 文档 |
 | :--- | :--- |
-| 调度/池（dir 二维、异步装载、全局线程、驱逐打分）| `docs/EXPERT_SCHEDULER_DESIGN.md` |
-| GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）| `docs/ROUTE_B_GPU_PHASE.md` |
+| 调度/池（dir 二维、异步装载、全局线程、驱逐打分） | `docs/EXPERT_SCHEDULER_DESIGN.md` |
+| GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置） | `docs/ROUTE_B_GPU_PHASE.md` |
 | 多模型池 / 异构子池 | `docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md` |
 | GGUF 格式 v1/v2 / RAID0 分片 | `docs/STREAMMOE_GGUF_FORMAT.md` |
 | prefill 交叉验证 / 专家历史模拟 / repack 排查 | `docs/PREFILL_CROSS_VALIDATION.md`、`docs/EXPERT_TRACE_SIMULATION.md`、`docs/REPACK_DIVERGENCE_DEBUG.md` |
@@ -100,7 +105,8 @@
 | v2 架构修正 | `docs/V2_ARCHITECTURE_REVISION.md` |
 
 ### 可以不读（参考/历史）
+
 | 文档 | 内容 |
 | :--- | :--- |
-| `docs/REVIEW_2026_08_28.md` | 早期审查对照（结论已并入代码）|
-| `docs/LLAMA_MMAP_CALLS.md` | mmap 调用点调试地图（低优先级）|
+| `docs/REVIEW_2026_08_28.md` | 早期审查对照（结论已并入代码） |
+| `docs/LLAMA_MMAP_CALLS.md` | mmap 调用点调试地图（低优先级） |

@@ -171,7 +171,7 @@ exec pin_layer(bitmap):
       find a READY copy (dir scan) -> try_pin -> success: record handle
       else (ABSENT / LOADING / MOVING_IN / pin race) -> mark still-need
     if none still-need: return all handles
-    submit ONE request { layer, still-need bitmap, n_load_target = count } 
+    submit ONE request { layer, still-need bitmap, n_load_target = count }
     sleep on the batch completion signal (wake-once on READY of all still-need)
     // scheduler makes every still-need expert READY (own load or an existing
     // in-flight one); exec re-pins after the wake; loops on any remaining race

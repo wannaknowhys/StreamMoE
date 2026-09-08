@@ -111,7 +111,7 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 ## 2. 结论总览
 
 | 需求 | 实现途径 | 是否改 llama.cpp |
-|---|---|---|
+| :--- | :--- | :--- |
 | MoE 专家权重不经过 mmap 数据路径 | `tensor_buft_overrides` → 自定义 buft；非默认 buft 走真实分配；`set_tensor` no-op 跳过物理读入 | **否** |
 | 专家按需装载 + 紧凑槽 | 自定义 backend 接管 MUL_MAT_ID 执行；`graph_compute` 内查 `expert_directory`、就绪等待、从槽内存计算 | **否** |
 | dense 维持 llama.cpp 默认 | 不覆盖 dense 张量的 buft → 默认 mmap 零拷贝不变 | **否** |
@@ -123,15 +123,15 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 
 ## 3. 三条路线最终对比
 
-| 维度 | 路线 A：Fork 1（RESERVE 区域 + 官方内核 + cb_eval）| 路线 B：紧凑槽 + 自定义 backend（Backend.md 原设计）| 路线 C：紧凑槽 + 改 llama.cpp 建 view |
-|---|---|---|---|
-| llama.cpp 改动 | **零** | **零**（注册 backend + buft）| **必须**（load_arch_tensors 建 view）|
-| MUL_MAT_ID 执行 | 官方 ggml-cpu 内核 | **我们实现**（mini-graph 委托或原生内核）| 官方内核（stride view 适配）|
-| 专家物理布局 | 大区域三区域 slice（非紧凑）| 紧凑 [gate\|up\|down] 槽 | 紧凑槽 |
-| ids | 专家 id，无需翻译 | 专家 id，图内不翻译（graph_compute 内私下查表）| 需翻译成 slot 索引（有 get_rows 冲突）|
-| 虚拟地址 | RESERVE 147GB（真实 VA 预留，免费）| 无 VA 预留；147GB 仅是 buffer size 记账值 | 池大小 |
-| 实现工作量 | 小（buft + cb_eval + scheduler）| **中-大**（backend 骨架 + MUL_MAT_ID 计算实现）| 中（改 llama.cpp + 翻译）|
-| 正确性风险 | 无（全官方内核）| 我们的 compute 需数值等价 | 翻译 hack 风险 |
+| 维度 | 路线 A：Fork 1（RESERVE 区域 + 官方内核 + cb_eval） | 路线 B：紧凑槽 + 自定义 backend（Backend.md 原设计） | 路线 C：紧凑槽 + 改 llama.cpp 建 view |
+| :--- | :--- | :--- | :--- |
+| llama.cpp 改动 | **零** | **零**（注册 backend + buft） | **必须**（load_arch_tensors 建 view） |
+| MUL_MAT_ID 执行 | 官方 ggml-cpu 内核 | **我们实现**（mini-graph 委托或原生内核） | 官方内核（stride view 适配） |
+| 专家物理布局 | 大区域三区域 slice（非紧凑） | 紧凑 [gate\|up\|down] 槽 | 紧凑槽 |
+| ids | 专家 id，无需翻译 | 专家 id，图内不翻译（graph_compute 内私下查表） | 需翻译成 slot 索引（有 get_rows 冲突） |
+| 虚拟地址 | RESERVE 147GB（真实 VA 预留，免费） | 无 VA 预留；147GB 仅是 buffer size 记账值 | 池大小 |
+| 实现工作量 | 小（buft + cb_eval + scheduler） | **中-大**（backend 骨架 + MUL_MAT_ID 计算实现） | 中（改 llama.cpp + 翻译） |
+| 正确性风险 | 无（全官方内核） | 我们的 compute 需数值等价 | 翻译 hack 风险 |
 
 ---
 
@@ -293,9 +293,9 @@ b_leaf：用 op==NONE + 手动 data/nb 的叶子包装主图激活（cur），�
 ### 7.3 与 §3 三路线的关系
 
 | 路线 | 本路径（第三路径）相对 |
-|---|---|
-| 路线 A（RESERVE + 官方内核 + cb_eval）| 无 147GB VA 预留；槽池按预算 commit |
-| 路线 B（紧凑槽 + 我们实现 MUL_MAT_ID）| **不需要我们实现计算路径**，官方内核直接执行 |
-| 路线 C（改 llama.cpp 建 view + 槽号翻译）| **零 llama.cpp 改动**，ids 翻译在私有 mini-graph 内 |
+| :--- | :--- |
+| 路线 A（RESERVE + 官方内核 + cb_eval） | 无 147GB VA 预留；槽池按预算 commit |
+| 路线 B（紧凑槽 + 我们实现 MUL_MAT_ID） | **不需要我们实现计算路径**，官方内核直接执行 |
+| 路线 C（改 llama.cpp 建 view + 槽号翻译） | **零 llama.cpp 改动**，ids 翻译在私有 mini-graph 内 |
 
 代价：槽池必须是"单块连续 + 均匀 stride"布局（不能按专家分片独立分配）；每个专家 gate/up/down 是**三个逻辑区域（branch offset）**，装载 = 3 次 DIO 到各自区域。

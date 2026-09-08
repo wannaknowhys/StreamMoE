@@ -6,7 +6,7 @@
 ## 1. 确定没问题的（已实证，不再怀疑）
 
 | # | 项 | 证据 |
-|---|----|----|
+| :--- | :--- | :--- |
 | 1 | DIO 装载字节全等 | layer3 全部 256 专家切片校验和 == 文件 |
 | 2 | 运行时槽内容正确 | s86-s115 全部 30 槽前 4 字节 == 文件；e235 全段校验和 `BCFB9B786148910B` 双端一致 |
 | 3 | 路由 ids 一致 | base vs eb `#ids` 记录逐位一致（含 L0 与 L3） |
@@ -26,7 +26,7 @@
 ## 2. 确定有问题的（实证定位）
 
 | # | 项 | 证据 |
-|---|----|----|
+| :--- | :--- | :--- |
 | 1 | **L3 gate/up t>=1 输出数值错误**（t0 正确；t1/t3 的 k5 例外） | 隔离 + live 均复现；每 (k,t) 唯一专家 cne1=1 |
 | 2 | **错误发生在 vec_dot 计算，不是写位置** | 内核 dot tmp=-0.3502 与期望 -0.8902 不符，而输入全部字节验证正确 |
 | 3 | L0 正确 / L3 错误，同代码同数据正确 | 差异只在数据值本身，指向数据相关的 SIMD 行为 |
@@ -62,8 +62,9 @@ ggml_backend_graph_compute(cpu, gf)                 [iso 入口]
 **Dump 到的记录**：L0 gate/up/down + L3 gate（4 条；L3 up/down 未入 dump，后续补）。
 
 **验证结论（moe 侧 vec_dot 全部输入正确）：**
+
 | 项 | 结果 |
-|----|------|
+| :--- | :--- |
 | L3 gate 槽内容 == 文件 | e235→s86 FNV=`BCFB9B786148910B` 与此前一致；30 槽全部正确 |
 | ids/idslot | L3: e235→s86, e217→s92, ..., e75→s115 全对；L0: 槽 0-29 |
 | cur | L3 col0=-0.2272... 与 base trace 逐值一致 |
@@ -110,9 +111,11 @@ int32_t e = *(const int32_t*)((const char*)ids->data + (size_t)t * ids->nb[1] + 
 ## 8. ✅ 修复实施与验证（2026-08-26）
 
 ### 改动
+
 - `src/backend/minigraph_exec.cpp`：新增 `MOE_ID_AT(ids,t,k)` 宏（按 `ids->nb[1]` 真实行步长读元素）；phase 1（pin 解析）、phase 2（ids_slot 翻译）、`[ids]` 调试、`dump_moe_node`、ABC 实验块全部改用它。gate/up/down 三处统一。
 
 ### 运行时验证（修复后 delegate 读到的 L3 gate ids）
+
 ```
 [ids] blk.3.ffn_gate_exps.weight nb1=1024:
   t0 = e235,e117,e129,e68,e47,e71
@@ -122,13 +125,12 @@ int32_t e = *(const int32_t*)((const char*)ids->data + (size_t)t * ids->nb[1] + 
 t1-t4 与 `trace_base3.bin` 的 stride1024 布局（offset 1024/2048/3072/4096）逐位一致。
 
 ### 端到端测试
+
 `--expert-backend --temp 0 -p "Say hi." -n 8`：
 - 修复前输出：`## Final answer\nSay hi.`（错误）
 - **修复后输出：`Hi! How can I help you today`（与基线逐字一致）✅**
 
 ### 遗留说明
+
 - 诊断代码仍在：`arch/x86/quants.c` / `ggml-cpu.c` 的 KDBG + vec_dot 逐行 detail（均 `#ifdef STREAM_MOE_KERNEL_DBG`，仅 kdbg-build 编译，不入主构建）；`minigraph_exec.cpp` 的 `[verify]` 打印（`STREAM_MOE_TEMP` 下）与 `dump_moe_node`（L0/L3 dump）。上下文压缩后清理。
 - 数值等价回归（全命中/混合 vs 官方图逐元素 diff）待后续跑。
-
-
-

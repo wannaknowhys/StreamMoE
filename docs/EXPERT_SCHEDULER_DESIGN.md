@@ -16,13 +16,13 @@
 
 | 成员 | 类型 | 语义 |
 | :--- | :--- | :--- |
-| `slots_` | `slot_meta[]`（64 位原子字数组）| **每 pool 一个**，长度 = `num_slots`（跨子池全局索引；异构组用 `subpool_t.slot_begin/n_slots` 分段）|
-| `owner_[]` | `(layer, expert)` 对数组 | 槽 → 专家的**反向映射**（scheduler 私有，驱逐打分用）|
-| `dir_` | `expert_directory` | **专家的数组**：`(layer, expert) → slot 或 UNASSIGNED`（`entries_` 原子 u32）+ `versions_`（每专家版本号）|
-| `stats_` | `expert_stats_tracker` | EST1 热度（`get_adaptive_frequency`，读时归一化）|
-| `staging_per_group_[]` | 每子池一块 staging 缓冲 | DIO 扇区对齐读的中转（组内专家布局相同，一块够）|
-| `requests_` | `mpsc_alloc_queue`（4096）| 计算线程的分配请求（layer, expert, seq）|
-| `subpools_` | `subpool_t[]` | 异构组（slot_begin / n_slots / expert_size / base）|
+| `slots_` | `slot_meta[]`（64 位原子字数组） | **每 pool 一个**，长度 = `num_slots`（跨子池全局索引；异构组用 `subpool_t.slot_begin/n_slots` 分段） |
+| `owner_[]` | `(layer, expert)` 对数组 | 槽 → 专家的**反向映射**（scheduler 私有，驱逐打分用） |
+| `dir_` | `expert_directory` | **专家的数组**：`(layer, expert) → slot 或 UNASSIGNED`（`entries_` 原子 u32）+ `versions_`（每专家版本号） |
+| `stats_` | `expert_stats_tracker` | EST1 热度（`get_adaptive_frequency`，读时归一化） |
+| `staging_per_group_[]` | 每子池一块 staging 缓冲 | DIO 扇区对齐读的中转（组内专家布局相同，一块够） |
+| `requests_` | `mpsc_alloc_queue`（4096） | 计算线程的分配请求（layer, expert, seq） |
+| `subpools_` | `subpool_t[]` | 异构组（slot_begin / n_slots / expert_size / base） |
 
 **回答：是不是"每 pool 一个 slots 数组 + 一个专家数组"——是。**
 - `slots_` 按 pool（scheduler 实例）一个，子池只是同一个数组里的分段。
@@ -42,9 +42,9 @@ bit 63........32 | 31........3 | 2 1 0
 | 分配槽 | `begin_reload()` | → IO_INFLIGHT，generation++ |
 | IO 完成 | `mark_ready()` | IO_INFLIGHT→READY（release），`WakeByAddressAll` |
 | IO 失败 | `mark_failed()` | →FAILED，等待线程醒后抛错 |
-| 计算面 pin | `try_pin()` | 仅 READY 可 pin，CAS refcount++，返回 generation（防御 ABA）|
+| 计算面 pin | `try_pin()` | 仅 READY 可 pin，CAS refcount++，返回 generation（防御 ABA） |
 | 计算面释放 | `unpin()` | refcount-- |
-| 驱逐 | `begin_evict()` | READY→EVICTING（阻止新 pin）|
+| 驱逐 | `begin_evict()` | READY→EVICTING（阻止新 pin） |
 | 等待 | `wait_ready(gen)` | wait-on-address 等 READY 且 generation 匹配 |
 
 等待原语：Windows `WaitOnAddress/WakeByAddressAll`；Linux futex（64 位字取低 32 位，醒后重读全字防 ABA）；其他 yield。**非忙等**。
@@ -93,12 +93,12 @@ freq  = stats_.get_adaptive_frequency(owner)   // EST1，读时按当前最大�
 
 | 问题 | 现状 | 方向 |
 | :--- | :--- | :--- |
-| score 魔数 | `1e9` 归一化，generation<<1e9 时 recency 区分度≈0（实际只看 freq）| 改 `last_used_token` recency + 动态 α（REVIEW_2026_08_28）|
-| 驱逐忙等无超时 | `while(refcount != 0) yield()` 无界自旋 | 加超时 + 日志（L/E + refcount）|
-| 单线程 + 同步读 | scheduler_loop 单线程，`read_expert_sync` 阻塞，跨专家串行 | **异步 IO 引擎**（IOCP 并发 in-flight / io_uring / io_submit fallback），pin 提交后立即返回，IO 完成 wake（ROUTE_B_GPU_PHASE §3）|
+| score 魔数 | `1e9` 归一化，generation<<1e9 时 recency 区分度≈0（实际只看 freq） | 改 `last_used_token` recency + 动态 α（REVIEW_2026_08_28） |
+| 驱逐忙等无超时 | `while(refcount != 0) yield()` 无界自旋 | 加超时 + 日志（L/E + refcount） |
+| 单线程 + 同步读 | scheduler_loop 单线程，`read_expert_sync` 阻塞，跨专家串行 | **异步 IO 引擎**（IOCP 并发 in-flight / io_uring / io_submit fallback），pin 提交后立即返回，IO 完成 wake（ROUTE_B_GPU_PHASE §3） |
 | 线性扫描 | 槽数几千时 OK | GPU/多池后槽数×设备，考虑按组索引/堆优化驱逐候选 |
 | 生命周期位置 | pin/unpin 在 `graph_compute` 按批猜角色 | 迁 cb_eval（hash 构建期预取 / argsort 首节点 wait / 汇合节点 unpin），见 ROUTE_B_GPU_PHASE §2 |
-| 多池（GPU） | 每模型一个 scheduler | 每模型×每设备一个 scheduler；池选择（pin 时按热度/空闲/后端能力）|
+| 多池（GPU） | 每模型一个 scheduler | 每模型×每设备一个 scheduler；池选择（pin 时按热度/空闲/后端能力） |
 
 ## 9. 文件对照
 
@@ -153,5 +153,3 @@ freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1    // lambda ~ 0.95
 - **IOCP 无"逻辑任务全完成"聚合**：每个 `aio_req_t` 独立完成、乱序；聚合靠头里 `pending` 计数（每 req 完成递减，`pending==0` → `mark_ready` + dir set + wake）。调度线程单线程收割，`pending--` 非原子。
 - **per-model layout 标记**：loader 解析 `stream_moe.layout`（无 = 原版 / `sections-v1` / `expert-blocks-v2`）→ 决定 staging 有无。**草稿与主体独立判断**（可能一个原版一个 v2，甚至结构大小差一个 staging 段）。
 - **ringbuffer 池**：每模型一个，元素大小 = `sizeof(async_load_t)` + (v1/原版 ? 组内 max staging : 0)；元素数 = 事实并发数（大规模 prefill 开大，如 64~128）。ringbuffer 满时调度线程**继续轮询完成**腾槽（不阻塞），"无完成可收割 + 满"才真正背压（IO 满载信号）；饱和报告用宏包裹（`STREAM_MOE_LOAD_SAT`，限频日志 + 屏幕）。
-
-

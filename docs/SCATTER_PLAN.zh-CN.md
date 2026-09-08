@@ -61,8 +61,8 @@ down mm dst、down_scaled、weighted，直到折叠——都免费继承 tight �
 per-token 数据按 `order` 拷进 tight staging）。一个通用 tight-gather 助手即可服务三者。
 
 | 数据 | 角色 | per-token 布局 | 桶影响 |
-|---|---|---|---|
-| `cur`（dense norm 输出） | gate/up mm src1 | 每 token 一共享列 `[d,1,n_t]` | token tight-gather → `[d,1,n_active]`（与 slot 无关）|
+| :--- | :--- | :--- | :--- |
+| `cur`（dense norm 输出） | gate/up mm src1 | 每 token 一共享列 `[d,1,n_t]` | token tight-gather → `[d,1,n_active]`（与 slot 无关） |
 | 路由 `ids` | mm src2、GET_ROWS src1 | per-(token,slot) `[n_k,n_t]` | slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块按 tight 重排 |
 | per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | slot 切片 `[k_lo..k_hi)` **且** token tight-gather |
 | 专家权重、per-expert scale（REPEAT 表） | mm src0 / GET_ROWS src0 | per-expert | 与 token 无关——不动 |
@@ -163,7 +163,7 @@ O(delta_range * n_active) 扫描、n_active 最多几百，没问题。模块按
 ### 配置网格（笛卡尔积）
 
 | n_t（全宽 token 数） | hit rate |
-| :-- | :-- |
+| :--- | :--- |
 | 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
 
 共 30 个任务。每个任务在 `build_scatter_plan` 前后各一次 rdtsc（`tsc_now`），输出

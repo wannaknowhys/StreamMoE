@@ -11,13 +11,13 @@
 ## 首轮 mock 点（计算线程私有链执行器）
 
 | # | mock 点 | 现状（mock）实现 | 最终（替换目标） | 引入时机 |
-|---|---|---|---|---|
-| M1 | **专家视图 resolve**：执行器要 `(L,E) -> {pool, slot 基址/stride, 布局}` | 直接经 scheduler（branch_layout/group_of/subpool——现状单池）| device_pool[] 多池查目录 | G3 实现时 |
-| M2 | **计算 backend**：mini-graph 委托目标 | 固定 CPU backend（moe_backend ctx 的 cpu）| 每 device 的 ggml backend（Vulkan…）| G3（CPU 正确性先过）|
-| M3 | **私有 arena**：中间落区 | 单 ctx scratch arena（现状 moe_backend scratch_arena）| 每 device_pool 的固定执行区（staging/exec/result 分块）| G3 |
-| M4 | **view 偏移衔接**：consumer 输入 = 上游 data+off | 直接在私有 arena 上算指针（现状 minigraph 已如此）| 同（C-style struct 记录 offset/stride）——无需换 | G3 |
-| M5 | **moe_out 写回** | 单池 = 结果本地已有，直写主图 dst | lead 设备选择 + 跨 device 汇总（M3+）| G3 先直写 |
-| M6 | **门控输入（ids/weights）来源** | 从主图读（dense 侧算好，sched 拷入 split）| 同（门控跟 dense device 已定，静态）——不 mock | G3 |
+| :--- | :--- | :--- | :--- | :--- |
+| M1 | **专家视图 resolve**：执行器要 `(L,E) -> {pool, slot 基址/stride, 布局}` | 直接经 scheduler（branch_layout/group_of/subpool——现状单池） | device_pool[] 多池查目录 | G3 实现时 |
+| M2 | **计算 backend**：mini-graph 委托目标 | 固定 CPU backend（moe_backend ctx 的 cpu） | 每 device 的 ggml backend（Vulkan…） | G3（CPU 正确性先过） |
+| M3 | **私有 arena**：中间落区 | 单 ctx scratch arena（现状 moe_backend scratch_arena） | 每 device_pool 的固定执行区（staging/exec/result 分块） | G3 |
+| M4 | **view 偏移衔接**：consumer 输入 = 上游 data+off | 直接在私有 arena 上算指针（现状 minigraph 已如此） | 同（C-style struct 记录 offset/stride）——无需换 | G3 |
+| M5 | **moe_out 写回** | 单池 = 结果本地已有，直写主图 dst | lead 设备选择 + 跨 device 汇总（M3+） | G3 先直写 |
+| M6 | **门控输入（ids/weights）来源** | 从主图读（dense 侧算好，sched 拷入 split） | 同（门控跟 dense device 已定，静态）——不 mock | G3 |
 
 ## 2026-09 更新：VRAM 数据层已从"将来项"提前落地（部分）
 
@@ -30,6 +30,7 @@
   M2 计算 backend 仍固定 CPU（vulkan 执行未接）；M3 私有 arena 仍单 scratch（device 侧固定执行区未建）
 
 ## 将来（M3+）才引入、现在不 mock 的
+
 - device_pool[] 结构（backend 句柄/多基址/多固定区）
 - 池本地驱逐多副本化
 - 跨 device 分散 + lead/汇总（同层专家跨池）

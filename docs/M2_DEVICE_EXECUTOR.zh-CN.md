@@ -329,7 +329,8 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
    无法 plan；全克隆干净消除歧义。
 
 ## 7.5 用户决策 2026-09-06：多 device 形态（compact 每桶链 + per-device 累加器 +
-##    DMA contribution 写回）
+
+## DMA contribution 写回）
 
 多 device / 多桶阶段的目标形态，直接建在 §7.4 clone builder + 已验"interval 布局在单 cgraph 可用"
 之上：
@@ -361,7 +362,8 @@ CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器
 传输本身只属 GPU 阶段。
 
 ## 7.6 §7.5 后的澄清（2026-09-06）——累加器在 device 端、它就是匿名折叠；需
-##     external-leaf 分析
+
+## external-leaf 分析
 
 1. **per-device 累加器在 DEVICE 上，不在 host RAM**。修正 §7.5"折进累加器在 host RAM 做"的措辞。
    每个有桶的 device 拥有一个专属 `[d_out, n_t]` 区（device 驻留输出块）。它存在是因为 device
