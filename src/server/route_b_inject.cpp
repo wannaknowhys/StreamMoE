@@ -36,11 +36,6 @@ struct model_pool_t {
     std::unique_ptr<moe_model_topology_t> topo;
     std::shared_ptr<async_dio_engine>     dio;   // shared across all pools
     std::vector<dio_file_t*>              shards;
-    // Dense takeover (chunk sources) uses a SEPARATE engine: it runs on the
-    // model-loader thread during load and must not race the global scheduler
-    // worker draining the shared IOCP (completion stealing corrupts both).
-    std::unique_ptr<async_dio_engine>     dense_dio;
-    std::vector<dio_file_t*>              dense_shards;
     std::unique_ptr<expert_scheduler>     sched;
     ggml_backend_buffer_type_t            buft = nullptr;       // expert pool buft
     ggml_backend_buffer_type_t            dense_buft = nullptr; // v2-chunk dense buft
@@ -190,22 +185,6 @@ llama_model_tensor_buft_override* route_b_setup(
                 return nullptr;
             }
             pool->shards.push_back(f);
-        }
-        if (pool->topo->incomplete) {
-            // Separate engine + handles for the dense takeover (see struct note).
-            pool->dense_dio = async_dio_engine::create(64);
-            if (!pool->dense_dio) {
-                std::fprintf(stderr, "route B: dense DIO engine unavailable\n");
-                return nullptr;
-            }
-            for (const auto& shard : pool->topo->shard_paths) {
-                dio_file_t* f = pool->dense_dio->open_file(shard);
-                if (!f) {
-                    std::fprintf(stderr, "route B: cannot DIO-open dense shard %s\n", shard.c_str());
-                    return nullptr;
-                }
-                pool->dense_shards.push_back(f);
-            }
         }
 
         // Parse "<device>:<MB>" pool specs. RAM -> scheduler bytes (bounded
@@ -381,7 +360,7 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
             if (!staging) return false;
         }
         uint8_t dummy = 0;
-        const bool ok = read_expert_sync(p->dense_dio.get(), p->dense_shards, plan,
+        const bool ok = read_expert_sync(p->dio.get(), p->shards, plan,
                                          staging ? staging : &dummy, static_cast<uint8_t*>(data));
         if (staging) async_dio_engine::free_aligned(staging);
         return ok;

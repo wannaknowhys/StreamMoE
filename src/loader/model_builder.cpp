@@ -113,8 +113,10 @@ std::vector<std::string> discover_shards(const std::string& main_path, const ggu
     return shards;
 }
 
-// Discover chunk siblings from a main strip file (writer names them
-// <prefix><i>.<ext>, e.g. c1.gguf .. cN.gguf; chunk_total in the header).
+// Discover chunk siblings from the main strip file: parse its trailing number
+// `k` and find `k, k+1, ...` (the writer names them <prefix><n>.<ext>), matching
+// `chunk_total` from the header. Only used when no explicit file list
+// (--moe-expert-files / ';'-joined paths) was given.
 std::vector<std::string> discover_chunk_files(const std::string& main_path, uint32_t total) {
     const std::filesystem::path p(main_path);
     const std::string stem = p.stem().string();
@@ -126,10 +128,11 @@ std::vector<std::string> discover_chunk_files(const std::string& main_path, uint
         throw std::runtime_error("chunk source needs a trailing index in the filename (e.g. c1.gguf): " + main_path);
     }
     const std::string prefix = stem.substr(0, e);
+    const long start = std::stol(stem.substr(e));
     std::vector<std::string> out;
     out.reserve(total);
-    for (uint32_t i = 1; i <= total; ++i) {
-        const std::string name = prefix + std::to_string(i) + ext;
+    for (uint32_t i = 0; i < total; ++i) {
+        const std::string name = prefix + std::to_string(start + static_cast<long>(i)) + ext;
         const std::string full = dir.empty() ? name : (std::filesystem::path(dir) / name).string();
         if (!std::filesystem::exists(full)) throw std::runtime_error("missing chunk file: " + full);
         out.push_back(full);
