@@ -1,6 +1,7 @@
 #include "backend/route_b_chain.h"
 
 #include "backend/alloc.h"
+#include "backend/moe_backend.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -17,6 +18,10 @@ namespace stream_moe {
 namespace {
 void * g_fullalloc_buf = nullptr;
 size_t g_fullalloc_cap = 0;
+
+// C4 replication cap: closure-used non-per-expert leaves at or below this size
+// are copied once into every device pool (gemma per-expert scale = 512 B/layer).
+constexpr size_t kResidentLeafMaxBytes = 1u << 20;   // 1 MiB
 
 // Whole-layer burst capture: per-layer privatised compute sequence from the
 // last graph build (see moe_chain_assign_backend).
@@ -347,6 +352,16 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
                 el.user   = cn->name ? cn->name : ggml_op_name(cn->op);
                 ex.external_leaves.push_back(el);
             }
+        }
+        // C4 replication (docs/STREAMMOE_GGUF_FORMAT.md SS3.1): a closure-used
+        // leaf that is not per-expert and is small (per-expert scale table) is
+        // copied once into every device pool. Idempotent per tensor.
+        for (const auto & el : ex.external_leaves) {
+            const ggml_tensor * t = el.tensor;
+            if (!t || t->op != GGML_OP_NONE || !t->name) continue;
+            if (strstr(t->name, "_exps") == nullptr || strstr(t->name, ".weight") != nullptr) continue;
+            if (ggml_nbytes(t) > kResidentLeafMaxBytes) continue;
+            stream_moe_backend_replicate_leaf(t);
         }
     }
 #ifdef STREAM_MOE_TEMP

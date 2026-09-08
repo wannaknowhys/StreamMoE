@@ -660,6 +660,8 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
 
 // External leaf: per-slot [1,n_k,n_t] -> tight index-gather; otherwise a plain
 // full leaf (expert weight tables / scale broadcast, untouched by bucketing).
+// A C4 leaf replicated at closure analysis (small closure-used non-per-expert,
+// e.g. gemma per-expert scale) binds the resident device copy - no re-upload.
 static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) {
     chain_ctx_t & c = *b.c;
     const int64_t n_k = b.ids_ne0;
@@ -669,6 +671,29 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
             it = b.gather_cache.emplace(m, bucket_gather_per_slot(b, m)).first;
         }
         return it->second;
+    }
+    if (c.dev) {
+        // resident C4 lookup keys on the unwrapped producer root (verify
+        // registered the weight leaf, not the reshape/view that consumes it)
+        const ggml_tensor * root = m;
+        int64_t off = 0;
+        while (root && (root->op == GGML_OP_VIEW || root->op == GGML_OP_RESHAPE ||
+                        root->op == GGML_OP_TRANSPOSE || root->op == GGML_OP_PERMUTE ||
+                        root->op == GGML_OP_CONT)) {
+            if (root->op == GGML_OP_VIEW) off += root->view_offs;
+            root = root->src[0];
+        }
+        ggml_backend_buffer_t rbuf = nullptr;
+        void* rdev = root ? stream_moe_backend_resident_leaf(c.dev->pool, root, &rbuf) : nullptr;
+        if (rdev) {
+            if (std::getenv("STREAM_MOE_DBG"))
+                std::fprintf(stderr, "[leaf] bind resident %s\n", m->name ? m->name : "?");
+            ggml_tensor * l = ggml_new_tensor_4d(c.ctx, m->type, m->ne[0], m->ne[1], m->ne[2], m->ne[3]);
+            for (int i = 0; i < 4; ++i) l->nb[i] = m->nb[i];
+            l->buffer = rbuf;
+            l->data   = stmoe_vk_buffer_host_offset(rbuf, static_cast<size_t>(off));
+            return l;
+        }
     }
     int64_t ne[4]; size_t nb[4];
     for (int i = 0; i < 4; ++i) { ne[i] = m->ne[i]; nb[i] = m->nb[i]; }

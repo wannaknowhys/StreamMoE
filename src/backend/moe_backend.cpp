@@ -459,4 +459,38 @@ bool stream_moe_backend_device_ensure(uint32_t pool, size_t arena_bytes, size_t 
     return true;
 }
 
+void stream_moe_backend_replicate_leaf(const ggml_tensor* t) {
+    if (!t || !t->data) return;
+    const size_t bytes = ggml_nbytes(t);
+    if (bytes == 0) return;
+    if (std::getenv("STREAM_MOE_DBG"))
+        std::fprintf(stderr, "[leaf] replicate %s (%zu B) into %zu device pool(s)\n",
+                     t->name ? t->name : "?", bytes, g_dev_execs.size());
+    for (auto& e : g_dev_execs) {
+        if (!e.be || !e.stage_buft) continue;   // no device pool registered
+        bool found = false;
+        for (const auto& r : e.resident_leaves) if (r.t == t) { found = true; break; }
+        if (found) continue;
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(e.stage_buft, bytes);
+        if (!buf) continue;
+        void* dev = stmoe_vk_buffer_host_ptr(buf);
+        if (!dev) { ggml_backend_buffer_free(buf); continue; }
+        std::memcpy(dev, t->data, bytes);
+        e.resident_leaves.push_back({ t, buf, dev, bytes });
+    }
+}
+
+void* stream_moe_backend_resident_leaf(uint32_t pool, const ggml_tensor* t,
+                                       ggml_backend_buffer_t* out_buf) {
+    auto* e = exec_ctx(pool);
+    if (!e || !t) return nullptr;
+    for (const auto& r : e->resident_leaves) {
+        if (r.t == t) {
+            if (out_buf) *out_buf = r.buf;
+            return r.dev;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace stream_moe

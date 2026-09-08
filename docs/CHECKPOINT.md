@@ -56,6 +56,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **设备执行（M2-2 全并行骨架，docs/M2_DEVICE_EXECUTOR.md §7.9，cae652b/6723f4e）**：round 按 pool 分区 → pool 0 一个 CPU 图、每个 device pool 一个整链设备图（mm→weightless→fold→acc_d 全在 Vulkan；device shell `t->buffer=sp.dev_buf; t->data=host_offset(sp.dev_buf,col_off)` + staging 上传）→ 设备图 async 提交、CPU 图并发跑（overlap 已验证 = 串行，逐层 acc IDENTICAL）→ 层尾 sync + `tensor_get` 回读 acc_d → host fold → moe_out。踩坑：`acc.comp` 的 nb2/nb3 必须传全张量步长（不能 0，否则除零 acc 归零）；合成图 view 需 `fix_view_buffers` 补 `buffer`。
 - **回归口径**：纯 RAM 默认对当前 HEAD 干净构建 **IDENTICAL**；RAM8G+VRAM256M 设备混跑对同分区 CPU **cos 0.982**（与已知 0.986 冻结基线 flip 噪声同量级；**用户 2026-09-08 决定不追这个差距**）。诊断 env 见 WIP O。
 - **deepseek 设备实测（2026-09-08）**：`RAM:71680 + Vulkan0:1024`（80 槽）、95-token prefill-from，设备 round `dev=1` 真在 Vulkan 上跑；对 CPU 桶引擎/上游基线 **embd cos 0.9999998 / hidden cos 0.99999997**（cos gate 内），expert_history 8.6% flip（允许），退出 0 泄漏。→ 设备路径对 gemma + deepseek 均成立。
+- **C4 resident 复制（2026-09）**：闭包分析（`moe_chain_verify_graph`）结束时把被闭包使用、非 per-expert、≤1 MiB 的叶子（gemma `ffn_down_exps.scale` 512 B/层）**一次性复制到每个有专家池的设备**（`stream_moe_backend_replicate_leaf`）；per-device 图绑定常驻副本（`bucket_ext_leaf` 命中 unwrap 后的根）而非每 build 重新 staging。gemma RAM8G+VRAM256M 实测：resident 路径与 staging 路径产物**逐字节一致**，cos 对 CPU 仍 ~0.98（既有 flip 噪声）。
 
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
 

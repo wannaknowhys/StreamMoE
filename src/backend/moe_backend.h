@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace stream_moe {
 
@@ -64,6 +65,18 @@ struct device_exec_ctx_t {
     ggml_backend_buffer_t      stage      = nullptr;
     size_t                     stage_cap  = 0;
     uint8_t*                   stage_map  = nullptr;
+
+    // Closure-used small non-per-expert leaves (C4, e.g. gemma per-expert
+    // scale) replicated once into this device (docs/STREAMMOE_GGUF_FORMAT.md
+    // SS3.1). Keyed by the source ggml tensor pointer; `dev` is the device copy
+    // the per-device graph binds instead of re-uploading each build.
+    struct resident_leaf_t {
+        const ggml_tensor*    t   = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        void*                 dev = nullptr;
+        size_t                bytes = 0;
+    };
+    std::vector<resident_leaf_t> resident_leaves;
 };
 // Register pool `pool`'s device exec backend. Idempotent per pool.
 void stream_moe_backend_bind_device_exec(uint32_t pool, ggml_backend_t be,
@@ -74,5 +87,14 @@ device_exec_ctx_t* stream_moe_backend_device_exec(uint32_t pool);
 // Lazily (re)allocate the arena / staging buffers to cover the requested bytes.
 // Returns false on allocation failure. No-op sizes keep existing buffers.
 bool stream_moe_backend_device_ensure(uint32_t pool, size_t arena_bytes, size_t stage_bytes);
+
+// Replicate a small closure-used non-per-expert leaf (C4) into EVERY registered
+// device pool, once (idempotent by tensor pointer). Called from the closure
+// analysis (`moe_chain_verify_graph`) after it classifies external leaves.
+void stream_moe_backend_replicate_leaf(const ggml_tensor* t);
+// Device copy of a replicated leaf for pool `pool` (nullptr when not resident).
+// `out_buf` (optional) receives the device buffer to bind on the tensor shell.
+void* stream_moe_backend_resident_leaf(uint32_t pool, const ggml_tensor* t,
+                                       ggml_backend_buffer_t* out_buf);
 
 } // namespace stream_moe

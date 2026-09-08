@@ -803,6 +803,12 @@ RAM:71680 + Vulkan0:1024 (80 slots), 95-token prefill-from: device rounds run on
 the GPU, embd cos 0.9999998 / hidden cos 0.99999997 vs both the CPU bucket-engine
 and the upstream reference, 0 leaks.
 
+C4 resident replication (2026-09): the closure analysis (`moe_chain_verify_graph`)
+copies small closure-used non-per-expert leaves (gemma per-expert scale, 512 B/layer)
+once into every device pool (`stream_moe_backend_replicate_leaf`); the per-device
+graph binds the resident copy instead of staging it each build. Verified byte-identical
+to the staging path (gemma RAM8G+Vulkan0:256M).
+
 Two hazards found (details in WORK_IN_PROGRESS O):
 - **vulkan ACC nb2/nb3 must not be 0.** `acc.comp` decomposes the src1 index via
   `src1_i / p.nb03 / p.nb02`; the CPU kernel ignores nb2/nb3 for a 2D src1. Pass
