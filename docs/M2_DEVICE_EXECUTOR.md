@@ -741,3 +741,74 @@ Slot-staleness (does a fixed add_in[k] slot leak garbage across batches?):
   needed. Alternative: memset the whole add_in before each batch's folds, or
   clear only non-participating slots. Preferred = participation-set filtering
   in the fold.
+
+## 7.9 Device execution landing plan (2026-09-08, M2-2 full parallel skeleton)
+
+Scope (user decision 2026-09-08): per-device whole-chain cgraph + async submit +
+CPU/VK overlap + multi-device fold, built on the landed compact-bucket engine
+(`exec_layer_burst_chain_buckets`). The data plane (SoA columns, vram residency,
+DMA demote) and the device-exec resources (`device_exec_ctx_t`,
+`bind_device_exec`, `device_ensure`) are already in place; this lands the
+execution side. No transitional mm-only + readback shape (principle 11).
+
+Targets: each layer's `build_mix_plan` rounds are partitioned by `r.pool`.
+Pool 0 -> one CPU cgraph (host arena, unchanged). Each device pool p with rounds
+-> one device cgraph (its own arena/stage), submitted async. Only the device
+accumulator `acc_d` crosses back to host.
+
+Per-target plumbing (`chain_ctx_t` gains a target: pool / backend / arena+stage
+buffers / host maps / bump offsets):
+- `bind_pool(t, sp, off)`: CPU `data = sp.base + off`; device `t->buffer =
+  sp.dev_buf`, `t->data = stmoe_vk_buffer_host_offset(sp.dev_buf, off)` (fake
+  base `vk_ptr_base + off`; the kernel derives `data - vk_ptr_base`).
+- `bind_arena(t, nbytes, use_layout)`: device arena at `ex->out_off[seq]`
+  (twins) or a bump region (fold / gather scratch); CPU unchanged
+  (fullalloc+out_off or heap).
+- `bind_stage(t, host_src, bytes)`: upload host source to the device stage and
+  bind. Used for cur `[d,1,n_t]`, ids, per-slot routing weights, and the
+  per-expert scale table (gemma `ffn_down_exps.scale` = 512 B/layer; deepseek has
+  none). Host->device is a host-map memcpy; device->host (acc_d) uses
+  `ggml_backend_tensor_get` (vulkan transfer-queue DMA, not the 0.02 GB/s rebar
+  host read).
+
+Chain: the same `append_*` builders emit into the current target's graph. cur /
+ids / weights / scale leaves become device staging tensors; the in-graph gathers
+(`ggml_get_rows`) run on the device; the fold (permute / cont / sum_rows) and the
+`ggml_acc` accumulation run on the device; `acc_d` lives in the device arena.
+Vulkan mm_id matches the SoA column stride (`stride_batch_x = ne00*ne01` when
+dim01 contiguous; SoA `col_stride = perExpert`), which is the K6 goal.
+
+Orchestration (per layer, inside the burst):
+1. build all target graphs (CPU + devices) in one round loop, switching target;
+2. submit each device graph async (`ggml_backend_graph_compute_async`);
+3. run the CPU graph on the calling thread (natural CPU/VK overlap);
+4. converge: synchronize every device; read each `acc_d` back via DMA; host fold
+   `add_in[device_used] -> moe_out` (participation-set filtering, SS7.8);
+5. write `moe_out`; return only after the converge (async never leaks).
+
+Gate: RAM-only default stays byte-IDENTICAL to HEAD (CPU target unchanged); RAM +
+small VRAM (256-512 MB) -> VRAM rounds reach the device, result within the
+relaxed backend gate (BACKEND_DIVERGENCE_ANALYSIS: cos ~0.9996, expert flips),
+not byte identity.
+
+### 7.9.1 Landed 2026-09-08 + open hazards
+
+Landed in `minigraph_exec.cpp`: `device_target_t` + `chain_ctx.dev`; target-aware
+`bind_fresh` / `bucket_ref_leaf` / `bucket_upload_leaf`; per-device whole-chain
+cgraph; `layer_fold`. Verified: RAM-only default byte-IDENTICAL to HEAD; RAM8G +
+Vulkan0:256M -> VRAM rounds execute on the device (`dev=1`), result cos 0.982 vs
+the same-partition CPU run (same ballpark as the known 0.986 baseline flip noise).
+
+Two hazards found (details in WORK_IN_PROGRESS O):
+- **vulkan ACC nb2/nb3 must not be 0.** `acc.comp` decomposes the src1 index via
+  `src1_i / p.nb03 / p.nb02`; the CPU kernel ignores nb2/nb3 for a 2D src1. Pass
+  the full-tensor stride (d_out*n_t*4), not 0, or the acc stays zero.
+- **CPU/VK overlap corrupts the device result (OPEN).** Running the CPU graph on
+  the calling thread while the device graph is in flight gives final cos 0.228;
+  synchronizing the device BEFORE the CPU graph gives 0.982 (known noise). The
+  current implementation serializes (async submit, then synchronize, then CPU
+  graph). Root cause of the overlap hazard is undetermined (suspected shared
+  vulkan submit/execute state). This is the remaining M2-2 item.
+- ggml-created views have `buffer == NULL`; `ggml_vk_tensor_subbuffer` reads
+  `tensor->buffer->context` directly (it does not follow `view_src`), so synthetic
+  device graphs need `fix_view_buffers` to fill view buffers from the root.

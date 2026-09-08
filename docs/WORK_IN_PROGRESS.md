@@ -411,3 +411,51 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - deepseek 无独立 scale 节点（scale 权重在 down_exps，weighted 前未展开成节点 dump）——需另查其
   ffn_moe_down/weighted 的乘结构是否内嵌 scale（见 §7.8 外 leaf 表：down 壳 w 3 分片 + scale 合并？）。
 - 桶化待处理外部输入：scale（node_57 类）也按桶槽取，不是"链内收缩"。
+
+### O. 设备执行（M2-2 全并行骨架，2026-09-08 开工）
+
+> 设计：docs/M2_DEVICE_EXECUTOR.md §7.9。用户拍板：直接上全并行骨架（per-device 整链
+> cgraph + async 提交 + CPU/VK 重叠 + 多设备 fold），不做 mm-only + 回读的过渡形态。
+
+**闭包外 leaf 盘点（verify dump，`baseline_regression/temp/struct_L0.txt` / `struct_ds_L0.txt`）**
+- 大权重（pool 驻留）：gemma 2 个（gate_up/down）；deepseek 3 个（gate/up/down 分片）。
+- 小张量：cur `[d,1,n_t]`（~1.4MB）；ids `[n_k,n_t]`（几 KB）；per-slot 路由权重
+  `ffn_moe_weights_norm`/`_scaled` `[1,n_k,n_t]`（几 KB）；per-expert scale 表
+  gemma `ffn_down_exps.scale` `[n_expert,1,1]`=**512 B/层**（deepseek 无）。
+- 结论：设备侧非权重开销 MB 级；scale 每设备存全量可忽略；cur 挑 token 已实现
+  （`bucket_gather_cur`）。
+
+**已确认的硬点（无阻塞）**
+- 设备 tensor 绑定范式（删 A 前 `exec_round_vk`）：`t->buffer=设备 buffer;
+  t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
+- vulkan mm_id 步长 = `ne00*ne01`（dim01 连续），命中 SoA `col_stride=perExpert`（K6 目标）。
+- vulkan 支持 ACC（op_params 的 nb1/2/3/offset，含 delta 等差）/GET_ROWS/SUM_ROWS/CLAMP。
+- 回读走 `ggml_backend_tensor_get`（transfer-queue DMA），不用 rebar host 读 0.02GB/s。
+
+**任务**
+- [x] chain_ctx 加 target（pool/backend/arena+stage buffer/host map/bump）+ bind_pool /
+      bind_arena / bind_stage 助手；CPU 路径行为不变（`device_target_t` + `chain_ctx.dev`；
+      `bucket_ref_leaf`/`bucket_upload_leaf`/`bind_fresh`；`fix_view_buffers` 给 ggml 视图补
+      `buffer`——vulkan 从 `tensor->buffer` 解析，不像通用 API 跟随 view_src）
+- [x] 设备 staging 上传（cur 全量 / ids / 路由权重 / scale 表）+ 池权重 shell 绑定
+      （`t->buffer=sp.dev_buf; t->data=stmoe_vk_buffer_host_offset(sp.dev_buf, col_off)`）
+- [x] per-device 整链 cgraph（mm→weightless→fold→acc_d 全在设备；device arena + 设备 acc；
+      `acc_d` 在 arena `[result_bytes, +d_out*n_t)`，层首 `tensor_set` 清零）
+- [x] 编排：round 按 pool 分区 → 各 target 建图 → 设备图 async 提交 → CPU 图跑 → converge
+      （synchronize + `ggml_backend_tensor_get` 回读）→ `layer_fold` → moe_out
+- [x] 回归：纯 RAM 默认 vs HEAD 干净构建 **IDENTICAL**；RAM8G+VRAM256M 跑通、VRAM round 真的
+      走设备（`dev=1`）、对同分区 force-cpu **cos 0.982**（与已知 0.986 同量级，backend gate）
+
+**踩坑记录**
+- **vulkan ACC 的 nb2/nb3 不能为 0**：`acc.comp` 用 `src1_i / p.nb03 / p.nb02` 分解索引（CPU 核
+  忽略 2D src1 的 nb2/nb3）。传 0 → 除零 → acc 全零。改成传 `d_out*n_t*4` 后 acc 正常。
+- **ggml 视图 buffer**：`ggml_vk_tensor_subbuffer` 直接读 `tensor->buffer->context`（不跟随
+  view_src），合成图里 ggml 建的 view（reshape/permute/view）buffer=NULL → `fix_view_buffers`
+  从根 view_src 补。
+- **⚠ 未解：CPU/VK 重叠会污染设备结果**。async 提交设备图后在调用线程跑 CPU 图，二者并发时
+  最终 cos 0.228；**先 synchronize 设备再跑 CPU 图 → cos 0.982**（=已知噪声）。当前实现**先
+  sync 再跑 CPU**（串行，结构保留 async）。重叠 hazard 根因未定（疑 vulkan 提交/执行与 CPU
+  图共享某状态）——M2-2 真重叠的后续。诊断 env：`STREAM_MOE_TMP_DEVDBG`（acc 范数/arena 范数/
+  gf 节点）、`STREAM_MOE_TMP_FORCE_CPU`（设备 round 落回 CPU 对拍分区）。
+- 设备多 round 几何本身已验证：512M 全设备 one-round vs k/t 奇偶 split-4-round **IDENTICAL**
+  （ACC 跨 round 累加无问题）。

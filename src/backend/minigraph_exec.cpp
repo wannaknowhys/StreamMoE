@@ -8,6 +8,7 @@
 #include "ggml-backend-impl.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -380,6 +381,22 @@ static void tmp_dump_chain_struct(const moe_layer_exec_t * ex) {
     fflush(stderr);
 }
 #endif
+// Per-device execution target (M2-2, docs/M2_DEVICE_EXECUTOR.md SS7.9): one
+// cgraph + arena/stage buffers on a device pool. The CPU target is dev == null.
+struct device_target_t {
+    uint32_t               pool = 0;
+    ggml_backend_t         be = nullptr;
+    ggml_backend_buffer_t  arena = nullptr;   // chain intermediates + acc_d
+    ggml_backend_buffer_t  stage = nullptr;   // uploaded cur/ids/weights/scale
+    uint8_t *              arena_map = nullptr;
+    uint8_t *              stage_map = nullptr;
+    size_t                 arena_used = 0;    // bump region (above result_bytes)
+    size_t                 stage_used = 0;
+    size_t                 acc_off = 0;       // acc_d[d_out, n_t] inside the arena
+    ggml_tensor *          acc = nullptr;     // device accumulator shell
+    ggml_cgraph *          gf = nullptr;
+};
+
 struct chain_ctx_t {
     ggml_context *             ctx  = nullptr;
     ggml_backend_t             cpu  = nullptr;
@@ -389,6 +406,10 @@ struct chain_ctx_t {
     const std::vector<expert_handle_t> * pins = nullptr;
     ggml_cgraph *              gf = nullptr;
     const moe_layer_exec_t *   ex = nullptr;
+    // Execution target (2026-09-08): dev == null -> CPU host arena; else the
+    // device pool. Pool 0 is always CPU.
+    device_target_t *          dev = nullptr;
+    bool is_device() const { return dev != nullptr; }
     // in-flight bucket geometry (full-width today: w == ids->ne[0])
     int64_t                    w_b = 0;   // experts per token in this bucket
     int64_t                    n_t = 0;   // tokens (full-width == ids->ne[1])
@@ -401,80 +422,34 @@ struct chain_ctx_t {
     // produce them via append_expert_fold + exit memcpy instead. Off = the old
     // IDENTICAL whole-clone behaviour (bring-up gate).
     bool fold_repl = false;
-    // SS7.8 multi-device structure (single-device CPU phase: device_used == 1):
-    //   per-device acc_d[d_out, n_t] = the device's expert-folded output (the
-    //   fold result lands here), and RAM add_in[device_used, d_out, n_t] = the
-    //   anonymous-add input, one slot per device (index k = device ordinal).
     int64_t                 d_out = 0;
-    int64_t                 device_used = 0;
-    std::vector<float>      add_in;     // host mirror of the RAM [device_used, d_out, n_t]
     int64_t                 n_slots = 0;          // full routed slot count (ids ne0)
-    // acc_d: the device's expert-folded accumulator [d_out, n_t] (bucketized
-    // path only; single full-width bucket fold goes through fold_buf + exit).
-    // Process-lifetime grow-only, zeroed per layer before the bucket loop.
+    // CPU accumulator [d_out, n_t]: process-lifetime grow-only, zeroed per layer.
+    // Device targets keep their own acc_d in the device arena.
     std::vector<float>      acc_d;
 };
 
-// Fold the bucket's experts: sum over the per-token expert axis (w_b, currently
-// the full ids->ne[0]) so the weighted output [d_out, w_b, n_t] becomes a
-// per-token column [d_out, n_t]. Returns the folded tensor (width == n_t).
-// Intermediate/output buffers are manually kept alive (no_alloc ctx).
-static ggml_tensor * append_expert_fold(chain_ctx_t & c, ggml_tensor * weighted) {
-    if (!weighted) return nullptr;
-    const int64_t ne0 = weighted->ne[0];   // d_out
-    const int64_t nw  = weighted->ne[1];   // w_b (experts per token)
-    const int64_t nt  = weighted->ne[2];   // n_t tokens
-    // permute (view) so the expert axis (ne1) becomes ne0, materialise it
-    // contiguous (sum_rows needs nb0 == esize), then sum over the expert axis:
-    // sum_rows -> [1, d_out, n_t]; cont to [d_out, n_t].
-    ggml_tensor * p   = ggml_permute(c.ctx, weighted, 1, 0, 2, 3);   // view: [nw, d_out, n_t]
-    ggml_tensor * pc  = ggml_cont(c.ctx, p);                         // contiguous [nw, d_out, n_t]
-    c.fold_buf.emplace_back((size_t)(nw * ne0 * nt), 0.0f);
-    pc->data = c.fold_buf.back().data();
-    ggml_tensor * s   = ggml_sum_rows(c.ctx, pc);                    // [1, d_out, n_t]
-    c.fold_buf.emplace_back((size_t)(ne0 * nt), 0.0f);               // s data
-    s->data = c.fold_buf.back().data();
-    ggml_tensor * acc = ggml_cont_2d(c.ctx, s, ne0, nt);             // [d_out, n_t]
-    if (!acc) return nullptr;
-    c.fold_buf.emplace_back((size_t)(ne0 * nt), 0.0f);               // acc data
-    acc->data = c.fold_buf.back().data();
-    ggml_build_forward_expand(c.gf, acc);
-    return acc;
-}
+// Fold / exit helpers live after bucket_build_t (they need bind_fresh).
 
-// Exit: run the graph; when fold_repl, follow the SS7.8 three-stage shape:
-//   1) graph_compute (the whole bucket chain + expert folds run here);
-//   2) copy each participating device's acc_d into its RAM add_in slot
-//      (CPU phase: memcpy; GPU phase: one ggml_backend_tensor_copy per device,
-//      device->host via tensor_get -> vulkan get_tensor -> vk_buffer_read);
-//   3) host fold: sum add_in's device_used slots -> [d_out, n_t] -> moe_out.
-static bool chain_exit(chain_ctx_t & c, ggml_tensor * acc) {
-    if (ggml_backend_graph_compute(c.cpu, c.gf) != GGML_STATUS_SUCCESS) {
-        LOG_ERROR("stream_moe: chain graph compute failed for layer " << c.layer);
-        return false;
-    }
-    if (!c.fold_repl) return true;   // moe_out computed on the graph
-
+// Exit fold (SS7.8): sum the per-target accumulators (host mirrors, already
+// read back from devices) into moe_out. `accs` holds one [d_out, n_t] pointer
+// per participating target (CPU acc first, then devices).
+static bool layer_fold(const moe_layer_exec_t * ex, int64_t d_out, int64_t n_t,
+                       const std::vector<const float *> & accs) {
     ggml_tensor * moe_out = nullptr;
-    for (const auto * cn : c.ex->compute) {
+    for (const auto * cn : ex->compute) {
         if (cn->name && strstr(cn->name, "ffn_moe_out") != nullptr) { moe_out = const_cast<ggml_tensor*>(cn); break; }
     }
-    if (!moe_out || !acc || !acc->data) return true;
-    const size_t slot = (size_t)(c.d_out * c.n_t);
-
-    // stage 2: acc_d (device-folded output, expert width 1) -> add_in[k]
-    // Single device today (device_used == 1): k = 0. GPU phase: this is the
-    // ggml_backend_tensor_copy(acc_d, add_in_slot) boundary.
-    if (c.add_in.size() < slot * (size_t)c.device_used) c.add_in.resize(slot * (size_t)c.device_used);
-    std::memcpy(c.add_in.data(), acc->data, slot * sizeof(float));
-
-    // stage 3: host fold over device_used slots -> moe_out (dense is on CPU).
-    // First slot overwrites moe_out, later slots accumulate.
+    if (!moe_out || !moe_out->data) return true;
+    const size_t slot = (size_t)(d_out * n_t);
     float * out = (float *) moe_out->data;
-    for (size_t d = 0; d < (size_t)c.device_used; ++d) {
-        const float * src = c.add_in.data() + d * slot;
-        for (size_t i = 0; i < slot; ++i) out[i] = d == 0 ? src[i] : out[i] + src[i];
+    bool first = true;
+    for (const float * a : accs) {
+        if (!a) continue;
+        for (size_t i = 0; i < slot; ++i) out[i] = first ? a[i] : out[i] + a[i];
+        first = false;
     }
+    if (first) std::fill(out, out + slot, 0.0f);
     return true;
 }
 
@@ -537,16 +512,85 @@ struct bucket_build_t {
         void * base = moe_chain_fullalloc_buffer(need);
         return base ? static_cast<char*>(base) + ex->out_off[(size_t) seq] : nullptr;
     }
+    // Bind a fresh output tensor to the current target. Device: the target
+    // arena at out_off[seq] (twins) or a bump region (scratch). CPU: fullalloc +
+    // out_off (twins) or the fold_buf heap (scratch) - unchanged behaviour.
+    void bind_fresh(ggml_tensor * t, size_t nbytes, bool use_layout) {
+        chain_ctx_t & cc = *c;
+        if (cc.dev) {
+            size_t off;
+            if (use_layout && ex && ex->layout_ok && seq >= 0 &&
+                seq < (int64_t) ex->out_off.size() && ex->out_off[(size_t) seq] >= 0) {
+                off = (size_t) ex->out_off[(size_t) seq];
+            } else {
+                off = (cc.dev->arena_used + 63u) & ~size_t(63u);
+                cc.dev->arena_used = off + nbytes;
+            }
+            t->buffer = cc.dev->arena;
+            t->data   = stmoe_vk_buffer_host_offset(cc.dev->arena, off);
+            return;
+        }
+        if (use_layout) {
+            void * p = twin_out(nbytes);
+            if (p) { t->data = p; return; }
+        }
+        t->data = buf((nbytes + 3) / 4);
+    }
 };
 
-// Make a plain NONE leaf with the given geometry/data (helper to avoid repeated
-// ggml_new_tensor_4d + nb-copy boilerplate).
-static ggml_tensor * bucket_mk_leaf(chain_ctx_t & c, enum ggml_type type,
-                                    const int64_t ne[4], const size_t nb[4], void * data) {
+// Reference an existing buffer region (chain twin / weight shell). `data` is a
+// host pointer on CPU, or a fake device pointer (host_offset) on device; in
+// device mode `buffer` is the owning backend buffer (no upload).
+static ggml_tensor * bucket_ref_leaf(chain_ctx_t & c, enum ggml_type type,
+                                     const int64_t ne[4], const size_t nb[4],
+                                     void * data, ggml_backend_buffer_t buffer = nullptr) {
     ggml_tensor * l = ggml_new_tensor_4d(c.ctx, type, ne[0], ne[1], ne[2], ne[3]);
     for (int i = 0; i < 4; ++i) l->nb[i] = nb[i];
     l->data = data;
+    if (c.dev) l->buffer = buffer;
     return l;
+}
+
+// Leaf over host source data: CPU references it in place; device uploads it to
+// the target staging buffer and binds the device tensor.
+static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
+                                        const int64_t ne[4], const size_t nb[4],
+                                        const void * host_data) {
+    ggml_tensor * l = ggml_new_tensor_4d(c.ctx, type, ne[0], ne[1], ne[2], ne[3]);
+    for (int i = 0; i < 4; ++i) l->nb[i] = nb[i];
+    if (c.dev && host_data) {
+        const size_t bytes = ggml_nbytes(l);
+        const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
+        if (c.dev->stage_map) std::memcpy(c.dev->stage_map + off, host_data, bytes);
+        c.dev->stage_used = off + bytes;
+        l->buffer = c.dev->stage;
+        l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+    } else {
+        l->data = const_cast<void *>(host_data);
+    }
+    return l;
+}
+
+// Fold the round's experts: sum over the per-token expert axis (w_b) so the
+// weighted output [d_out, w_b, n_active] becomes a per-token column
+// [d_out, n_active]. Every intermediate/output is bound to the current target
+// (CPU heap/fullalloc or the device arena).
+static ggml_tensor * append_expert_fold(bucket_build_t & b, ggml_tensor * weighted) {
+    if (!weighted) return nullptr;
+    chain_ctx_t & c = *b.c;
+    const int64_t ne0 = weighted->ne[0];   // d_out
+    const int64_t nw  = weighted->ne[1];   // w_b (experts per token)
+    const int64_t nt  = weighted->ne[2];   // n_active tokens
+    ggml_tensor * p   = ggml_permute(c.ctx, weighted, 1, 0, 2, 3);   // view: [nw, d_out, n_active]
+    ggml_tensor * pc  = ggml_cont(c.ctx, p);                         // contiguous [nw, d_out, n_active]
+    b.bind_fresh(pc, (size_t)(nw * ne0 * nt) * sizeof(float), false);
+    ggml_tensor * s   = ggml_sum_rows(c.ctx, pc);                    // [1, d_out, n_active]
+    b.bind_fresh(s, (size_t)(ne0 * nt) * sizeof(float), false);
+    ggml_tensor * acc = ggml_cont_2d(c.ctx, s, ne0, nt);             // [d_out, n_active]
+    if (!acc) return nullptr;
+    b.bind_fresh(acc, (size_t)(ne0 * nt) * sizeof(float), false);
+    ggml_build_forward_expand(c.gf, acc);
+    return acc;
 }
 
 // ---- general index-gather (docs/BUCKET_EXEC_TOKEN_SUBSET.md SS2.1/2.1a) ------
@@ -567,7 +611,7 @@ static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tenso
                          stride_k * (size_t)(m->ne[1] ? m->ne[1] - 1 : 0)) / esz + 1;
     int64_t sne[4] = { 1, (int64_t) span, 1, 1 };
     size_t  snb[4] = { esz, esz, span * esz, span * esz };
-    ggml_tensor * flat = bucket_mk_leaf(c, m->type, sne, snb, m->data);
+    ggml_tensor * flat = bucket_upload_leaf(c, m->type, sne, snb, m->data);
     std::vector<int32_t> idx((size_t) b.w_b * b.n_active);
     for (int64_t i = 0; i < b.n_active; ++i) {
         const uint32_t a = b.order[(size_t) i];
@@ -581,10 +625,10 @@ static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tenso
     const int64_t n = (int64_t) b.w_b * b.n_active;
     int64_t ine[4] = { n, 1, 1, 1 };
     size_t  inb[4] = { 4, (size_t) n * 4, (size_t) n * 4, (size_t) n * 4 };
-    ggml_tensor * idx_leaf = bucket_mk_leaf(c, GGML_TYPE_I32, ine, inb,
-                                            c.mm_ids_pool.back().data());
+    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb,
+                                                c.mm_ids_pool.back().data());
     ggml_tensor * gr = ggml_get_rows(c.ctx, flat, idx_leaf);
-    gr->data = b.buf((size_t) b.w_b * b.n_active);
+    b.bind_fresh(gr, (size_t) b.w_b * b.n_active * sizeof(float), false);
     return ggml_reshape_3d(c.ctx, gr, 1, b.w_b, b.n_active);
 }
 
@@ -598,7 +642,7 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     int64_t sne[4] = { d, n_t, 1, 1 };
     size_t  snb[4] = { m->nb[0], m->nb[2], m->nb[2] * (size_t) n_t,
                        m->nb[2] * (size_t) n_t };
-    ggml_tensor * src2d = bucket_mk_leaf(c, m->type, sne, snb, m->data);
+    ggml_tensor * src2d = bucket_upload_leaf(c, m->type, sne, snb, m->data);
     std::vector<int32_t> idx((size_t) b.n_active);
     for (int64_t i = 0; i < b.n_active; ++i) {
         idx[(size_t) i] = (int32_t) b.t_round[b.order[(size_t) i]];
@@ -607,10 +651,10 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     int64_t ine[4] = { b.n_active, 1, 1, 1 };
     size_t  inb[4] = { 4, (size_t) b.n_active * 4, (size_t) b.n_active * 4,
                        (size_t) b.n_active * 4 };
-    ggml_tensor * idx_leaf = bucket_mk_leaf(c, GGML_TYPE_I32, ine, inb,
-                                            c.mm_ids_pool.back().data());
+    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb,
+                                                c.mm_ids_pool.back().data());
     ggml_tensor * gr = ggml_get_rows(c.ctx, src2d, idx_leaf);
-    gr->data = b.buf((size_t) d * b.n_active);
+    b.bind_fresh(gr, (size_t) d * b.n_active * sizeof(float), false);
     return ggml_reshape_3d(c.ctx, gr, d, 1, b.n_active);
 }
 
@@ -628,7 +672,7 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
     }
     int64_t ne[4]; size_t nb[4];
     for (int i = 0; i < 4; ++i) { ne[i] = m->ne[i]; nb[i] = m->nb[i]; }
-    return bucket_mk_leaf(c, m->type, ne, nb, m->data);
+    return bucket_upload_leaf(c, m->type, ne, nb, m->data);
 }
 
 // Leaf twin of a chain producer `p` (already built) narrowed to the bucket.
@@ -638,7 +682,7 @@ static ggml_tensor * bucket_twin_leaf(bucket_build_t & b, const ggml_tensor * p)
     const ggml_tensor * t = it->second;
     int64_t ne[4]; size_t nb[4];
     for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
-    return bucket_mk_leaf(*b.c, t->type, ne, nb, t->data);
+    return bucket_ref_leaf(*b.c, t->type, ne, nb, t->data, t->buffer);
 }
 
 // Resolve a weightless clone's src[s]: a chain producer twin leaf, a view of a
@@ -664,8 +708,8 @@ static ggml_tensor * bucket_src_leaf(bucket_build_t & b, const ggml_tensor * src
             for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
             // apply the outermost view's d-slice: ne0 (d rows) from the src view
             ne[0] = src->ne[0];
-            return bucket_mk_leaf(*b.c, t->type, ne, nb,
-                                  static_cast<char*>(t->data) + off);
+            return bucket_ref_leaf(*b.c, t->type, ne, nb,
+                                   static_cast<char*>(t->data) + off, t->buffer);
         }
     }
     // external leaf: cur (shared per token) / ids / scale table / weights
@@ -701,14 +745,20 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
     int64_t ne_ids[4] = { b.w_b, b.n_active, 1, 1 };
     size_t nb_ids[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, 0 };
     nb_ids[3] = nb_ids[2];
-    ggml_tensor * ids_leaf = bucket_mk_leaf(c, GGML_TYPE_I32, ne_ids, nb_ids,
-                                            c.mm_ids_pool.back().data());
+    ggml_tensor * ids_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ne_ids, nb_ids,
+                                                c.mm_ids_pool.back().data());
 
     ggml_tensor * w3d = ggml_new_tensor_3d(c.ctx, w->type, w->ne[0], w->ne[1], 1);
     w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
     w3d->nb[2] = col_stride;
     w3d->nb[3] = col_stride * sp->n_slots;
-    w3d->data  = sp->base + col_off;
+    if (c.dev) {
+        ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp->dev_buf);
+        w3d->buffer = wbuf;
+        w3d->data   = stmoe_vk_buffer_host_offset(wbuf, col_off);
+    } else {
+        w3d->data   = sp->base + col_off;
+    }
 
     // cur: chain twin (down mm reads the bucket's own compact GLU) or external
     // shared cur leaf (gate_up, ne11 == 1 -> every bucket slot reads col 0).
@@ -733,9 +783,7 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
     // no verify layout (then every bucket keeps its own copies - safe, just no
     // serial reuse).
     const size_t nf = (size_t)(w->ne[1] * b.w_b * b.n_active);
-    void * dst_arena = b.twin_out(nf * sizeof(float));
-    if (dst_arena) ++b.n_arena; else ++b.n_heap;
-    mm->data = dst_arena ? dst_arena : (void*) b.buf(nf);
+    b.bind_fresh(mm, nf * sizeof(float), true);
     // nb: contiguous compact layout (ggml_new_tensor_4d would not apply to an op)
     mm->nb[0] = 4;
     mm->nb[1] = (size_t)(w->ne[1]) * 4;
@@ -794,7 +842,7 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
             c.mm_ids_pool.push_back(b.ids_exp);
             int64_t sne[4] = { b.w_b, b.n_active, 1, 1 };
             size_t snb[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, (size_t)(b.w_b * b.n_active) * 4 };
-            lf = bucket_mk_leaf(c, GGML_TYPE_I32, sne, snb, c.mm_ids_pool.back().data());
+            lf = bucket_upload_leaf(c, GGML_TYPE_I32, sne, snb, c.mm_ids_pool.back().data());
 #ifdef STREAM_MOE_TEMP
             if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
                 int32_t mn = INT32_MAX, mx = INT32_MIN;
@@ -816,9 +864,7 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
         if (!lf) return nullptr;
         cl->src[s] = lf;
     }
-    void * dst_arena = b.twin_out(nf * sizeof(float));
-    if (dst_arena) ++b.n_arena; else ++b.n_heap;
-    cl->data = dst_arena ? dst_arena : (void*) b.buf(nf);
+    b.bind_fresh(cl, nf * sizeof(float), true);
     ggml_build_forward_expand(c.gf, cl);
     b.twin[nd] = cl;
     return cl;
@@ -842,6 +888,26 @@ static ggml_tensor * append_bucket_chain_compact(bucket_build_t & b) {
         last = t;
     }
     return last;
+}
+
+// Device graphs need every tensor's `buffer` set: vulkan resolves the buffer
+// from tensor->buffer directly (ggml_vk_tensor_subbuffer), unlike the generic
+// API which follows view_src. Our synthetic graph sets it on allocated tensors
+// but not on ggml-created views (reshape/permute/view) - fill those from their
+// root view_src.
+static void fix_view_buffers(ggml_cgraph * gf) {
+    auto root_buf = [](ggml_tensor * t) -> ggml_backend_buffer_t {
+        while (t && t->buffer == nullptr && t->view_src) t = t->view_src;
+        return t ? t->buffer : nullptr;
+    };
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * n = gf->nodes[i];
+        if (n->buffer == nullptr && n->view_src) n->buffer = root_buf(n->view_src);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ggml_tensor * src = n->src[s];
+            if (src && src->buffer == nullptr && src->view_src) src->buffer = root_buf(src->view_src);
+        }
+    }
 }
 
 // Whole-layer compact-chain bucket engine (the only executor). The round list
@@ -907,33 +973,99 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     }
 #endif
 
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    // ---- targets: CPU (pool 0) + one graph per participating device pool ----
+    int64_t d_out = 0;
+    for (const auto * cn : ex->compute) {
+        if (cn) d_out = std::max(d_out, (int64_t) cn->ne[0]);
+    }
+    if (d_out <= 0) return GGML_STATUS_FAILED;
+    // Shared activation dimension (uploaded per round by the cur gather).
+    int64_t d_in = 0;
+    for (const auto * cn : ex->compute) {
+        if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[1] && cn->src[1]->op == GGML_OP_NONE) {
+            d_in = std::max(d_in, (int64_t) cn->src[1]->ne[0]);
+        }
+    }
+
     chain_ctx_t c;
     c.ctx   = ctx;   c.cpu   = cpu;   c.sched = &sched;
     c.topo  = &sched.topology();
-    c.layer = layer; c.pins  = &pins; c.gf    = gf; c.ex    = ex;
+    c.layer = layer; c.pins  = &pins; c.ex    = ex;
     c.fold_repl = true;
-    c.w_b = n_k; c.n_t = n_t; c.d_out = 0; c.device_used = 1;
+    c.w_b = n_k; c.n_t = n_t; c.d_out = d_out;
 
     bucket_build_t b;
     b.c = &c; b.ex = ex; b.ids = ids; b.ids_data = ids;
     b.ids_ne0 = n_k; b.ids_ne1 = n_t;
 
-    // acc_d: process-lifetime, sized to the fold output once known
-    int64_t d_out = 0;
-    for (const auto * cn : ex->compute) {
-        if (!cn) continue;
-        d_out = std::max(d_out, (int64_t)(cn->ne[0]));
+    ggml_cgraph * gf_cpu = ggml_new_graph(ctx);
+
+    // Resolve each distinct non-RAM pool to a device target (skip pools without
+    // an exec context: their rounds fall back to the CPU host-map read).
+    std::unordered_map<uint32_t, device_target_t> dev_targets;
+#ifdef STREAM_MOE_TEMP
+    const bool force_cpu_dev = std::getenv("STREAM_MOE_TMP_FORCE_CPU") != nullptr;
+#else
+    const bool force_cpu_dev = false;
+#endif
+    for (const auto & r : rounds) {
+        if (force_cpu_dev) break;
+        if (r.pool == 0 || r.width == 0 || r.n_active == 0) continue;
+        if (dev_targets.count(r.pool)) continue;
+        device_exec_ctx_t * dv = stream_moe_backend_device_exec(r.pool);
+        if (!dv || !dv->be) continue;
+        device_target_t t;
+        t.pool = r.pool;
+        t.be   = dv->be;
+        dev_targets.emplace(r.pool, t);
     }
-    if (d_out <= 0) return GGML_STATUS_FAILED;
-    c.d_out = d_out;
-    const size_t acc_sz = (size_t)(c.d_out * c.n_t);
+
+    const size_t acc_sz = (size_t)(d_out * n_t);
+    const size_t acc_bytes = acc_sz * sizeof(float);
+    size_t stage_est = 32u * 1024 * 1024;
+    for (const auto & r : rounds) {
+        if (r.width == 0 || r.n_active == 0) continue;
+        const size_t cells = (size_t) r.width * r.n_active;
+        stage_est += (size_t) d_in * n_t * sizeof(float)   // cur full source
+                   + (size_t) n_k * n_t * sizeof(float)    // routing-weight flat source
+                   + (size_t) n_expert * sizeof(float)     // per-expert scale table
+                   + cells * sizeof(int32_t) * 4 + 4096;   // ids + idx leaves
+    }
+    for (auto & kv : dev_targets) {
+        device_target_t & t = kv.second;
+        device_exec_ctx_t * dv = stream_moe_backend_device_exec(t.pool);
+        const size_t base = ex->layout_ok ? ((ex->result_bytes + 63u) & ~size_t(63u)) : 0;
+        t.acc_off    = base;
+        t.arena_used = base + acc_bytes;
+        const size_t arena_bytes = t.arena_used + 32u * 1024 * 1024;
+        if (!stream_moe_backend_device_ensure(t.pool, arena_bytes, stage_est)) {
+            LOG_ERROR("stream_moe: device arena/stage alloc failed pool " << t.pool);
+            return GGML_STATUS_FAILED;
+        }
+        t.arena = dv->arena; t.stage = dv->stage;
+        t.arena_map = dv->arena_map; t.stage_map = dv->stage_map;
+        t.gf = ggml_new_graph(ctx);
+        t.acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_out, n_t);
+        t.acc->nb[0] = 4; t.acc->nb[1] = (size_t) d_out * 4;
+        t.acc->buffer = t.arena;
+        t.acc->data   = stmoe_vk_buffer_host_offset(t.arena, t.acc_off);
+        const std::vector<float> zeros(acc_sz, 0.0f);   // zero acc_d on the device
+        ggml_backend_tensor_set(t.acc, zeros.data(), 0, acc_bytes);
+    }
+
     if (c.acc_d.size() < acc_sz) c.acc_d.assign(acc_sz, 0.0f);
     std::fill(c.acc_d.begin(), c.acc_d.end(), 0.0f);
 
     for (size_t ri = 0; ri < rounds.size(); ++ri) {
         const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
+        device_target_t * dt = nullptr;
+        if (r.pool != 0) {
+            auto it = dev_targets.find(r.pool);
+            if (it != dev_targets.end()) dt = &it->second;
+        }
+        c.dev = dt;
+        c.gf  = dt ? dt->gf : gf_cpu;
         b.r = &r;
         b.w_b = r.width; b.n_active = r.n_active;
 
@@ -972,8 +1104,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         if (!ok) { LOG_ERROR("stream_moe: chain_buckets ids staging failed L" << layer); return GGML_STATUS_FAILED; }
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
-            fprintf(stderr, "[chain_buckets]   r%zu: pool=%u w_b=%u n_active=%u segs=%zu\n",
-                    ri, r.pool, r.width, r.n_active, sp.segs.size());
+            fprintf(stderr, "[chain_buckets]   r%zu: pool=%u dev=%d w_b=%u n_active=%u segs=%zu\n",
+                    ri, r.pool, dt ? 1 : 0, r.width, r.n_active, sp.segs.size());
         }
 #endif
         // Keep the round's ids copies alive until graph_compute (append-only pool).
@@ -986,7 +1118,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         b.n_arena = 0; b.n_heap = 0;
         ggml_tensor * last = append_bucket_chain_compact(b);
         if (!last) { LOG_ERROR("stream_moe: chain_buckets append failed L" << layer); return GGML_STATUS_FAILED; }
-        ggml_tensor * per_token = append_expert_fold(c, last);
+        ggml_tensor * per_token = append_expert_fold(b, last);
         if (!per_token) return GGML_STATUS_FAILED;
         if (per_token->ne[1] != (int64_t) r.n_active) {
             LOG_ERROR("stream_moe: chain_buckets fold width " << per_token->ne[1]
@@ -994,29 +1126,109 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             return GGML_STATUS_FAILED;
         }
         // acc_d[d_out, n_t] += per_token tight columns, one ggml_acc per run.
-        ggml_tensor * acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
-        acc->data = c.acc_d.data();
-        acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
+        ggml_tensor * acc = nullptr;
+        if (dt) {
+            acc = dt->acc;
+        } else {
+            acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
+            acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
+            acc->data = c.acc_d.data();
+        }
         const size_t col = (size_t)(c.d_out) * 4;
         for (const auto & seg : sp.segs) {
             if (seg.len == 0) continue;
             ggml_tensor * pv = ggml_view_2d(c.ctx, per_token, c.d_out, seg.len,
                                             per_token->nb[1], (size_t) seg.src * per_token->nb[1]);
+            // nb2/nb3 must be > the 2D src1 element span: the vulkan ACC shader
+            // divides by them (the CPU kernel ignores them for a 2D src1).
             ggml_tensor * a = ggml_acc_inplace(c.ctx, acc, pv,
-                                               (size_t) seg.delta * col, 0, 0,
+                                               (size_t) seg.delta * col, acc_bytes, acc_bytes,
                                                (size_t) seg.dst * col);
             ggml_build_forward_expand(c.gf, a);
         }
     }
-    // exit: acc_d -> moe_out (device_used == 1 -> the anonymous cross-device fold
-    // is a plain copy). Reuse chain_exit's stage 2/3 with an acc tensor view of
-    // the persistent acc_d buffer.
-    {
-        ggml_tensor * acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
-        acc->data = c.acc_d.data();
-        acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
-        if (!chain_exit(c, acc)) return GGML_STATUS_FAILED;
+    c.dev = nullptr;
+
+    // Submit device graphs async (overlap with the CPU graph), run the CPU
+    // graph on the calling thread, then converge: sync devices, read each acc_d
+    // back via DMA, and fold every target's partial sum into moe_out.
+    for (auto & kv : dev_targets) {
+        device_target_t & t = kv.second;
+        if (!t.gf || t.gf->n_nodes == 0) continue;
+        fix_view_buffers(t.gf);
+        if (ggml_backend_graph_compute_async(t.be, t.gf) != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("stream_moe: device graph submit failed pool " << t.pool);
+            return GGML_STATUS_FAILED;
+        }
+        // Serialize before the CPU graph: running them concurrently corrupts the
+        // device result (STREAM_MOE_TMP_SYNC_DEV experiment: final cos 0.228 ->
+        // 0.982). Root cause of the overlap hazard is open (WIP O); the async
+        // structure is in place, the overlap is the M2-2 follow-up.
+        ggml_backend_synchronize(t.be);
     }
+    if (gf_cpu->n_nodes > 0 &&
+        ggml_backend_graph_compute(cpu, gf_cpu) != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("stream_moe: CPU chain graph compute failed L" << layer);
+        return GGML_STATUS_FAILED;
+    }
+    std::vector<std::vector<float>> dev_accs(dev_targets.size());
+    std::vector<const float *> accs;
+    accs.reserve(1 + dev_targets.size());
+    accs.push_back(c.acc_d.data());
+    size_t di = 0;
+    for (auto & kv : dev_targets) {
+        device_target_t & t = kv.second;
+        ggml_backend_synchronize(t.be);
+        dev_accs[di].assign(acc_sz, 0.0f);
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
+            std::memcpy(dev_accs[di].data(), t.arena_map + t.acc_off, acc_bytes);
+        } else {
+            ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+        }
+#else
+        ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+#endif
+        accs.push_back(dev_accs[di].data());
+        ++di;
+    }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
+        auto nrm = [](const std::vector<float> & v) {
+            double s = 0; for (float x : v) s += (double) x * x; return std::sqrt(s);
+        };
+        fprintf(stderr, "[devdbg] L%d d_out=%lld n_t=%u cpu_nodes=%d devs=%zu cpu_acc=%.5g\n",
+                layer, (long long) d_out, n_t, gf_cpu->n_nodes, dev_targets.size(), nrm(c.acc_d));
+        for (auto & kv : dev_targets) {
+            double sa = 0;
+            if (kv.second.arena_map) {
+                const float * am = (const float *) kv.second.arena_map;
+                for (int i = 0; i < 262144; ++i) sa += (double) am[i] * am[i];
+            }
+            int n_acc = 0;
+            if (kv.second.gf) {
+                for (int i = 0; i < kv.second.gf->n_nodes; ++i) {
+                    if (kv.second.gf->nodes[i]->op == GGML_OP_ACC) ++n_acc;
+                }
+            }
+            fprintf(stderr, "[devdbg]   pool%u gf_nodes=%d acc_nodes=%d arena[0..1MB]=%.5g\n",
+                    kv.first, kv.second.gf ? kv.second.gf->n_nodes : -1, n_acc, std::sqrt(sa));
+            if (layer == 0 && kv.second.gf) {
+                for (int i = kv.second.gf->n_nodes - 4; i < kv.second.gf->n_nodes; ++i) {
+                    if (i < 0) continue;
+                    ggml_tensor * n = kv.second.gf->nodes[i];
+                    fprintf(stderr, "[devdbg]     node[%d] op=%s ne=[%lld,%lld] buf=%p data=%p\n",
+                            i, ggml_op_name(n->op), (long long) n->ne[0], (long long) n->ne[1],
+                            (void *) n->buffer, n->data);
+                }
+            }
+        }
+        for (size_t q = 0; q < dev_accs.size(); ++q) {
+            fprintf(stderr, "[devdbg]   dev%zu acc=%.5g\n", q, nrm(dev_accs[q]));
+        }
+    }
+#endif
+    if (!layer_fold(ex, d_out, n_t, accs)) return GGML_STATUS_FAILED;
 #ifdef STREAM_MOE_TEMP
     // Numeric gate dump: moe_out per layer (same tmp_dump_node harness as the
     // single-bucket path) so an offline diff gates acc_d results.
