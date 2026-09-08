@@ -31,6 +31,10 @@ route B 第三路径要求**每专家等大**（均匀 stride 槽：`nb[2]=slot_
 - exec 以单张量为单位：w3d 壳 data = 列基址 + e×stride、nb[2] = perExpert。
 - 装载：专家 e 的每张量切片独立 DIO（文件侧块内切片 4K 对齐，见 GGUF_FORMAT §2.6）；
   perExpert 4K 倍数 → 直写；非 4K → staging move。
+- 执行（2026-09-08，docs/M2_DEVICE_EXECUTOR.md §7.9）：`build_mix_plan` 按 (group,pool) 产出
+  round；pool 0 → CPU 图，pool p>0 → **per-device 整链设备图**（mm→weightless→fold→acc_d 全在
+  Vulkan，device shell + staging 上传），async 提交 + CPU 图并发，层尾 sync + 回读 acc_d → host
+  fold。设备混跑对同分区 CPU cos 0.982（已知 flip 噪声量级）。
 
 ## 2. 设计：按专家种类分子池
 

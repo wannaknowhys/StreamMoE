@@ -41,12 +41,12 @@
 ## 阶段 6：用户体验项（2026-08-27，用户想试，优先）
 
 - [ ] **草稿推理（B11）**：`llama-cli/server --model-draft N:\AI_LLM\DeepSeek-V4-Flash-0731\dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf`（上游原生支持；验证 deepseek MTP 加速）。
-- [ ] **GPU 加速**：`GGML_VULKAN=ON` 构建（build.bat 环境变量透传已就绪；RX 590 8GB Vulkan-only）；`--device Vulkan0`/`-ngl` 验证 dense 加速；Phase B 专家池 GPU（`--moe-vram-pool`）。
-- [ ] **自造 4K 对齐 GGUF（`stream_moe_convert`）**：dense/expert 分区 + 4K 对齐 → dense 段/专家段整块 DIO（无 staging）。设计见 `docs/LLAMA_MMAP_CALLS.md` §6、`docs/LLAMA_EXE_ROADMAP.md` Phase 9。
-- [ ] **数值等价回归**：gemma/deepseek std vs `--expert-backend` 输出逐 token 一致（--temp 0）。
+- [x] **GPU 加速**：`GGML_VULKAN=ON` 构建已就绪；**per-device 整链设备执行已落地**（2026-09-08，docs/M2_DEVICE_EXECUTOR.md §7.9）——VRAM 专家 round 真在 Vulkan 上算（mm→weightless→fold→acc_d），只回读 acc_d；`--moe-expert-pools RAM:N,Vulkan0:M`。
+- [x] **自造 4K 对齐 GGUF（`stream_moe_convert`）**：v2 块内分支 4K 对齐变体（`stream_moe.branch_align=1`，docs/STREAMMOE_GGUF_FORMAT.md §2.6）+ SoA 列 DIO 直写。
+- [x] **数值等价回归**：gemma/deepseek baseline_regression（纯 RAM IDENTICAL；设备混跑 cos gate）。
 - [ ] **长程命中率曲线**：`run_long_horizon` 采长历史 + `simulate_cache.js`（LRU/LFU/EST1/OPT）。
-- [ ] **导出功能重新适配上游**：prefill/KV/expert_history 导出（patch A 在 llama-context 通用；patch B 需新 server/cli 侧全 token logits）。
-- [ ] **M4 收尾**：删自研 `src/main.cpp`/`server_main.cpp`/`server/http_server.*`/`engine/llama_engine.*`（被上游替代）。
+- [x] **导出功能重新适配上游**：prefill/KV/expert_history 导出走 vendored server（`--export-dir` / `--prefill-from`）。
+- [x] **M4 收尾**：删自研 `src/main.cpp`/`server_main.cpp`/`server/http_server.*`/`engine/llama_engine.*`（被上游替代）。
 - [ ] **`--moe-preload` / `--moe-eviction`** 参数（common_params member + arg.cpp）。
 
 ---

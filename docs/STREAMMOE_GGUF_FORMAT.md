@@ -125,6 +125,12 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 > - 数值上块 = 原紧凑块 + 分支间 pad（约 +2048B/块, gemma；deepseek perExpert 全 4K 无 pad）。
 > - 兼容：tensor_info 占位、expert_sections 表、chunk 机制不变；仅"块内分支布局"变。loader 需按
 >   `stream_moe.branch_align` 区分新旧（无/0 = 旧紧凑拼接，1 = 新分支 4K 对齐）。
+>
+> **执行侧（2026-09-08 落地）**：SoA 列 + 分支 4K 对齐的最终目的——ggml-vulkan 的
+> `MUL_MAT_ID` 专家步长硬编码 `ne0*ne1` 与列 stride（= 单张量紧凑 perExpert）天然一致。
+> per-device 整链设备图已落地（docs/M2_DEVICE_EXECUTOR.md §7.9）：VRAM round 的
+> mm→weightless→fold→acc_d 全在 Vulkan 上跑，只回读 acc_d；RAM8G+Vulkan0:256M 设备混跑对
+> 同分区 CPU cos 0.982（已知 flip 噪声量级，用户决定不追）。
 
 ---
 

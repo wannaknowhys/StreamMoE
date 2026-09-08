@@ -4,16 +4,20 @@
 > 用途：升级/还原/审阅时对照。所有改动都围绕"route B 专家池注入 + dense/moe 分流 + KV 实测显示"。
 > 基线：f280b2698。
 
-## 修改文件总览（6 个）
+## 修改文件总览（route-b-inject.patch，7 文件）
+
+> phase-1 `streammoe-macros.patch` 另含共享锚点（根 CMakeLists features 块 + `arg.cpp` / `common.cpp` / `common.h` / `include/llama.h` / `tools/server/server-context.cpp` 的 include 锚点），
+> phase-2b `prefill-export-llama.patch` 另含 `src/llama-context.cpp/h`、`src/llama-kv-cache.cpp/h`、`tools/server/server.cpp`。此处只列 route-b 专属。
 
 | 文件 | 改动 | 用途 |
 | :--- | :--- | :--- |
-| `common/common.h` | `common_params` 加 6 字段 | route B 参数载体（主池 2 + 草稿池 2 + flag + prompt-log） |
-| `common/arg.cpp` | 注册 6 个 CLI 参数 | `--expert-backend/--moe-ram-pool/--moe-vram-pool/--moe-draft-ram-pool/--moe-draft-vram-pool/--prompt-log` |
-| `common/common.cpp` | `common_init_from_params` 注入 route_b_setup | 主模型加载前初始化专家池 + 挂 tensor_buft_overrides |
-| `common/speculative.cpp` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型） |
-| `common/CMakeLists.txt` | `llama-common` 加父仓库 route B 源 + include + Windows 库 | 把 src/server/route_b_inject + backend/io/loader/pool 编译进 llama-server/cli |
-| `tools/server/server-context.cpp` | `llama-ext.h` include + 加载后打印 KV 内存 + 析构打印 spec 统计 | 实际 KV 尺寸 + draft 统计 |
+| `common/CMakeLists.txt` | `STREAM_MOE_SRC` 源列表 + include + Windows 库 | 把父仓库 route B 源编译进 llama-server/cli（含 backend/io/loader/pool/server + `route_b_chain.cpp` / `mix_split.cpp` / `scatter_plan.cpp` / `model_builder.cpp` / `topo_builder.cpp`；async_dio 按平台选 win/posix） |
+| `common/speculative.cpp` / `.h` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型） |
+| `src/llama-model-loader.cpp` / `.h` | route B 加载钩子（专家张量 buft 覆盖 / 池装载） | 专家张量走池而非 mmap |
+| `src/llama-model.cpp` | route B 设备注册 / 专家放置接线 | 设备池 + 调度 |
+| `src/llama.cpp` | route B 后端注册 + `[TMR]` 计时 include | 设备注册早于模型加载 |
+| `common/arg.cpp` / `common/common.cpp` / `common/common.h` | （phase1 锚点 + frag）参数 + `common_init_from_params` 注入 `route_b_setup` | 主模型加载前初始化专家池 + 挂 `tensor_buft_overrides` |
+| `tools/server/server-context.cpp` | （phase1 锚点 + frag）route_b_setup 注入 + KV 内存打印 | 加载后打印实际 KV + draft 统计 |
 
 ## 逐文件明细
 
@@ -76,13 +80,20 @@ target_sources(${TARGET} PRIVATE
     ${STREAM_MOE_SRC}/server/route_b_inject.cpp
     ${STREAM_MOE_SRC}/backend/moe_backend.cpp
     ${STREAM_MOE_SRC}/backend/minigraph_exec.cpp
+    ${STREAM_MOE_SRC}/backend/mix_split.cpp
+    ${STREAM_MOE_SRC}/backend/scatter_plan.cpp
     ${STREAM_MOE_SRC}/backend/scheduler.cpp
-    ${STREAM_MOE_SRC}/io/async_dio_win.cpp
+    ${STREAM_MOE_SRC}/backend/route_b_chain.cpp
     ${STREAM_MOE_SRC}/io/staging_reader.cpp
     ${STREAM_MOE_SRC}/loader/moe_loader.cpp
+    ${STREAM_MOE_SRC}/loader/model_builder.cpp
+    ${STREAM_MOE_SRC}/loader/topo_builder.cpp
     ${STREAM_MOE_SRC}/pool/expert_stats.cpp)
 if (WIN32)
+    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_win.cpp)
     target_link_libraries(${TARGET} PRIVATE ws2_32 advapi32 synchronization)
+else()
+    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_posix.cpp)
 endif()
 ```
 
@@ -101,7 +112,8 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
 - patch 备份：`patches/route-b-inject.patch`（**必须用 cmd 重定向生成**，PS 5.1 的 `>` 会写 UTF-16，导致 `git apply` 报 "No valid patches"）：
   ```bat
   rem 在父仓库根目录执行（cmd 重定向字节透传，产出纯文本 patch）
-  cmd /c "git -C third_party/llama.cpp diff > patches\route-b-inject.patch"
+  rem 各 patch 各管各的文件，用文件列表限定（绝不 `git diff >` 全量抄，会把其他 patch 混进来）
+  cmd /c "git -C third_party/llama.cpp diff HEAD -- common/CMakeLists.txt common/speculative.cpp common/speculative.h src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model.cpp src/llama.cpp > patches\route-b-inject.patch"
   rem 校验 patch 有效（在已应用的工作区应通过 reverse-check）
   git -C third_party/llama.cpp apply --check -R patches\route-b-inject.patch
   ```
