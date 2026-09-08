@@ -7,7 +7,9 @@
 //
 // usage:
 //   stream_moe_convert -m <model.gguf> -o <out.gguf> [--format v2|v3]
-//   stream_moe_convert -m <model.gguf> -o <dir> --format v3chunk --chunks 5 [--ratio 8:9:9:7:9]
+//   stream_moe_convert -m <model.gguf> -o <base> --format v3chunk --chunks 5 [--ratio 8:9:9:7:9]
+//     (v3chunk writes <base>-00001.gguf, <base>-00002.gguf, ...; digit width
+//      mirrors the source filename's trailing number, else 5, and grows)
 //   stream_moe_convert -m "c1.gguf;c2.gguf;..." -o <out.gguf> [--format v2|v3]
 
 #include "convert/writer.h"

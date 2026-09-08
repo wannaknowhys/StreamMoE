@@ -259,7 +259,7 @@ v3 → v2 把三段合回一段。
 ## 5. 转换器（stream_moe_convert）
 
 - 输入：`-m <model.gguf>`（多分片自动合并；chunk 源用 `;` 分隔全部文件）。
-- 输出：`-o <out.gguf>` + `--format v2|v3`（默认 v3）；`--format v3chunk --chunks N [--ratio a:b:c]`。
+- 输出：`-o <out.gguf>` + `--format v2|v3`（默认 v3）；`--format v3chunk --chunks N [--ratio a:b:c]` 时 `-o <base>`，产出 `<base>-00001.gguf`、`<base>-00002.gguf`……（数字宽度取自源文件名的末尾数字，缺省 5 位补零，超出自然变长）。
 - 流程：
   1. `parse_model` 解析 GGUF（header/KV/tensor_info，张量 offset/size/type/ne）→ `model_t`。
   2. 分类张量（C1/C2/C3/C4，见 §3.3）。
@@ -321,7 +321,7 @@ v3 → v2 把三段合回一段。
   - **v3chunk**：统一 unit 切分（每段 = 一串 unit，同一条 4K base/rem 规则切 N 份）+ 逐条带 copy/fill。
   - **4K 对齐**：从内存 seed 上下文（含 `general.alignment=4096` 的最小 GGUF）初始化 `gguf_context`，
     `gguf_add_tensor` 即按 4K 布局——**不需要 vendored `gguf_set_alignment`**（`gguf-alignment.patch` 已删）。
-- **CLI**（`src/convert/main.cpp`）：`stream_moe_convert -m <model> -o <out> [--format v2|v3|v3chunk] [--chunks N] [--ratio a:b:c]`。
+- **CLI**（`src/convert/main.cpp`）：`stream_moe_convert -m <model> -o <out|base> [--format v2|v3|v3chunk] [--chunks N] [--ratio a:b:c]`（v3chunk 的 `-o` 是基名前缀，输出 `<base>-00001.gguf`…）。
 - **构建**：`build.bat convert <tag>`（CMake target `stream_moe_convert`，链 ggml-base + `model_builder.cpp`）。
 - **已删除**：`tools/stream_moe_layout.js` / `stream_moe_convert.js` / `stream_moe_convertd.cpp` /
   `stream_moe_model.js` / `convertd_call.js`、`scripts/convert_v1.bat`、`patches/gguf-alignment.patch`。

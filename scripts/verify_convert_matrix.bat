@@ -46,7 +46,7 @@ call :cmp "%DIR%\v3_base.gguf" "%DIR%\t2_v3.gguf" "v3-to-v3" || goto fail
 call :cmp "%DIR%\v3_base.gguf" "%DIR%\t2_v3b.gguf" "v3-to-v2-to-v3" || goto fail
 
 echo [step 4/4] v3chunk source
-set CHUNKS=%DIR%\v3c_base\c1.gguf;%DIR%\v3c_base\c2.gguf;%DIR%\v3c_base\c3.gguf;%DIR%\v3c_base\c4.gguf;%DIR%\v3c_base\c5.gguf
+set CHUNKS=%DIR%\v3c_base-00001.gguf;%DIR%\v3c_base-00002.gguf;%DIR%\v3c_base-00003.gguf;%DIR%\v3c_base-00004.gguf;%DIR%\v3c_base-00005.gguf
 "%CONV%" -m "%CHUNKS%" -o "%DIR%\t3_v3.gguf" --format v3 || goto fail
 call :cmp "%DIR%\v3_base.gguf" "%DIR%\t3_v3.gguf" "v3chunk-to-v3" || goto fail
 "%CONV%" -m "%CHUNKS%" -o "%DIR%\t3_v2.gguf" --format v2 || goto fail

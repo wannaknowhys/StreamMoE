@@ -14,6 +14,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -533,7 +534,25 @@ void content_to_ops(const std::vector<content_item_t>& content, uint64_t start, 
     }
 }
 
-void write_v3_chunk(const model_t& model, const std::string& outBase, int N, const std::vector<int>& ratio) {
+std::string zero_pad(long num, int width) {
+    std::string s = std::to_string(num);
+    if (static_cast<int>(s.size()) < width) s = std::string(static_cast<size_t>(width) - s.size(), '0') + s;
+    return s;
+}
+
+// Chunk-name digit width: mirror the source filename's trailing number width
+// (e.g. "-00005" -> 5); default 5 (GGUF-style) when the source has none. The
+// number grows naturally past the width (printf-style).
+int infer_chunk_pad_width(const std::string& input_path) {
+    const std::string stem = std::filesystem::path(input_path).stem().string();
+    size_t e = stem.size();
+    while (e > 0 && std::isdigit(static_cast<unsigned char>(stem[e - 1]))) --e;
+    if (e < stem.size()) return static_cast<int>(stem.size() - e);
+    return 5;
+}
+
+void write_v3_chunk(const model_t& model, const std::string& outBase, int N,
+                    const std::vector<int>& ratio, int pad) {
     const plan_t p = build_plan(model, convert_opts_t::target_t::V3);
     const std::vector<unit_t> units = build_units(model, p);
 
@@ -547,7 +566,7 @@ void write_v3_chunk(const model_t& model, const std::string& outBase, int N, con
     }
 
     for (int i = 0; i < N; ++i) {
-        const std::string out = outBase + std::to_string(i + 1) + ".gguf";
+        const std::string out = outBase + "-" + zero_pad(i + 1, pad) + ".gguf";
         const std::vector<uint64_t> cs(slices[static_cast<size_t>(i)].begin(), slices[static_cast<size_t>(i)].end());
         write_header_to(model, p, true, out, &cs, i, N);
         const uint64_t data_offset = sm_align_up(file_size(out), ALIGN);
@@ -593,9 +612,11 @@ void write_v3_chunk(const model_t& model, const std::string& outBase, int N, con
 
 void convert_model(const model_t& model, const convert_opts_t& opts, const std::string& out) {
     if (opts.target == convert_opts_t::target_t::V3_CHUNK) {
-        std::filesystem::create_directories(out);
         if (opts.chunks < 1) throw std::runtime_error("chunks must be >= 1");
-        write_v3_chunk(model, out + "/c", opts.chunks, opts.ratio);
+        const std::filesystem::path op(out);
+        if (!op.parent_path().empty()) std::filesystem::create_directories(op.parent_path());
+        const int pad = infer_chunk_pad_width(model.files.empty() ? std::string() : model.files[0]);
+        write_v3_chunk(model, out, opts.chunks, opts.ratio, pad);
     } else {
         write_single(model, out, opts.target);
     }
