@@ -452,10 +452,12 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - **ggml 视图 buffer**：`ggml_vk_tensor_subbuffer` 直接读 `tensor->buffer->context`（不跟随
   view_src），合成图里 ggml 建的 view（reshape/permute/view）buffer=NULL → `fix_view_buffers`
   从根 view_src 补。
-- **⚠ 未解：CPU/VK 重叠会污染设备结果**。async 提交设备图后在调用线程跑 CPU 图，二者并发时
-  最终 cos 0.228；**先 synchronize 设备再跑 CPU 图 → cos 0.982**（=已知噪声）。当前实现**先
-  sync 再跑 CPU**（串行，结构保留 async）。重叠 hazard 根因未定（疑 vulkan 提交/执行与 CPU
-  图共享某状态）——M2-2 真重叠的后续。诊断 env：`STREAM_MOE_TMP_DEVDBG`（acc 范数/arena 范数/
-  gf 节点）、`STREAM_MOE_TMP_FORCE_CPU`（设备 round 落回 CPU 对拍分区）。
+- **CPU/VK 重叠（已核实可用，2026-09-08）**：async 提交设备图 → 调用线程跑 CPU 图 → 层尾
+  sync + 回读。**overlap vs 串行（`STREAM_MOE_TMP_NO_OVERLAP`）逐层 acc 与最终产物
+  IDENTICAL**（128M/256M 都试），3 次重跑一致。早前一次 0.228 观测是旧 binary/状态残留
+  （非重叠问题）——按"先对比每专家张量/累加器/最终 add"的口径逐层 acc 全部 maxAbs=0。
+  诊断 env：`STREAM_MOE_TMP_DEVDBG`（acc/arena 范数、gf 节点）、`STREAM_MOE_TMP_FORCE_CPU`
+  （设备 round 落回 CPU 对拍分区）、`STREAM_MOE_TMP_ACC_DUMP=<dir>`（逐层 acc dump）、
+  `STREAM_MOE_TMP_NO_OVERLAP`（串行对拍）。
 - 设备多 round 几何本身已验证：512M 全设备 one-round vs k/t 奇偶 split-4-round **IDENTICAL**
   （ACC 跨 round 累加无问题）。

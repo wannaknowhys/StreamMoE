@@ -803,12 +803,11 @@ Two hazards found (details in WORK_IN_PROGRESS O):
 - **vulkan ACC nb2/nb3 must not be 0.** `acc.comp` decomposes the src1 index via
   `src1_i / p.nb03 / p.nb02`; the CPU kernel ignores nb2/nb3 for a 2D src1. Pass
   the full-tensor stride (d_out*n_t*4), not 0, or the acc stays zero.
-- **CPU/VK overlap corrupts the device result (OPEN).** Running the CPU graph on
-  the calling thread while the device graph is in flight gives final cos 0.228;
-  synchronizing the device BEFORE the CPU graph gives 0.982 (known noise). The
-  current implementation serializes (async submit, then synchronize, then CPU
-  graph). Root cause of the overlap hazard is undetermined (suspected shared
-  vulkan submit/execute state). This is the remaining M2-2 item.
+- **CPU/VK overlap (verified working).** Running the CPU graph on the calling
+  thread while the device graph is in flight, then synchronizing at layer end,
+  is correct: per-layer `acc_d` and the final export are IDENTICAL to the
+  serialized variant (`STREAM_MOE_TMP_NO_OVERLAP`), stable across runs. An early
+  0.228 observation was a stale-binary/state artifact, not the overlap.
 - ggml-created views have `buffer == NULL`; `ggml_vk_tensor_subbuffer` reads
   `tensor->buffer->context` directly (it does not follow `view_src`), so synthetic
   device graphs need `fix_view_buffers` to fill view buffers from the root.

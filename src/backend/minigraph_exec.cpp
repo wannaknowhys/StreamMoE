@@ -1160,11 +1160,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             LOG_ERROR("stream_moe: device graph submit failed pool " << t.pool);
             return GGML_STATUS_FAILED;
         }
-        // Serialize before the CPU graph: running them concurrently corrupts the
-        // device result (STREAM_MOE_TMP_SYNC_DEV experiment: final cos 0.228 ->
-        // 0.982). Root cause of the overlap hazard is open (WIP O); the async
-        // structure is in place, the overlap is the M2-2 follow-up.
-        ggml_backend_synchronize(t.be);
+        // Overlap: submit async and let the CPU graph run concurrently on the
+        // calling thread. Verified stable: per-layer acc and final output are
+        // IDENTICAL to the serialized variant (WIP O). STREAM_MOE_TMP_NO_OVERLAP
+        // serializes for debugging.
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_NO_OVERLAP")) ggml_backend_synchronize(t.be);
+#endif
     }
     if (gf_cpu->n_nodes > 0 &&
         ggml_backend_graph_compute(cpu, gf_cpu) != GGML_STATUS_SUCCESS) {
@@ -1192,6 +1194,19 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         accs.push_back(dev_accs[di].data());
         ++di;
     }
+#ifdef STREAM_MOE_TEMP
+    if (const char * ad = std::getenv("STREAM_MOE_TMP_ACC_DUMP")) {
+        char fn[512];
+        snprintf(fn, sizeof(fn), "%s/acc_L%d_cpu.bin", ad, layer);
+        if (FILE * f = fopen(fn, "wb")) { fwrite(c.acc_d.data(), sizeof(float), acc_sz, f); fclose(f); }
+        size_t q = 0;
+        for (auto & kv : dev_targets) {
+            snprintf(fn, sizeof(fn), "%s/acc_L%d_p%u.bin", ad, layer, kv.first);
+            if (FILE * f = fopen(fn, "wb")) { fwrite(dev_accs[q].data(), sizeof(float), acc_sz, f); fclose(f); }
+            ++q;
+        }
+    }
+#endif
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
         auto nrm = [](const std::vector<float> & v) {
