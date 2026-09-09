@@ -108,23 +108,25 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ## 3. 你可以跑的验证
 
-| 动作 | 命令 |  |
-| :--- | :--- | :--- |
-| route-b 完整推理 | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe` |  |
-| prefill 导出（上游基准） | `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe` |  |
-| 完整栈导出 | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2） |  |
-| 转换器（C++） | `build.bat convert main` → `build\main\bin\stream_moe_convert.exe -m <model> -o <out> --format v3` |  |
-| 转换矩阵 | `scripts\verify_convert_matrix.bat <workdir>`（C++ 转换器；源默认 `SM_GEMMA_ORIG`） |  |
-| gemma 冒烟 | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui` |  |
-| prefill 导出（--export-dir） | `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text |  |
-| prefill-from | `llama-server -m <gemma> --prefill-from <prompt.txt | tokens.bin> --export-dir <dir> -c 1024 -t 8` |
-| **基线回归** | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；CPU 编对 `moe_129_8192`、默认 vulkan 编对 `moe_129_8192_vk`，见其 README） |  |
-| vram 池驻留 | `llama-server -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <dir> -c 2048 -t 16 --expert-backend --moe-expert-pools RAM:8192,Vulkan0:4096 --fit off --no-warmup`（全量专家进 vram；池 1024 触发 demote）→ 产物对 `moe_129_8192_vk` IDENTICAL |  |
+| 动作                         | 命令                                                                                                                                                                                                                                                                                                                                 |                                              |
+| :--------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| route-b 完整推理             | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe`                                                                                                                                                                                                                                                           |                                              |
+| prefill 导出（上游基准）     | `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe`                                                                                                                                                                                                                                         |                                              |
+| 完整栈导出                   | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2）                                                                                                                                                                                                                   |                                              |
+| 转换器（C++）                | `build.bat convert main` → `build\main\bin\stream_moe_convert.exe -m <model> -o <out> --format v3`                                                                                                                                                                                                                                   |                                              |
+| 转换矩阵                     | `scripts\verify_convert_matrix.bat <workdir>`（C++ 转换器；源默认 `SM_GEMMA_ORIG`）                                                                                                                                                                                                                                                  |                                              |
+| gemma 冒烟                   | `build\main\llama-build\bin\llama-server.exe -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --host 127.0.0.1 --port 8997 -c 8192 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup --no-webui`                                                                                                                     |                                              |
+| prefill 导出（--export-dir） | `llama-server -m <gemma> --export-dir <dir> ...` + 喂 prompt + shutdown → 导出 prefill_export/tokens_id/tokens_text                                                                                                                                                                                                                  |                                              |
+| prefill-from                 | `llama-server -m <gemma> --prefill-from <prompt.txt                                                                                                                                                                                                                                                                                  | tokens.bin> --export-dir <dir> -c 1024 -t 8` |
+| **基线回归**                 | **`baseline_regression\run_baseline.bat`**（改代码+编译后跑：129-token prefill-from 三组 IDENTICAL-vs-baseline + per-token KL 报告 + kv_cos，直接出 PASS/FAIL；CPU 编对 `moe_129_8192`、默认 vulkan 编对 `moe_129_8192_vk`，见其 README）                                                                                            |                                              |
+| vram 池驻留                  | `llama-server -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin --export-dir <dir> -c 2048 -t 16 --expert-backend --moe-expert-pools RAM:8192,Vulkan0:4096 --fit off --no-warmup`（全量专家进 vram；池 1024 触发 demote）→ 产物对 `moe_129_8192_vk` IDENTICAL |                                              |
 
 **run_export 前台窗口启动**（跑 cn/en/prefill10000 导出任务——脱离 opencode 管控但用户可见）：
+
 ```bat
 agy-run -c "start cmd /k temp\run_export_win.bat"
 ```
+
 - agy-run 绑 `WinSta0\Default` 在**交互桌面**弹新 cmd 窗口 → llama-server 在窗口里跑（**用户实时看**）。
 - `start` 立即返回 → **opencode/bash 不阻塞**。别用 `start /b` 后台（那才真正脱离管控且看不到）。
 - `temp\run_export_win.bat`：`call temp\sm_env.bat`（机器路径 env）+ `node tools\run_export.js --models ... --engines ... --tasks ...`。
@@ -147,6 +149,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 7. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）；3 个 direct_fill task spec；OpenSSL（`OPENSSL_ROOT_DIR`）。
 
 **明确不做**（用户决策）
+
 - deepseek prefill 追 bit 级（A1）；prefill 全 token 层状态验证（B5）；v1 张量级分片（C6）。
 - 设备混跑 vs CPU 的 cos 0.982 差距（2026-09-08，与已知 0.986 冻结基线同量级，不追）。
 

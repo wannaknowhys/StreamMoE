@@ -19,11 +19,11 @@ a prefill/decode pass with vram pressure does hundreds of demotes.
 
 Measured host-read bandwidth by memory type (direct vulkan test):
 
-| memory type | heap | host read | note |
-| :--- | :--- | :--- | :--- |
-| DEVICE_LOCAL \| HOST_VISIBLE (rebar) | vram 8 GB | **0.02 GB/s** | current move source - unusable |
-| HOST_VISIBLE \| COHERENT | sys-ram 64 GB | 0.27 GB/s | uncached |
-| HOST_VISIBLE \| COHERENT \| **CACHED** | sys-ram 64 GB | **21-27 GB/s** | ggml sync_staging heap |
+| memory type                                  | heap          | host read      | note                           |
+| :------------------------------------------- | :------------ | :------------- | :----------------------------- |
+| `DEVICE_LOCAL &#124; HOST_VISIBLE` (rebar)   | vram 8 GB     | **0.02 GB/s**  | current move source - unusable |
+| `HOST_VISIBLE &#124; COHERENT`               | sys-ram 64 GB | 0.27 GB/s      | uncached                       |
+| `HOST_VISIBLE &#124; COHERENT &#124; CACHED` | sys-ram 64 GB | **21-27 GB/s** | ggml sync_staging heap         |
 
 ## 2. Transfer-queue DMA is the fix
 
@@ -31,12 +31,12 @@ Measured host-read bandwidth by memory type (direct vulkan test):
 family) copies VRAM -> a host buffer at **~14 GB/s**, and the CPU can then read
 that host buffer at cached speed:
 
-| path | 3.63 MB expert |
-| :--- | :--- |
-| CPU memcpy from VRAM rebar map (current) | ~158 ms |
-| `vkCmdCopyBuffer` VRAM -> CACHED staging | ~0.38 ms |
-| + memcpy CACHED staging -> RAM slot | ~0.17 ms |
-| total (DMA + memcpy) | **~0.5 ms (~300x faster)** |
+| path                                     | 3.63 MB expert             |
+| :--------------------------------------- | :------------------------- |
+| CPU memcpy from VRAM rebar map (current) | ~158 ms                    |
+| `vkCmdCopyBuffer` VRAM -> CACHED staging | ~0.38 ms                   |
+| + memcpy CACHED staging -> RAM slot      | ~0.17 ms                   |
+| total (DMA + memcpy)                     | **~0.5 ms (~300x faster)** |
 
 10-expert concurrency over one fixed staging buffer showed **no bandwidth
 loss**: sequential per-expert submits 9.5 GB/s, one batch of 10 copies 10.7
@@ -53,6 +53,7 @@ GB/s, pipelined 10 submits 10.2 GB/s (all ~0.35-0.39 ms/expert).
 
 Host-map bandwidth is **asymmetric**: VRAM rebar CPU **write is ~8 GB/s** (PCIe
 posted writes) but CPU **read is ~0.02 GB/s**. Consequences:
+
 - r2v (loading RAM/disk bytes into VRAM, = CPU writes to the vram host-map)
   needs **no staging** - the current DIO-direct write path already runs at the
   fast write speed.
@@ -131,9 +132,10 @@ same ggml-vulkan TU as the region buffers.
 ### 4.4 Timing (rdtsc, gated behind STREAM_MOE_LOG=debug)
 
 Per move, log:
-- `dma_us`  = vkCmdCopyBuffer submit -> queue idle (download time)
-- `mc_us`   = staging -> RAM slot copy time (0 with the internal staging path,
-              already inside the dma_read)
+
+- `dma_us` = vkCmdCopyBuffer submit -> queue idle (download time)
+- `mc_us` = staging -> RAM slot copy time (0 with the internal staging path,
+  already inside the dma_read)
 - plus the existing queued total
 
 So the decision "drop the memcpy worker" can be re-evaluated from data: if

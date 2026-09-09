@@ -6,7 +6,7 @@
 > (docs/WORK_IN_PROGRESS.md M2-5) and the eventual per-device mini-graph
 > (docs/M2_DEVICE_EXECUTOR.md SS7.8). A bucket here = one `mix_round_t` of a
 > `mix_plan_t` (docs/Backend.md J6 / mix_split): a full rectangle `[w_b,
-> n_active]` of routed (token, slot) columns.
+n_active]` of routed (token, slot) columns.
 
 ## 1. Problem
 
@@ -79,13 +79,13 @@ Only three external per-token inputs need handling; every one is the same
 operation - a tight-gather (copy main-graph per-token data into tight staging
 in `order`). A single generic tight-gather helper serves all three.
 
-| data | role | per-token layout | bucket effect |
-| :--- | :--- | :--- | :--- |
-| `cur` (dense norm out) | gate/up mm src1 | one shared column per token `[d,1,n_t]` | token tight-gather -> `[d,1,n_active]` (slot-independent) |
-| routing `ids` | mm src2, GET_ROWS src1 | per (token, slot) `[n_k,n_t]` | slot subset staged (`ids_exp`/`ids_slot`); token blocks reordered to tight order |
-| per-slot routing weights (`ffn_moe_weights_norm`) | weighted mul src1 | one scalar per (slot, token) `[1,n_k,n_t]` = softmax weight of the routed expert; produced dense-side after topk, leaf into the chain | arbitrary (t,k) index-gather -> `[1,w_b,n_active]` (flat get_rows; BUCKET_EXEC_TOKEN_SUBSET SS2.1a) |
-| expert weights, per-expert scale (REPEAT table) | mm src0 / GET_ROWS src0 | per-expert | token-independent - untouched |
-| chain-internal tensors (GLU/down/weighted) | - | `[d,w_b,n_t]` | inherit the order fixed at the first tight gather |
+| data                                              | role                    | per-token layout                                                                                                                      | bucket effect                                                                                       |
+| :------------------------------------------------ | :---------------------- | :------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------- |
+| `cur` (dense norm out)                            | gate/up mm src1         | one shared column per token `[d,1,n_t]`                                                                                               | token tight-gather -> `[d,1,n_active]` (slot-independent)                                           |
+| routing `ids`                                     | mm src2, GET_ROWS src1  | per (token, slot) `[n_k,n_t]`                                                                                                         | slot subset staged (`ids_exp`/`ids_slot`); token blocks reordered to tight order                    |
+| per-slot routing weights (`ffn_moe_weights_norm`) | weighted mul src1       | one scalar per (slot, token) `[1,n_k,n_t]` = softmax weight of the routed expert; produced dense-side after topk, leaf into the chain | arbitrary (t,k) index-gather -> `[1,w_b,n_active]` (flat get_rows; BUCKET_EXEC_TOKEN_SUBSET SS2.1a) |
+| expert weights, per-expert scale (REPEAT table)   | mm src0 / GET_ROWS src0 | per-expert                                                                                                                            | token-independent - untouched                                                                       |
+| chain-internal tensors (GLU/down/weighted)        | -                       | `[d,w_b,n_t]`                                                                                                                         | inherit the order fixed at the first tight gather                                                   |
 
 ## 3. Module interface (pure, no ggml/llama dependency)
 
@@ -158,12 +158,12 @@ Algorithm (n_active tokens, values in [0, n_t)):
    rectangle peel never produces; reject as an input error otherwise).
 2. Repeat until the value set is empty:
    a. For every candidate delta from 1 upward (delta such that the token value
-      can appear again, i.e. any two values in the set), count the longest
-      chain of equal-delta in-set values: `len(delta) = max over v of
-      #{k >= 0 : v + k*delta in set}`. delta is unbounded above but only
-      deltas <= (max-min) matter; scan deltas that actually divide a pair.
+   can appear again, i.e. any two values in the set), count the longest
+   chain of equal-delta in-set values: `len(delta) = max over v of
+#{k >= 0 : v + k*delta in set}`. delta is unbounded above but only
+   deltas <= (max-min) matter; scan deltas that actually divide a pair.
    b. Pick the delta with the largest `len(delta)` (ties: smallest delta, then
-      smallest start value - deterministic).
+   smallest start value - deterministic).
    c. Emit one seg for that run; remove its values from the set.
 3. The emission order (segs in the order the runs are extracted) defines the
    tight order: concatenate each run's values ascending.
@@ -193,7 +193,7 @@ along its row axis with an i32 index leaf built in tight order.
 - **acc loop** (replaces the offset-0 single acc in
   `exec_layer_burst_chain_buckets`): for each seg, one
   `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
-  offset=dst*d_out*4)`. The src slice is contiguous in `per_token` because the
+offset=dst*d_out*4)`. The src slice is contiguous in `per_token` because the
   chain ran in tight order.
 
 ## 6. Unit tests (planned)
@@ -202,9 +202,9 @@ along its row axis with an i32 index leaf built in tight order.
 
 ### Config grid (cartesian product)
 
-| n_t (full-width tokens) | hit rate |
-| :--- | :--- |
-| 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
+| n_t (full-width tokens) | hit rate            |
+| :---------------------- | :------------------ |
+| 1, 2, 3, 4, 16, 1024    | 0, 0.1, 0.5, 0.9, 1 |
 
 30 tasks. One rdtsc timing per task around `build_scatter_plan`
 (`tsc_now` before/after, report `tsc_delta_ns`); a single measurement per task

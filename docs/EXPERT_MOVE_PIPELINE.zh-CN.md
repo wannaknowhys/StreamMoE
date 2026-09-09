@@ -34,7 +34,7 @@
 ## 2. 已落地基座（WORK_IN_PROGRESS L）——不可回归
 
 - `slot_request_t` 96B POD：`{layer, total_tokens, start_rdtsc, n_load_target(=批装载数),
-  batch_ready ptr, needed[8]=512bit bitmap}`。
+batch_ready ptr, needed[8]=512bit bitmap}`。
 - `mpsc_alloc_queue`：普通 POD ring + 每槽发布 generation（release/acquire），
   多生产者安全，无 ABA。绝不用 `std::atomic<96B>`。
 - `expert_scheduler::pin_layer(layer, bitmap, await, out)`：扫 dir → pin 已驻留，
@@ -96,6 +96,7 @@ FAILED       无槽      装载/迁移失败
 ```
 
 状态条目要点：
+
 - 携带槽的状态发布时，`slot` 必须是**真实已预约的物理槽号**（LOADING = 其
   IO_INFLIGHT 槽；MOVING_IN = 已预约的目标槽）。与 §3.4 同一可见性规则：
   先发布带合法槽的意图、worker 再行动——绝不发布占位槽。
@@ -171,6 +172,7 @@ FAILED（装载/move 硬失败）作为错误上抛，不无限重试。
 （登记 :258/:328、打分读 :278/:281、victim 反查 :293-294）。无其他文件/函数碰它。
 
 一旦驱逐改成 (L,E) 键（下节），调度线程永不需要问"槽 i 里住着哪个专家？"：
+
 - 装载完成 `dir_->set(t->layer, t->expert, ...)` 已从 async_load_t 带 (L,E)；
 - 驱逐按 (L,E) 选，经 `entries_` 读槽。
 
@@ -196,7 +198,7 @@ host-visible 目标 buffer。当时结论：本硬件上 v2r 到普通 malloc RA
 memcpy；GPU copy-engine DMA 记为未来 UMA/APU 目标。
 
 > **2026-09-04 修订——该结论对"两步路径"是错的。** copy engine 确实写不进
-> *普通 malloc* RAM（上面正确），但能写 **CACHED host-visible *vulkan* host
+> _普通 malloc_ RAM（上面正确），但能写 **CACHED host-visible _vulkan_ host
 > buffer**（heap0 / memtype 7），再从该 host buffer 以 cached 速度读回很快。
 > RX590 实测：`vkCmdCopyBuffer` vram → cached staging ~14 GB/s、staging → RAM 槽
 > memcpy ~21+ GB/s ⇒ 单个 demote 从 ~158 ms（rebar CPU 读 0.02 GB/s）降到 ~0.5 ms。
@@ -366,6 +368,7 @@ still-need 数**——绝不是 round-1 总数。调度线程按当轮自己的 
 > pin**——scheduler 已替 B pin 好。exec 算完对 A∪B 统一释放。
 
 **为什么成立（pin 责任切分）**：
+
 - A 与 B 永不重叠：A = exec scan 时 `try_pin` CAS 成功的那批；B = 其余。exec 提交 B 的
   一刻 partition 即固定。
 - 保护无需新规则：A 由自身 refcount 就地保护（已 +1）；B 由 **LOADING→READY 状态转换**
@@ -374,6 +377,7 @@ still-need 数**——绝不是 round-1 总数。调度线程按当轮自己的 
 - 全有或全无的 pin 只发生在**一处**（scheduler 侧），永无半 pin 中间态。
 
 **scheduler 侧 active 槽（`expert_scheduler` 成员，per-model）**：
+
 ```cpp
 struct active_request_t {
     uint32_t layer = 0;
@@ -384,14 +388,16 @@ struct active_request_t {
 };
 active_request_t active_;   // 空 = 无在途请求
 ```
+
 - `accept_requests()` 是**唯一登记点**：pop 一个 exec 请求存入 `active_`，然后**同一
   scheduler 线程轮内**立即逐项 triage B（同一临界区）：
-  READY    -> 当场 CAS pin 并记账（n_left--）
-  ABSENT   -> alloc + 提交装载（走 M3 驱逐腾位）；稍后经 drain settle
+  READY -> 当场 CAS pin 并记账（n_left--）
+  ABSENT -> alloc + 提交装载（走 M3 驱逐腾位）；稍后经 drain settle
   LOADING / MOVING_* -> 留给 drain（在飞，settle 时会 pin）
 - `active_` 非空期间不 pop 新 exec 请求（单活跃纪律 §7.1），只 drain/move/settle。
 
 **drain_completions() 是唯一 settle 点并**代为 pin（owner 线程，无需额外通知）：
+
 - drain 在 scheduler 线程内由 `worker_loop` 同步调用（wait_events→drain_completions）。
   "drain 如何通知 scheduler？"是伪问题——drain 本就是 scheduler 自己的线程步骤，直接
   bump exec 的唤醒词。
@@ -405,6 +411,7 @@ active_request_t active_;   // 空 = 无在途请求
 wake exec。exec 永远看不到"半 pin 的 B"。
 
 **两个登记时刻的竞态，必须编码 + 测试（Claude 审阅）**：
+
 1. **登记前 settle（丢事件窗口）**：某专家在 exec scan（B 含它为 LOADING）之后、
    scheduler 登记 active_ **之前**就 settle 成 READY（先跑的是 drain 那轮，当时无
    active_）——它的 drain 事件就此永久丢失。修法：登记步骤必须在同一轮**现查每个 B 项的
@@ -415,6 +422,7 @@ wake exec。exec 永远看不到"半 pin 的 B"。
    （活锁）。写进登记步骤（上面 accept_requests 的 ABSENT 分支），不能靠隐含。
 
 **exec 侧——单程 pin_layer（取代 §3.5 loop / §7.3 两轮）**：
+
 ```
 exec pin_layer(layer, needed, await, out):
   A = {}; B = {}
@@ -432,6 +440,7 @@ exec pin_layer(layer, needed, await, out):
                     -> 记 handle；scan miss 在非 failed 下不可能
     return A + B handles
 ```
+
 exec 算完对 A∪B 逐个 unpin()。**绝不重复 pin B**（refcount 已被 scheduler +1），
 **绝不 loop 重测**。
 
@@ -441,6 +450,7 @@ exec 算完对 A∪B 逐个 unpin()。**绝不重复 pin B**（refcount 已被 s
 不再 hack 计数词。
 
 **并发验收用例（UT）**：
+
 - B 项在 active_ 登记**同一轮**先 settle 成 READY → 登记时必须补 pin（竞态 1）。
 - B 含 ABSENT 项 → 登记时必须提交装载（竞态 2）；验证经 drain 变 READY 且 exec 恰好醒一次。
 - B 中途失败：已 pin 的 B 全释放、exec 带 failed 唤醒、exec 释放 A 并报错；refcount 归零。

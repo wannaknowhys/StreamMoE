@@ -119,6 +119,7 @@
 > deepseek+dspark Q8_0 4456448 全 4K。
 
 **定案（用户 2026-09，两步 + 装载分流）**
+
 - **文件侧（B，保留 expert-blocks 架构）**：v2 块内**每个张量切片独立 4K 对齐**（gate_up 段、
   down 段各自起点 4K；原紧凑拼接 down 起点因 gate_up 2230272 半块错开非 4K）。块内 offset 计算
   每分支起点 align_up(累计,4096)；pad 由 fill 补（块内空洞）。**DIO 源对齐成立**（每个专家每个
@@ -133,6 +134,7 @@
   - 异步 ring buffer / pending 聚合 / staging 基础设施已有（async_load_t reqs[pending]）
 
 **任务**
+
 - [x] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）——57a2838
 - [x] K2 跑转换 gemma original→新 v2（v2align，branch_align=1），验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（16/16 切片采样逐字节一致）——N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf
 - [x] **K3 loader/topo（SoA 列描述）**：`moe_loader.h` expert_group_t 加 `columns`（tag/ggml_type/ne/per_expert/per_expert_4k）；topo_builder 按 (tag,type,perExpert) 合并派生。**纯增量**（AoS 不动，数值不变，prefill-from IDENTICAL）。实测 gemma v2align：group0 = gate_up Q4_K[staging]+down Q5_1[direct]；group1 = gate_up[staging]+down Q8_0[staging]。——9ce6e1f
@@ -156,6 +158,7 @@
 > profile 字段一直没载体。
 >
 > **定案（用户 2026-09）**：
+>
 > 1. **请求 = 整层一条**：`slot_request_t` 从 `{layer,expert,seq}`（12B）改 **96B 定长 POD**（用户定 80B + wake-once 指针 → 96B）：
 >    `{layer u32, total_tokens u32, start_rdtsc u64, n_load_target u32, batch_ready ptr, needed[8]=512bit}`。
 >    **n_load_target（曾名 seq）从没被读的 per-expert id 重定义为 batch 装载目标数**；`batch_ready` 是 exec 侧 wake-once 计数词。
@@ -178,6 +181,7 @@
 > 消费端（M2-4，仅补字段载体）。
 >
 > **任务**
+>
 > - [x] L1 slot.h：slot_request_t 96B 定长（layer/total_tokens/start_rdtsc/n_load_target/batch_ready/needed[8]，字段曾名 seq=target）；mpsc 队列普通 POD + 每槽 publish generation + release/acquire，多生产者安全——0518153
 > - [x] L2 scheduler.h：MAX_EXPERTS_PER_LAYER=512；删 pin_expert/wait_ready 单专家 API；加 pin_layer(layer, bitmap, await, out)（wake-once）+ bit 助手——0518153
 > - [x] L3 scheduler.cpp：init n_expert≤512 fail-fast；accept_requests 按 bitmap 集体装载（device-first，per-bit bump）；drain_completions settle 时 bump batch 计数 + wake（成败都 bump 防 spin）——0518153
@@ -192,10 +196,12 @@
 > **根因（lldb 定位，进程 27544）**：`alloc_or_evict` 驱逐扫描是固定下窗 `delta 1..layer`——
 > **layer 0 候选集恒空**（delta 无负层），池满后任何新 layer-0 专家 miss 永远无法驱逐 →
 > `accept_requests` 收 leftover requeue + `worker_loop` 因 any=true 不 sleep → **单核 100% 自旋**
-> + exec 在 `batch_await.wait()` 永久睡（此前 `-p hi` decode ~20 轮后卡死在 `*Selected response:*`）。
-> 也解释了为何长 decode（>池容量累积）必死、短 `-n` 能过、vram 池场景更易触发。
+>
+> - exec 在 `batch_await.wait()` 永久睡（此前 `-p hi` decode ~20 轮后卡死在 `*Selected response:*`）。
+>   也解释了为何长 decode（>池容量累积）必死、短 `-n` 能过、vram 池场景更易触发。
 >
 > **修复**：
+>
 > 1. **驱逐组内 ring**（alloc_or_evict）：从当前层 `(pos + n - k) % n` 环扫本 group 全部层，
 >    layer 自身 ref0 旧专家优先（本 token 不用 = 最安全 victim），L0 自然覆盖高层兜底；
 >    victim 限本组 slot 区间（顺带消除跨 group 列几何误用）。**数值门 = CPU 基线回归 IDENTICAL PASS**。
@@ -221,6 +227,7 @@
 > 卡在批等待、从未触发 `exec_mm_vk`（L6b）。
 >
 > **定案要点**：
+>
 > 1. **Directory 加宽为 (L,E)×pool 生命周期状态表**（A1：state_+slot_ 两个并行原子）：
 >    ABSENT/LOADING/READY/MOVING_OUT/MOVING_IN/FAILED——半途状态对 exec 可见，
 >    消灭"正在装/在搬"与"缺失"不可分的重复装载窗口。完整 move 描述住任务对象，
@@ -249,11 +256,11 @@
 >    LOADING；settle 时若属 active.still-need 则 bump——无需专门预取→active 通道。
 >
 > **任务（详细 build order 见设计文档 §9）**
+>
 > - [x] M1 directory 加宽（A1 state_+slot_）——6b6300e
 > - [x] M2 装载路径：先发 LOADING 再 begin_reload；state-aware accept——dbaff8f
 > - [x] M3 驱逐改 (L,E) 层距（alloc_or_evict 内）；删 owner_——45b14de
-> - [x] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进驱逐——fdf4982
->       + **2026-09 DMA 提速**：v2r demote 改 transfer-queue DMA（stmoe_vk_dma_read，
+> - [x] M4 move_task ring + worker（v2r+r2v）+ 完成 drain；v2r 接进驱逐——fdf4982 + **2026-09 DMA 提速**：v2r demote 改 transfer-queue DMA（stmoe_vk_dma_read，
 >       ggml_vk_buffer_read 同步路径，cached staging），158ms→~1ms/专家（717bac8）。
 >       r2v 无需改（rebar 写 ~8GB/s）。实测见 docs/VRAM_DMA_MOVE.md。
 > - [x] M5 调度侧记账（active-slot + exec 单程，2026-09-05）：exec 本地 try_pin 已 READY 的 A；
@@ -270,8 +277,8 @@
 >       "pool ok - N/M slots used, all refcount 0"。注入测试证实能抓 slot 泄漏；
 >       RAM/Vulkan0/deepseek 三场景退出全 0 泄漏。
 > - [~] M6 验证：纯 RAM 路径零影响（DMA 代码只在 v2r 触发，RAM 走 memcpy 不变）；VRAM
->       demote 场景 DMA 内容 0 BAD（4-token 64MB，238 demote，列级对比纯 RAM golden）；
->       129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
+>   demote 场景 DMA 内容 0 BAD（4-token 64MB，238 demote，列级对比纯 RAM golden）；
+>   129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
 > - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛；EXPERT_MOVE_PIPELINE 更新 M4 DMA）
 > - [ ] M8 UT：M5 §7.4 四个并发验收用例（登记前 settle / B 含 ABSENT / B 中途失败回滚 / 单活跃）——
 >       test_scheduler 目前因 stmoe_vk_dma_read 链接问题不编（既有），M8 需先修 test 链接或改独立测试
@@ -302,6 +309,7 @@
 
 **落地（2026-09-07，STREAM_MOE_TEMP / dbg 构建 / env STREAM_MOE_TMP_CHAIN_BUCKETS）**：
 CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（minigraph_exec.cpp）：
+
 - 桶划分 = k-slot 连续段（`tmp_split_blocks` 家族，新增 `cut<N>`/`cutN,M`/`head<N>`；"one"= 单满宽桶走紧凑构建器用于隔离调试）；
 - 每桶：`append_mm_bucket`（壳 ids 用 `b.ids_slot` 子集、cur 取链内紧凑孪生/外部共享 leaf、写紧凑 `[d_out,w_b,n_t]` dst）→
   `append_op_bucket`（weightless 紧凑孪生：槽轴只窄 ne1、REPEAT 满宽、GET_ROWS 换桶 ids_exp、外部 per-slot leaf 按 k_lo 推进）
@@ -314,6 +322,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - 待做：逆序桶序看 ULP 上限；token 子集 scatter-add（mock 挡）；deepseek 的 clamp/swiglu 紧凑克隆；把紧凑孪生孪生键从"per-bucket 重建"提升到跨桶复用（REPEAT/外部 scale 表与桶无关）。
 
 **scatter_plan 设计（2026-09-07，docs/SCATTER_PLAN.md 双语文档已落，等用户）**：
+
 - 语义确认：tight 重排（如桶 token {0,2,3,4} → {0,2,4,3}）+ acc 等差段（src 连续 len 列 → dst 等差 base/Δ）。
 - **ggml_acc 支持 dst 等差间隔（Δ≠1）**：CPU 核 dst[offset+i1*nb1]+=src1[...]，nb1=Δ*d_out*4、offset=base*d_out*4，中间 dst 列不动（ops.cpp:1215-1233 验证）。
 - 重排消费在 **cur 拷贝层**（首 mm 前按 tight 序收集 cur → 链列序继承 → per_token 天然分段）。
@@ -321,6 +330,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - 待做：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp。
 
 **收敛计划（2026-09-07 冻结，未执行——先做 out_off buffer 改造）**：
+
 - 目标：唯一执行引擎 = 紧凑链 buckets 引擎；删 A 全族（exec_split_legacy_impl / exec_mixed_mm /
   exec_one_burst / hide_output / hide_burst / refresh_aliases / tmp_split_* 自测 / exec_round_cpu|vk /
   build_cur_sub / scatter_sub_dst）；B（`exec_layer_burst_chain_buckets` + append_*_bucket 全族 +
@@ -332,6 +342,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   append_bucket_chain 单桶参考，buckets 自吞单桶）；legacy 分支也删（非捕获报错）；B 移出 TEMP。
 
 **✅ 删 A 收敛完成（2026-09-07 落地）**：minigraph_exec.cpp 2490 → 1119 行。
+
 - 桶引擎 + tmp_split_blocks/tmp_blk_t + tmp_dump_node dump 族全部移出 `#ifdef STREAM_MOE_TEMP`
   无条件编译（内部 debug/dump 子块保留，env 门控）；删 B 单桶参考（append_mm_shell/append_op_clone/
   append_bucket_chain/append_scatter_to_fullwidth/exec_layer_burst_chain）；exec_layer_burst 只留
@@ -351,6 +362,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   multi-pool。buckets 引擎现在仅验证过 gemma 全 token 垂直切。
 
 **DeepSeek 删 A 后验证 + 数值基准冻结（2026-09-07）**：
+
 - **能运行**：`upstream_dump`（纯上游 llama CPU）能跑 UD-00001（v2chunk 布局上游原生可读）；
   删 A 后桶引擎 `-p hi -st` 跑通、无崩溃、泄漏审计 0、两次同参重跑逐字一致（确定性正常）。
 - **数值 gate（hidden cos 判据）**：upstream `-p hi -st --export-dir` 导出 96-token 生成流 →
@@ -364,6 +376,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   `deepseek_hi_moe`（桶引擎产物，同 tokens），README 记 DeepSeek gate 判据（cos，非逐字节）。
 
 **out_off arena 改造（2026-09-07 落地，M2 §7.2.1 手动 arena 串行复用）**：
+
 - 孪生输出 data 从"每桶独立 fold_buf heap"改为钉 `fullalloc arena + ex->out_off[闭包索引]`
   （bucket_build_t.twin_out；compact [d,w_b,n_t] ≤ 满宽 [d,n_k,n_t] 同 out_off 区不冲突；
   无 verify 布局时 fallback heap）。多桶在同一 cgraph 按序串行，后桶自动复用前桶 dead 区。
@@ -372,15 +385,17 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - acc_d 即累加器（chain_ctx 持），层首 fill 0 = reset（既有）。fold 中间仍走 fold_buf。
 
 **test 修复（2026-09-07）**：
+
 - **scheduler 后端解耦**（per-pool DMA reader）：scheduler.cpp 删除 `stmoe_vk_dma_read` 前置声明/直调，改 `expert_scheduler::set_pool_dma_read(pool, fn)` + 私有表 `pool_dma_read_[MAX_DEVICE_POOLS=8]`（pool-1 索引）；move_worker 按 `t.src_pool` 查表，未注册回退 host memcpy。route_b_inject 在 vram_seg 注册时按 seg.dev 前缀（Vulkan）`set_pool_dma_read`；CUDA 落地时同点注册 cuda 壳。**test_scheduler 不再需链 vulkan**。
 - **test_moe_loader 修复**：CMake 源补 model_builder.cpp/topo_builder.cpp（缺 parse_model_path/build_topology/parse_model）；断言从废弃 `expert_slot_size/staging_size` 改验 `groups[].columns[].per_expert`（SoA 真载体）。deepseek 实模型跑通。
 - **test_async_dio 临时禁用**：SoA 重构删了 `sub_tensor_req_t::slot_offset`，其用例3（多 tensor 单 slot 拼装）是 AoS 语义需重写；CMake 注释目标 + build.bat test 列表去之。文件保留待重写。
 - 结果：`build.bat test main` 5/5 绿（moe_loader/profiler/scheduler/slot/mix_plan）。
 
 **token-subset round（2026-09-08 定案，docs/BUCKET_EXEC_TOKEN_SUBSET.md + SCATTER_PLAN.md 已同步）**：
+
 - 目标：桶源从"全 token k-slice（`tmp_split_blocks`）"换成 `build_mix_plan` 的**真 token
   子集 round**（`[w_b, n_active]`），接 `scatter_plan` 做累加器写回。`expert_pool[e] =
-  handle.pool` 直接从 pin 返回的 handle 取（`pin_layer` 本就 per-expert 带 pool），不需要
+handle.pool` 直接从 pin 返回的 handle 取（`pin_layer` 本就 per-expert 带 pool），不需要
   新 scheduler 查询；单 RAM 池退化为一个满 round（默认路径必须逐字节 IDENTICAL）。
 - 关键修正：
   1. cur gather = 把 `[d,1,n_t]`（ne1==1）**reshape 成 `[d,n_t]` + get_rows + reshape 回**
@@ -389,7 +404,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
      reshape `[1,n_k*n_t]`，i32 leaf `idx[i*w+s]=k+t*n_k`，get_rows，reshape
      `[1,w,n_active]`。取代 `bucket_ext_leaf` 的连续-k 切片。
   3. 测试分桶 = `minigraph_exec.cpp` 内 `static` 助手，**定义 + 调用点都 `#ifdef
-     STREAM_MOE_TEMP`**（只有 `StreamMoE_dump_dbg` 带宏）；k 奇偶 × t 奇偶 = 4 round
+STREAM_MOE_TEMP`**（只有 `StreamMoE_dump_dbg` 带宏）；k 奇偶 × t 奇偶 = 4 round
      （刻意非连续 k），验证完即删。不建 `bucket_split.h/.cpp`、不写离线 UT。
   4. 删 `tmp_split_blocks`/`tmp_blk_t`（旧测试 cut 族，现无条件编译）。
 - 任务（实施中，principle 14：全写完再统一回归）：
@@ -422,6 +437,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 > cgraph + async 提交 + CPU/VK 重叠 + 多设备 fold），不做 mm-only + 回读的过渡形态。
 
 **闭包外 leaf 盘点（verify dump，`baseline_regression/temp/struct_L0.txt` / `struct_ds_L0.txt`）**
+
 - 大权重（pool 驻留）：gemma 2 个（gate_up/down）；deepseek 3 个（gate/up/down 分片）。
 - 小张量：cur `[d,1,n_t]`（~1.4MB）；ids `[n_k,n_t]`（几 KB）；per-slot 路由权重
   `ffn_moe_weights_norm`/`_scaled` `[1,n_k,n_t]`（几 KB）；per-expert scale 表
@@ -430,13 +446,15 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
   （`bucket_gather_cur`）。
 
 **已确认的硬点（无阻塞）**
+
 - 设备 tensor 绑定范式（删 A 前 `exec_round_vk`）：`t->buffer=设备 buffer;
-  t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
+t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 - vulkan mm_id 步长 = `ne00*ne01`（dim01 连续），命中 SoA `col_stride=perExpert`（K6 目标）。
 - vulkan 支持 ACC（op_params 的 nb1/2/3/offset，含 delta 等差）/GET_ROWS/SUM_ROWS/CLAMP。
 - 回读走 `ggml_backend_tensor_get`（transfer-queue DMA），不用 rebar host 读 0.02GB/s。
 
 **任务**
+
 - [x] chain_ctx 加 target（pool/backend/arena+stage buffer/host map/bump）+ bind_pool /
       bind_arena / bind_stage 助手；CPU 路径行为不变（`device_target_t` + `chain_ctx.dev`；
       `bucket_ref_leaf`/`bucket_upload_leaf`/`bind_fresh`；`fix_view_buffers` 给 ggml 视图补
@@ -451,6 +469,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
       走设备（`dev=1`）、对同分区 force-cpu **cos 0.982**（与已知 0.986 同量级，backend gate）
 
 **踩坑记录**
+
 - **vulkan ACC 的 nb2/nb3 不能为 0**：`acc.comp` 用 `src1_i / p.nb03 / p.nb02` 分解索引（CPU 核
   忽略 2D src1 的 nb2/nb3）。传 0 → 除零 → acc 全零。改成传 `d_out*n_t*4` 后 acc 正常。
 - **ggml 视图 buffer**：`ggml_vk_tensor_subbuffer` 直接读 `tensor->buffer->context`（不跟随

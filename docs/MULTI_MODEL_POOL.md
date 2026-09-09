@@ -15,11 +15,11 @@
 
 ## 2. 参数设计（与主池多设备参数对称）
 
-| 参数 | 归属 | 语义 |
-| :--- | :--- | :--- |
-| `--moe-ram-pool <MB>` | 主模型专家池（RAM） | 不变；缺省 0 = 75% 空闲 RAM |
-| `--moe-vram-pool <MB>` | 主模型专家池（VRAM） | 不变；Phase B 前占位 |
-| `--moe-draft-ram-pool <MB>` | **草稿专家池（RAM）** | 新增；**缺省 = 草稿专家完整字节（全常驻，无驱逐）** |
+| 参数                         | 归属                   | 语义                                                  |
+| :--------------------------- | :--------------------- | :---------------------------------------------------- |
+| `--moe-ram-pool <MB>`        | 主模型专家池（RAM）    | 不变；缺省 0 = 75% 空闲 RAM                           |
+| `--moe-vram-pool <MB>`       | 主模型专家池（VRAM）   | 不变；Phase B 前占位                                  |
+| `--moe-draft-ram-pool <MB>`  | **草稿专家池（RAM）**  | 新增；**缺省 = 草稿专家完整字节（全常驻，无驱逐）**   |
 | `--moe-draft-vram-pool <MB>` | **草稿专家池（VRAM）** | 新增；缺省 0 = 草稿不进 VRAM（Phase B 前仅 RAM 生效） |
 
 - **位置** = 给了哪个设备参数就是哪个设备（与主池完全对称）。
@@ -46,17 +46,17 @@
 
 ## 5. 实现落点
 
-| 文件 | 改动 |
-| :--- | :--- |
-| `common/arg.cpp` | 新增 `--moe-draft-ram-pool` / `--moe-draft-vram-pool` |
-| `common/common.h` | `common_params` 加 `moe_draft_ram_pool_mb` / `moe_draft_vram_pool_mb` |
-| `common/common.cpp` | 主模型注入点不变（只取主池字段）；draft 注入点见下 |
-| `common/speculative.cpp` | **新注入点**：加载 draft 前调 `route_b_setup(draft_path, draft_pool_mb, ...)`，draft overrides 挂 draft mparams |
-| `src/server/route_b_inject.*` | `route_b_setup` 泛化：池实例注册表（每模型独立 buft/overrides/scheduler/拓扑）+ 预算切分逻辑 |
-| `src/backend/moe_backend.*` | 支持多 weight buft；backend 持 `buft -> 池实例` 映射 |
-| `src/backend/minigraph_exec.*` | `w3d` 按 `src0.buft` 定位池实例，再取 `branch_layout/slot_size/pool_base` |
-| `src/backend/scheduler.*` | 每池实例独立实例化（复用现有多子池逻辑，模型 = 顶层组） |
-| `scripts/run_deepseek_draft.bat` | 可显式加 `--moe-draft-ram-pool`（不写则 draft 全常驻） |
+| 文件                             | 改动                                                                                                            |
+| :------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| `common/arg.cpp`                 | 新增 `--moe-draft-ram-pool` / `--moe-draft-vram-pool`                                                           |
+| `common/common.h`                | `common_params` 加 `moe_draft_ram_pool_mb` / `moe_draft_vram_pool_mb`                                           |
+| `common/common.cpp`              | 主模型注入点不变（只取主池字段）；draft 注入点见下                                                              |
+| `common/speculative.cpp`         | **新注入点**：加载 draft 前调 `route_b_setup(draft_path, draft_pool_mb, ...)`，draft overrides 挂 draft mparams |
+| `src/server/route_b_inject.*`    | `route_b_setup` 泛化：池实例注册表（每模型独立 buft/overrides/scheduler/拓扑）+ 预算切分逻辑                    |
+| `src/backend/moe_backend.*`      | 支持多 weight buft；backend 持 `buft -> 池实例` 映射                                                            |
+| `src/backend/minigraph_exec.*`   | `w3d` 按 `src0.buft` 定位池实例，再取 `branch_layout/slot_size/pool_base`                                       |
+| `src/backend/scheduler.*`        | 每池实例独立实例化（复用现有多子池逻辑，模型 = 顶层组）                                                         |
+| `scripts/run_deepseek_draft.bat` | 可显式加 `--moe-draft-ram-pool`（不写则 draft 全常驻）                                                          |
 
 ## 6. Bookkeeping 清单
 

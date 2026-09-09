@@ -5,31 +5,31 @@
 
 ## 1. 确定没问题的（已实证，不再怀疑）
 
-| # | 项 | 证据 |
-| :--- | :--- | :--- |
-| 1 | DIO 装载字节全等 | layer3 全部 256 专家切片校验和 == 文件 |
-| 2 | 运行时槽内容正确 | s86-s115 全部 30 槽前 4 字节 == 文件；e235 全段校验和 `BCFB9B786148910B` 双端一致 |
-| 3 | 路由 ids 一致 | base vs eb `#ids` 记录逐位一致（含 L0 与 L3） |
-| 4 | gate 输入 cur 一致 | base vs eb `#cur` 逐字节一致；== ffn_norm-3；全 5 列 81920B 完整 |
-| 5 | w3d 元数据 | off=0, nb1=2176, nb2=slot_size, pool 基址，type=39 |
-| 6 | mm->nb == dst->nb | [4,8192,49152] 双端一致 |
-| 7 | wdata 尺寸 | `ggml_graph_plan` 含 atomic_current_chunk，无溢出 |
-| 8 | metadata 无关 | B==C 组输出逐位相同（ne2=256/stride 与 ne2=5621/slot 无差别） |
-| 9 | 非竞态 | 单线程复现相同错误 |
-| 10 | 隔离复现 | iso 独立程序复现：L0 gate 5 token 全对，L3 gate t0 对 t1-4 错 |
-| 11 | 内核读偏移正确 | KDBG: cur_a=217 rm={0,1} src1_col_off=4352（t1 的 Q8_0 列）；dst_off=49152 |
-| 12 | 内核读的 src1 字节正确 | Q8_0(cur col1) 实算 `C8 1E CE F6 CB FE 10 EF` == 内核读到；col0 同理 |
-| 13 | 内核读的权重字节正确 | wb=`793A2B22C9E143D9` == e217 文件字节；e235 同理 |
-| 14 | 转换环节正确 | 内核 F32→Q8_0 输出 == ggml_quantize_chunk；PRECONVERT_Q8 预转后仍错（排除转换） |
-| 15 | 写回位置正确 | iso 输出 t1 k0 == 内核 dot tmp（-0.3502 写入 dst_off=49152），与 base 期望 -0.8902 不符 |
+| #   | 项                     | 证据                                                                                    |
+| :-- | :--------------------- | :-------------------------------------------------------------------------------------- |
+| 1   | DIO 装载字节全等       | layer3 全部 256 专家切片校验和 == 文件                                                  |
+| 2   | 运行时槽内容正确       | s86-s115 全部 30 槽前 4 字节 == 文件；e235 全段校验和 `BCFB9B786148910B` 双端一致       |
+| 3   | 路由 ids 一致          | base vs eb `#ids` 记录逐位一致（含 L0 与 L3）                                           |
+| 4   | gate 输入 cur 一致     | base vs eb `#cur` 逐字节一致；== ffn_norm-3；全 5 列 81920B 完整                        |
+| 5   | w3d 元数据             | off=0, nb1=2176, nb2=slot_size, pool 基址，type=39                                      |
+| 6   | mm->nb == dst->nb      | [4,8192,49152] 双端一致                                                                 |
+| 7   | wdata 尺寸             | `ggml_graph_plan` 含 atomic_current_chunk，无溢出                                       |
+| 8   | metadata 无关          | B==C 组输出逐位相同（ne2=256/stride 与 ne2=5621/slot 无差别）                           |
+| 9   | 非竞态                 | 单线程复现相同错误                                                                      |
+| 10  | 隔离复现               | iso 独立程序复现：L0 gate 5 token 全对，L3 gate t0 对 t1-4 错                           |
+| 11  | 内核读偏移正确         | KDBG: cur_a=217 rm={0,1} src1_col_off=4352（t1 的 Q8_0 列）；dst_off=49152              |
+| 12  | 内核读的 src1 字节正确 | Q8_0(cur col1) 实算 `C8 1E CE F6 CB FE 10 EF` == 内核读到；col0 同理                    |
+| 13  | 内核读的权重字节正确   | wb=`793A2B22C9E143D9` == e217 文件字节；e235 同理                                       |
+| 14  | 转换环节正确           | 内核 F32→Q8_0 输出 == ggml_quantize_chunk；PRECONVERT_Q8 预转后仍错（排除转换）         |
+| 15  | 写回位置正确           | iso 输出 t1 k0 == 内核 dot tmp（-0.3502 写入 dst_off=49152），与 base 期望 -0.8902 不符 |
 
 ## 2. 确定有问题的（实证定位）
 
-| # | 项 | 证据 |
-| :--- | :--- | :--- |
-| 1 | **L3 gate/up t>=1 输出数值错误**（t0 正确；t1/t3 的 k5 例外） | 隔离 + live 均复现；每 (k,t) 唯一专家 cne1=1 |
-| 2 | **错误发生在 vec_dot 计算，不是写位置** | 内核 dot tmp=-0.3502 与期望 -0.8902 不符，而输入全部字节验证正确 |
-| 3 | L0 正确 / L3 错误，同代码同数据正确 | 差异只在数据值本身，指向数据相关的 SIMD 行为 |
+| #   | 项                                                            | 证据                                                             |
+| :-- | :------------------------------------------------------------ | :--------------------------------------------------------------- |
+| 1   | **L3 gate/up t>=1 输出数值错误**（t0 正确；t1/t3 的 k5 例外） | 隔离 + live 均复现；每 (k,t) 唯一专家 cne1=1                     |
+| 2   | **错误发生在 vec_dot 计算，不是写位置**                       | 内核 dot tmp=-0.3502 与期望 -0.8902 不符，而输入全部字节验证正确 |
+| 3   | L0 正确 / L3 错误，同代码同数据正确                           | 差异只在数据值本身，指向数据相关的 SIMD 行为                     |
 
 ## 3. 调用链与 log 计划（按函数进出打 log）
 
@@ -44,6 +44,7 @@ ggml_backend_graph_compute(cpu, gf)                 [iso 入口]
 ```
 
 打 log 位置：
+
 - `ggml_vec_dot_mxfp4_q8_0`（ggml-cpu/arch/x86/quants.c）：入口打 x/y 首块字节、退出打 sumf。
 - `ggml_vec_dot_mxfp4_q8_0_generic`（ggml-cpu/quants.c）：同样打（对照）。
 - 主函数转换循环后：打 wdata 首块字节（验证 == Q8_0 实算）。
@@ -63,12 +64,12 @@ ggml_backend_graph_compute(cpu, gf)                 [iso 入口]
 
 **验证结论（moe 侧 vec_dot 全部输入正确）：**
 
-| 项 | 结果 |
-| :--- | :--- |
+| 项                     | 结果                                                      |
+| :--------------------- | :-------------------------------------------------------- |
 | L3 gate 槽内容 == 文件 | e235→s86 FNV=`BCFB9B786148910B` 与此前一致；30 槽全部正确 |
-| ids/idslot | L3: e235→s86, e217→s92, ..., e75→s115 全对；L0: 槽 0-29 |
-| cur | L3 col0=-0.2272... 与 base trace 逐值一致 |
-| w3d | off=0, nb2=13369344, pool=0x2019da70000, type=39 |
+| ids/idslot             | L3: e235→s86, e217→s92, ..., e75→s115 全对；L0: 槽 0-29   |
+| cur                    | L3 col0=-0.2272... 与 base trace 逐值一致                 |
+| w3d                    | off=0, nb2=13369344, pool=0x2019da70000, type=39          |
 
 **闭环结论**：moe 侧 vec_dot 输入（槽内容 + cur Q8_0 + ids）全部 == 文件/trace 真值，且 vdot 探针证明这些字节的数学结果 = -0.3502（iso 值）≠ base -0.8902。→ **base 的 L3 vec_dot 输入必与这些字节不同**（唯一待确认项）。
 
@@ -103,9 +104,11 @@ ggml_backend_graph_compute(cpu, gf)                 [iso 入口]
 ### 修复
 
 delegate 读 ids 必须按张量真实 stride：
+
 ```cpp
 int32_t e = *(const int32_t*)((const char*)ids->data + (size_t)t * ids->nb[1] + (size_t)k * ids->nb[0]);
 ```
+
 （替换 `ids_data[t * n_ids + k]`，同位置还有 gate/up/down 的遍历与 ids_slot 翻译。）
 
 ## 8. ✅ 修复实施与验证（2026-08-26）
@@ -122,11 +125,13 @@ int32_t e = *(const int32_t*)((const char*)ids->data + (size_t)t * ids->nb[1] + 
   t1 = e208,e90,e71,e255,e6,e128      <- 修复前误读 e217,e161,...
   t2 = e174,e230,e29,e90,e59,e246
 ```
+
 t1-t4 与 `trace_base3.bin` 的 stride1024 布局（offset 1024/2048/3072/4096）逐位一致。
 
 ### 端到端测试
 
 `--expert-backend --temp 0 -p "Say hi." -n 8`：
+
 - 修复前输出：`## Final answer\nSay hi.`（错误）
 - **修复后输出：`Hi! How can I help you today`（与基线逐字一致）✅**
 

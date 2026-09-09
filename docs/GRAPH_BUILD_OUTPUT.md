@@ -8,11 +8,11 @@
 
 `model.build_graph()` is called from exactly three sites, all in `src/llama-context.cpp`:
 
-| # | Site (file:line) | Upper callers | Purpose | Graph built |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | `graph_reserve` : `src/llama-context.cpp:2431` | `sched_reserve()` (581) -> `graph_reserve` at 633 (PP worst-case), 653 (TG), 668 (PP again); `resolve_fused_ops` (513, fused-op probe); post-memory-update (830) | **Reserve** worst-case graphs to size sched splits / compute buffers; **never executed** | Full-size PP graph (n_tokens = min(n_ctx,n_ubatch)) + single-seq TG graph |
-| 2 | `process_ubatch` : `src/llama-context.cpp:1358` | `llama_decode` main loop (1816, once per ubatch); `llama_encode` (1463) | **Real inference** graph. First checks `can_reuse` (1339): if the params match the previous graph it reuses, otherwise rebuilds | Actual ubatch shape (prefill = many tokens, decode = n_seqs tokens) |
-| 3 | `llama_encode` direct path : `src/llama-context.cpp:3418` | `llama_encode` API | encode/embedding path, **forced** `res->reset()` + build every ubatch (no reuse), own compute context | Actual ubatch graph |
+| #   | Site (file:line)                                          | Upper callers                                                                                                                                                    | Purpose                                                                                                                         | Graph built                                                               |
+| :-- | :-------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------ |
+| 1   | `graph_reserve` : `src/llama-context.cpp:2431`            | `sched_reserve()` (581) -> `graph_reserve` at 633 (PP worst-case), 653 (TG), 668 (PP again); `resolve_fused_ops` (513, fused-op probe); post-memory-update (830) | **Reserve** worst-case graphs to size sched splits / compute buffers; **never executed**                                        | Full-size PP graph (n_tokens = min(n_ctx,n_ubatch)) + single-seq TG graph |
+| 2   | `process_ubatch` : `src/llama-context.cpp:1358`           | `llama_decode` main loop (1816, once per ubatch); `llama_encode` (1463)                                                                                          | **Real inference** graph. First checks `can_reuse` (1339): if the params match the previous graph it reuses, otherwise rebuilds | Actual ubatch shape (prefill = many tokens, decode = n_seqs tokens)       |
+| 3   | `llama_encode` direct path : `src/llama-context.cpp:3418` | `llama_encode` API                                                                                                                                               | encode/embedding path, **forced** `res->reset()` + build every ubatch (no reuse), own compute context                           | Actual ubatch graph                                                       |
 
 Both prefill and decode run through **entry #2** (`process_ubatch`). They differ only by the ubatch parameters (n_tokens / n_seqs / n_outputs), never by a distinct prefill-vs-decode entry.
 
@@ -20,14 +20,14 @@ Both prefill and decode run through **entry #2** (`process_ubatch`). They differ
 
 The "which tokens get logits/embd" decision flows: server decides -> `batch.logits[]` -> `llama_decode` -> `ubatch.output[]` -> `n_outputs` -> LM-head gather.
 
-| Layer | File:line | What it does |
-| :--- | :--- | :--- |
-| Server decides per-token output | `tools/server/server-context.cpp:151-154` (`server_batch::set_output`) — callers in update_slots / process mark the **last** token true by default | Stores `tokens[idx].output` |
-| Batch render -> `batch.logits[]` | `common/common.cpp:1851` (`common_batch_add`): `batch.logits[batch.n_tokens] = logits;` — invoked from `server_batch::render()` (server-context.cpp:156) | Writes the output flag into the llama_batch |
-| `--prefill-from` mode (prefill patch) | `tools/server/server.cpp`: `lg.back() = 1;` | Forces output on the last token for the prefill-from one-shot decode |
-| llama_batch -> llama_ubatch | `src/llama-context.cpp` (`llama_decode` -> ubatch prep) | Copies `batch.logits` into `ubatch.output[]` |
-| `n_outputs` count | `src/llama-context.cpp:1800-1811` | `n_outputs = sum(ubatch.output[i])` |
-| Graph: out_ids tensor | `src/llama-graph.cpp:2425-2444` (`build_inp_out_ids`), `199-224` (`llm_graph_input_out_ids::set_input` collects indices where `ubatch.output[i]`) | LM head only computes the `n_outputs` output rows |
+| Layer                                 | File:line                                                                                                                                                | What it does                                                         |
+| :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- |
+| Server decides per-token output       | `tools/server/server-context.cpp:151-154` (`server_batch::set_output`) — callers in update_slots / process mark the **last** token true by default       | Stores `tokens[idx].output`                                          |
+| Batch render -> `batch.logits[]`      | `common/common.cpp:1851` (`common_batch_add`): `batch.logits[batch.n_tokens] = logits;` — invoked from `server_batch::render()` (server-context.cpp:156) | Writes the output flag into the llama_batch                          |
+| `--prefill-from` mode (prefill patch) | `tools/server/server.cpp`: `lg.back() = 1;`                                                                                                              | Forces output on the last token for the prefill-from one-shot decode |
+| llama_batch -> llama_ubatch           | `src/llama-context.cpp` (`llama_decode` -> ubatch prep)                                                                                                  | Copies `batch.logits` into `ubatch.output[]`                         |
+| `n_outputs` count                     | `src/llama-context.cpp:1800-1811`                                                                                                                        | `n_outputs = sum(ubatch.output[i])`                                  |
+| Graph: out_ids tensor                 | `src/llama-graph.cpp:2425-2444` (`build_inp_out_ids`), `199-224` (`llm_graph_input_out_ids::set_input` collects indices where `ubatch.output[i]`)        | LM head only computes the `n_outputs` output rows                    |
 
 Note: hidden (`t_h_nextn`) and embd (`result_norm` = `t_embd`) are **whole-tensor** graph nodes — they always cover every token (layers run for all), independent of output[]. Only logits (LM head) is pruned by n_outputs. The prefill export (`prefill-export-llama.patch`) therefore captures all-token embd/hidden even with output[] = last-token-only; `--logits-all` / setting all output[] is only needed for all-token **logits**.
 

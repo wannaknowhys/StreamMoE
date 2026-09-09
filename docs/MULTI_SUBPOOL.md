@@ -9,6 +9,7 @@
 route B 第三路径要求**每专家等大**（均匀 stride 槽：`nb[2]=slot_size`）。但 MoE 模型可能**异构**：不同层用不同量化 → 每专家字节大小不同。
 
 实测 gemma-4-26B-A4B：
+
 - layer 0-28（29 层）：`gate_up Q4_K + down Q5_1`，每专家 **3717120 B**
 - layer 29（1 层）：`gate_up Q4_K + down Q8_0`，每专家 **4336640 B**
 

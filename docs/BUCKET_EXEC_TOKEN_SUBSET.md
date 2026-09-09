@@ -39,9 +39,9 @@
 The bucket source becomes **`mix_plan_t.rounds`** from `build_mix_plan`
 (backend/mix_split.h): each round is a TRUE token-subset bucket
 
-- `r.ids`        = expert ids, llama layout `[w_b, n_active]` (`r.ids[a*w_b+s]`),
+- `r.ids` = expert ids, llama layout `[w_b, n_active]` (`r.ids[a*w_b+s]`),
   `w_b = r.width`, `n_active = r.n_active`.
-- `r.scatter`    = per `(a,s)`, the original `(t, k)` the column belongs to.
+- `r.scatter` = per `(a,s)`, the original `(t, k)` the column belongs to.
 - pool (device) = `r.pool`.
 
 `round.scatter[a*w_b].t` = original token of active column `a` -> this is the
@@ -97,6 +97,7 @@ exercised on CPU before real multi-pool exists.
 ### 2.3 Scatter-add into the accumulator (scatter_plan)
 
 For each round:
+
 1. `t[a] = r.scatter[a*r.width].t` (a order, original token per active column).
 2. `plan = build_scatter_plan(t, n_active, n_t)` -> `order[]`, `segs[]`.
 3. The cur copy gathered cur in `order`, so `per_token` is already tight:
@@ -129,6 +130,7 @@ Placement and gating (decided 2026-09-08): a `static` helper in
 the subset path is verified. No separate `bucket_split.h/.cpp`, no offline UT.
 
 Split shape: split BOTH axes so arbitrary (t,k) is exercised:
+
 - k axis by parity -> rounds with non-contiguous k (a valid rectangle when n_k is
   even: each token contributes n_k/2);
 - token axis by parity -> token subset + scatter delta > 1;
@@ -139,7 +141,7 @@ Split shape: split BOTH axes so arbitrary (t,k) is exercised:
 ## 4. Executor change sketch (exec_layer_burst_chain_buckets)
 
 - default round list = `build_mix_plan(ids, n_k, n_t, expert_pool, n_expert,
-  n_pools).rounds`, with `expert_pool[e] = handle.pool` filled from the pinned
+n_pools).rounds`, with `expert_pool[e] = handle.pool` filled from the pinned
   handles (`pin_layer` already returns per-expert pool). Single RAM pool = one
   full round (degenerate, byte-identical to today's default single bucket).
 - the macro-gated forced split replaces that list with the split rounds.

@@ -16,6 +16,7 @@
 ## 1. 内存诊断：临时应用 memwatch 补丁（不再用分支）
 
 遇到"内存被撑爆"时：
+
 1. 按 `patches/README.md` 应用 memwatch 补丁（`git -C third_party/llama.cpp apply patches\memwatch-ggml.patch` + `git apply patches\memwatch-build.patch`）。
 2. 构建特殊版：`build.bat llamalibs memwatch && build.bat build memwatch`（独立 `build\memwatch\` 产物，不碰 `build\main\`）。
 3. 单 prompt 复现：`build\memwatch\llama-build\bin\llama-cli.exe ...`。
@@ -45,13 +46,13 @@ scripts\run_long_horizon_test.bat zh memwatch  rem 指定 build tag
 
 ## 4. 产物与日志位置速查
 
-| 产物 | 路径 |
-| :--- | :--- |
-| 单 prompt 输出 | 直接终端 |
-| server 运行日志 | `build\<btag>\server_<tag>.log` |
-| 逐轮遥测 JSONL | `benchmark\results\profile_real_<tag>.jsonl` |
-| 完整对话转写 | `benchmark\results\conversation_real_<tag>.txt` |
-| memwatch 哨兵日志 | `%TEMP%\memwatch_<pid>.log`（memwatch 版构建） |
+| 产物              | 路径                                            |
+| :---------------- | :---------------------------------------------- |
+| 单 prompt 输出    | 直接终端                                        |
+| server 运行日志   | `build\<btag>\server_<tag>.log`                 |
+| 逐轮遥测 JSONL    | `benchmark\results\profile_real_<tag>.jsonl`    |
+| 完整对话转写      | `benchmark\results\conversation_real_<tag>.txt` |
+| memwatch 哨兵日志 | `%TEMP%\memwatch_<pid>.log`（memwatch 版构建）  |
 
 ## 5. 已知坑
 

@@ -50,6 +50,7 @@ Build a one-expert `MUL_MAT_ID` whose src0 is a repacked copy of the slot weight
 ### Idea 2 (used): drive the kernel directly
 
 Expose a helper in `repack.cpp` that:
+
 1. allocates a repack buffer (`ggml_backend_buft_alloc_buffer`), sets `t->buffer/data/extra`, repacks via `traits->repack(...)` (must match the kernel, see below);
 2. builds `ggml_tensor` structs on the stack (src0/src1/ids/op with explicit ne/nb/data), a `ggml_compute_params` (wdata/wsize, threadpool, ith=0, nth=1), then calls `((tensor_traits*)src0->extra)->compute_forward(&params, &op)`.
 

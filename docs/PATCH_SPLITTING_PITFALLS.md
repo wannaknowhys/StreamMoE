@@ -10,7 +10,7 @@
    - 只有头部上下文 + 纯新增（无尾）→ `apply` **失败**（`patch failed: <file>:<line>`）。
    - 纯新增 + 尾部上下文（无头）→ `apply` **OK**（`@@ -1686,3` 行号 + 尾 3 行定位）。
    - 头 + 尾上下文 → `apply` **OK**。
-   拆分同文件 hunk 时，被拆出的"插入段"必须保留尾部上下文作为定位锚点；头部上下文可省。
+     拆分同文件 hunk 时，被拆出的"插入段"必须保留尾部上下文作为定位锚点；头部上下文可省。
 
 2. **同 patch 同文件多 hunk：行号用 clean 值**。git apply 会对同一 patch 内同一文件的后续 hunk
    **自动累计**前面 hunk 的净增偏移（原 patch 能 apply 全靠这个）。**不要手动加同 patch 的偏移**
@@ -61,6 +61,7 @@ git -C temp/llama_verify diff --stat ffe029953   rem 应为空
 问题：应用 A.patch、B.patch 后又在工作区改了代码，想把后续修改并入 B.patch。
 
 方法（A/B 分开 commit -> 修复 amend 进 B -> 重新导出）：
+
 1. 先确保当前工作区状态已提交（含 A+B+后续修改）；未提交则先 commit 或 stash。
 2. 临时分支从干净基线重建 A 和 B：
    ```

@@ -9,21 +9,22 @@
 > phase-1 `streammoe-macros.patch` 另含共享锚点（根 CMakeLists features 块 + `arg.cpp` / `common.cpp` / `common.h` / `include/llama.h` / `tools/server/server-context.cpp` 的 include 锚点），
 > phase-2b `prefill-export-llama.patch` 另含 `src/llama-context.cpp/h`、`src/llama-kv-cache.cpp/h`、`tools/server/server.cpp`。此处只列 route-b 专属。
 
-| 文件 | 改动 | 用途 |
-| :--- | :--- | :--- |
-| `common/CMakeLists.txt` | `STREAM_MOE_SRC` 源列表 + include + Windows 库 | 把父仓库 route B 源编译进 llama-server/cli（含 backend/io/loader/pool/server + `route_b_chain.cpp` / `mix_split.cpp` / `scatter_plan.cpp` / `model_builder.cpp` / `topo_builder.cpp`；async_dio 按平台选 win/posix） |
-| `common/speculative.cpp` / `.h` | draft 加载前注入 route_b_setup | **多模型池**：draft 挂自己的 overrides（不重用主模型） |
-| `src/llama-model-loader.cpp` / `.h` | route B 加载钩子（专家张量 buft 覆盖 / 池装载） | 专家张量走池而非 mmap |
-| `src/llama-model.cpp` | route B 设备注册 / 专家放置接线 | 设备池 + 调度 |
-| `src/llama.cpp` | route B 后端注册 + `[TMR]` 计时 include | 设备注册早于模型加载 |
-| `common/arg.cpp` / `common/common.cpp` / `common/common.h` | （phase1 锚点 + frag）参数 + `common_init_from_params` 注入 `route_b_setup` | 主模型加载前初始化专家池 + 挂 `tensor_buft_overrides` |
-| `tools/server/server-context.cpp` | （phase1 锚点 + frag）route_b_setup 注入 + KV 内存打印 | 加载后打印实际 KV + draft 统计 |
+| 文件                                                       | 改动                                                                        | 用途                                                                                                                                                                                                                 |
+| :--------------------------------------------------------- | :-------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `common/CMakeLists.txt`                                    | `STREAM_MOE_SRC` 源列表 + include + Windows 库                              | 把父仓库 route B 源编译进 llama-server/cli（含 backend/io/loader/pool/server + `route_b_chain.cpp` / `mix_split.cpp` / `scatter_plan.cpp` / `model_builder.cpp` / `topo_builder.cpp`；async_dio 按平台选 win/posix） |
+| `common/speculative.cpp` / `.h`                            | draft 加载前注入 route_b_setup                                              | **多模型池**：draft 挂自己的 overrides（不重用主模型）                                                                                                                                                               |
+| `src/llama-model-loader.cpp` / `.h`                        | route B 加载钩子（专家张量 buft 覆盖 / 池装载）                             | 专家张量走池而非 mmap                                                                                                                                                                                                |
+| `src/llama-model.cpp`                                      | route B 设备注册 / 专家放置接线                                             | 设备池 + 调度                                                                                                                                                                                                        |
+| `src/llama.cpp`                                            | route B 后端注册 + `[TMR]` 计时 include                                     | 设备注册早于模型加载                                                                                                                                                                                                 |
+| `common/arg.cpp` / `common/common.cpp` / `common/common.h` | （phase1 锚点 + frag）参数 + `common_init_from_params` 注入 `route_b_setup` | 主模型加载前初始化专家池 + 挂 `tensor_buft_overrides`                                                                                                                                                                |
+| `tools/server/server-context.cpp`                          | （phase1 锚点 + frag）route_b_setup 注入 + KV 内存打印                      | 加载后打印实际 KV + draft 统计                                                                                                                                                                                       |
 
 ## 逐文件明细
 
 ### common/common.h
 
 `common_params` 结构体 `n_predict` 后新增：
+
 ```cpp
 bool    expert_backend   = false; // route MoE expert tensors to the stream_moe pool
 size_t  moe_ram_pool_mb  = 0;     // MAIN expert residency budget in MB (0 = 75% free RAM)
@@ -36,6 +37,7 @@ std::string prompt_log_path;      // append /v1/chat/completions bodies
 ### common/arg.cpp
 
 `--swa-full` 后新增 6 个 `add_opt(common_arg(...))`：
+
 - `--expert-backend`（flag）
 - `--moe-ram-pool <MB>` / `--moe-vram-pool <MB>`（主池）
 - `--moe-draft-ram-pool <MB>` / `--moe-draft-vram-pool <MB>`（草稿池，`0 = full resident`）
@@ -44,6 +46,7 @@ std::string prompt_log_path;      // append /v1/chat/completions bodies
 ### common/common.cpp
 
 `common_model_params_to_llama`（mparams 构造，`no_host` 后）注入：
+
 ```cpp
 if (params.expert_backend) {
     auto * ovr = stream_moe::route_b_setup(params.model.path.c_str(),
@@ -54,11 +57,13 @@ if (params.expert_backend) {
     }
 }
 ```
+
 （`route_b_setup` 幂等：按模型路径去重，draft/MTP 二次上下文不复用主池。）
 
 ### common/speculative.cpp
 
 `common_speculative_init_result` ctor 加载 draft 模型前注入（多模型池）：
+
 ```cpp
 // draft gets its own pool + buft; NEVER reuse the main-model overrides.
 if (params.expert_backend) {
@@ -73,6 +78,7 @@ if (params.expert_backend) {
 ### common/CMakeLists.txt
 
 `llama-common` 目标末尾追加：
+
 ```cmake
 set(STREAM_MOE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../../src)
 target_include_directories(${TARGET} PRIVATE ${STREAM_MOE_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
@@ -101,6 +107,7 @@ endif()
 
 1. include `"../src/llama-ext.h"`（拿 `llama_get_memory_breakdown`）。
 2. `load_model()` 里 `vocab = llama_model_get_vocab(model_tgt)` 后：
+
 ```cpp
 size_t kv_bytes = 0;
 for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) kv_bytes += mb.context;

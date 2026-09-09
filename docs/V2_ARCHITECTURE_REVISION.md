@@ -46,11 +46,11 @@ Expert Blocks（blockStart = align_up(denseDataEnd, 4096)）
 
 ## 已确认现状（代码核对）
 
-| 项 | 结论 |
-| :--- | :--- |
-| scale 在 dense 桶、真实写 offset | ✓（:194-198, :335-340） |
-| moe_backend 不摸 tensor->data | ✓（哨兵 + no-op） |
-| DIO 无 buffered fallback | ⚠️ 现有 CreateFileW(NO_BUFFERING) 失败仅 LOG_ERROR |
+| 项                               | 结论                                               |
+| :------------------------------- | :------------------------------------------------- |
+| scale 在 dense 桶、真实写 offset | ✓（:194-198, :335-340）                            |
+| moe_backend 不摸 tensor->data    | ✓（哨兵 + no-op）                                  |
+| DIO 无 buffered fallback         | ⚠️ 现有 CreateFileW(NO_BUFFERING) 失败仅 LOG_ERROR |
 
 ## To-Do（按优先级）
 

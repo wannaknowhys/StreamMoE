@@ -26,22 +26,24 @@
 
 迁移到上游 llama-cli/server 的计划（route B 作为插件）：**[docs/UPSTREAM_TOOLS_MIGRATION.md](docs/UPSTREAM_TOOLS_MIGRATION.md)**。
 
-| 可执行程序 | 职责说明 | 状态 |
-| :--- | :--- | :--- |
-| **`build/main/llama-build/bin/llama-cli.exe`** | 上游 CLI + route B 插件（交互 REPL / 单次提示词） | **已就绪** |
-| **`build/main/llama-build/bin/llama-server.exe`** | 上游 OpenAI 兼容 HTTP/SSE 服务端 + route B 插件 | **已就绪** |
-| **`build/main/bin/stream_moe_convert.exe`** | 4KB 扇区对齐零拷贝 GGUF 转换优化器 | 规划中 |
-| **`build/main/bin/stream_moe_bench.exe`** | MoE 专属多维基准评测工具 | 规划中 |
+| 可执行程序                                        | 职责说明                                          | 状态       |
+| :------------------------------------------------ | :------------------------------------------------ | :--------- |
+| **`build/main/llama-build/bin/llama-cli.exe`**    | 上游 CLI + route B 插件（交互 REPL / 单次提示词） | **已就绪** |
+| **`build/main/llama-build/bin/llama-server.exe`** | 上游 OpenAI 兼容 HTTP/SSE 服务端 + route B 插件   | **已就绪** |
+| **`build/main/bin/stream_moe_convert.exe`**       | 4KB 扇区对齐零拷贝 GGUF 转换优化器                | 规划中     |
+| **`build/main/bin/stream_moe_bench.exe`**         | MoE 专属多维基准评测工具                          | 规划中     |
 
 ---
 
 ## 编译与测试指引
 
 ### 环境要求
+
 - 支持 C++17 和 OpenMP 的 Clang / LLVM、MSVC 或 GCC
 - Windows (PowerShell / `cmd`) 或 Linux / POSIX
 
 ### Windows 编译
+
 ```powershell
 # 编译 vendored libllama + 上游 llama-cli/llama-server（链接 route B 插件）
 .\build.bat llamalibs main
@@ -55,6 +57,7 @@
 ```
 
 ### Linux 编译
+
 ```bash
 make test
 ```
@@ -66,6 +69,7 @@ make test
 > 两个可执行程序都是上游 `llama-cli` / `llama-server` 注入 route B 插件。用 `--expert-backend` 开启专家池；不加则走 stock llama.cpp。MoE 模型建议加 `--fit off --no-warmup`（跳过空跑前向，避免启动时冷盘装载专家）。
 
 ### 1. 交互式多轮对话 CLI 模式
+
 ```powershell
 # 启动交互式 REPL，使用 70GB 专家池与 16 物理核心
 build\main\llama-build\bin\llama-cli.exe `
@@ -77,6 +81,7 @@ build\main\llama-build\bin\llama-cli.exe `
 ```
 
 ### 2. 启动 OpenAI 兼容 API 服务端
+
 ```powershell
 # 在 8080 端口启动 API 服务
 build\main\llama-build\bin\llama-server.exe `
@@ -88,6 +93,7 @@ build\main\llama-build\bin\llama-server.exe `
 ```
 
 #### API 端点（上游 llama-server）
+
 - `POST /v1/chat/completions`（支持 `"stream": true` 流式 SSE）
 - `POST /v1/completions`
 - `GET /v1/models`
@@ -97,4 +103,5 @@ build\main\llama-build\bin\llama-server.exe `
 ---
 
 ## 许可证
+
 MIT License.

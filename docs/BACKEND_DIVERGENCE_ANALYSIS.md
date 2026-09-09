@@ -22,14 +22,14 @@
 
 用 verify/关联分析（temp/analyze_div.js）对比同输入（129-token prefill-from）的 moe 与 upstream 产物：
 
-| 指标 | 值 |
-| :--- | :--- |
-| 专家历史条目分歧 | 3344/61920（5.4%） |
-| 路由集合一致的 token | 25/129 |
-| 路由一致 token 的 hidden cos | mean **0.9996**（min 0.9987） |
-| 路由分歧 token 的 hidden cos | 低至 0.975 |
-| 最早路由分歧位置 | 全部在 layer > 1 |
-| KV cos（kv_cos.js） | mean 0.9998（数值级一致；verify_prefill 字节 diff 是 f16 表示微小差） |
+| 指标                         | 值                                                                    |
+| :--------------------------- | :-------------------------------------------------------------------- |
+| 专家历史条目分歧             | 3344/61920（5.4%）                                                    |
+| 路由集合一致的 token         | 25/129                                                                |
+| 路由一致 token 的 hidden cos | mean **0.9996**（min 0.9987）                                         |
+| 路由分歧 token 的 hidden cos | 低至 0.975                                                            |
+| 最早路由分歧位置             | 全部在 layer > 1                                                      |
+| KV cos（kv_cos.js）          | mean 0.9998（数值级一致；verify_prefill 字节 diff 是 f16 表示微小差） |
 
 **机制链**：同路由下 moe 与 upstream 就有微小浮点差（cos 0.9996，非 repack 0.508 级严重分歧）
 → 门控概率近等处在较深层发生 top-k rank 翻转/选相邻专家（路由分叉）→ 后续 hidden/KV 分歧放大。
@@ -39,14 +39,14 @@
 
 同输入跑 upstream_dump（CPU）vs upstream_vulkan_dump（`-ngl 2`，GPU offload 2 层）——**两个纯上游原版之间**：
 
-| 指标 | moe vs CPU | CPU vs Vulkan |
-| :--- | :--- | :--- |
-| 专家历史分歧 | 5.4% | 5.5% |
-| 路由一致 hidden cos | mean 0.9996 | mean 0.9996 |
-| 路由分歧 cos 下限 | 0.975 | 0.960 |
-| 最早路由分歧 | 全部 >L1 | L0/L1 就有 15 个 |
-| embd/hidden token0 cos | 0.9817 | 0.9830 |
-| KV diff 处 | 58 | 60 |
+| 指标                   | moe vs CPU  | CPU vs Vulkan    |
+| :--------------------- | :---------- | :--------------- |
+| 专家历史分歧           | 5.4%        | 5.5%             |
+| 路由一致 hidden cos    | mean 0.9996 | mean 0.9996      |
+| 路由分歧 cos 下限      | 0.975       | 0.960            |
+| 最早路由分歧           | 全部 >L1    | L0/L1 就有 15 个 |
+| embd/hidden token0 cos | 0.9817      | 0.9830           |
+| KV diff 处             | 58          | 60               |
 
 **结论**："同路由浮点小差 → 路由边界翻转 → 下游放大"是**任何两个计算后端对比的固有属性**
 （上游自己 CPU↔Vulkan 就产生同量级分歧）。moe 与上游 CPU 的差异完全落在该固有噪声框架内，
@@ -75,6 +75,7 @@
 > v2align 文件/loader/route-B 混算 bug。判别实验证明与 route-B 无关。
 
 **判别实验链**：
+
 1. **同 build 纯 RAM**：v2.gguf 与 v2align.gguf 对 CPU 基线 `moe_129_8192` 均 **IDENTICAL**
    （embd/hidden 逐字节 + expert history 全同）→ 装载/寻址/SoA 列/route-B 无回归，两文件等价。
 2. **route-B GPU 混算**（RAM:1024+Vulkan0:2048）：164 vk round + 152 cpu round 混跑 →
@@ -84,6 +85,7 @@
    16 unexplained——**与 route-B GPU 混算形态几乎一致**。
 
 **结论（以后不纠结）**：
+
 - **GPU（vulkan）执行相对 CPU 天生产生 ~80% token 专家翻转 + 数值漂移**，与是否 route-B 无关——
   连纯 upstream 原版在 GPU 上都不能复现 CPU 的逐字节/逐路由结果。**vk 没有绝对理想还原**。
 - route-B 的 GPU 混算差异不是 route-B 引入的 bug，落在"任何 GPU vs CPU 后端"固有噪声框架内。

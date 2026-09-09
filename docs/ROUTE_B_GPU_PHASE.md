@@ -62,10 +62,11 @@ execution layer; the graph/reuse shape is static.
 **Execution boundary**: the whole per-layer MoE chain is executed by us into our
 own fixed arenas; the main graph only carries the two ends - layer input (`cur`)
 and layer output (`ffn_moe_out-N`). Cross-device "copying" is not a physical law
+
 - it only appears when intermediates live in llama-managed buffers where the
-scheduler inserts cpy by backend ownership. Intermediates in our own arena are
-never copied; the price is the chain execution is ours to orchestrate and the
-main graph cannot keep individual MoE-chain nodes between the two ends.
+  scheduler inserts cpy by backend ownership. Intermediates in our own arena are
+  never copied; the price is the chain execution is ours to orchestrate and the
+  main graph cannot keep individual MoE-chain nodes between the two ends.
 
 ### 3.1 Privatization admission check (fail-fast, no fallback)
 

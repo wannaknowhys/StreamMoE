@@ -24,22 +24,22 @@ common_params_parse (arg.cpp)                      <- 参数解析（--expert-ba
 
 ## 2. mmap 调用点表
 
-| 位置 | 功能 | 角色 |
-| :--- | :--- | :--- |
-| `llama-mmap.cpp:457` | POSIX `mmap()` 内核映射 | **实际 mmap 调用**（lldb 断点） |
-| `llama-mmap.cpp:543` | Windows `CreateFileMappingA` | Windows 映射句柄 |
-| `llama-mmap.cpp:550` | Windows `MapViewOfFile` | Windows 视图映射 |
-| `llama-mmap.cpp:588` | `UnmapViewOfFile` | 释放 |
-| `llama-model-loader.cpp:1364` | `make_unique<llama_mmap>`（每分片） | **映射创建点**（lldb 断点） |
-| `llama-model-loader.cpp:1367` | `llama_mlock`（mlock 模式） | mlock 化 |
-| `llama-model-loader.cpp:817` | use_mmap 平台支持检查 | 开关 |
-| `llama-model-loader.cpp:1189` | overrides + mmap 警告 | 诊断 |
-| `llama-model-loader.cpp:1212` | mmap 时避免 host buffer | 分配策略 |
-| `llama-model-loader.cpp:1556+` | `load_all_data` mmap 分支（tensor 指向映射页） | **零拷贝赋值点** |
-| `llama-model.cpp:1131` | `llama_mmaps mappings`（model 持有映射） | 生命周期 |
-| `llama-model.cpp:1703` | mmap 区域 -> backend buffer（dense） | 零拷贝 |
-| `llama.cpp:56/70` | load_mode 枚举（mmap / mmap+mlock） | 参数 |
-| `llama-mmap.h:43` | `llama_mmap` 接口 | 接口 |
+| 位置                           | 功能                                           | 角色                            |
+| :----------------------------- | :--------------------------------------------- | :------------------------------ |
+| `llama-mmap.cpp:457`           | POSIX `mmap()` 内核映射                        | **实际 mmap 调用**（lldb 断点） |
+| `llama-mmap.cpp:543`           | Windows `CreateFileMappingA`                   | Windows 映射句柄                |
+| `llama-mmap.cpp:550`           | Windows `MapViewOfFile`                        | Windows 视图映射                |
+| `llama-mmap.cpp:588`           | `UnmapViewOfFile`                              | 释放                            |
+| `llama-model-loader.cpp:1364`  | `make_unique<llama_mmap>`（每分片）            | **映射创建点**（lldb 断点）     |
+| `llama-model-loader.cpp:1367`  | `llama_mlock`（mlock 模式）                    | mlock 化                        |
+| `llama-model-loader.cpp:817`   | use_mmap 平台支持检查                          | 开关                            |
+| `llama-model-loader.cpp:1189`  | overrides + mmap 警告                          | 诊断                            |
+| `llama-model-loader.cpp:1212`  | mmap 时避免 host buffer                        | 分配策略                        |
+| `llama-model-loader.cpp:1556+` | `load_all_data` mmap 分支（tensor 指向映射页） | **零拷贝赋值点**                |
+| `llama-model.cpp:1131`         | `llama_mmaps mappings`（model 持有映射）       | 生命周期                        |
+| `llama-model.cpp:1703`         | mmap 区域 -> backend buffer（dense）           | 零拷贝                          |
+| `llama.cpp:56/70`              | load_mode 枚举（mmap / mmap+mlock）            | 参数                            |
+| `llama-mmap.h:43`              | `llama_mmap` 接口                              | 接口                            |
 
 ## 3. dense vs expert 分流（设计）
 
@@ -74,6 +74,7 @@ F:\Tools\软件\VMMap\vmmap.exe -p <pid> F:\path\memory.csv
 rem 或按进程名：
 F:\Tools\软件\VMMap\vmmap.exe -p <pid> memory.csv
 ```
+
 分类列：Image / Private / Mapped File / Shareable / Heap / Stack / Page Table / ...——可看出 mmap 模型页是否驻留、池/私有内存占多少。
 
 ## 6. 未来自研格式（stream_moe_convert 规划）对 mmap 的意义

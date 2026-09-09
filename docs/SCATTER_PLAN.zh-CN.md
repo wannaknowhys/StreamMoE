@@ -60,13 +60,13 @@ down mm dst、down_scaled、weighted，直到折叠——都免费继承 tight �
 外部 per-token 输入只有三个需要处理，且全部是同一操作——**tight-gather**（把主图
 per-token 数据按 `order` 拷进 tight staging）。一个通用 tight-gather 助手即可服务三者。
 
-| 数据 | 角色 | per-token 布局 | 桶影响 |
-| :--- | :--- | :--- | :--- |
-| `cur`（dense norm 输出） | gate/up mm src1 | 每 token 一共享列 `[d,1,n_t]` | token tight-gather → `[d,1,n_active]`（与 slot 无关） |
-| 路由 `ids` | mm src2、GET_ROWS src1 | per-(token,slot) `[n_k,n_t]` | slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块按 tight 重排 |
-| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1 | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | 任意 (t,k) index-gather → `[1,w_b,n_active]`（flat get_rows；BUCKET_EXEC_TOKEN_SUBSET §2.1a） |
-| 专家权重、per-expert scale（REPEAT 表） | mm src0 / GET_ROWS src0 | per-expert | 与 token 无关——不动 |
-| 链内张量（GLU/down/weighted） | - | `[d,w_b,n_t]` | 继承首次 tight-gather 定下的顺序 |
+| 数据                                        | 角色                    | per-token 布局                                                                                        | 桶影响                                                                                        |
+| :------------------------------------------ | :---------------------- | :---------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
+| `cur`（dense norm 输出）                    | gate/up mm src1         | 每 token 一共享列 `[d,1,n_t]`                                                                         | token tight-gather → `[d,1,n_active]`（与 slot 无关）                                         |
+| 路由 `ids`                                  | mm src2、GET_ROWS src1  | per-(token,slot) `[n_k,n_t]`                                                                          | slot 子集已暂存（`ids_exp`/`ids_slot`）；token 块按 tight 重排                                |
+| per-slot 路由权重（`ffn_moe_weights_norm`） | weighted mul src1       | 每 (slot,token) 一标量 `[1,n_k,n_t]` = 路由到的专家的 softmax 权重；dense 侧 topk 后算好、作链的 leaf | 任意 (t,k) index-gather → `[1,w_b,n_active]`（flat get_rows；BUCKET_EXEC_TOKEN_SUBSET §2.1a） |
+| 专家权重、per-expert scale（REPEAT 表）     | mm src0 / GET_ROWS src0 | per-expert                                                                                            | 与 token 无关——不动                                                                           |
+| 链内张量（GLU/down/weighted）               | -                       | `[d,w_b,n_t]`                                                                                         | 继承首次 tight-gather 定下的顺序                                                              |
 
 ## 3. 模块接口（纯计算，无 ggml/llama 依赖）
 
@@ -130,8 +130,8 @@ run 里。
    slot 切片才会发生，而矩形 peel 永不产生这种情形；否则当输入错误拒绝）。
 2. 直到值集为空：
    a. 对每个候选 delta（从 1 向上，只要 token 值还能再出现，即集中任意两值之差）统计
-      等 delta 的最长链：`len(delta) = max over v of #{k >= 0 : v + k*delta in set}`。
-      delta 无上界，但只有 delta <= (max-min) 有意义；只扫真正整除某对值的 delta。
+   等 delta 的最长链：`len(delta) = max over v of #{k >= 0 : v + k*delta in set}`。
+   delta 无上界，但只有 delta <= (max-min) 有意义；只扫真正整除某对值的 delta。
    b. 选 `len(delta)` 最大的 delta（平手：delta 最小，再起点最小——确定性）。
    c. 为该 run 发一个 seg，从集合去掉其值。
 3. 发出顺序（run 被抽取的先后）即 tight 序：把每个 run 的值升序拼接。
@@ -157,7 +157,7 @@ host staging）。一个通用 **index-gather** 助手服务三者：把连续�
   `[1, width, n_active]`。这就是通用 index-gather 节点（BUCKET_EXEC_TOKEN_SUBSET §2.1a）。
 - **acc 循环**（取代 `exec_layer_burst_chain_buckets` 里的 offset-0 单次 acc）：对每个
   seg 做一次 `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
-  offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。
+offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。
 
 ## 6. 单元测试（计划）
 
@@ -165,8 +165,8 @@ host staging）。一个通用 **index-gather** 助手服务三者：把连续�
 
 ### 配置网格（笛卡尔积）
 
-| n_t（全宽 token 数） | hit rate |
-| :--- | :--- |
+| n_t（全宽 token 数） | hit rate            |
+| :------------------- | :------------------ |
 | 1, 2, 3, 4, 16, 1024 | 0, 0.1, 0.5, 0.9, 1 |
 
 共 30 个任务。每个任务在 `build_scatter_plan` 前后各一次 rdtsc（`tsc_now`），输出

@@ -3,6 +3,7 @@
 > 目标问题：**不改（或极小改）llama.cpp 的前提下，能否让 MoE 专家权重完全不经过 mmap、全部走自研 expert pool，而 dense 维持 llama.cpp 默认行为？**
 > 基于 vendored llama.cpp @ f280b2698。
 > 修订记录：
+>
 > - §7 v2（2026-08-26）：根据"自定义 backend 接管 MUL_MAT_ID"的设计修正结论——紧凑槽方案可行且零 llama.cpp 改动，代价是**必须自行实现 MUL_MAT_ID 计算路径**（mini-graph 委托给 ggml-cpu 或原生内核）。
 > - §7 第三路径定案（2026-08-26 落地）：最终采纳**官方 `ggml_mul_mat_id` 内核 + 均匀 stride 槽**（单块连续池），既不需要自研计算路径，也不需要改 llama.cpp——详见 §7。
 > - 编码修复（2026-08-26）：整文件重写为纯 UTF-8；此前 PowerShell 追加段落导致编码混合。
@@ -110,12 +111,12 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 
 ## 2. 结论总览
 
-| 需求 | 实现途径 | 是否改 llama.cpp |
-| :--- | :--- | :--- |
-| MoE 专家权重不经过 mmap 数据路径 | `tensor_buft_overrides` → 自定义 buft；非默认 buft 走真实分配；`set_tensor` no-op 跳过物理读入 | **否** |
-| 专家按需装载 + 紧凑槽 | 自定义 backend 接管 MUL_MAT_ID 执行；`graph_compute` 内查 `expert_directory`、就绪等待、从槽内存计算 | **否** |
-| dense 维持 llama.cpp 默认 | 不覆盖 dense 张量的 buft → 默认 mmap 零拷贝不变 | **否** |
-| 计算正确性 | 我们的 compute 路径必须数值等价于 build_moe_ffn → 数值等价回归兜底 | 责任在我们 |
+| 需求                             | 实现途径                                                                                             | 是否改 llama.cpp |
+| :------------------------------- | :--------------------------------------------------------------------------------------------------- | :--------------- |
+| MoE 专家权重不经过 mmap 数据路径 | `tensor_buft_overrides` → 自定义 buft；非默认 buft 走真实分配；`set_tensor` no-op 跳过物理读入       | **否**           |
+| 专家按需装载 + 紧凑槽            | 自定义 backend 接管 MUL_MAT_ID 执行；`graph_compute` 内查 `expert_directory`、就绪等待、从槽内存计算 | **否**           |
+| dense 维持 llama.cpp 默认        | 不覆盖 dense 张量的 buft → 默认 mmap 零拷贝不变                                                      | **否**           |
+| 计算正确性                       | 我们的 compute 路径必须数值等价于 build_moe_ffn → 数值等价回归兜底                                   | 责任在我们       |
 
 **诚实的边界说明**：llama.cpp 仍会为分片文件创建 mmap 映射对象（dense 张量需要），但专家权重区域的页**永远不会被 fault**——专家数据 100% 走私有槽内存 + DIO。
 
@@ -123,15 +124,15 @@ sched 的后端列表来自 `model.devices` + CPU（llama-context.cpp:330-357）
 
 ## 3. 三条路线最终对比
 
-| 维度 | 路线 A：Fork 1（RESERVE 区域 + 官方内核 + cb_eval） | 路线 B：紧凑槽 + 自定义 backend（Backend.md 原设计） | 路线 C：紧凑槽 + 改 llama.cpp 建 view |
-| :--- | :--- | :--- | :--- |
-| llama.cpp 改动 | **零** | **零**（注册 backend + buft） | **必须**（load_arch_tensors 建 view） |
-| MUL_MAT_ID 执行 | 官方 ggml-cpu 内核 | **我们实现**（mini-graph 委托或原生内核） | 官方内核（stride view 适配） |
-| 专家物理布局 | 大区域三区域 slice（非紧凑） | 紧凑 [gate\|up\|down] 槽 | 紧凑槽 |
-| ids | 专家 id，无需翻译 | 专家 id，图内不翻译（graph_compute 内私下查表） | 需翻译成 slot 索引（有 get_rows 冲突） |
-| 虚拟地址 | RESERVE 147GB（真实 VA 预留，免费） | 无 VA 预留；147GB 仅是 buffer size 记账值 | 池大小 |
-| 实现工作量 | 小（buft + cb_eval + scheduler） | **中-大**（backend 骨架 + MUL_MAT_ID 计算实现） | 中（改 llama.cpp + 翻译） |
-| 正确性风险 | 无（全官方内核） | 我们的 compute 需数值等价 | 翻译 hack 风险 |
+| 维度            | 路线 A：Fork 1（RESERVE 区域 + 官方内核 + cb_eval） | 路线 B：紧凑槽 + 自定义 backend（Backend.md 原设计） | 路线 C：紧凑槽 + 改 llama.cpp 建 view  |
+| :-------------- | :-------------------------------------------------- | :--------------------------------------------------- | :------------------------------------- |
+| llama.cpp 改动  | **零**                                              | **零**（注册 backend + buft）                        | **必须**（load_arch_tensors 建 view）  |
+| MUL_MAT_ID 执行 | 官方 ggml-cpu 内核                                  | **我们实现**（mini-graph 委托或原生内核）            | 官方内核（stride view 适配）           |
+| 专家物理布局    | 大区域三区域 slice（非紧凑）                        | 紧凑 `[gate/up/down]` 槽                             | 紧凑槽                                 |
+| ids             | 专家 id，无需翻译                                   | 专家 id，图内不翻译（graph_compute 内私下查表）      | 需翻译成 slot 索引（有 get_rows 冲突） |
+| 虚拟地址        | RESERVE 147GB（真实 VA 预留，免费）                 | 无 VA 预留；147GB 仅是 buffer size 记账值            | 池大小                                 |
+| 实现工作量      | 小（buft + cb_eval + scheduler）                    | **中-大**（backend 骨架 + MUL_MAT_ID 计算实现）      | 中（改 llama.cpp + 翻译）              |
+| 正确性风险      | 无（全官方内核）                                    | 我们的 compute 需数值等价                            | 翻译 hack 风险                         |
 
 ---
 
@@ -221,11 +222,13 @@ mul(experts, weights) + view + 跨专家相加    → CPU  │ split E（CPU）
 **根因**：gate/up/down 三个 `mul_mat_id` 吃**同一份 ids** → 在 split B 第一次摸到专家 e 时，就已确定"本层本次前向还会被 split D 再用"。数据生命周期跨越两次 graph_compute 调用。
 
 **定案方案（角色式，无需状态表）**：
+
 ```text
 split B（非 down 角色）：对 ids 里每个专家 pin（ref 0→1），【不 unpin】
 split D（down 角色）：  【不重复 pin】，直接验证 READY + generation 后计算，
                        计算完对该 ids 集合 unpin（ref 1→0）
 ```
+
 - 角色识别：节点权重名含 `down_exps` → down 角色；否则 pin 角色。
 - 为何不需要状态表：B 和 D 读的是同一份 ids 张量，D 重读 ids 即得同一集合，不需要 B 传状态。
 - 为何无空窗：refcount 在 B..D 全程 ≥1（只有 D 的末触释放把它归零），驱逐不可能介入。
@@ -292,10 +295,10 @@ b_leaf：用 op==NONE + 手动 data/nb 的叶子包装主图激活（cur），�
 
 ### 7.3 与 §3 三路线的关系
 
-| 路线 | 本路径（第三路径）相对 |
-| :--- | :--- |
-| 路线 A（RESERVE + 官方内核 + cb_eval） | 无 147GB VA 预留；槽池按预算 commit |
-| 路线 B（紧凑槽 + 我们实现 MUL_MAT_ID） | **不需要我们实现计算路径**，官方内核直接执行 |
+| 路线                                      | 本路径（第三路径）相对                              |
+| :---------------------------------------- | :-------------------------------------------------- |
+| 路线 A（RESERVE + 官方内核 + cb_eval）    | 无 147GB VA 预留；槽池按预算 commit                 |
+| 路线 B（紧凑槽 + 我们实现 MUL_MAT_ID）    | **不需要我们实现计算路径**，官方内核直接执行        |
 | 路线 C（改 llama.cpp 建 view + 槽号翻译） | **零 llama.cpp 改动**，ids 翻译在私有 mini-graph 内 |
 
 代价：槽池必须是"单块连续 + 均匀 stride"布局（不能按专家分片独立分配）；每个专家 gate/up/down 是**三个逻辑区域（branch offset）**，装载 = 3 次 DIO 到各自区域。

@@ -10,31 +10,31 @@
 
 ## 1. 输入格式
 
-| 格式 | `stream_moe.layout` | `incomplete` | 专家布局 | 对齐 | 读取计划 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **原始 GGUF**（单文件或 `-00001-of-N.gguf`） | 缺省 / `"original"` | - | 按张量连续：专家切片 = `tensor.offset + e*perExpert`；每个专家 3 个子张量（gate/up/down 或 gate_up/down） | GGUF 默认（32B / 量化块） | 3 次扇区对齐读取至中转 buffer + memcpy 至槽位（需要中转） |
-| **v2 expert-blocks-v2** | `"expert-blocks-v2"` | - | 按 (layer, expert) 块；分支（gate_up/gate/up/down）在块内按 `branchOff` 拼接；块大小 = alignUp(sum(branch perExpert), 4096) | 4096 块 | 1 次整块异步 DIO 直接读入槽位（块布局 == 槽位布局） |
-| **v2 chunk** | `"expert-blocks-v2"` | `1` | 块条带分散在 N 个分片文件中（每文件 `chunk_slices`）；单个专家块跨越至多 N 个文件段 | 4096 条带 | **未实现**——加载器硬编码单文件（`shard_idx = 0`） |
-| **v3 category-sections** | `"v3"` | - | 四个段：C2 全局 dense / C1 按层 dense / C4 专家小表 / C3 专家块（块布局同 v2）。按"是否被 MoE 闭包消费"划分（见 `STREAMMOE_GGUF_FORMAT.md` §3） | 4096 | **未实现**——每段对应一种驻留策略：C2 常驻、C1 按层流式、C4 每设备复制、C3 池化 / 跨设备 |
+| 格式                                         | `stream_moe.layout`  | `incomplete` | 专家布局                                                                                                                                        | 对齐                      | 读取计划                                                                                |
+| :------------------------------------------- | :------------------- | :----------- | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------- |
+| **原始 GGUF**（单文件或 `-00001-of-N.gguf`） | 缺省 / `"original"`  | -            | 按张量连续：专家切片 = `tensor.offset + e*perExpert`；每个专家 3 个子张量（gate/up/down 或 gate_up/down）                                       | GGUF 默认（32B / 量化块） | 3 次扇区对齐读取至中转 buffer + memcpy 至槽位（需要中转）                               |
+| **v2 expert-blocks-v2**                      | `"expert-blocks-v2"` | -            | 按 (layer, expert) 块；分支（gate_up/gate/up/down）在块内按 `branchOff` 拼接；块大小 = alignUp(sum(branch perExpert), 4096)                     | 4096 块                   | 1 次整块异步 DIO 直接读入槽位（块布局 == 槽位布局）                                     |
+| **v2 chunk**                                 | `"expert-blocks-v2"` | `1`          | 块条带分散在 N 个分片文件中（每文件 `chunk_slices`）；单个专家块跨越至多 N 个文件段                                                             | 4096 条带                 | **未实现**——加载器硬编码单文件（`shard_idx = 0`）                                       |
+| **v3 category-sections**                     | `"v3"`               | -            | 四个段：C2 全局 dense / C1 按层 dense / C4 专家小表 / C3 专家块（块布局同 v2）。按"是否被 MoE 闭包消费"划分（见 `STREAMMOE_GGUF_FORMAT.md` §3） | 4096                      | **未实现**——每段对应一种驻留策略：C2 常驻、C1 按层流式、C4 每设备复制、C3 池化 / 跨设备 |
 
 ## 2. 布局 KV 语义 (`stream_moe.*`)
 
 由 `src/convert/writer.cpp` 写入，由 `parse_model`（`src/loader/model_builder.cpp`）读取：
 
-| KV | 含义 |
-| :--- | :--- |
-| `stream_moe.layout` | `"original"` / `"expert-blocks-v2"` / `"v3"` |
-| `stream_moe.incomplete` | `1` = v2 chunk（分片文件）；`0`/缺省 = 单文件 |
-| `stream_moe.dense_section` | `[0, denseEnd]` - 密集张量区（在专家块之前） |
-| `stream_moe.expert_sections` | 每个块 `[off, size, nsub]`（共 nLayer*nExpert 个块） |
-| `stream_moe.expert_branch_names` | 按层展平的完整分支张量名称 |
-| `stream_moe.expert_branch_sizes` | 每个分支的 `perExpert` 字节数（已展平，与名称顺序一致） |
-| `stream_moe.expert_branch_counts` | 每层的分支数量（支持异构非均匀 MoE 层） |
-| `stream_moe.chunk_no` / `chunk_total` | v2 chunk 的分片索引 / 总分片数 |
-| `stream_moe.chunk_slices` | 每个文件的 `[denseBlocks, blockSlices...]`——该文件持有的 4K 对齐条带 |
-| `stream_moe.dense_global_section` (v3) | `[off, size]` - C2 全局 dense 区 |
-| `stream_moe.dense_layer_sections` (v3) | `[layer, off, size, ...]` - C1 按层 dense 区 |
-| `stream_moe.expert_meta_sections` (v3) | `[layer, off, size, ...]` - C4 每层专家小表（可为空） |
+| KV                                     | 含义                                                                 |
+| :------------------------------------- | :------------------------------------------------------------------- |
+| `stream_moe.layout`                    | `"original"` / `"expert-blocks-v2"` / `"v3"`                         |
+| `stream_moe.incomplete`                | `1` = v2 chunk（分片文件）；`0`/缺省 = 单文件                        |
+| `stream_moe.dense_section`             | `[0, denseEnd]` - 密集张量区（在专家块之前）                         |
+| `stream_moe.expert_sections`           | 每个块 `[off, size, nsub]`（共 nLayer*nExpert 个块）                 |
+| `stream_moe.expert_branch_names`       | 按层展平的完整分支张量名称                                           |
+| `stream_moe.expert_branch_sizes`       | 每个分支的 `perExpert` 字节数（已展平，与名称顺序一致）              |
+| `stream_moe.expert_branch_counts`      | 每层的分支数量（支持异构非均匀 MoE 层）                              |
+| `stream_moe.chunk_no` / `chunk_total`  | v2 chunk 的分片索引 / 总分片数                                       |
+| `stream_moe.chunk_slices`              | 每个文件的 `[denseBlocks, blockSlices...]`——该文件持有的 4K 对齐条带 |
+| `stream_moe.dense_global_section` (v3) | `[off, size]` - C2 全局 dense 区                                     |
+| `stream_moe.dense_layer_sections` (v3) | `[layer, off, size, ...]` - C1 按层 dense 区                         |
+| `stream_moe.expert_meta_sections` (v3) | `[layer, off, size, ...]` - C4 每层专家小表（可为空）                |
 
 ## 3. 当前差距（加载器 vs 转换器）
 
@@ -58,6 +58,7 @@
 ```
 
 各格式 DIO 特征：
+
 - **original**：每个专家 3 次读取，每次读入 8K 填充的中转缓冲区（前后填充，大小为 size+2*4096），然后 memcpy 至槽位。按 4K 对齐以满足 DIO。
 - **v2**：1 次整块异步 DIO 直接读入槽位。
 - **v2/v3 chunk**：按文件条带读取（每专家 N 个分段），直接读入槽位。

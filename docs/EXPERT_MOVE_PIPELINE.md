@@ -41,7 +41,7 @@ removes the need for `owner_` entirely.
 ## 2. Landed base (WORK_IN_PROGRESS L) - do not regress
 
 - `slot_request_t` 96B POD: `{layer, total_tokens, start_rdtsc, n_load_target(=batch
-  target count), batch_ready ptr, needed[8]=512-bit bitmap}`.
+target count), batch_ready ptr, needed[8]=512-bit bitmap}`.
 - `mpsc_alloc_queue`: plain POD ring + per-slot publish generation
   (release/acquire), multi-producer safe, no ABA. NO `std::atomic<96B>`.
 - `expert_scheduler::pin_layer(layer, bitmap, await, out)`: scan dir -> pin
@@ -74,7 +74,7 @@ Access pattern today: exec scans by (L,E); eviction scans slots then uses
 `entries_` only records READY residency (`dir_->set` fires at mark_ready).
 Between "alloc reserved the slot" and "mark_ready", the slot is IO_INFLIGHT
 and `owner_[slot]` already names (L,E) but `entries_[(L,E)]` is UNASSIGNED.
-So a compute-side scan cannot see an expert that is *being loaded*, and a
+So a compute-side scan cannot see an expert that is _being loaded_, and a
 scheduler request cannot tell "already loading" from "absent" - both look
 identical through entries_. This creates a duplicate-load window (exec asks
 for an expert that is mid-load; accept allocs a second slot; two loads race,
@@ -110,6 +110,7 @@ FAILED       no slot    load/move failed
 ```
 
 Notes on state entries:
+
 - When a state carrying a slot is published, `slot` must be the real reserved
   physical slot id (LOADING = its IO_INFLIGHT slot; MOVING_IN = the reserved
   destination slot). Same visibility rule as §3.4: publish the intent with a
@@ -185,7 +186,7 @@ becomes READY, and exec is woken at that point.
 
 FAILED (a load/move hard-failed) is surfaced as an error, not retried forever.
 
-> Decision history: an earlier "decision 6a" (exec never *submits* in-flight
+> Decision history: an earlier "decision 6a" (exec never _submits_ in-flight
 > experts because it can see LOADING) is superseded. Exec cannot reliably
 > distinguish "will be loaded by my own request" from "already loading for
 > someone else" at submit time (races + prefetch), so it stays stateless and
@@ -199,6 +200,7 @@ reverse-lookup :293-294). No other file/function touches it.
 
 Once eviction is (L,E)-keyed (below), the scheduler never needs to ask "what
 expert lives in slot i?":
+
 - load completion `dir_->set(t->layer, t->expert, ...)` already carries (L,E)
   from the async_load_t;
 - eviction selects by (L,E) and reads the slot via `entries_`.
@@ -220,8 +222,7 @@ model clean.)
 ### 5.2 v2r device read: "CPU-memcpy-only" is REVISED (DMA via cached staging)
 
 Original reasoning (kept for history): `vkCmdCopyBuffer` / copy engines can copy
-device<->device and device<->host-visible-vulkan-buffer. On a discrete GPU (RX
-590) the host-visible heap is still VRAM (rebar BAR1); the 128GB system-RAM pool
+device<->device and device<->host-visible-vulkan-buffer. On a discrete GPU (RX 590) the host-visible heap is still VRAM (rebar BAR1); the 128GB system-RAM pool
 is NOT in the GPU address space, so a copy engine cannot write it. A real
 `vkCmdCopyBuffer` vram->system-RAM target does not exist on discrete GPUs (only
 on UMA/APU). Cross-backend `ggml_backend_tensor_copy` likewise falls back to
@@ -230,8 +231,8 @@ Conclusion then: v2r to ordinary malloc RAM is CPU-memcpy-only on this
 hardware; GPU copy-engine DMA is a future UMA/APU target.
 
 > **2026-09-04 revision - that conclusion was wrong for a two-step path.**
-> A discrete GPU's copy engine cannot write *ordinary malloc* RAM (correct
-> above), but it CAN write a CACHED host-visible *vulkan* host buffer (heap0 /
+> A discrete GPU's copy engine cannot write _ordinary malloc_ RAM (correct
+> above), but it CAN write a CACHED host-visible _vulkan_ host buffer (heap0 /
 > memtype 7), and reading that host buffer back at cached speed is fast.
 > Measured on RX590: `vkCmdCopyBuffer` vram -> cached staging ~14 GB/s, memcpy
 > staging -> RAM slot ~21+ GB/s => one demote went from ~158 ms (rebar CPU read
@@ -431,6 +432,7 @@ The scheduler counts down the round's own n_load_target.
 > the scheduler has already pinned B for it. Exec releases A u B after compute.
 
 **Why this is sound (pin ownership split):**
+
 - A and B never overlap: A = the set whose `try_pin` CAS succeeded during the
   exec scan; B = everything else. Partition is fixed the moment exec submits B.
 - Protection needs no new rule: A is protected by its refcount (already +1);
@@ -441,6 +443,7 @@ The scheduler counts down the round's own n_load_target.
   never half-pinned, never an orphaned middle state.
 
 **Scheduler-side active slot (a member of `expert_scheduler`, per-model):**
+
 ```cpp
 struct active_request_t {
     uint32_t layer = 0;
@@ -451,17 +454,19 @@ struct active_request_t {
 };
 active_request_t active_;   // empty iff no request in flight
 ```
+
 - `accept_requests()` is the ONLY place that registers a request: it pops one
   exec request, stores it in `active_`, then immediately triages every B item
   (same critical section / same scheduler-thread turn):
-  READY    -> CAS-pin it now, account it (n_left--)
-  ABSENT   -> alloc + submit a load (eviction path, M3); it will settle via drain
+  READY -> CAS-pin it now, account it (n_left--)
+  ABSENT -> alloc + submit a load (eviction path, M3); it will settle via drain
   LOADING / MOVING_* -> leave to drain (in flight; settle will pin)
 - While `active_` is non-empty the scheduler does NOT pop a new exec request
   (single-active discipline, §7.1); it only drains / moves / settles.
 
 **drain_completions() is the single settle point and DOES the pin (owner
 thread, no extra notification needed):**
+
 - drain runs on the scheduler thread inside `worker_loop` (wait_events ->
   drain_completions is synchronous). "How does drain notify the scheduler?" is
   a non-question: drain IS the scheduler's own thread step. It bumps the exec
@@ -478,8 +483,9 @@ which B items it has pinned; on the failure path it releases exactly those
 before waking exec. Exec never sees a partially-pinned B.
 
 **Two register-time races that MUST be coded + tested (peer review, Claude):**
+
 1. **Settle before register (lost-event window).** An expert may settle to
-   READY *between* exec's scan (B includes it as LOADING) and the scheduler
+   READY _between_ exec's scan (B includes it as LOADING) and the scheduler
    registering active_ (the drain turn ran first, when no active_ existed).
    The drain event for it is then gone forever. Fix: the registration step
    MUST re-scan the current state of every B item in the same turn (READY ->
@@ -493,6 +499,7 @@ before waking exec. Exec never sees a partially-pinned B.
    (accept_requests ABSENT branch above), not left implicit.
 
 **Exec side - single-pass pin_layer (replaces §3.5 loop / §7.3 rounds):**
+
 ```
 exec pin_layer(layer, needed, await, out):
   A = {}; B = {}
@@ -511,6 +518,7 @@ exec pin_layer(layer, needed, await, out):
       failed (guarded above)
     return A + B handles
 ```
+
 Exec releases A u B with unpin() after compute. It never re-pins B (refcount
 already +1 by the scheduler) and never loops to re-measure.
 
@@ -521,6 +529,7 @@ a settle" to "mark active_.failed + RAII-release pinned B + wake exec with the
 failure signal". The ledger lives in active_, not in hack bumps.
 
 **Concurrency acceptance cases (UT):**
+
 - B item settles (READY) in the same scheduler turn BEFORE active_ registration
   -> must be pinned at registration (race 1).
 - B contains an ABSENT item -> must get a load submitted at registration

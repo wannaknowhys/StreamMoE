@@ -21,31 +21,31 @@
 
 ## 1. Input formats
 
-| format | `stream_moe.layout` | `incomplete` | expert layout | alignment | read plan |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **original GGUF** (single or `-00001-of-N.gguf`) | absent / `"original"` | - | per-tensor contiguous: expert slice = `tensor.offset + e*perExpert`; 3 sub-tensors (gate/up/down or gate_up/down) per expert | GGUF default (32B / quant block) | 3 sector-aligned reads into staging buffer + memcpy to slot (needs staging) |
-| **v2 expert-blocks-v2** | `"expert-blocks-v2"` | - | per-(layer,expert) block; branches (gate_up/gate/up/down) concatenated at `branchOff` inside the block; block size = alignUp(sum(branch perExpert), 4096) | 4096 blocks | 1 async DIO whole-block straight into slot (block layout == slot layout) |
-| **v2 chunk** | `"expert-blocks-v2"` | `1` | block strips scattered across N strip files (`chunk_slices` per file); one expert block spans up to N file segments | 4096 strips | **Not implemented** - loader hardcodes single file (`shard_idx = 0`) |
-| **v3 category-sections** | `"v3"` | - | four sections: C2 global-dense / C1 layer-dense / C4 expert-meta / C3 expert blocks (block layout == v2). Split by whether the tensor is consumed by the MoE closure (see `STREAMMOE_GGUF_FORMAT.md` §3) | 4096 | **Not implemented** - each section maps to a distinct residency policy: C2 pinned resident, C1 streamed per layer, C4 replicated per device, C3 pooled / cross-device |
+| format                                           | `stream_moe.layout`   | `incomplete` | expert layout                                                                                                                                                                                            | alignment                        | read plan                                                                                                                                                             |
+| :----------------------------------------------- | :-------------------- | :----------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **original GGUF** (single or `-00001-of-N.gguf`) | absent / `"original"` | -            | per-tensor contiguous: expert slice = `tensor.offset + e*perExpert`; 3 sub-tensors (gate/up/down or gate_up/down) per expert                                                                             | GGUF default (32B / quant block) | 3 sector-aligned reads into staging buffer + memcpy to slot (needs staging)                                                                                           |
+| **v2 expert-blocks-v2**                          | `"expert-blocks-v2"`  | -            | per-(layer,expert) block; branches (gate_up/gate/up/down) concatenated at `branchOff` inside the block; block size = alignUp(sum(branch perExpert), 4096)                                                | 4096 blocks                      | 1 async DIO whole-block straight into slot (block layout == slot layout)                                                                                              |
+| **v2 chunk**                                     | `"expert-blocks-v2"`  | `1`          | block strips scattered across N strip files (`chunk_slices` per file); one expert block spans up to N file segments                                                                                      | 4096 strips                      | **Not implemented** - loader hardcodes single file (`shard_idx = 0`)                                                                                                  |
+| **v3 category-sections**                         | `"v3"`                | -            | four sections: C2 global-dense / C1 layer-dense / C4 expert-meta / C3 expert blocks (block layout == v2). Split by whether the tensor is consumed by the MoE closure (see `STREAMMOE_GGUF_FORMAT.md` §3) | 4096                             | **Not implemented** - each section maps to a distinct residency policy: C2 pinned resident, C1 streamed per layer, C4 replicated per device, C3 pooled / cross-device |
 
 ## 2. Layout KV semantics (`stream_moe.*`)
 
 Written by `src/convert/writer.cpp`, read by `parse_model` (`src/loader/model_builder.cpp`):
 
-| KV | meaning |
-| :--- | :--- |
-| `stream_moe.layout` | `"original"` / `"expert-blocks-v2"` / `"v3"` |
-| `stream_moe.incomplete` | `1` = v2 chunk (strip files); `0`/absent = single file |
-| `stream_moe.dense_section` | `[0, denseEnd]` - dense tensor area (before blocks) |
-| `stream_moe.expert_sections` | `[off, size, nsub]` per block (nLayer*nExpert blocks) |
-| `stream_moe.expert_branch_names` | flattened per-layer full branch tensor names |
-| `stream_moe.expert_branch_sizes` | per-branch `perExpert` bytes (flattened, same order as names) |
-| `stream_moe.expert_branch_counts` | per-layer branch count (non-uniform MoE layers) |
-| `stream_moe.chunk_no` / `chunk_total` | strip index / total for v2 chunk |
-| `stream_moe.chunk_slices` | `[denseBlocks, blockSlices...]` per file - 4K-aligned strips this file holds |
-| `stream_moe.dense_global_section` (v3) | `[off, size]` - C2 global-dense area |
-| `stream_moe.dense_layer_sections` (v3) | `[layer, off, size, ...]` - C1 per-layer dense areas |
-| `stream_moe.expert_meta_sections` (v3) | `[layer, off, size, ...]` - C4 per-layer expert-meta tables (may be empty) |
+| KV                                     | meaning                                                                      |
+| :------------------------------------- | :--------------------------------------------------------------------------- |
+| `stream_moe.layout`                    | `"original"` / `"expert-blocks-v2"` / `"v3"`                                 |
+| `stream_moe.incomplete`                | `1` = v2 chunk (strip files); `0`/absent = single file                       |
+| `stream_moe.dense_section`             | `[0, denseEnd]` - dense tensor area (before blocks)                          |
+| `stream_moe.expert_sections`           | `[off, size, nsub]` per block (nLayer*nExpert blocks)                        |
+| `stream_moe.expert_branch_names`       | flattened per-layer full branch tensor names                                 |
+| `stream_moe.expert_branch_sizes`       | per-branch `perExpert` bytes (flattened, same order as names)                |
+| `stream_moe.expert_branch_counts`      | per-layer branch count (non-uniform MoE layers)                              |
+| `stream_moe.chunk_no` / `chunk_total`  | strip index / total for v2 chunk                                             |
+| `stream_moe.chunk_slices`              | `[denseBlocks, blockSlices...]` per file - 4K-aligned strips this file holds |
+| `stream_moe.dense_global_section` (v3) | `[off, size]` - C2 global-dense area                                         |
+| `stream_moe.dense_layer_sections` (v3) | `[layer, off, size, ...]` - C1 per-layer dense areas                         |
+| `stream_moe.expert_meta_sections` (v3) | `[layer, off, size, ...]` - C4 per-layer expert-meta tables (may be empty)   |
 
 ## 3. Current gaps (loader vs converter)
 
@@ -76,6 +76,7 @@ input path(s)
 ```
 
 Per-format DIO profile:
+
 - **original**: 3 reads/expert, each into an 8K-padded staging buffer (front+back
   padding, size+2*4096), then memcpy to slot. Aligned to 4K for DIO.
 - **v2**: 1 async DIO whole-block straight into slot.

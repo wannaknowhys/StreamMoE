@@ -50,6 +50,7 @@ L0 gate_up 输出，token 0，专家列（1408 floats）：
 ### 思路 2（最终采用）：直接驱动内核
 
 在 `repack.cpp` 暴露辅助函数：
+
 1. 分配 repack buffer（`ggml_backend_buft_alloc_buffer`），设 `t->buffer/data/extra`，用 `traits->repack(...)` 重打包（必须与内核匹配，见下）；
 2. 在栈上构造 `ggml_tensor`（src0/src1/ids/op，显式 ne/nb/data）、`ggml_compute_params`（wdata/wsize、threadpool、ith=0、nth=1），然后调 `((tensor_traits*)src0->extra)->compute_forward(&params, &op)`。
 

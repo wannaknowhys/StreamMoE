@@ -34,12 +34,12 @@ the same style as `--moe-expert-pools`, with four rules:
 
 From `docs/STREAMMOE_GGUF_FORMAT.md` §3.1/§3.1 table (measured):
 
-| Class | Meaning | deepseek4 (43 layers / 256 experts) | gemma4 (30 / 128) |
-| :-- | :-- | :-- | :-- |
-| C1 | per-layer dense (`blk.N.*` non-expert: attn, norms, dense ffn, router, shexp, indexer/hc) | 9920.6 MB total, 209.0-245.6 MB/layer | 1711.2 MB, 54.6-69.2 MB/layer |
-| C2 | global dense (non `blk.*`: `token_embd`, `output`, `output_norm`, `rope_freqs`, `output_hc_*`) | 2020.3 MB | 748.0 MB |
-| C3 | per-expert (`_exps.weight`, `ne[2]==n_expert`) | 137.1 GB (12.8 MB/expert) | 13.4 GB |
-| C4 | closure-used non-per-expert small table (gemma `_exps.scale`) | empty | 15 KB |
+| Class | Meaning                                                                                        | deepseek4 (43 layers / 256 experts)   | gemma4 (30 / 128)             |
+| :---- | :--------------------------------------------------------------------------------------------- | :------------------------------------ | :---------------------------- |
+| C1    | per-layer dense (`blk.N.*` non-expert: attn, norms, dense ffn, router, shexp, indexer/hc)      | 9920.6 MB total, 209.0-245.6 MB/layer | 1711.2 MB, 54.6-69.2 MB/layer |
+| C2    | global dense (non `blk.*`: `token_embd`, `output`, `output_norm`, `rope_freqs`, `output_hc_*`) | 2020.3 MB                             | 748.0 MB                      |
+| C3    | per-expert (`_exps.weight`, `ne[2]==n_expert`)                                                 | 137.1 GB (12.8 MB/expert)             | 13.4 GB                       |
+| C4    | closure-used non-per-expert small table (gemma `_exps.scale`)                                  | empty                                 | 15 KB                         |
 
 **Key fact**: deepseek C1+C2 = 11940.9 MB ~= 11.66 GiB, which fits in 128 GiB
 RAM. Dense streaming is therefore **not** a capacity necessity for RAM; it is a
@@ -188,11 +188,11 @@ automatically (`offload_kqv`).
 
 ## 6. Capacity math (deepseek4)
 
-| Config | Capacity | C1+C2 = 11.66 GB fits? | Notes |
-| :-- | :-- | :-- | :-- |
-| P100 16G alone | ~15.5 GB usable | **yes** | ~3.8 GB spare for KV + small expert pool |
-| RX590 8G alone | ~7 GB usable | **no** | C2 (2.02 GB) + ~20 C1 layers, or all to expert pool |
-| RX590 8G + P100 16G | ~24 GB | **yes, easily** | put all dense on P100, 590 for expert pool |
+| Config              | Capacity        | C1+C2 = 11.66 GB fits? | Notes                                               |
+| :------------------ | :-------------- | :--------------------- | :-------------------------------------------------- |
+| P100 16G alone      | ~15.5 GB usable | **yes**                | ~3.8 GB spare for KV + small expert pool            |
+| RX590 8G alone      | ~7 GB usable    | **no**                 | C2 (2.02 GB) + ~20 C1 layers, or all to expert pool |
+| RX590 8G + P100 16G | ~24 GB          | **yes, easily**        | put all dense on P100, 590 for expert pool          |
 
 Once a P100 16G is available, **all dense should be statically resident on it**
 (HBM2 ~732 GB/s vs PCIe 21 GB/s), which removes the dense bottleneck from both
@@ -201,12 +201,12 @@ prefill and decode. Dynamic migration then only matters when dense does not fit
 
 KV budget on P100 (deepseek MLA, ~1.15 KB/token/layer x 43 ~= 49.5 KB/token):
 
-| Context | KV | C1+C2+KV | Spare of 15.5 GB |
-| --: | --: | --: | --: |
-| 4k | 0.20 GB | 11.86 GB | ~3.6 GB |
-| 32k | 1.62 GB | 13.28 GB | ~2.2 GB |
-| 64k | 3.24 GB | 14.90 GB | ~0.6 GB |
-| 128k | 6.48 GB | 18.14 GB | does not fit |
+| Context |      KV | C1+C2+KV | Spare of 15.5 GB |
+| ------: | ------: | -------: | ---------------: |
+|      4k | 0.20 GB | 11.86 GB |          ~3.6 GB |
+|     32k | 1.62 GB | 13.28 GB |          ~2.2 GB |
+|     64k | 3.24 GB | 14.90 GB |          ~0.6 GB |
+|    128k | 6.48 GB | 18.14 GB |     does not fit |
 
 Pascal caveat: P100 is CC 6.0 with no tensor cores and no display output; verify
 ggml-vulkan runs `MUL_MAT_ID` and the quantized kernels on it, and keep a display

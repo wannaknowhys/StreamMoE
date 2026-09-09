@@ -34,9 +34,9 @@
 桶源变为 **`mix_plan_t.rounds`**（`build_mix_plan`，backend/mix_split.h）：每个 round 是
 真 token 子集桶：
 
-- `r.ids`        = 专家 id，llama 布局 `[w_b, n_active]`（`r.ids[a*w_b+s]`），
+- `r.ids` = 专家 id，llama 布局 `[w_b, n_active]`（`r.ids[a*w_b+s]`），
   `w_b = r.width`，`n_active = r.n_active`。
-- `r.scatter`    = 每 `(a,s)` 列对应的原 `(t, k)`。
+- `r.scatter` = 每 `(a,s)` 列对应的原 `(t, k)`。
 - pool（device）= `r.pool`。
 
 `round.scatter[a*w_b].t` = active 列 a 的原 token → 这就是喂给 `build_scatter_plan` 的 `t`。
@@ -113,6 +113,7 @@ build.bat）。它是一次性验证码——子集路径验证完即删。不�
 离线 UT。
 
 分桶形状：两轴都切，才能打到任意 (t,k)：
+
 - k 轴按奇偶 → 非连续 k 的 round（n_k 为偶数时是合法矩形：每 token 贡献 n_k/2）；
 - token 轴按奇偶 → token 子集 + scatter delta > 1；
 - 叠加 → 4 个 round，每个 `width = n_k/2, n_active = n_t/2`，`(t,k)` 任意。
@@ -122,7 +123,7 @@ build.bat）。它是一次性验证码——子集路径验证完即删。不�
 ## 4. 执行器改动草图（exec_layer_burst_chain_buckets）
 
 - 默认 round 列表 = `build_mix_plan(ids, n_k, n_t, expert_pool, n_expert,
-  n_pools).rounds`，`expert_pool[e] = handle.pool` 由已 pin 的 handle 填
+n_pools).rounds`，`expert_pool[e] = handle.pool` 由已 pin 的 handle 填
   （`pin_layer` 本就返回 per-expert pool）。单 RAM 池 = 一个满 round（退化，与今天默认
   单桶逐字节一致）。
 - 宏门控的强制分桶替换该列表。

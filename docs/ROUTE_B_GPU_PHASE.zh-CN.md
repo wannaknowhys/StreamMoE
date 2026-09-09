@@ -64,6 +64,7 @@ MoE 执行**不是**在 llama 图上逐节点：stream_moe backend 在 `graph_co
 ### 3.2 为什么整层落一个 split（sched 机制，已查证）
 
 ggml-backend-sched（`ggml/src/ggml-backend.cpp`）按连续 backend 切分：
+
 - **pass1-4（backend 分配）**：有权重节点跟权重 buffer backend；无权重节点向相邻扩展
   （GPU 优先、CPU 最低），`supports_op` 把关。view/reshape/transpose 有**确定性规则**
   （pass4：view 永远跟 `view_src` 同 backend）。

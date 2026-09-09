@@ -33,8 +33,8 @@ User's target shape:
      alternating result buffers) is enough;
    - long-range (a producer read many nodes later, e.g. compute#4 reads
      compute#1): needs a larger set or an interval-allocated buffer.
-   The analysis must be a DEBUG DUMP + `exit 0` first (print each result's
-   free/last-use + the dependency graph), THEN decide the allocator.
+     The analysis must be a DEBUG DUMP + `exit 0` first (print each result's
+     free/last-use + the dependency graph), THEN decide the allocator.
 3. **Per-device whole chain to the closure exit**: each device that holds active
    experts runs its OWN column mini-graph ALL THE WAY to the per-expert
    contribution / closure output - not "mm on GPU, then read back for the
@@ -64,9 +64,10 @@ Landed: `moe_chain_assign_backend` now computes a node-level interval layout for
 every layer (always, not debug): per result take the LAST reader index
 (last_use), then greedy first-fit in exec order - a node reuses a slot whose
 occupant died (last_use < current index). Output `moe_layer_exec_t.out_off[i]`
-+ `result_bytes` + `layout_ok`; exec `hide_burst` writes compute[i]'s output to
-`out_off[i]` (per-node bump fallback when no layout). Verified: gemma + deepseek
-run IDENTICAL to the CPU baseline; `STREAM_MOE_CAP_DUMP` prints the layout.
+
+- `result_bytes` + `layout_ok`; exec `hide_burst` writes compute[i]'s output to
+  `out_off[i]` (per-node bump fallback when no layout). Verified: gemma + deepseek
+  run IDENTICAL to the CPU baseline; `STREAM_MOE_CAP_DUMP` prints the layout.
 
 **Layout scales with ubatch automatically**: layout lives in `g_layer_exec`,
 rebuilt by `moe_chain_assign_backend` on every graph REBUILD. llama's
@@ -80,6 +81,7 @@ tracking the batch the graph was built for. Slot TOPOLOGY (which nodes share a
 slot) is dependency-only; only slot BYTE sizes scale with ubatch.
 
 **Gap to ideal (measured, gemma 14 nodes/layer)**:
+
 - layout = 191488 B/layer vs full-alloc reference 417312 B (saves 54%).
 - 3 slots/layer: slot0 90112 B (gate_up 45K + down-mm 90K + weighted 90K),
   slot1 90112 B (geglu 22K + down_scaled 90K + 5 small ADD/scale nodes),
@@ -205,8 +207,8 @@ entirely on the device - reading per-expert contributions back to the host for t
 merge is too expensive to run. Main-graph tensors are never mutated (a b4-2 crash:
 llama's scheduler keeps bookkeeping the mutated buffers after the burst).
 
-The builder is fed a **per-layer node plan** that separates *what the graph is*
-from *where bytes go*:
+The builder is fed a **per-layer node plan** that separates _what the graph is_
+from _where bytes go_:
 
 ```cpp
 enum class moe_in_kind { k_chain, k_external };
@@ -301,6 +303,7 @@ Gap to the final design (per-device expert-column mini graphs, §1-§7). Items
 below, roughly in dependency order:
 
 **Analysis layer (verify/assign) - mostly landed, needs device-ization**
+
 - [x] closure collection + internal dependency/last-use + layout
       (best-fit out_off / result_bytes) - done (e6995dd, 488930f).
 - [ ] `moe_node_plan` (per-step in[prod+off] relative offsets) - layout covers
@@ -312,6 +315,7 @@ below, roughly in dependency order:
       ITS OWN columns (whole chain to the contribution), not just the mm.
 
 **Per-device arena (user decision 2026-09-05): NO per-device shrinking**
+
 - [ ] each device that participates in a layer allocates a FULL whole-layer
       result block (result_bytes from the existing best-fit layout) - NOT a
       per-device column-sliced arena. Reason: keep layout identical across
@@ -323,6 +327,7 @@ below, roughly in dependency order:
       buckets (columns), leaving other slices untouched (see executor items).
 
 **Executor resources**
+
 - [ ] per-device ping-pong / event tracking (async GPU must not let the next
       layer overwrite in-flight results - §3 sync discipline).
 - [ ] template instantiation at exec entry from verify product + THIS run's
@@ -332,6 +337,7 @@ below, roughly in dependency order:
       so the device reaches its contribution without host round-trips.
 
 **Async execution skeleton**
+
 - [ ] `exec_round_vk` -> async submit (`graph_compute_async`) + completion
       tracking instead of per-round sync + read back.
 - [ ] CPU/VK overlap: submit device graphs async, continue CPU columns on the
@@ -342,6 +348,7 @@ below, roughly in dependency order:
       (same §4.1 geometry, one block per device, not column-sliced).
 
 **Verification gates**
+
 - [ ] pure-device numeric gate once device execution lands (K6 shape; note GPU
       has no absolute fidelity vs CPU - validate structural equivalence, not
       byte identity, per BACKEND_DIVERGENCE_ANALYSIS.md §6).
@@ -349,6 +356,7 @@ below, roughly in dependency order:
       blocker (stmoe_vk_* symbols need ggml-vulkan at link, B33).
 
 **Profile (deferred, §6)**
+
 - [ ] profile ring + per-device completion timestamps; slot_request_t already
       carries total_tokens / start_rdtsc fields.
 
@@ -401,6 +409,7 @@ decisions, all confirmed:
    offset rescaling). Simple and uniform; not column-sliced per device.
 
 Downstream implications:
+
 - moe_out / the anonymous per-topk convergence adds are NOT run inside any
   bucket chain. In the multi-bucket shape the fixed llama ADD tree (built for
   contiguous per-token k) does not match the split k columns, so the fold is a
@@ -486,12 +495,13 @@ device's own output region.
 temp/bucket_acc_calib.js)**: the accumulator is CONSTRUCTIVELY identical to
 llama's linear per-k fold (k-order reference reproduces moe_out byte-for-byte,
 0 diff). Reordering the fold changes only float summation order:
+
 - `buckets 2+3+rest natural` (same-bucket k stays ascending) = 0 diff - real
   peel buckets that preserve in-bucket k order are EXACT;
 - any cross-bucket reorder / shuffle: maxAbs <= 7.6e-6 (~1 f32 ulp of the
   value scale), cos = 1.000000000, ~55% of elements differ by exactly 1 ulp;
 - per-token random shuffle worst case: maxAbs <= 3.8e-6.
-Gate to use downstream: **maxAbs <= 1e-5 (f32 1-2 ulp), cos ~= 1.0**.
+  Gate to use downstream: **maxAbs <= 1e-5 (f32 1-2 ulp), cos ~= 1.0**.
 
 ## 7.4 Landed: whole-layer clone graph on CPU (commit fa94ecb, 2026-09-06)
 
@@ -539,6 +549,7 @@ How it works (implementation details):
   column sets) is the next step on top of this builder.
 
 Key gotchas learned (why the earlier hide+append attempts failed):
+
 1. `ggml_build_forward_expand` follows src op nodes - every main-graph src must
    become a data leaf before it enters our graph.
 2. Manually stuffing `gf->nodes[]` without expand left the mm dst unwritten
@@ -563,6 +574,7 @@ Target shape for the multi-device / multi-bucket phase, building directly on the
 SS7.4 clone builder and the verified interval-layout-in-one-cgraph result:
 
 For EVERY device that has buckets:
+
 - **cur is copied (uploaded) to the device** - the CPU "reference llama's
   activation" trick is only safe inside llama's synchronous graph_compute frame
   for the single local device. Multi-device / async invalidates that window, so
@@ -590,11 +602,12 @@ cross-device write races (each (k,t) column belongs to exactly one device).
 **Contribution writeback MUST be device DMA async to host RAM, not host
 per-column memcpy reads** (user decision, v2r lesson: host memcpy of expert
 data was ~158 ms/expert vs ~1 ms via transfer-queue DMA through cached staging
+
 - see VRAM_DMA_MOVE.md). Design consequence: what crosses the boundary is the
-device's CONTIGUOUS contribution block (DMA-friendly bulk), and the fold into
-the accumulator happens on host RAM (fast) - DMA must not try to scatter single
-columns into accumulator rows (that would regress to the per-column slow path).
-The v2r cached-staging DMA channel is the transport.
+  device's CONTIGUOUS contribution block (DMA-friendly bulk), and the fold into
+  the accumulator happens on host RAM (fast) - DMA must not try to scatter single
+  columns into accumulator rows (that would regress to the per-column slow path).
+  The v2r cached-staging DMA channel is the transport.
 
 CPU phase cannot fake the DMA (principle 11): it validates the NUMERICS of
 compact bucket chains + accumulator folding against dumps/baselines; the DMA
@@ -654,10 +667,10 @@ transport itself is GPU-phase work only.
      the SPARSE form of the dense 0/1 selection-matrix multiply (which ggml
      cannot express sparsely and would cost d_out*n_active*n_t flops vs
      d_out*n_active for acc).
-   Constraint: one acc expresses one arithmetic-progression column map
-   `t = t0 + a*stride` (acc src1 may be 2D/3D so nb1/nb2/nb3 give an
-   arithmetic GRID); arbitrary-scattered token sets need one acc per
-   segment (inplace, chained on the same accumulator) or host fold.
+     Constraint: one acc expresses one arithmetic-progression column map
+     `t = t0 + a*stride` (acc src1 may be 2D/3D so nb1/nb2/nb3 give an
+     arithmetic GRID); arbitrary-scattered token sets need one acc per
+     segment (inplace, chained on the same accumulator) or host fold.
 
 ## 7.7 Reduction re-partition: the cross-device accumulator in reduction terms
 
@@ -677,6 +690,7 @@ acc_d[t]   = sum_{k in topk(t) ∩ device_d}  contrib(k, t)   // expert axis con
 ```
 
 Terminology:
+
 - **acc_d = per-device partial sum** (local accumulator, SS7.6.1). The expert /
   routed-expert axis is CONTRACTED (reduced away); the accumulator shape
   `[d_out, n_t]` is ISOMORPHIC to the anonymous-fold output - it is that fold's
@@ -698,6 +712,7 @@ numerics vs moe_out under the relaxed gate).
 Construction-time shape (after buckets are split, BEFORE the bucket loop):
 
 For EVERY device d that has buckets:
+
 - Build a **per-device accumulator** `acc_d[d_out, n_t]` = the device's expert-
   folded output (expert axis already contracted). `acc_d` is a DEVICE-side
   ordinary vk buffer.
@@ -706,10 +721,12 @@ For EVERY device d that has buckets:
   is the count of participating devices this batch).
 
 Then, per bucket of device d:
+
 - `append_expert_fold`: sum the CURRENT bucket's experts and ACCUMULATE into
   `acc_d` (`[d_out, n_t]`, expert width 1; in-place add across the bucket loop).
 
 Chain tail (after all of device d's buckets are folded into acc_d):
+
 - **One `ggml_backend_tensor_copy` (acc_d -> add_in[k])**: the cross-backend
   transfer from the device accumulator (vk buffer) into the RAM anonymous-add
   input slot. No hand-written DMA node is needed: ggml's cross-backend copy is
@@ -721,6 +738,7 @@ Chain tail (after all of device d's buckets are folded into acc_d):
   (dense on CPU) phase the final fold runs on HOST.
 
 Finally, the anonymous add:
+
 - Fold `add_in[device_used, d_out, n_t]` (sum over the device axis) ->
   `[d_out, n_t]` = the add result (moe_out-equivalent; the cross-device fold,
   re-partitioned per SS7.7: leaves go from experts to devices).
@@ -733,6 +751,7 @@ Finally, the anonymous add:
   dense PLACEMENT mechanics themselves stay in TODO.md stage 7.
 
 Slot-staleness (does a fixed add_in[k] slot leak garbage across batches?):
+
 - Yes, if a device participated last batch but not this one, its slot holds a
   stale partial sum and WOULD corrupt the final fold if read.
 - Cleanest fix (consistent with SS7.6.4 discipline): the final fold reads ONLY
@@ -758,8 +777,9 @@ accumulator `acc_d` crosses back to host.
 
 Per-target plumbing (`chain_ctx_t` gains a target: pool / backend / arena+stage
 buffers / host maps / bump offsets):
+
 - `bind_pool(t, sp, off)`: CPU `data = sp.base + off`; device `t->buffer =
-  sp.dev_buf`, `t->data = stmoe_vk_buffer_host_offset(sp.dev_buf, off)` (fake
+sp.dev_buf`, `t->data = stmoe_vk_buffer_host_offset(sp.dev_buf, off)` (fake
   base `vk_ptr_base + off`; the kernel derives `data - vk_ptr_base`).
 - `bind_arena(t, nbytes, use_layout)`: device arena at `ex->out_off[seq]`
   (twins) or a bump region (fold / gather scratch); CPU unchanged
@@ -779,6 +799,7 @@ Vulkan mm_id matches the SoA column stride (`stride_batch_x = ne00*ne01` when
 dim01 contiguous; SoA `col_stride = perExpert`), which is the K6 goal.
 
 Orchestration (per layer, inside the burst):
+
 1. build all target graphs (CPU + devices) in one round loop, switching target;
 2. submit each device graph async (`ggml_backend_graph_compute_async`);
 3. run the CPU graph on the calling thread (natural CPU/VK overlap);
@@ -810,6 +831,7 @@ graph binds the resident copy instead of staging it each build. Verified byte-id
 to the staging path (gemma RAM8G+Vulkan0:256M).
 
 Two hazards found (details in WORK_IN_PROGRESS O):
+
 - **vulkan ACC nb2/nb3 must not be 0.** `acc.comp` decomposes the src1 index via
   `src1_i / p.nb03 / p.nb02`; the CPU kernel ignores nb2/nb3 for a 2D src1. Pass
   the full-tensor stride (d_out*n_t*4), not 0, or the acc stays zero.

@@ -21,7 +21,7 @@
 2. **闭包内跨节点依赖图**（不是跨层——层间独立，Check1 已验证）。两种形态：
    - 链式/近邻（结果只被下一节点读）：乒乓（两块交替结果缓冲）够；
    - 长距（产者隔很多节点才被读，如 compute#4 读 compute#1）：需更大缓冲组或 interval 分配。
-   先做 **DEBUG DUMP + exit 0**（打印每个结果的 free/last-use + 依赖图），再决定分配器。
+     先做 **DEBUG DUMP + exit 0**（打印每个结果的 free/last-use + 依赖图），再决定分配器。
 3. **每设备整链算到闭包出口**：持有激活专家的每个设备把自己专家的**列 mini graph 一路算到
    per-expert 贡献/闭包出口**——不是"mm 在 GPU、再回读给 CPU 跑无权重链尾"。每设备算到最终出口。
 4. 缓冲尺寸 + 每步输入输出**相对偏移**由 verify 分析导出（执行期不猜）。产物 = `moe_node_plan`：
@@ -54,6 +54,7 @@ graph（布局不变，而 shape 未变故正确）。实测 12610-token prefill
 随 ubatch 缩放。
 
 **与理想差距（实测，gemma 14 节点/层）**：
+
 - layout = 191488 B/层 vs full-alloc 参照 417312 B（省 54%）。
 - 3 slot/层：slot0 90112B（gate_up 45K + down-mm 90K + weighted 90K）、slot1 90112B
   （geglu 22K + down_scaled 90K + 5 个小 ADD/scale 节点）、slot2 11264B（GET_ROWS 32B + 3 ADD）。
@@ -106,6 +107,7 @@ graph_compute 主线程沿用现有逐节点路径算；只有出口 merge 跨�
 vulkan 提交设备队列即返回；CPU 同步算完（自身图调用内多线程）。
 
 执行模型（最终形态）：
+
 - vram 设备 mini graph：`ggml_backend_graph_compute_async(vulkan, mini)`——一次提交，GPU 图内无需
   逐节点同步；
 - CPU pool 列：graph_compute 主线程算（不需要专门 CPU worker——CPU 工作本就在调用线程，
@@ -166,6 +168,7 @@ per-device arena、无设备侧整链。
 与最终设计（每设备专家列 mini graph，§1-§7）的差距，按依赖序列出：
 
 **分析层（verify/assign）——大多已落地，需设备化**
+
 - [x] 闭包收集 + 链内依赖/last-use + 布局（best-fit out_off/result_bytes）——完成（e6995dd, 488930f）。
 - [ ] `moe_node_plan`（每步 in[prod+off] 相对偏移）——布局只覆盖每节点 out 偏移；输入仍由执行器临时解析。
 - [ ] **每设备整链执行规划**：每设备拥有哪些专家 / contribution 列（mix_plan 的 pool 划分），
@@ -173,6 +176,7 @@ per-device arena、无设备侧整链。
       的列**跑完整节点链（算到 contribution），不只 mm。
 
 **Per-device arena（用户决策 2026-09-05：不做按设备收缩）**
+
 - [ ] 参与一层的每个设备各申请**一整层结果块**（现有 best-fit 布局的 result_bytes）——**不**
       按设备列切 arena。理由：各设备布局几何相同（同一 out_off[]）、简单统一；设备列只是运行
       时划分，只影响每设备实际填哪些切片，不影响块几何。成本 = 每参与设备一块整层 best-fit 块
@@ -180,12 +184,14 @@ per-device arena、无设备侧整链。
 - [ ] 桶执行：设备在自己块内**只算自己分到的桶（列）**，其余切片不动。
 
 **执行器资源**
+
 - [ ] per-device ping-pong / 事件跟踪（async GPU 不能让下一层覆写在飞结果，§3 同步纪律）。
 - [ ] 执行入口从 verify 产物 + 本次 pin 分布**实例化模板**（填 data/ids/偏移，不改结构）。
 - [ ] 每设备列执行：设备沿层内每个 compute 节点的**自己切片**走（同节点链、限自己列），
       设备侧直达 contribution，无 host 往返。
 
 **异步执行骨架**
+
 - [ ] `exec_round_vk` → 异步提交（`graph_compute_async`）+ 完成跟踪，取代每 round 同步+回读。
 - [ ] CPU/VK 重叠：设备图异步提交后主线继续算 CPU 列，层尾 converge。
 - [ ] converge 点：强制同步每设备，经 host map 读回 contribution，折进 moe_out（通用出口
@@ -193,12 +199,14 @@ per-device arena、无设备侧整链。
 - [ ] 每个参与设备各持自己的**整层结果块**（§4.1 几何，每设备一块，不按列切）。
 
 **验证门**
+
 - [ ] 设备执行落地后纯设备数值门（K6 形态；注意 GPU 对 CPU 无绝对还原——验证结构等价而非字节
       一致，见 BACKEND_DIVERGENCE_ANALYSIS.md §6）。
 - [ ] M8 UT（布局自检、设备规划、merge）——test 链接问题是 blocker（stmoe_vk_* 符号需
       ggml-vulkan 链接，B33）。
 
 **profile（延后，§6）**
+
 - [ ] profile ring + 每设备完成时间戳；slot_request_t 已带 total_tokens/start_rdtsc 字段。
 
 建议下一步：让每个参与设备**用自己的桶（列）把整节点链算进自己的整层结果块**（同一 best-fit
@@ -229,6 +237,7 @@ sim.js 可验证），再在其上加异步骨架。
    且跨设备几何逐字节一致（同一 `out_off[]`，无需按设备重算偏移）。简单统一，不做按设备列切片。
 
 下游推论：
+
 - moe_out / 匿名 per-topk 收敛 ADD **不放进任何桶链内跑**。多桶形态下 llama 那棵固定 ADD 树
   （按每 token k 连续搭的）对不上被拆散的 k 列，所以折叠是**汇聚步骤**：按原始 (t,k) 映射 gather
   各设备贡献列、加进外部 dst（§2.1/§5 的私有化汇聚图，phase 2）。CPU phase 1 安全恰恰因为
@@ -248,6 +257,7 @@ sim.js 可验证），再在其上加异步骨架。
 贡献列与它是**同构计算**——只差顺序（桶序 vs k 序），落在已接受的宽松 gate 内。
 
 exec-time 流程（一层 burst）：
+
 1. **入口**（层首个私有 split）触发 burst：
    - pin_layer 整层激活专家（现有 M5 单程）→ 之后每专家所属 pool/device 已知；
    - 按 (token,pool) 命中数 peel 算桶；计划**算一次**、跨层内各 mm 复用（同 ids）；
@@ -266,6 +276,7 @@ device 的桶链喂进该 device **自己的**累加器（= §7.2 输出区）�
 累加器 merge。无需二次设计。
 
 per-device 资源生命周期（arena + 累加器）——用户确认：可常驻可复用，无逐层释放：
+
 - **per-device arena**（verify 布局 `out_off[]`/`result_bytes`）：进程常驻、grow-only，跨层靠
   offset 归零（`reset_layer`）+ 覆盖复用——与现在 `g_fullalloc_buf` 同模式。复用安全只因层结束
   = 全同步（graph_compute 在 converge 后返回）。释放点 = 设备销毁/进程退出。
@@ -281,11 +292,12 @@ per-device 资源生命周期（arena + 累加器）——用户确认：可常�
 **宽松 gate 标定（2026-09-06 实测，129-token gemma L0 dump，temp/bucket_acc_calib.js）**：
 累加器与 llama 线性逐 k 折叠**构造性等价**（k 序参考逐字节复现 moe_out，0 差）。重排折叠序只
 改浮点求和顺序：
+
 - `buckets 2+3+rest natural`（同桶内 k 保持升序）= 0 差——真实 peel 桶若保持桶内 k 序则**精确**；
 - 任意跨桶重排/shuffle：maxAbs ≤ 7.6e-6（值尺度约 1 f32 ulp），cos = 1.000000000，~55% 元素恰差
   1 ulp；
 - per-token 全随机 shuffle 最坏情形：maxAbs ≤ 3.8e-6。
-后续数值门建议用：**maxAbs ≤ 1e-5（f32 1-2 ulp），cos ≈ 1.0**。
+  后续数值门建议用：**maxAbs ≤ 1e-5（f32 1-2 ulp），cos ≈ 1.0**。
 
 ## 7.4 已落地：CPU 整层 clone 图（commit fa94ecb，2026-09-06）
 
@@ -318,6 +330,7 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
   device 列集）是在此 builder 之上的下一步。
 
 踩坑记录（此前 hide+append 尝试失败的根因）：
+
 1. `ggml_build_forward_expand` 会追 src op 节点——主图 src 必须先变成 data leaf 才能进我们的图。
 2. 手动塞 `gf->nodes[]` 不 expand 会让 mm dst 没被写（全 0）；节点必须经 build_forward_expand
    （或等价）注册 CPU plan 才执行。
@@ -336,6 +349,7 @@ env `STREAM_MOE_TMP_CHAIN_GRAPH`（仅 STREAM_MOE_TEMP 构建）在 `exec_layer_
 之上：
 
 对**每个有桶的 device**：
+
 - **cur 拷贝上传到 device**——CPU "引用 llama 激活"的技巧只在 llama 同步 graph_compute 帧内、对
   单个本地 device 安全。多 device / async 使该窗口失效，所以每个 device 在自己的 staging buffer
   上拿一份 cur。CPU 阶段保持引用形态不变。
@@ -396,21 +410,26 @@ CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器
      `nb1 = 列跨度 × d_out × esize`、offset 定起点。所以定步长/连续的 scatter-add 是**单个 acc 节点**——
      这是稠密 0/1 选择矩阵乘的**稀疏形式**（ggml 无法稀疏表达，稠密要 d_out×n_active×n_t flops，
      acc 只要 d_out×n_active）。
-   约束：单个 acc 表达一个**等差列映射** `t = t0 + a·stride`（acc 的 src1 可 2D/3D，nb1/nb2/nb3 给出
-   等差**网格**）；任意散列 token 集需要每段一个 acc（inplace、链在同一个累加器上）或 host 折叠。
+     约束：单个 acc 表达一个**等差列映射** `t = t0 + a·stride`（acc 的 src1 可 2D/3D，nb1/nb2/nb3 给出
+     等差**网格**）；任意散列 token 集需要每段一个 acc（inplace、链在同一个累加器上）或 host 折叠。
 
 ## 7.7 归约重分组：用归约术语表述跨 device 累加器
 
 匿名 per-token 跨专家折叠 = 对每 token 在其路由专家上做归约（llama-graph.cpp 2274-2304）：
+
 ```
 moe_out[t] = Σ_{k ∈ topk(t)}  contrib(k, t)        // 归约域 = 专家
 ```
+
 多 device 靠结合律重排同一归约（只差浮点求和顺序——宽松 gate，§7.3）：
+
 ```
 moe_out[t] = Σ_{d ∈ devices}  acc_d[t]
 acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收缩
 ```
+
 术语：
+
 - **acc_d = per-device 部分和**（局部累加器，§7.6.1）。专家/路由轴被**收缩（reduce away）**；累加器形状
   `[d_out, n_t]` 与匿名折叠输出**同构**——它是该折叠在单 device 上的**部分归约结果**。
 - 整体 = **两阶段/分层归约（two-stage / hierarchical reduction）**：stage 1 = device 图尾对该 device
@@ -426,16 +445,19 @@ acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收
 构造期形态（分完桶之后、**桶循环之前**）：
 
 对**每个有桶的 device d**：
+
 - 建 **per-device 累加器 `acc_d[d_out, n_t]`** = 该 device 的专家折叠输出（专家轴已收缩）。`acc_d`
   是 **device 端普通 vk buffer**。
 - 在 RAM 建 `add_in[device_used, d_out, n_t]` = **匿名 add 的输入**：每 device 一个槽
   `[d_out, n_t]`（索引 k = device ordinal；device_used = 本次参与 device 数）。
 
 然后对 device d 的每个桶：
+
 - `append_expert_fold`：把**当前桶**的专家求和并**累加进 `acc_d`**（`[d_out, n_t]`、专家宽 1；桶循环内
   in-place 累加）。
 
 链尾（device d 的全部桶折进 acc_d 之后）：
+
 - **一次 `ggml_backend_tensor_copy(acc_d → add_in[k])`**：从 device 累加器（vk buffer）到 RAM
   匿名 add 输入槽的**跨 backend 传输**。**无需手写 DMA 节点**——ggml 的跨 backend copy 就是传输
   通道：`ggml_backend_tensor_copy` 的 device→host 归边走 `tensor_get` → vulkan
@@ -444,6 +466,7 @@ acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收
   当前 RAM-pool（dense 在 CPU）阶段，最终 fold 在 **HOST** 跑。
 
 最后，匿名 add：
+
 - 折叠 `add_in[device_used, d_out, n_t]`（沿 device 轴求和）→ `[d_out, n_t]` = add 结果
   （moe_out 等价；跨 device 折叠，§7.7 归约重分组：叶从专家变 device）。
 - **TODO（未来）**：dense 进 vram / no-RAM-pool 路径（TODO.md 阶段 7 与 M2 dense-offload 注）后，
@@ -452,6 +475,7 @@ acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收
   执行结构演化；dense 放置**机制本身**留在 TODO.md 阶段 7。
 
 **槽滞留（固定 add_in[k] 槽跨 batch 会不会留垃圾？）**：
+
 - 会——若某 device 上批参与、本批未参与，其槽残留旧部分和，若被最终 fold 读到就污染。
 - 最干净的修法（与 §7.6.4 纪律一致）：最终 fold **只读本批参与 device 的槽**（fold 遍历每批参与
   集合/位图），垃圾槽永不读 → 无需清零。替代：每批 fold 前整块 memset add_in，或只清未参与槽。

@@ -6,6 +6,7 @@
 > 依据：ggml-org/ggml `docs/gguf.md`（`general.alignment` 可设 4096；`tensor_data` 是 arbitrary binary data、tensor 由显式 offset 定位、offset 必须 ALIGNMENT 倍数；社区 KV namespaced）。
 >
 > **关键结论**：GGUF 张量没有 stride/切片语义（`gguf_tensor_info_t` 只有 name/ne/type/offset，数据必须连续）——"专家物理连续"与"原版可读"**不可兼得**。因此：
+>
 > - **v1 = GGUF 超集（兼容，原版可读）**：每分支张量连续，dense/expert 分区。**已废弃**（见下）。
 > - **v2 = expert-blocks（自有格式，原版不可读）**：每专家一个紧凑块，一次 DIO 装载。旧格式。
 > - **v3 = 按闭包四分类（目标格式，2026-09）**：C1 dense 按层 / C2 dense 与层无关 / C3 每专家 / C4 专家小表，各占一个 section（见 §3）。
@@ -49,6 +50,7 @@ GGUF v3
 ### 1.3 布局（专家三分支分散）
 
 每层三个 3D 张量各占一块连续（`gate_up[128]` → `down[128]` → `scale[128]`，层内相邻）：
+
 - 专家 e 的 gate_up 在 gate_up 块 `e*size`，down 在 down 块，scale 在 scale 块——**三分支分散**。
 - 装载专家 e = **3 次独立 DIO**（三个分支各自 4K 对齐位置）。
 
@@ -150,35 +152,35 @@ GGUF v3（复用 header/KV/tensor_infos，但 tensor_data 语义变）
 锚点（权重名含 `_exps` 且不含 `_shexp`）沿消费者前向 BFS 到 `ffn_moe_out`；gating 段
 `ffn_moe_logits`/`probs`/`argsort`/`topk`/`weights` 留在 dense 侧，不进闭包）。
 
-| 类 | 名称 | 判据 | 基数 | 跨设备策略 |
-| :-- | :-- | :-- | :-- | :-- |
-| C1 | dense 按层 | 不被闭包消费 + `blk.N.*` | 每层一组 | 按层 DIO/预取，层后驱逐 |
-| C2 | dense 与层无关 | 不被闭包消费 + 非 `blk.*` | 全局一个 | 一次载入，永久常驻 |
-| C3 | 每专家独立 | 被闭包消费 + 按专家切片（`_exps.weight`，`ne[2] == n_expert`） | 每专家一块 | 专家池（SoA 列），跨设备分片读取 |
-| C4 | 专家不按每专家 | 被闭包消费 + 非按专家切片（小表） | 每层一组 | 每设备复制一份（广播） |
+| 类  | 名称           | 判据                                                           | 基数       | 跨设备策略                       |
+| :-- | :------------- | :------------------------------------------------------------- | :--------- | :------------------------------- |
+| C1  | dense 按层     | 不被闭包消费 + `blk.N.*`                                       | 每层一组   | 按层 DIO/预取，层后驱逐          |
+| C2  | dense 与层无关 | 不被闭包消费 + 非 `blk.*`                                      | 全局一个   | 一次载入，永久常驻               |
+| C3  | 每专家独立     | 被闭包消费 + 按专家切片（`_exps.weight`，`ne[2] == n_expert`） | 每专家一块 | 专家池（SoA 列），跨设备分片读取 |
+| C4  | 专家不按每专家 | 被闭包消费 + 非按专家切片（小表）                              | 每层一组   | 每设备复制一份（广播）           |
 
 **实测归属**（gemma4 / deepseek4）：
 
-| 张量 | 类 | 说明 |
-| :-- | :-- | :-- |
-| `token_embd` / `output` / `output_norm` / `rope_freqs` / `output_hc_*` | C2 | 每 token 必用，常驻 |
-| `attn_*` / `ffn_norm` / dense `ffn_gate/up/down` / `hc_*` / `indexer*` | C1 | 逐层 |
-| `ffn_gate_inp`（router） | C1 | 每层一个；输出 `ffn_moe_logits` 属 gating 段，不在闭包 |
-| `ffn_{gate,up,down}_shexp` | C1 | 每层一个；普通 `MUL_MAT`（`_shexp` 不含 `_exps`），不在闭包 |
-| `ffn_*_exps.weight` | C3 | 专家池 |
-| `ffn_down_exps.scale`（gemma） | C4 | 闭包 REPEAT/GET_ROWS 消费，512 B/层 |
-| deepseek | C4 = 空 | 无 `_exps.scale`；`exp_probs_b` / `tid2eid` 属 gating，归 C1 |
+| 张量                                                                   | 类      | 说明                                                         |
+| :--------------------------------------------------------------------- | :------ | :----------------------------------------------------------- |
+| `token_embd` / `output` / `output_norm` / `rope_freqs` / `output_hc_*` | C2      | 每 token 必用，常驻                                          |
+| `attn_*` / `ffn_norm` / dense `ffn_gate/up/down` / `hc_*` / `indexer*` | C1      | 逐层                                                         |
+| `ffn_gate_inp`（router）                                               | C1      | 每层一个；输出 `ffn_moe_logits` 属 gating 段，不在闭包       |
+| `ffn_{gate,up,down}_shexp`                                             | C1      | 每层一个；普通 `MUL_MAT`（`_shexp` 不含 `_exps`），不在闭包  |
+| `ffn_*_exps.weight`                                                    | C3      | 专家池                                                       |
+| `ffn_down_exps.scale`（gemma）                                         | C4      | 闭包 REPEAT/GET_ROWS 消费，512 B/层                          |
+| deepseek                                                               | C4 = 空 | 无 `_exps.scale`；`exp_probs_b` / `tid2eid` 属 gating，归 C1 |
 
 > 关键结论：**两个模型都不存在"大的、被闭包消费、但非每专家"的张量**。大的要么是 C3（专家池），
 > 要么不被闭包消费（C1/C2）。C4 只有"闭包消费的、按专家索引的小表"，目前仅 gemma 的 scale
 > （512 B/层，30 层共 15 KB）。实测体积见下表。
 
-| 类 | gemma4（30 层 / 128 专家） | deepseek4（43 层 / 256 专家） |
-| :-- | :-- | :-- |
-| C2 全局 | 748.0 MB | 2020.3 MB |
-| C1 按层（含 router） | 1711.2 MB（54.6~69.2 MB/层） | 9920.6 MB（209.0~245.6 MB/层） |
-| C3 每专家 | 3.5 MB/专家（末层 4.1），总 13.4 GB | 12.8 MB/专家，总 137.1 GB |
-| C4 专家小表 | 15 KB | 空 |
+| 类                   | gemma4（30 层 / 128 专家）          | deepseek4（43 层 / 256 专家）  |
+| :------------------- | :---------------------------------- | :----------------------------- |
+| C2 全局              | 748.0 MB                            | 2020.3 MB                      |
+| C1 按层（含 router） | 1711.2 MB（54.6~69.2 MB/层）        | 9920.6 MB（209.0~245.6 MB/层） |
+| C3 每专家            | 3.5 MB/专家（末层 4.1），总 13.4 GB | 12.8 MB/专家，总 137.1 GB      |
+| C4 专家小表          | 15 KB                               | 空                             |
 
 ### 3.2 物理布局
 
@@ -216,12 +218,12 @@ GGUF v3
 
 转换器不能跑图，用与闭包一致的名字/结构规则代理：
 
-| 类 | 规则 |
-| :-- | :-- |
-| C2 | 名字不以 `blk.` 开头 |
-| C3 | `blk.*_exps.weight` 且 `ne[2] == n_expert`（否则报错，不静默切片） |
-| C4 | `blk.*_exps.*` 非 `.weight`（专家索引小表，如 `.scale`） |
-| C1 | 其余 `blk.*` |
+| 类  | 规则                                                               |
+| :-- | :----------------------------------------------------------------- |
+| C2  | 名字不以 `blk.` 开头                                               |
+| C3  | `blk.*_exps.weight` 且 `ne[2] == n_expert`（否则报错，不静默切片） |
+| C4  | `blk.*_exps.*` 非 `.weight`（专家索引小表，如 `.scale`）           |
+| C1  | 其余 `blk.*`                                                       |
 
 > 注意：router（`ffn_gate_inp`）与 shexp（`ffn_*_shexp`）都不含 `_exps`，天然落 C1；`_shexp` 的
 > 子串是 `_shexp` 而非 `_exps`，不会被误判进 C3/C4。
@@ -269,13 +271,13 @@ v3 → v2 把三段合回一段。
 
 ## 6. 收益与代价
 
-|  | v2（expert-blocks） | v3（四类 section） |
-| :--- | :--- | :--- |
-| 原版可读 | ❌ | ❌ |
-| dense 整段读 | ✅ | ✅（C2/C1/C4 三段，各按策略） |
-| 专家 DIO | 1 次/专家（紧凑块） | 1 次/专家（同 v2） |
-| 异构支持 | ✅（块大小独立） | ✅ |
-| 生态 | 自研 | 自研 |
+|              | v2（expert-blocks） | v3（四类 section）            |
+| :----------- | :------------------ | :---------------------------- |
+| 原版可读     | ❌                  | ❌                            |
+| dense 整段读 | ✅                  | ✅（C2/C1/C4 三段，各按策略） |
+| 专家 DIO     | 1 次/专家（紧凑块） | 1 次/专家（同 v2）            |
+| 异构支持     | ✅（块大小独立）    | ✅                            |
+| 生态         | 自研                | 自研                          |
 
 ---
 
@@ -370,21 +372,21 @@ struct src_seg_t { uint32_t file; uint64_t off, len, in_off; };
 
 ### 10.2 解析器（各格式 → `model_t`，`parse_model`）
 
-| 源格式 | 解析 |
-| :--- | :--- |
+| 源格式          | 解析                                                                                                                |
+| :-------------- | :------------------------------------------------------------------------------------------------------------------ |
 | 官方分片 / 原版 | 张量列表 → dense/expert（`_exps.weight` 且 `ne[2]==n_expert`）→ `src` = file+off+size；`split.count>1` 自动合并分片 |
-| v2 | `expert_sections` + `expert_branch_*` → 每专家块拆出分支区间 |
-| v2chunk | `chunk_slices` → 区间 × 各文件条带求交 → 多段 `src`（全部 N 文件同时传入） |
-| v3 | 同 v2 + `dense_global_section` / `dense_layer_sections` / `expert_meta_sections`；dense 按 category 分类 |
-| v3chunk | 同 v3 + `chunk_slices`（unit = [global] + [C1 层] + [C4 层] + [block]）→ 多段 `src` |
+| v2              | `expert_sections` + `expert_branch_*` → 每专家块拆出分支区间                                                        |
+| v2chunk         | `chunk_slices` → 区间 × 各文件条带求交 → 多段 `src`（全部 N 文件同时传入）                                          |
+| v3              | 同 v2 + `dense_global_section` / `dense_layer_sections` / `expert_meta_sections`；dense 按 category 分类            |
+| v3chunk         | 同 v3 + `chunk_slices`（unit = [global] + [C1 层] + [C4 层] + [block]）→ 多段 `src`                                 |
 
 ### 10.3 写入器（`model_t` → 各格式，`src/convert/writer.cpp`）
 
-| 目标 | 写入 |
-| :--- | :--- |
-| v2 | 源顺序 dense + 每专家块（`branch_align=1`）→ 分支间/块尾 0 填充 |
-| v3 | C2/C1/C4/C3 四段 + 各自 offset 表 |
-| v3chunk | 每 unit 按 4K base/rem 切 N 份 → 逐条带 copy + 补零 |
+| 目标    | 写入                                                            |
+| :------ | :-------------------------------------------------------------- |
+| v2      | 源顺序 dense + 每专家块（`branch_align=1`）→ 分支间/块尾 0 填充 |
+| v3      | C2/C1/C4/C3 四段 + 各自 offset 表                               |
+| v3chunk | 每 unit 按 4K base/rem 切 N 份 → 逐条带 copy + 补零             |
 
 ### 10.4 矩阵不变量（`scripts/verify_convert_matrix.bat`）
 

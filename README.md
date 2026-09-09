@@ -43,22 +43,24 @@ Project layout, build sub-path pattern, and test/result archiving conventions: [
 
 Upstream tool migration plan (route B as a plugin): [`docs/UPSTREAM_TOOLS_MIGRATION.md`](docs/UPSTREAM_TOOLS_MIGRATION.md).
 
-| Binary | Description | Status |
-| :--- | :--- | :--- |
-| **`build/main/llama-build/bin/llama-cli.exe`** | Upstream CLI + route B plugin (interactive REPL / single-shot prompt) | **Ready** |
-| **`build/main/llama-build/bin/llama-server.exe`** | Upstream OpenAI-compatible HTTP/SSE server + route B plugin | **Ready** |
-| **`build/main/bin/stream_moe_convert.exe`** | 4KB sector-aligned zero-copy GGUF optimizer (`stream_moe_convert`) | Planned |
-| **`build/main/bin/stream_moe_bench.exe`** | Multi-dimensional MoE benchmark suite | Planned |
+| Binary                                            | Description                                                           | Status    |
+| :------------------------------------------------ | :-------------------------------------------------------------------- | :-------- |
+| **`build/main/llama-build/bin/llama-cli.exe`**    | Upstream CLI + route B plugin (interactive REPL / single-shot prompt) | **Ready** |
+| **`build/main/llama-build/bin/llama-server.exe`** | Upstream OpenAI-compatible HTTP/SSE server + route B plugin           | **Ready** |
+| **`build/main/bin/stream_moe_convert.exe`**       | 4KB sector-aligned zero-copy GGUF optimizer (`stream_moe_convert`)    | Planned   |
+| **`build/main/bin/stream_moe_bench.exe`**         | Multi-dimensional MoE benchmark suite                                 | Planned   |
 
 ---
 
 ## Build & Test Instructions
 
 ### Prerequisites
+
 - Clang / LLVM (or MSVC / GCC) supporting C++17 and OpenMP
 - Windows (PowerShell / `cmd`) or Linux / POSIX
 
 ### Windows Build
+
 ```powershell
 # Build vendored libllama + upstream llama-cli/llama-server (route B plugin linked in)
 .\build.bat llamalibs main
@@ -72,6 +74,7 @@ Upstream tool migration plan (route B as a plugin): [`docs/UPSTREAM_TOOLS_MIGRAT
 ```
 
 ### Linux Build
+
 ```bash
 make test
 ```
@@ -83,10 +86,11 @@ make test
 > Both binaries are the upstream `llama-cli` / `llama-server` with the route B
 > plugin injected. Enable the expert pool with `--expert-backend`; without it
 > the model runs in stock llama.cpp mode. MoE models should add `--fit off
-> --no-warmup` (skip the empty startup forward pass so boot does not cold-read
+--no-warmup` (skip the empty startup forward pass so boot does not cold-read
 > experts from disk).
 
 ### 1. Interactive Multi-Turn CLI Mode
+
 ```powershell
 # Launch interactive REPL with a 70 GB expert pool and 16 physical cores
 build\main\llama-build\bin\llama-cli.exe `
@@ -98,6 +102,7 @@ build\main\llama-build\bin\llama-cli.exe `
 ```
 
 ### 2. OpenAI-Compatible API Server Mode
+
 ```powershell
 # Start HTTP/SSE API server on port 8080
 build\main\llama-build\bin\llama-server.exe `
@@ -109,6 +114,7 @@ build\main\llama-build\bin\llama-server.exe `
 ```
 
 #### API Endpoints (upstream llama-server)
+
 - `POST /v1/chat/completions` (OpenAI format, supports `"stream": true`)
 - `POST /v1/completions`
 - `GET /v1/models`
@@ -118,4 +124,5 @@ build\main\llama-build\bin\llama-server.exe `
 ---
 
 ## License
+
 MIT License.

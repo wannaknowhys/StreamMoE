@@ -5,10 +5,10 @@
 StreamMoE targets **agentic / long-reasoning use**; the following follow the
 DeepSeek official deployment guidance:
 
-| Scenario | temperature | top_p | max output length |
-| :--- | :--- | :--- | :--- |
-| Agentic / tool-use / long reasoning | **1.0** | **0.95** | high/max effort: **384K tokens** |
-| Non-agentic (plain chat / generation) | 1.0 | 1.0 | as needed |
+| Scenario                              | temperature | top_p    | max output length                |
+| :------------------------------------ | :---------- | :------- | :------------------------------- |
+| Agentic / tool-use / long reasoning   | **1.0**     | **0.95** | high/max effort: **384K tokens** |
+| Non-agentic (plain chat / generation) | 1.0         | 1.0      | as needed                        |
 
 ## Where it is applied
 
@@ -35,10 +35,10 @@ For long-context use the default launcher also sets:
 
 Measured KV footprint at `-c 1048576` (llama.cpp `memory_breakdown`):
 
-| config | KV memory |
-| :--- | :--- |
-| f16 + full-size SWA (`--swa-full`) | ~49.7 GB |
-| **q8_0 + windowed (default)** | **~3.6 GB** |
+| config                             | KV memory   |
+| :--------------------------------- | :---------- |
+| f16 + full-size SWA (`--swa-full`) | ~49.7 GB    |
+| **q8_0 + windowed (default)**      | **~3.6 GB** |
 
 > Note: windowed SWA keeps the sliding-window attention mask unchanged (the
 > computation semantics are the same); only the raw KV storage is windowed.

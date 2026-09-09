@@ -17,23 +17,23 @@ demote。
 
 按内存类型实测 host 读带宽（直连 vulkan 测试）：
 
-| 内存类型 | heap | host 读 | 备注 |
-| :--- | :--- | :--- | :--- |
-| DEVICE_LOCAL \| HOST_VISIBLE (rebar) | vram 8 GB | **0.02 GB/s** | 现 move 源——不可用 |
-| HOST_VISIBLE \| COHERENT | 系统 RAM 64 GB | 0.27 GB/s | 非 cached |
-| HOST_VISIBLE \| COHERENT \| **CACHED** | 系统 RAM 64 GB | **21-27 GB/s** | ggml sync_staging heap |
+| 内存类型                                     | heap           | host 读        | 备注                   |
+| :------------------------------------------- | :------------- | :------------- | :--------------------- |
+| `DEVICE_LOCAL &#124; HOST_VISIBLE` (rebar)   | vram 8 GB      | **0.02 GB/s**  | 现 move 源——不可用     |
+| `HOST_VISIBLE &#124; COHERENT`               | 系统 RAM 64 GB | 0.27 GB/s      | 非 cached              |
+| `HOST_VISIBLE &#124; COHERENT &#124; CACHED` | 系统 RAM 64 GB | **21-27 GB/s** | ggml sync_staging heap |
 
 ## 2. Transfer-queue DMA 是解法
 
 在带 transfer 能力的队列（RX590 有纯 transfer 队列族）上 `vkCmdCopyBuffer`
 把 vram 拷到 host buffer **~14 GB/s**，随后 CPU 以 cached 速度读该 host buffer：
 
-| 路径 | 3.63 MB 专家 |
-| :--- | :--- |
-| 从 vram rebar map CPU memcpy（现状） | ~158 ms |
-| `vkCmdCopyBuffer` vram → CACHED staging | ~0.38 ms |
-| + memcpy CACHED staging → RAM 槽 | ~0.17 ms |
-| 总计（DMA + memcpy） | **~0.5 ms（快 ~300×）** |
+| 路径                                    | 3.63 MB 专家            |
+| :-------------------------------------- | :---------------------- |
+| 从 vram rebar map CPU memcpy（现状）    | ~158 ms                 |
+| `vkCmdCopyBuffer` vram → CACHED staging | ~0.38 ms                |
+| + memcpy CACHED staging → RAM 槽        | ~0.17 ms                |
+| 总计（DMA + memcpy）                    | **~0.5 ms（快 ~300×）** |
 
 一块固定 staging buffer 上 10 专家并发**无带宽损失**：逐专家顺序提交 9.5
 GB/s、10 条 copy 一次提交 10.7 GB/s、流水 10 次提交 10.2 GB/s（都 ~0.35-0.39
@@ -49,6 +49,7 @@ ms/专家）。
 
 Host-map 带宽是**不对称的**：vram rebar CPU **写 ~8 GB/s**（PCIe posted write）
 但 CPU **读 ~0.02 GB/s**。后果：
+
 - r2v（RAM/磁盘字节载入 vram = CPU 写 vram host-map）**不需要 staging**——现状
   DIO 直写路径已跑在快的写速度上。
 - 只有 v2r demote（把 vram 读回 RAM）慢；这是唯一需要下面 DMA/staging 修复的路径。
@@ -117,8 +118,9 @@ bool stmoe_vk_dma_available(void);                // 仅诊断
 ### 4.4 计时（rdtsc，STREAM_MOE_LOG=debug 门控）
 
 每个 move 记：
+
 - `dma_us` = vkCmdCopyBuffer submit → queue idle（下载时间）
-- `mc_us`  = staging → RAM 槽拷贝时间（内部 staging 路径下为 0——已含在 dma_read）
+- `mc_us` = staging → RAM 槽拷贝时间（内部 staging 路径下为 0——已含在 dma_read）
 - 加既有 queued 总时间
 
 据此可重新评估"删掉 memcpy worker"：若 `dma_us + mc_us` 很小、worker 不再是
