@@ -150,21 +150,21 @@ function loadPrefillPrompt(pathStr) {
 }
 
 function loadFeed(run) {
-    if (!run.feed) return { mode: 'single', prompt: loadPrompt(run) };
+    if (!run.feed) return { mode: 'single', prompt: loadPrompt(run), source: run.promptFile ? absPath(run.promptFile) : null };
     const f = run.feed;
     if (f.type === 'jsonl') {
         const raw = fs.readFileSync(absPath(f.path), 'utf8').replace(/^\uFEFF/, '');
         const lines = raw.trim().split('\n').map((l) => JSON.parse(l));
-        return { mode: 'jsonl', lines, maxTurns: Number(f.maxTurns || lines.length) };
+        return { mode: 'jsonl', lines, maxTurns: Number(f.maxTurns || lines.length), source: absPath(f.path) };
     }
     if (f.type === 'prefill') {
         if (f.path) {
             let prompt = loadPrefillPrompt(f.path);
             if (f.tokens) prompt = sliceToTokens(prompt, Number(f.tokens));
-            return { mode: 'single', prefill: true, prompt, tokens: Math.round(estTokens(prompt)) };
+            return { mode: 'single', prefill: true, prompt, tokens: Math.round(estTokens(prompt)), source: absPath(f.path) };
         }
         const tokens = Number(f.tokens || 10000);
-        return { mode: 'single', prefill: true, tokens, prompt: makeFillerPrompt(tokens) };
+        return { mode: 'single', prefill: true, tokens, prompt: makeFillerPrompt(tokens), source: null };
     }
     throw new Error('[run_bench] unsupported feed.type: ' + f.type);
 }
@@ -279,7 +279,7 @@ async function runOne(run, port, healthTimeout) {
     let summary;
 
     const mode = feed.prefill ? 'prefill' : feed.mode;
-    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} (${mode}) ===`);
+    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let log = '';
     let exited = false;
@@ -385,10 +385,10 @@ async function runOne(run, port, healthTimeout) {
     }
 
     console.log('\n==================== SUMMARY ====================');
-    console.log('model            engine                 decode     pp        status');
+    console.log('model            task         engine                 decode     pp        status');
     for (const s of summaries) {
         console.log(
-            String(s.model).padEnd(16) + ' ' + String(s.engine).padEnd(22) + ' ' +
+            String(s.model).padEnd(16) + ' ' + String(s.input).padEnd(12) + ' ' + String(s.engine).padEnd(22) + ' ' +
             fmt(s.decode_tps).padStart(8) + ' ' + fmt(s.prompt_tps, 1).padStart(9) + '   ' +
             s.status + (s.error ? ' (' + s.error + ')' : '') +
             (s.detail ? '  [' + s.detail + ']' : '') + (s.turns ? '  [' + s.turns + ' turns]' : '')
