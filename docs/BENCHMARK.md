@@ -102,7 +102,9 @@ Stock upstream: `stock-cpu.json` (`-ngl 0`), `stock-vulkan.json` (`-ngl 99`),
 both via `binPath: ${SM_UPSTREAM_BIN}`.
 
 Tasks: `bench.json` (~1k-token prompt), `bench_long.json` (~4k via
-`promptRepeat`), plus the existing `en.json` / `cn.json` multi-turn sets.
+`promptRepeat`), the existing `en.json` / `cn.json` multi-turn sets, and the
+prefill tasks `prefill10000.json` (full chat snapshot, ~9-10k) and
+`prefill3000.json` (~3k slice of the same snapshot, fits olmoe's 4096 ctx).
 
 ## 5. Private env (machine paths stay out of the repo)
 

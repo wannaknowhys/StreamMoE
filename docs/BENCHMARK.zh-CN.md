@@ -96,7 +96,9 @@ task 字段：
 `binPath: ${SM_UPSTREAM_BIN}`。
 
 任务：`bench.json`（约 1k token prompt）、`bench_long.json`（`promptRepeat` 约
-4k），另有现成的 `en.json` / `cn.json` 多轮集。
+4k），另有现成的 `en.json` / `cn.json` 多轮集，以及 prefill 任务
+`prefill10000.json`（整份聊天快照，约 9-10k）和 `prefill3000.json`（同一快照切
+约 3k，适配 olmoe 的 4096 ctx）。
 
 ## 5. 私有 env（本机路径不入库）
 

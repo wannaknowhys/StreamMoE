@@ -121,6 +121,18 @@ function makeFillerPrompt(targetTokens) {
     return new Array(n).fill(base).join(' ');
 }
 
+// Rough token count (CJK-aware) and a character slice that targets it. Only used
+// to size/trim a prefill prompt; the exact count is reported as prompt_n.
+function estTokens(s) {
+    const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length;
+    return cjk / 1.2 + (s.length - cjk) / 4;
+}
+// Character prefix of ~target*4 (rough English tokens); exact count is prompt_n.
+function sliceToTokens(s, target) {
+    const budget = target * 4;
+    return s.length <= budget ? s : s.slice(0, budget);
+}
+
 // A prefill snapshot is a JSON array of chat messages. Flatten it to plain text
 // so /completion works for any model (tool-call templates reject non-tool models).
 function flattenMessages(msgs) {
@@ -147,8 +159,9 @@ function loadFeed(run) {
     }
     if (f.type === 'prefill') {
         if (f.path) {
-            const prompt = loadPrefillPrompt(f.path);
-            return { mode: 'single', prefill: true, prompt, tokens: Math.round(prompt.length / 4) };
+            let prompt = loadPrefillPrompt(f.path);
+            if (f.tokens) prompt = sliceToTokens(prompt, Number(f.tokens));
+            return { mode: 'single', prefill: true, prompt, tokens: Math.round(estTokens(prompt)) };
         }
         const tokens = Number(f.tokens || 10000);
         return { mode: 'single', prefill: true, tokens, prompt: makeFillerPrompt(tokens) };

@@ -1,0 +1,1 @@
+{ "input": "prefill3000", "feed": { "type": "prefill", "path": "${SM_PREFILL_10K}", "tokens": 3000 }, "ctx": 4096 }
