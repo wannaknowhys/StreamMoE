@@ -89,6 +89,8 @@ All route-B specs use `bin: StreamMoE`; `${pool}` comes from the model spec.
 | `place-c1c2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}` |
 | `place-c1c2-exp2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
 | `place-c1c2-exp1.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:1024` |
+| `place-c2-exp5.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
+| `place-c1c2-exp5.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
 
 Stock upstream: `stock-cpu.json` (`-ngl 0`), `stock-vulkan.json` (`-ngl 99`),
 both via `binPath: ${SM_UPSTREAM_BIN}`.
@@ -135,3 +137,38 @@ private\bench.bat --models tools\run_specs\models\gemma.json ^
   43.5 tg. `-lv 4` confirmed `offloaded 17/17 layers to GPU` (3961 MiB on
   Vulkan0), so the GPU path is real; a tiny decode is launch-overhead bound.
   Use `bench.json` / `bench_long.json` for representative numbers.
+
+## 9. Findings log
+
+### 2026-09-09 - olmoe (1B-7B), en.json 10 turns, RX590 8GB
+
+Average over 10 turns (tg = decode tok/s, pp = prefill tok/s):
+
+| engine | tg | pp | placement |
+| :--- | ---: | ---: | :--- |
+| stock-cpu | 42.38 | 102.3 | upstream, CPU |
+| stock-vulkan | 41.32 | 221.9 | upstream, all layers Vulkan0 |
+| place-cpu | 40.00 | 171.5 | route B baseline (dense + experts RAM) |
+| place-c2 | 36.87 / 36.54 | 143.7 / 144.6 | C2 on Vulkan0 (run twice) |
+| place-c1 | 19.50 | 188.4 | C1 on Vulkan0 |
+| place-c1c2 | 20.26 | 195.8 | C1+C2 on Vulkan0 |
+| place-exp2 | 27.03 | 101.3 | experts 2G VRAM |
+| place-exp5 | 25.42 | 140.9 | experts 5G VRAM |
+| place-c2-exp2 | 28.00 | 101.0 | C2 + 2G experts |
+| place-c2-exp5 | 26.21 | 145.8 | C2 + 5G experts |
+| place-c1-exp2 | 16.69 | 111.4 | C1 + 2G experts |
+| place-c1c2-exp1 | 17.77 | 143.5 | C1+C2 + 1G experts |
+| place-c1c2-exp2 | 17.12 | 109.1 | C1+C2 + 2G experts |
+| place-c1c2-exp5 | 16.39 | 160.5 | C1+C2 + 5G experts |
+
+Tentative reading (NOT a conclusion):
+
+- **Prefill clearly benefits from the GPU**: stock 102 -> 222 pp, C1+C2 196 pp.
+- **Decode does not on this model**: the RX590 is at/below the 16-thread CPU
+  (stock 41.3 vs 42.4), and both C1-on-VRAM and expert-pool-on-VRAM show large
+  decode losses (C1 40 -> ~20; experts 40 -> 25-27; combined 40 -> 16-17).
+- Suspected causes: GPU decode is not faster for a 1B-active model, plus
+  cross-device/sync/move overhead in the route B VRAM pool path; dense C1 on a
+  GPU re-enables `op_offload`.
+- **Next: re-test with gemma** (larger dense + heavier experts, C1+C2 fit in
+  VRAM) before drawing any conclusion.

@@ -84,6 +84,8 @@ task 字段：
 | `place-c1c2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}` |
 | `place-c1c2-exp2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
 | `place-c1c2-exp1.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:1024` |
+| `place-c2-exp5.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
+| `place-c1c2-exp5.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
 
 纯粹原版：`stock-cpu.json`（`-ngl 0`）、`stock-vulkan.json`（`-ngl 99`），都走
 `binPath: ${SM_UPSTREAM_BIN}`。
@@ -129,3 +131,36 @@ private\bench.bat --models tools\run_specs\models\gemma.json ^
   43.5 tg。用 `-lv 4` 确认了 `offloaded 17/17 layers to GPU`（Vulkan0 占 3961 MiB），
   显卡路径是真的；这么小的 decode 受启动开销主导。代表性数字请用 `bench.json` /
   `bench_long.json`。
+
+## 9. 发现记录
+
+### 2026-09-09 - olmoe (1B-7B)，en.json 10 轮，RX590 8GB
+
+10 轮平均（tg = decode tok/s，pp = prefill tok/s）：
+
+| engine | tg | pp | 布局 |
+| :--- | ---: | ---: | :--- |
+| stock-cpu | 42.38 | 102.3 | 原版，CPU |
+| stock-vulkan | 41.32 | 221.9 | 原版，全部层 Vulkan0 |
+| place-cpu | 40.00 | 171.5 | route B 基线（dense + 专家全 RAM） |
+| place-c2 | 36.87 / 36.54 | 143.7 / 144.6 | C2 进 Vulkan0（跑了两次） |
+| place-c1 | 19.50 | 188.4 | C1 进 Vulkan0 |
+| place-c1c2 | 20.26 | 195.8 | C1+C2 进 Vulkan0 |
+| place-exp2 | 27.03 | 101.3 | 专家 2G VRAM |
+| place-exp5 | 25.42 | 140.9 | 专家 5G VRAM |
+| place-c2-exp2 | 28.00 | 101.0 | C2 + 2G 专家 |
+| place-c2-exp5 | 26.21 | 145.8 | C2 + 5G 专家 |
+| place-c1-exp2 | 16.69 | 111.4 | C1 + 2G 专家 |
+| place-c1c2-exp1 | 17.77 | 143.5 | C1+C2 + 1G 专家 |
+| place-c1c2-exp2 | 17.12 | 109.1 | C1+C2 + 2G 专家 |
+| place-c1c2-exp5 | 16.39 | 160.5 | C1+C2 + 5G 专家 |
+
+初步判断（**不是结论**）：
+
+- **prefill 明显吃 GPU 红利**：原版 102 -> 222 pp，C1+C2 196 pp。
+- **decode 在这个模型上不吃**：RX590 与 16 线程 CPU 持平甚至更慢（原版 41.3 vs
+  42.4），而 C1 进 VRAM、专家池进 VRAM 都出现较大 decode 损耗（C1 40 -> ~20；专家
+  40 -> 25-27；叠加 40 -> 16-17）。
+- 疑似原因：1B-active 模型上 GPU decode 本来就不快，加上 route B VRAM 池路径的
+  跨设备/同步/搬迁开销；dense C1 上 GPU 还会重新打开 `op_offload`。
+- **下一步：换 gemma 重测**（dense 更重、专家更多、C1+C2 能进 VRAM）后再下结论。
