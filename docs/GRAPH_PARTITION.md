@@ -12,6 +12,16 @@
 > (C1/C2/C3/C4), `docs/M2_DEVICE_EXECUTOR.md` (per-device executor),
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`.
 
+> **Iron rule - data movement (2026-09-09)**: never dereference or `memcpy` a
+> `ggml_tensor::data` on the host. A tensor's data may live on any backend
+> (device-only memory, or a host mapping). Always use the backend-agnostic
+> copies `ggml_backend_tensor_get` / `ggml_backend_tensor_set` (and `_2d`
+> variants); mid-graph use `_async` + `ggml_backend_synchronize`, resolving the
+> backend with `ggml_backend_sched_get_tensor_backend` (the pattern in
+> `llama-context.cpp:1806` `export_capture_experts`). Raw `memcpy` is legal only
+> for byte arenas we own that are NOT ggml tensors (expert-pool slots, staging,
+> scratch) and inside a backend's own `iface` implementation. See §7.4.
+
 ## 1. How the map is produced
 
 `moe_chain_verify_graph(gf)` runs in the route-b `graph_reserve` frag
@@ -169,6 +179,51 @@ seam disappears by construction.
   **dynamic / split C1** and multi-device, where the layer unit is already the
   placement unit.
 
+### 7.3 Multi-outlet whole-layer package
+
+C1 is atomic per layer and does **not** cross devices (`DENSE_PLACEMENT.md`
+§3.2); experts **do** cross devices (RAM + Vulkan0 + ...). So the layer package
+is a fan-out / fan-in shape:
+
+```
+C1 prefix (device A) --cur--> [ expert closure pool0 (device A) ]--\
+                      \--cur--> [ expert closure pool1 (device B) ]--+--> C1 tail (residual, device A)
+                      \--cur--> [ expert closure pool2 (RAM)      ]--/
+```
+
+- `cur` is **multi-outlet**: the C1 prefix writes it once; each per-device
+  expert sub-package consumes a copy (or the same on-device buffer when the
+  device matches).
+- `ffn_moe_out` is **multi-inlet**: each sub-package folds its `acc_d`, and the
+  C1 tail sums the partials (M2-2's per-pool `acc_d` fan-in, generalised).
+- N=1 (C1 and all experts on one device) degenerates to "same-device seam, no
+  round-trip" (§7.1).
+- `ids` stays control data (host round planner) regardless of N - a whole-layer
+  package does not remove that until the planner moves device-side.
+
+### 7.4 B39 (FIXED): raw memcpy on a device leaf
+
+The callout rule comes from a real crash. gemma `C1:Vulkan0` + Vulkan expert
+pool crashed at load with `0xC0000005`. lldb stack: `memcpy` <-
+`stream_moe_backend_replicate_leaf` (`moe_backend.cpp:478`) <-
+`moe_chain_assign_backend` (C4 replication) <- `graph_reserve`. The C4 leaf
+(`blk.N.ffn_down_exps.scale`) was allocated on Vulkan (C1 on GPU) and the code
+did `memcpy(dev, t->data, bytes)` on the host. **Not** a VRAM-space issue: a
+128 MB pool + `-ub 16` still crashed. C1:RAM keeps the leaf host-resident, and
+with no Vulkan pool the replication loop is empty - both work, which is why only
+`C1:Vulkan0 + pool` hit it. Fix: `ggml_backend_tensor_get(t, dev, 0, bytes)`.
+Both crashing configs (`place-c1-exp2`, `place-c1c2-exp2`) now load clean.
+
+Raw-memcpy audit (2026-09-09, `src/`): only `moe_backend.cpp:478` was unsafe.
+The rest are legal: backend `iface` implementations (`moe_backend.cpp:98-108`),
+non-tensor memory (`moe_backend.cpp:190/199/327`, `async_dio_win.cpp:191`),
+name slicing (`route_b_chain.cpp:536`), our own byte arenas - expert-pool slots
+and staging (`scheduler.cpp:322/724`, `staging_reader.cpp:114`), and the
+`STREAM_MOE_TMP_DEVDBG` diagnostic read of the device arena
+(`minigraph_exec.cpp:1256`). The staging upload `minigraph_exec.cpp:564`
+(`memcpy(stage_map + off, host_data, bytes)`) writes a host-mapped stage buffer;
+it should move to `ggml_backend_tensor_set` when the seam becomes tensor-based.
+
 ## 8. Open questions
 
 1. Device-identity map: how to prove "same device" across llama `dev_layer` and
@@ -177,6 +232,6 @@ seam disappears by construction.
    a host round-trip for the small int tensor only?
 3. Whole-layer closure vs llama.cpp dense execution: how much of attention/KV can
    be reused as-is (per-device graph) vs must be re-implemented.
-4. gemma `C1:Vulkan0 + pool` load crash (BUG_TRACKER B39, open) sits exactly on
-   the C1<->closure seam and must be fixed before either step is exercised on a
+4. gemma `C1:Vulkan0 + pool` load crash (BUG_TRACKER B39) - **FIXED** 2026-09-09
+   by the backend-agnostic copy rule (§7.4); the seam can now be exercised on a
    shared device.

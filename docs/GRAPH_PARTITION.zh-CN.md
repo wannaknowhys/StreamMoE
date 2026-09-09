@@ -11,6 +11,14 @@
 >（C1/C2/C3/C4）、`docs/M2_DEVICE_EXECUTOR.md`（每设备执行器）、
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`。
 
+> **铁律 - 数据搬运（2026-09-09）**：永远不要在 host 上解引用或 `memcpy` 一个
+> `ggml_tensor::data`。张量的数据可能在任何后端（设备独显存，或 host 映射）。一律用
+> 后端无关拷贝：`ggml_backend_tensor_get` / `ggml_backend_tensor_set`（及 `_2d` 变体）；
+> mid-graph 用 `_async` + `ggml_backend_synchronize`，后端用
+> `ggml_backend_sched_get_tensor_backend` 取（见 `llama-context.cpp:1806`
+> `export_capture_experts` 的写法）。裸 `memcpy` 只对**我们自己拥有、且不是 ggml 张量**
+> 的字节区（专家池槽、staging、scratch）以及后端自己的 `iface` 实现合法。来源见 §7.4。
+
 ## 1. 地图怎么来的
 
 `moe_chain_verify_graph(gf)` 在 route-b 的 `graph_reserve` frag
@@ -154,6 +162,45 @@ C1 本身**不是**锚点驱动的闭包：它的节点与专家链交织（pre-
 - 顺序：7.1 对**静态全驻留 C1**（单设备、零往返）就能拿到大部分收益，且不用接管
   C1；7.2 是**动态/拆分 C1** 与多设备的终态，那时层已经是放置单位。
 
+### 7.3 多出口整层包
+
+C1 每层是原子、**不跨设备**（`DENSE_PLACEMENT §3.2`）；专家**跨设备**（RAM + Vulkan0 +
+…）。所以整层包是扇出/扇入形状：
+
+```
+C1 前段（设备A） --cur--> [ 专家闭包 pool0（设备A） ]--\
+                 \--cur--> [ 专家闭包 pool1（设备B） ]--+--> C1 尾段（残差，设备A）
+                 \--cur--> [ 专家闭包 pool2（RAM）  ]--/
+```
+
+- `cur` 是**多出口**：C1 前段只写一次；每个 per-device 专家子包消费一份副本（设备相同
+  时就是同一块设备内 buffer）。
+- `ffn_moe_out` 是**多入口**：每个子包 fold 自己的 `acc_d`，C1 尾段把各部分相加
+  （M2-2 现有 per-pool `acc_d` fan-in 的推广）。
+- N=1（C1 与全部专家同设备）退化为"同设备接缝、零往返"（§7.1）。
+- 无论 N 是多少，`ids` 仍是控制数据（host 侧 round 规划），整层包不改变这一点，除非
+  规划器设备侧化。
+
+### 7.4 B39（已修）：对设备 leaf 的裸 memcpy
+
+上面的铁律来自一次真实崩溃。gemma `C1:Vulkan0` + Vulkan 专家池在装载时 `0xC0000005`。
+lldb 栈：`memcpy` <- `stream_moe_backend_replicate_leaf`（`moe_backend.cpp:478`）<-
+`moe_chain_assign_backend`（C4 复制）<- `graph_reserve`。C4 leaf
+（`blk.N.ffn_down_exps.scale`）在 C1 上 GPU 时被分到 Vulkan，而代码在 host 上做
+`memcpy(dev, t->data, bytes)`。**不是显存问题**：128 MB 池 + `-ub 16` 仍崩。C1:RAM 时
+leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——所以只有 `C1:Vulkan0 + 池` 中招。
+修复：`ggml_backend_tensor_get(t, dev, 0, bytes)`。两个原崩溃配置
+（`place-c1-exp2`、`place-c1c2-exp2`）现在都能干净装载。
+
+裸 memcpy 审计（2026-09-09，`src/`）：只有 `moe_backend.cpp:478` 不安全。其余都合法：
+后端 `iface` 实现（`moe_backend.cpp:98-108`）、非张量内存
+（`moe_backend.cpp:190/199/327`、`async_dio_win.cpp:191`）、名字切片
+（`route_b_chain.cpp:536`）、我们自己的字节区——专家池槽与 staging
+（`scheduler.cpp:322/724`、`staging_reader.cpp:114`），以及
+`STREAM_MOE_TMP_DEVDBG` 诊断读设备 arena（`minigraph_exec.cpp:1256`）。staging 上传
+`minigraph_exec.cpp:564`（`memcpy(stage_map + off, host_data, bytes)`）写的是 host
+映射的 stage buffer；等接缝改成张量后应改用 `ggml_backend_tensor_set`。
+
 ## 8. 待定问题
 
 1. 设备身份映射：如何跨 llama `dev_layer` 与 route-B 池设备证明"同一设备"，并在
@@ -162,5 +209,5 @@ C1 本身**不是**锚点驱动的闭包：它的节点与专家链交织（pre-
    host 往返。
 3. 整层闭包 vs llama.cpp dense 执行：attention/KV 有多少能按"每设备图"直接复用，
    多少必须重写。
-4. gemma `C1:Vulkan0 + 池` load 崩溃（BUG_TRACKER B39，OPEN）正好落在 C1<->闭包
-   接缝上，任一步要在共享设备上跑之前必须先修。
+4. gemma `C1:Vulkan0 + 池` load 崩溃（BUG_TRACKER B39）——**2026-09-09 已修**，
+   靠后端无关拷贝铁律（§7.4）；接缝现在可以在共享设备上验证。
