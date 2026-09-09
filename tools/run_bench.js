@@ -110,6 +110,33 @@ function loadPrompt(run) {
     return n > 1 ? new Array(n).fill(base).join('\n\n') : base;
 }
 
+// Deterministic filler sized to ~targetTokens. CHARS_PER_TOKEN is a rough
+// English-prose estimate; the exact count is reported per request as prompt_n,
+// so every config sees the same prompt regardless of tokenizer.
+const CHARS_PER_TOKEN = 5.5;
+function makeFillerPrompt(targetTokens) {
+    const base = 'The memory-bounded mixture-of-experts engine streams expert weights from disk while keeping dense attention layers fully resident.';
+    const perRepeat = Math.max(1, Math.round(base.length / CHARS_PER_TOKEN));
+    const n = Math.max(1, Math.ceil(targetTokens / perRepeat));
+    return new Array(n).fill(base).join(' ');
+}
+
+// A prefill snapshot is a JSON array of chat messages. Flatten it to plain text
+// so /completion works for any model (tool-call templates reject non-tool models).
+function flattenMessages(msgs) {
+    return msgs.map((m) => {
+        const s = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+        return '[' + (m.role || '?') + ']\n' + s;
+    }).join('\n\n');
+}
+
+function loadPrefillPrompt(pathStr) {
+    const raw = fs.readFileSync(absPath(pathStr), 'utf8').replace(/^\uFEFF/, '');
+    const msgs = JSON.parse(raw);
+    if (!Array.isArray(msgs)) throw new Error('[run_bench] prefill path must be a JSON array of chat messages');
+    return flattenMessages(msgs);
+}
+
 function loadFeed(run) {
     if (!run.feed) return { mode: 'single', prompt: loadPrompt(run) };
     const f = run.feed;
@@ -117,6 +144,14 @@ function loadFeed(run) {
         const raw = fs.readFileSync(absPath(f.path), 'utf8').replace(/^\uFEFF/, '');
         const lines = raw.trim().split('\n').map((l) => JSON.parse(l));
         return { mode: 'jsonl', lines, maxTurns: Number(f.maxTurns || lines.length) };
+    }
+    if (f.type === 'prefill') {
+        if (f.path) {
+            const prompt = loadPrefillPrompt(f.path);
+            return { mode: 'single', prefill: true, prompt, tokens: Math.round(prompt.length / 4) };
+        }
+        const tokens = Number(f.tokens || 10000);
+        return { mode: 'single', prefill: true, tokens, prompt: makeFillerPrompt(tokens) };
     }
     throw new Error('[run_bench] unsupported feed.type: ' + f.type);
 }
@@ -205,12 +240,22 @@ const fmt = (x, d) => (x == null ? '-' : Number(x).toFixed(d == null ? 2 : d));
 
 async function runOne(run, port, healthTimeout) {
     const bin = binPath(run);
-    const ctx = Number(run.ctx || 8192);
     const threads = Number(run.threads || 16);
     const nPredict = Number(run.nPredict || 128);
     const warmup = run.warmup != null ? Number(run.warmup) : 1;
     const repeat = Number(run.repeat || 3);
 
+    let feed;
+    try {
+        feed = loadFeed(run);
+    } catch (e) {
+        const rec = { ts: new Date().toISOString(), model: run.model, engine: run.engine, input: run.input, bin, kind: 'single', status: 'FAIL', error: e.message };
+        console.error('  FAILED: ' + e.message);
+        return { records: [rec], summary: { model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
+    }
+
+    // prefill feed sizes ctx to fit the prompt (+ decode + margin) unless set.
+    const ctx = Number(run.ctx || (feed.prefill ? Math.max(16384, (feed.tokens || 0) + nPredict + 4096) : 8192));
     const args = ['-m', run.modelPath, '--host', '127.0.0.1', '--port', String(port),
         '-c', String(ctx), '-t', String(threads), '--no-warmup', '--no-webui'];
     if (run.draft) args.push('--model-draft', run.draft);
@@ -220,16 +265,8 @@ async function runOne(run, port, healthTimeout) {
     const records = [];
     let summary;
 
-    let feed;
-    try {
-        feed = loadFeed(run);
-    } catch (e) {
-        const rec = Object.assign({}, base, { kind: 'single', status: 'FAIL', error: e.message });
-        console.error('  FAILED: ' + e.message);
-        return { records: [rec], summary: { model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
-    }
-
-    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} (${feed.mode}) ===`);
+    const mode = feed.prefill ? 'prefill' : feed.mode;
+    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} (${mode}) ===`);
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let log = '';
     let exited = false;

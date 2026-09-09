@@ -11,6 +11,8 @@ set SM_DS_V1=
 set SM_OLMOE=
 set SM_JSONL_CN=
 set SM_JSONL_EN=
+rem JSON array of chat messages used by feed.type=prefill (e.g. a ~10k-token snapshot).
+set SM_PREFILL_10K=
 set SM_OUT_ROOT=
 rem Stock upstream llama.cpp llama-server.exe (Vulkan build), for run_bench stock-* engines.
 set SM_UPSTREAM_BIN=

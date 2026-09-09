@@ -67,6 +67,11 @@ task 字段：
 - single：`prompt` | `promptFile`、`promptRepeat?`、`nPredict?`、`warmup?`、
   `repeat?`、`ctx?`、`threads?`
 - jsonl：`feed:{type:"jsonl", path, maxTurns}`、`nPredict?`、`ctx?`、`threads?`
+- prefill：`feed:{type:"prefill", path?, tokens?}`、`nPredict?`、`ctx?`、`threads?`。
+  `path` 是 JSON 消息数组，会扁平化成纯文本走 `/completion`（模型无关，tool_calls
+  模板不会把它顶掉）；`tokens` 是无 path 时的合成 filler 兜底。`ctx` 不设时按 prompt
+  自动放大；但模型 `n_ctx_train` 仍会封顶 slot（olmoe = 4096，所以 `prefill10000`
+  要用长上下文模型）。
 
 ## 4. 布局矩阵（`tools/run_specs/engines/`）
 
@@ -96,8 +101,9 @@ task 字段：
 ## 5. 私有 env（本机路径不入库）
 
 `private/` 已 gitignore。`private/env.bat` 设模型路径、`SM_UPSTREAM_BIN`（原版
-Vulkan 构建）和 `SM_BENCH_OUT`；`private/bench.bat` 加载后调用 runner。提交的模板
-是 `scripts/sm_env.example.bat`。
+Vulkan 构建）、`SM_PREFILL_10K`（`prefill10000` 用的 ~10.4k token 聊天快照）和
+`SM_BENCH_OUT`；`private/bench.bat` 加载后调用 runner。提交的模板是
+`scripts/sm_env.example.bat`。
 
 ## 6. 结果结构（`benchmark/results/*.jsonl`，已 gitignore）
 

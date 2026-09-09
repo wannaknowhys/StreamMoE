@@ -72,6 +72,12 @@ Task fields:
 - single: `prompt` | `promptFile`, `promptRepeat?`, `nPredict?`, `warmup?`,
   `repeat?`, `ctx?`, `threads?`
 - jsonl: `feed:{type:"jsonl", path, maxTurns}`, `nPredict?`, `ctx?`, `threads?`
+- prefill: `feed:{type:"prefill", path?, tokens?}`, `nPredict?`, `ctx?`, `threads?`.
+  `path` is a JSON array of chat messages; it is flattened to plain text and sent
+  via `/completion` (model-agnostic, so tool-call templates do not break it).
+  `tokens` is a synthetic-filler fallback. `ctx` auto-sizes to fit the prompt
+  unless set; the model's `n_ctx_train` still caps the slot (olmoe = 4096, so use
+  a long-context model for `prefill10000`).
 
 ## 4. Placement matrix (`tools/run_specs/engines/`)
 
@@ -101,9 +107,9 @@ Tasks: `bench.json` (~1k-token prompt), `bench_long.json` (~4k via
 ## 5. Private env (machine paths stay out of the repo)
 
 `private/` is gitignored. `private/env.bat` sets model paths,
-`SM_UPSTREAM_BIN` (stock Vulkan build) and `SM_BENCH_OUT`; `private/bench.bat`
-loads it and calls the runner. The committed template is
-`scripts/sm_env.example.bat`.
+`SM_UPSTREAM_BIN` (stock Vulkan build), `SM_PREFILL_10K` (the ~10.4k-token chat
+snapshot for `prefill10000`) and `SM_BENCH_OUT`; `private/bench.bat` loads it and
+calls the runner. The committed template is `scripts/sm_env.example.bat`.
 
 ## 6. Result schema (`benchmark/results/*.jsonl`, gitignored)
 
