@@ -504,20 +504,33 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 （冷启专家装载）+ `burst_tail` 5.4s（CPU 图+设备 sync+acc 回读+host fold）+ `burst_rounds`
 0.08s（host 规划+紧凑图构建+提交）。
 
-- [ ] **P1 满宽/单设备直通（省略条件分两类）**：
-      - **展宽类**（把 full `[d,n_t]` 选/展成紧凑 `[d,w_b,n_active]`）→ **满宽可省**：
-        - `GET_ROWS(cur)`：满宽是恒等置换，直接引用原 cur。
-        - `GET_ROWS(权重)`：满宽 `w_b==n_k, n_active==n_t`，目标布局与源 `ffn_moe_weights`
-          一致，直接拿源张量当壳子（改指针/形状）。
-      - **多 device 类**（per-device 部分和 + 合并）→ **本层单 device 可省**：
-        - `ACC`（scatter-add 进 `acc_d`）：单 device 单 round 时只是拷贝。
-        - `acc_d` 清零 + host `layer_fold`：单 device 时是拷贝。
-        - → 单 device 时 `SUM_ROWS` 结果可**直接写 `moe_out`**，省掉 ACC + layer_fold。
-      - 其余不在这两类：`SUM_ROWS`（专家轴折叠，始终需要）、`CONT×2`（给 fold 铺路，
-        看 `sum_rows`/出口能否吃 strided 视图）。
-      - 关系：当前设计下**单 pool ⇒ 单 round ⇒ 满宽**（`build_mix_plan` 单池退化为一个满宽
-        round），所以单 device 的常见路径两类条件同时满足。
-      现状 `bucket_gather_cur`（minigraph_exec.cpp:655）/`bucket_gather_per_slot`（:621）。
+- [ ] **P1 统一路径 + 建图期条件发射 + scratch 灭小 vector（2026-09-09 定）**：
+      设计见 `docs/BUCKET_FAST_PATH.md`（EN）/ `.zh-CN.md` §9。用户拍板：**单一执行器不变**，
+      单 pool 靠建图期不生成多余节点（等价图优化）；**CONT 保留**（P1b 再量）；
+      **`mix_plan` 并入 scratch**。判据（每桶独立）：cur 省略 `n_active==n_t`；
+      weights 省略 `n_active==n_t && width==n_k`；单 target（`cell_full` ⇒ 单 pool ⇒ 单桶）
+      时 ACC/fold 直写 `moe_out`。
+      - [x] **P1-a 条件发射**：`bucket_gather_cur`/`bucket_gather_per_slot` 恒等跳过（`tok_full`/
+            `cell_full` + `bucket_direct_leaf`；device 加源紧凑性判断，否则回退 gather）。连续优化待补。
+      - [x] **P1-b 单 target**：ACC 直写 `moe_out`（CPU 绑 `per_token->data` / device 单次 `tensor_get`），
+            跳过 host `layer_fold`；多 target 路径不变。
+      - [ ] **P1-c scratch**：per-backend grow-only host scratch（i32+f32，verify 定容），替换
+            `mm_ids_pool`/`fold_buf`/`ids_exp`/`ids_slot`/`t_round`/`order`/局部 `idx`。
+      - [ ] **P1-d `mix_plan` 并入 scratch**：`build_mix_plan` 写 flat ids/scatter，rounds 变 span；
+            同步改 `test_mix_plan`。
+      - [ ] **P1-e `twin`/`gather_cache` 换定长数组**（闭包 ≤ ~20 节点/桶）。
+      - [ ] **P1-f 回归**：默认单 pool 对 HEAD 干净构建 **IDENTICAL**；`STREAM_MOE_TMP_BUCKET_ROUNDS=1`
+            宽松 gate；TMR 前后对拍。
+      - [x] **P1-g device arena 估算**：把每轮 bump（fold `pc`/`s`/`acc` + cur gather + per-slot
+            gather，`bind_fresh(...,false)` 全部消费者）**之和**并入 `arena_bytes`，删掉固定 32MB slack
+            （原 slack 不覆盖大 prefill 的 fold 临时，理论越界；未观察到破坏疑似 host-visible 越界不 fault）。
+            验证：129 设备回归（256/4096）仍 **IDENTICAL**；olmoe prefill3000 `place-c1c2-exp5` 跑通
+            （pp 391.0 / tg 18.81），无崩溃。注：fold 中间量在 device 侧是 arena 尾部 bump（CPU 侧是
+            独立 `fold_buf` heap），**不在 result_bytes**——只有链孪生用 result_bytes/out_off。
+      - 回归（2026-09-09，P1-a/b 后）：纯 CPU / `RAM:8192,Vulkan0:256` / `RAM:8192,Vulkan0:4096`
+        三配置对 HEAD 二进制 **IDENTICAL**（embd/hidden/KV + expert_history）。bench olmoe
+        prefill3000 `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67
+        （记录 380.5 / 17.81）。
 - [ ] **P1b 查 ACC/CONT/SUM_ROWS 为何这么慢**：perf logger（`GGML_VK_PERF_LOGGER=1`）实测
       2-token 一层：ACC 983us、CONT×2 986us、SUM_ROWS 510us、GET_ROWS×2 732us——都比
       4~32K 元素的应有时间高几个数量级。都在同一设备 arena、**非跨设备**。疑点：`acc.comp`

@@ -9,7 +9,9 @@
 #include "ggml-backend-impl.h"
 
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +32,14 @@ void* stmoe_vk_buffer_host_offset(ggml_backend_buffer_t buffer, size_t off);
 namespace stream_moe {
 
 namespace {
+
+#ifdef STREAM_MOE_TEMP
+// Accumulating wall-clock timer (STREAM_MOE_TMR=1), one line per bucket at exit.
+struct tmr_acc_t {
+    const char * name; double ms = 0; long n = 0;
+    ~tmr_acc_t() { if (std::getenv("STREAM_MOE_TMR")) fprintf(stderr, "[TMR] %s total=%.1f ms n=%ld avg=%.3f ms\n", name, ms, n, n ? ms / n : 0.0); }
+};
+#endif
 
 // "blk.N.ffn_gate_exps.weight" -> N and branch ("ffn_gate_exps.weight" etc.)
 struct parsed_node_t {
@@ -412,6 +422,7 @@ struct device_target_t {
     size_t                 stage_used = 0;
     size_t                 acc_off = 0;       // acc_d[d_out, n_t] inside the arena
     ggml_tensor *          acc = nullptr;     // device accumulator shell
+    ggml_tensor *          result = nullptr;  // single-target direct output shell
     ggml_cgraph *          gf = nullptr;
 };
 
@@ -491,6 +502,10 @@ struct bucket_build_t {
     const moe_layer_exec_t* ex = nullptr;
     // current round geometry: w_b = slots per active token, n_active = tokens
     int64_t w_b = 0, n_active = 0;
+    // Identity-selection flags for the current round (docs/BUCKET_FAST_PATH):
+    // tok_full  = n_active == n_t  -> the cur gather is identity;
+    // cell_full = tok_full && w_b == n_k -> the weights gather is identity.
+    bool tok_full = false, cell_full = false;
     // index of the closure node currently being cloned (== its out_off slot).
     // Twins write their compact output at the SAME out_off region as the main
     // full-width node (compact [d, w_b, n_t] <= full [d, n_k, n_t], so it stays
@@ -618,12 +633,31 @@ static ggml_tensor * append_expert_fold(bucket_build_t & b, ggml_tensor * weight
 // leaf over `m->data`, an i32 index leaf in tight order, get_rows, reshape to
 // the chain geometry. The reshape view carries the data dependency, so it is the
 // consumer's src (a detached leaf would lose the edge).
+static ggml_tensor * bucket_direct_leaf(bucket_build_t & b, const ggml_tensor * m,
+                                        const int64_t ne[4], const size_t nb[4]) {
+    // Identity selection (docs/BUCKET_FAST_PATH): the bucket's rectangle IS the
+    // whole source grid, so the source is consumed directly instead of gathered.
+    // CPU references it in place; a device needs a compact (contiguous) source
+    // for the one-shot upload - callers fall back to the gather otherwise.
+    chain_ctx_t & c = *b.c;
+    if (c.dev) return bucket_upload_leaf(c, m->type, ne, nb, m->data);
+    return bucket_ref_leaf(c, m->type, ne, nb, const_cast<void *>(m->data));
+}
+
 static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tensor * m) {
     // m is a per-(slot, token) external leaf [1, n_k, n_t] (routing weights). A
     // mix_plan round selects an ARBITRARY (t,k) subset, so the affine k-slice no
     // longer applies: gather flat element offsets.
     chain_ctx_t & c = *b.c;
     const size_t esz = sizeof(float);
+    // Identity: the round covers the whole (t,k) grid -> reference the source.
+    if (b.cell_full &&
+        (!c.dev || (m->nb[0] == esz && m->nb[1] == esz &&
+                    m->nb[2] == (size_t) m->ne[1] * esz))) {
+        int64_t ne[4]; size_t nb[4];
+        for (int i = 0; i < 4; ++i) { ne[i] = m->ne[i]; nb[i] = m->nb[i]; }
+        return bucket_direct_leaf(b, m, ne, nb);
+    }
     // flat source [1, span] over m->data; index uses the tensor's real strides
     // so a strided view still works. span = max flat element index + 1.
     const size_t stride_k = m->nb[1], stride_t = m->nb[2];
@@ -659,6 +693,13 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     chain_ctx_t & c = *b.c;
     const int64_t d = m->ne[0], n_t = m->ne[2];
     const size_t  esz = sizeof(float);
+    // Identity: the round covers every token -> reference the source.
+    if (b.tok_full &&
+        (!c.dev || (m->nb[0] == esz && m->nb[2] == (size_t) d * esz))) {
+        int64_t ne[4] = { d, 1, n_t, 1 };
+        size_t  nb[4] = { m->nb[0], m->nb[1], m->nb[2], m->nb[3] };
+        return bucket_direct_leaf(b, m, ne, nb);
+    }
     int64_t sne[4] = { d, n_t, 1, 1 };
     size_t  snb[4] = { m->nb[0], m->nb[2], m->nb[2] * (size_t) n_t,
                        m->nb[2] * (size_t) n_t };
@@ -1123,13 +1164,43 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                    + (size_t) n_expert * sizeof(float)     // per-expert scale table
                    + cells * sizeof(int32_t) * 4 + 4096;   // ids + idx leaves
     }
+    // Device arena bump consumers (bind_fresh(..., false)): the fold scratch
+    // (pc/s/acc) + the cur gather + one gather per per-(slot,token) routing-
+    // weight leaf. The bump is never reset within a layer (all tensors stay valid
+    // until the single graph_compute), so size it to the SUM over the device's
+    // rounds. The arena is allocated BEFORE the build (a grow would invalidate
+    // already-bound twin data pointers), so this estimate must be an upper bound.
+    int n_per_slot = 0;
+    {
+        std::vector<const ggml_tensor*> seen;
+        for (const auto & el : ex->external_leaves) {
+            const ggml_tensor * et = el.tensor;
+            if (!et || et->ne[0] != 1 || et->ne[1] != (int64_t) n_k) continue;
+            bool dup = false;
+            for (auto * s : seen) if (s == et) { dup = true; break; }
+            if (!dup) { seen.push_back(et); ++n_per_slot; }
+        }
+        if (n_per_slot < 2) n_per_slot = 2;   // safety margin (tiny vs the fold)
+    }
+    auto align64 = [](size_t x) { return (x + 63u) & ~size_t(63u); };
+    std::unordered_map<uint32_t, size_t> pool_bump;
+    for (const auto & r : rounds) {
+        if (r.width == 0 || r.n_active == 0) continue;
+        const size_t cells = (size_t) r.width * r.n_active;
+        size_t b = align64(cells * (size_t) d_out * sizeof(float))            // pc [w,d,nt]
+                 + align64((size_t) d_out * r.n_active * sizeof(float))       // s  [1,d,nt]
+                 + align64((size_t) d_out * r.n_active * sizeof(float))       // acc[d,nt]
+                 + align64((size_t) d_in * r.n_active * sizeof(float))        // cur gather
+                 + (size_t) n_per_slot * align64(cells * sizeof(float));      // per-slot gathers
+        pool_bump[r.pool] += b;
+    }
     for (auto & kv : dev_targets) {
         device_target_t & t = kv.second;
         device_exec_ctx_t * dv = stream_moe_backend_device_exec(t.pool);
         const size_t base = ex->layout_ok ? ((ex->result_bytes + 63u) & ~size_t(63u)) : 0;
         t.acc_off    = base;
         t.arena_used = base + acc_bytes;
-        const size_t arena_bytes = t.arena_used + 32u * 1024 * 1024;
+        const size_t arena_bytes = t.arena_used + pool_bump[t.pool];
         if (!stream_moe_backend_device_ensure(t.pool, arena_bytes, stage_est)) {
             LOG_ERROR("stream_moe: device arena/stage alloc failed pool " << t.pool);
             return GGML_STATUS_FAILED;
@@ -1148,6 +1219,83 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     if (c.acc_d.size() < acc_sz) c.acc_d.assign(acc_sz, 0.0f);
     std::fill(c.acc_d.begin(), c.acc_d.end(), 0.0f);
 
+    // Single-target fast path (docs/BUCKET_FAST_PATH): one round covering the
+    // whole (t,k) grid -> per_token IS the layer output. Skip ACC + host fold and
+    // write it to moe_out directly (CPU: bind data; device: one D2H readback).
+    const bool single_target = (rounds.size() == 1 &&
+                                rounds[0].n_active == n_t && rounds[0].width == n_k);
+    ggml_tensor * moe_out = nullptr;
+    for (const auto * cn : ex->compute) {
+        if (cn && cn->name && strstr(cn->name, "ffn_moe_out") != nullptr) {
+            moe_out = const_cast<ggml_tensor*>(cn); break;
+        }
+    }
+    const bool moe_out_host = moe_out && moe_out->data &&
+        (!moe_out->buffer ||
+         ggml_backend_buft_is_host(ggml_backend_buffer_get_type(moe_out->buffer)));
+    const bool direct_out = single_target && moe_out_host &&
+        moe_out->nb[0] == sizeof(float) && moe_out->nb[1] == (size_t) d_out * sizeof(float);
+
+#ifdef STREAM_MOE_TEMP
+    // ACC / SUM_ROWS micro-bench (STREAM_MOE_TMP_ACC_BENCH=1), min of 5, on the
+    // device: ACC [d,k] += [d,k]; SUM_ROWS sums the k axis ([k,d] -> [1,d], the
+    // real expert-fold shape). Shows fixed vs proportional cost in k.
+    if (std::getenv("STREAM_MOE_TMP_ACC_BENCH") && !dev_targets.empty()) {
+        static bool acc_benched = false;
+        if (!acc_benched) {
+            acc_benched = true;
+            device_target_t & dt = dev_targets.begin()->second;
+            const int64_t d = 2048;
+            const int64_t ks[] = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 };
+            auto run = [&](ggml_context * bctx, ggml_cgraph * gf) -> double {
+                double best = 1e9;
+                for (int rep = 0; rep < 5; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    ggml_backend_graph_compute_async(dt.be, gf);
+                    ggml_backend_synchronize(dt.be);
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    if (ms < best) best = ms;
+                }
+                (void) bctx;
+                return best;
+            };
+            for (int64_t k : ks) {
+                {   // ACC [d,k] += [d,k]
+                    ggml_init_params ip = { 8u * 1024u * 1024u, nullptr, true };
+                    ggml_context * bctx = ggml_init(ip);
+                    ggml_tensor * a = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, d, k);
+                    ggml_tensor * b = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, d, k);
+                    a->buffer = dt.arena; a->data = stmoe_vk_buffer_host_offset(dt.arena, 0);
+                    b->buffer = dt.arena; b->data = stmoe_vk_buffer_host_offset(dt.arena, (size_t) (d * k) * 4);
+                    ggml_tensor * node = ggml_acc_inplace(bctx, a, b, (size_t) d * 4, (size_t) d * k * 4, (size_t) d * k * 4, 0);
+                    ggml_cgraph * gf = ggml_new_graph(bctx);
+                    ggml_build_forward_expand(gf, node);
+                    std::fprintf(stderr, "[accbench] ACC      d=%lld k=%-4lld min_ms=%.4f\n", (long long) d, (long long) k, run(bctx, gf));
+                    ggml_free(bctx);
+                }
+                {   // SUM_ROWS over k: [k,d] -> [1,d]
+                    ggml_init_params ip = { 8u * 1024u * 1024u, nullptr, true };
+                    ggml_context * bctx = ggml_init(ip);
+                    ggml_tensor * b = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, k, d);
+                    b->buffer = dt.arena; b->data = stmoe_vk_buffer_host_offset(dt.arena, 0);
+                    ggml_tensor * node = ggml_sum_rows(bctx, b);
+                    ggml_cgraph * gf = ggml_new_graph(bctx);
+                    ggml_build_forward_expand(gf, node);
+                    std::fprintf(stderr, "[accbench] SUMROWS  k=%-4lld d=%lld min_ms=%.4f\n", (long long) k, (long long) d, run(bctx, gf));
+                    ggml_free(bctx);
+                }
+            }
+        }
+    }
+#endif
+
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_rounds_dec{ "chain_rounds_dec" }, g_rounds_pre{ "chain_rounds_pre" },
+                      g_tail_dec{ "chain_tail_dec" }, g_tail_pre{ "chain_tail_pre" };
+    tmr_acc_t & _rt = (n_t == 1) ? g_rounds_dec : g_rounds_pre;
+    tmr_acc_t & _tt = (n_t == 1) ? g_tail_dec : g_tail_pre;
+    auto _ch_t0 = std::chrono::steady_clock::now();
+#endif
     for (size_t ri = 0; ri < rounds.size(); ++ri) {
         const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
@@ -1160,6 +1308,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         c.gf  = dt ? dt->gf : gf_cpu;
         b.r = &r;
         b.w_b = r.width; b.n_active = r.n_active;
+        b.tok_full  = (r.n_active == n_t);
+        b.cell_full = b.tok_full && (r.width == n_k);
 
         // scatter_plan: t_round[a] = original token of round column a; order[i]
         // = round column of tight column i; segs = acc arithmetic runs.
@@ -1217,26 +1367,33 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                       << " != n_active " << r.n_active << " L" << layer);
             return GGML_STATUS_FAILED;
         }
-        // acc_d[d_out, n_t] += per_token tight columns, one ggml_acc per run.
-        ggml_tensor * acc = nullptr;
-        if (dt) {
-            acc = dt->acc;
+        if (direct_out) {
+            // Single target: per_token is the whole answer -> write moe_out
+            // directly, no ACC, no host fold.
+            if (dt) dt->result = per_token;
+            else    per_token->data = moe_out->data;
         } else {
-            acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
-            acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
-            acc->data = c.acc_d.data();
-        }
-        const size_t col = (size_t)(c.d_out) * 4;
-        for (const auto & seg : sp.segs) {
-            if (seg.len == 0) continue;
-            ggml_tensor * pv = ggml_view_2d(c.ctx, per_token, c.d_out, seg.len,
-                                            per_token->nb[1], (size_t) seg.src * per_token->nb[1]);
-            // nb2/nb3 must be > the 2D src1 element span: the vulkan ACC shader
-            // divides by them (the CPU kernel ignores them for a 2D src1).
-            ggml_tensor * a = ggml_acc_inplace(c.ctx, acc, pv,
-                                               (size_t) seg.delta * col, acc_bytes, acc_bytes,
-                                               (size_t) seg.dst * col);
-            ggml_build_forward_expand(c.gf, a);
+            // acc_d[d_out, n_t] += per_token tight columns, one ggml_acc per run.
+            ggml_tensor * acc = nullptr;
+            if (dt) {
+                acc = dt->acc;
+            } else {
+                acc = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, c.d_out, c.n_t);
+                acc->nb[0] = 4; acc->nb[1] = (size_t)(c.d_out) * 4;
+                acc->data = c.acc_d.data();
+            }
+            const size_t col = (size_t)(c.d_out) * 4;
+            for (const auto & seg : sp.segs) {
+                if (seg.len == 0) continue;
+                ggml_tensor * pv = ggml_view_2d(c.ctx, per_token, c.d_out, seg.len,
+                                                per_token->nb[1], (size_t) seg.src * per_token->nb[1]);
+                // nb2/nb3 must be > the 2D src1 element span: the vulkan ACC shader
+                // divides by them (the CPU kernel ignores them for a 2D src1).
+                ggml_tensor * a = ggml_acc_inplace(c.ctx, acc, pv,
+                                                   (size_t) seg.delta * col, acc_bytes, acc_bytes,
+                                                   (size_t) seg.dst * col);
+                ggml_build_forward_expand(c.gf, a);
+            }
         }
     }
     c.dev = nullptr;
@@ -1248,9 +1405,38 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         device_target_t & t = kv.second;
         if (!t.gf || t.gf->n_nodes == 0) continue;
         fix_view_buffers(t.gf);
-        if (ggml_backend_graph_compute_async(t.be, t.gf) != GGML_STATUS_SUCCESS) {
-            LOG_ERROR("stream_moe: device graph submit failed pool " << t.pool);
-            return GGML_STATUS_FAILED;
+#ifdef STREAM_MOE_TEMP
+        if (const char * dg = std::getenv("STREAM_MOE_TMP_DEVGRAPH_DUMP")) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                char fn[512]; std::snprintf(fn, sizeof(fn), "%s.txt", dg);
+                if (FILE * f = std::fopen(fn, "w")) {
+                    std::fprintf(f, "# device graph: pool=%u n_nodes=%d\n", t.pool, t.gf->n_nodes);
+                    for (int i = 0; i < t.gf->n_nodes; ++i) {
+                        const ggml_tensor * nd = t.gf->nodes[i];
+                        std::fprintf(f, "%3d %-16s %-44s ne=[%lld,%lld,%lld,%lld] bytes=%zu\n", i,
+                                ggml_op_name(nd->op), nd->name ? nd->name : "?",
+                                (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3],
+                                ggml_nbytes(nd));
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+#endif
+        int submit_n = 1;
+#ifdef STREAM_MOE_TEMP
+        if (const char * sn = std::getenv("STREAM_MOE_TMP_SUBMIT_N")) {
+            const int v = std::atoi(sn);
+            if (v > 0) submit_n = v;
+        }
+#endif
+        for (int si = 0; si < submit_n; ++si) {
+            if (ggml_backend_graph_compute_async(t.be, t.gf) != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("stream_moe: device graph submit failed pool " << t.pool);
+                return GGML_STATUS_FAILED;
+            }
         }
         // Overlap: submit async and let the CPU graph run concurrently on the
         // calling thread. Verified stable: per-layer acc and final output are
@@ -1260,6 +1446,14 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         if (std::getenv("STREAM_MOE_TMP_NO_OVERLAP")) ggml_backend_synchronize(t.be);
 #endif
     }
+#ifdef STREAM_MOE_TEMP
+    { _rt.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _ch_t0).count();
+      _rt.n++; _ch_t0 = std::chrono::steady_clock::now(); }
+#endif
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_tsync{ "tail_sync" }, g_tread{ "tail_read" }, g_tfold{ "tail_fold" };
+    auto _tt0 = std::chrono::steady_clock::now();
+#endif
     if (gf_cpu->n_nodes > 0 &&
         ggml_backend_graph_compute(cpu, gf_cpu) != GGML_STATUS_SUCCESS) {
         LOG_ERROR("stream_moe: CPU chain graph compute failed L" << layer);
@@ -1268,26 +1462,48 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     std::vector<std::vector<float>> dev_accs(dev_targets.size());
     std::vector<const float *> accs;
     accs.reserve(1 + dev_targets.size());
-    accs.push_back(c.acc_d.data());
+    if (!direct_out) accs.push_back(c.acc_d.data());
     size_t di = 0;
     for (auto & kv : dev_targets) {
         device_target_t & t = kv.second;
-        ggml_backend_synchronize(t.be);
-        dev_accs[di].assign(acc_sz, 0.0f);
 #ifdef STREAM_MOE_TEMP
-        if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
-            std::memcpy(dev_accs[di].data(), t.arena_map + t.acc_off, acc_bytes);
-        } else {
-            ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+        if (const char * sp = std::getenv("STREAM_MOE_TMP_SYNC_SPIN")) {
+            const long spin_us = std::atol(sp);
+            if (spin_us > 0) {
+                const auto t_spin = std::chrono::steady_clock::now();
+                while (std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - t_spin).count() < spin_us) {}
+            }
         }
-#else
-        ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+        _tt0 = std::chrono::steady_clock::now();
 #endif
-        accs.push_back(dev_accs[di].data());
+        ggml_backend_synchronize(t.be);
+#ifdef STREAM_MOE_TEMP
+        { g_tsync.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tt0).count(); g_tsync.n++; _tt0 = std::chrono::steady_clock::now(); }
+#endif
+        if (direct_out) {
+            // single target: the device result IS the layer output -> one D2H
+            if (t.result) ggml_backend_tensor_get(t.result, moe_out->data, 0, acc_bytes);
+        } else {
+            dev_accs[di].assign(acc_sz, 0.0f);
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
+                std::memcpy(dev_accs[di].data(), t.arena_map + t.acc_off, acc_bytes);
+            } else {
+                ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+            }
+#else
+            ggml_backend_tensor_get(t.acc, dev_accs[di].data(), 0, acc_bytes);
+#endif
+            accs.push_back(dev_accs[di].data());
+        }
+#ifdef STREAM_MOE_TEMP
+        { g_tread.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tt0).count(); g_tread.n++; _tt0 = std::chrono::steady_clock::now(); }
+#endif
         ++di;
     }
 #ifdef STREAM_MOE_TEMP
-    if (const char * ad = std::getenv("STREAM_MOE_TMP_ACC_DUMP")) {
+    if (const char * ad = direct_out ? nullptr : std::getenv("STREAM_MOE_TMP_ACC_DUMP")) {
         char fn[512];
         snprintf(fn, sizeof(fn), "%s/acc_L%d_cpu.bin", ad, layer);
         if (FILE * f = fopen(fn, "wb")) { fwrite(c.acc_d.data(), sizeof(float), acc_sz, f); fclose(f); }
@@ -1300,7 +1516,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     }
 #endif
 #ifdef STREAM_MOE_TEMP
-    if (std::getenv("STREAM_MOE_TMP_DEVDBG")) {
+    if (!direct_out && std::getenv("STREAM_MOE_TMP_DEVDBG")) {
         auto nrm = [](const std::vector<float> & v) {
             double s = 0; for (float x : v) s += (double) x * x; return std::sqrt(s);
         };
@@ -1335,7 +1551,15 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
     }
 #endif
-    if (!layer_fold(ex, d_out, n_t, accs)) return GGML_STATUS_FAILED;
+#ifdef STREAM_MOE_TEMP
+    _tt0 = std::chrono::steady_clock::now();
+#endif
+    if (!direct_out) {
+        if (!layer_fold(ex, d_out, n_t, accs)) return GGML_STATUS_FAILED;
+    }
+#ifdef STREAM_MOE_TEMP
+    { g_tfold.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tt0).count(); g_tfold.n++; }
+#endif
 #ifdef STREAM_MOE_TEMP
     // Numeric gate dump: moe_out per layer (same tmp_dump_node harness as the
     // single-bucket path) so an offline diff gates acc_d results.
@@ -1350,6 +1574,9 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
     }
 #endif
+#ifdef STREAM_MOE_TEMP
+    { _tt.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _ch_t0).count(); _tt.n++; }
+#endif
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1359,7 +1586,43 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                                          int /*n_threads*/) {
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
+#ifdef STREAM_MOE_TEMP
+    int64_t _n_t = 0;
+    for (const auto * cn : ex->compute)
+        if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { _n_t = cn->src[2]->ne[1]; break; }
+    static tmr_acc_t g_burst_dec{ "burst_dec" }, g_burst_pre{ "burst_pre" },
+                      g_pin_dec{ "pin_dec" }, g_pin_pre{ "pin_pre" },
+                      g_unpin_dec{ "unpin_dec" }, g_unpin_pre{ "unpin_pre" };
+    tmr_acc_t & _bt = (_n_t == 1) ? g_burst_dec : g_burst_pre;
+    tmr_acc_t & _pt = (_n_t == 1) ? g_pin_dec : g_pin_pre;
+    tmr_acc_t & _ut = (_n_t == 1) ? g_unpin_dec : g_unpin_pre;
+    auto _burst_t0 = std::chrono::steady_clock::now();
+    struct _burst_guard_t { tmr_acc_t & a; std::chrono::steady_clock::time_point t0;
+        _burst_guard_t(tmr_acc_t & a_, std::chrono::steady_clock::time_point t0_) : a(a_), t0(t0_) {}
+        ~_burst_guard_t() { a.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); a.n++; } } _burst_guard(_bt, _burst_t0);
+#endif
     const moe_model_topology_t& topo = sched.topology();
+#ifdef STREAM_MOE_TEMP
+    // TEMP pre-warm (STREAM_MOE_TMP_PREWARM=1): pin+unpin every expert of every
+    // layer once so the pool is fully resident before the timed work.
+    if (std::getenv("STREAM_MOE_TMP_PREWARM")) {
+        static bool prewarmed = false;
+        if (!prewarmed) {
+            prewarmed = true;
+            size_t total = 0;
+            for (uint32_t L = 0; L < topo.n_layer; ++L) {
+                uint64_t all[BITMAP_WORDS] = { 0 };
+                for (uint32_t e = 0; e < topo.n_expert; ++e) expert_scheduler::bit_set(all, e);
+                batch_await_t aw;
+                std::vector<expert_handle_t> pp(topo.n_expert);
+                const int32_t np = sched.pin_layer(L, all, aw, pp.data(), static_cast<uint32_t>(pp.size()));
+                if (np > 0) { for (int32_t i = 0; i < np; ++i) sched.unpin(pp[i]); total += static_cast<size_t>(np); }
+            }
+            if (std::getenv("STREAM_MOE_TMR"))
+                std::fprintf(stderr, "[TMR] prewarm pinned %zu experts\n", total);
+        }
+    }
+#endif
 #ifdef STREAM_MOE_TEMP
     // Closure-structure dump (env STREAM_MOE_TMP_CHAIN_DUMP_STRUCT=1). Fire
     // once per process on the layer selected by STREAM_MOE_TMP_CHAIN_DUMP_LAYER
@@ -1430,8 +1693,14 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     for (const auto & k : keys) expert_scheduler::bit_set(needed, k.expert);
     batch_await_t await;
     std::vector<expert_handle_t> pins(keys.size());
+#ifdef STREAM_MOE_TEMP
+    auto _pin_t0 = std::chrono::steady_clock::now();
+#endif
     const int32_t np = sched.pin_layer(static_cast<uint32_t>(layer), needed, await,
                                        pins.data(), static_cast<uint32_t>(pins.size()));
+#ifdef STREAM_MOE_TEMP
+    { _pt.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _pin_t0).count(); _pt.n++; }
+#endif
     if (np < 0 || static_cast<size_t>(np) != keys.size()) {
         LOG_ERROR("stream_moe: burst pin_layer failed (wanted " << keys.size() << ", got " << np << ")");
         return GGML_STATUS_FAILED;
@@ -1449,7 +1718,13 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // The compact-chain bucket engine is the only executor: a full-width single
     // bucket by default (no env), or an env-selected multi-bucket cut.
     const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
+#ifdef STREAM_MOE_TEMP
+    auto _unpin_t0 = std::chrono::steady_clock::now();
+#endif
     for (const auto & h : pins) sched.unpin(h);
+#ifdef STREAM_MOE_TEMP
+    { _ut.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _unpin_t0).count(); _ut.n++; }
+#endif
     return st;
 }
 

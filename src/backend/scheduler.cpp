@@ -283,6 +283,11 @@ bool expert_scheduler::submit_move(uint32_t layer, uint32_t expert,
         }
         t.cols.push_back(cp);
     }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG"))
+        std::fprintf(stderr, "[move] L%u E%u pool %u->%u bytes=%zu\n", layer, expert, src_pool, dst_pool,
+                     (size_t) ssp->cols.size() * (ssp->cols.empty() ? 0 : ssp->cols[0].stride));
+#endif
     {
         std::lock_guard<std::mutex> lk(move_mtx_);
         move_submit_.push_back(std::move(t));
@@ -495,6 +500,10 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
                   << " NO evictable victim (all pinned/fresh)");
         return -1; // all slots pinned/in-flight
     }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG"))
+        std::fprintf(stderr, "[evict] need L%u E%u pool%u victim L%u E%u\n", layer, expert, pool, v_layer, v_expert);
+#endif
     SCHED_DIAG("sched: evict L" << v_layer << " E" << v_expert << " (slot " << victim
               << ") to make room for L" << layer << " E" << expert << " in pool " << pool);
 
@@ -949,6 +958,11 @@ int32_t expert_scheduler::pin_layer(uint32_t layer, const uint64_t* needed, batc
         n_hits_.fetch_add(n_hit, std::memory_order_relaxed);
         return static_cast<int32_t>(want);
     }
+
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG"))
+        std::fprintf(stderr, "[pin] L%u want=%u hit=%u miss=%u\n", layer, want, n_hit, n_missing);
+#endif
 
     // Submit ONE active request for B. `await` counts the scheduler's per-settle
     // pins; exec sleeps once until done == n_load_target (all B pinned) or the
