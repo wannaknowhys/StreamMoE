@@ -2,6 +2,7 @@
 #include "backend/minigraph.h"
 #include "backend/minigraph_exec.h"
 #include "backend/scheduler.h"
+#include "backend/tensor_io.h"
 #include "common/logger.h"
 
 #include "ggml-backend-impl.h"
@@ -477,7 +478,7 @@ void stream_moe_backend_replicate_leaf(const ggml_tensor* t) {
         if (!dev) { ggml_backend_buffer_free(buf); continue; }
         // Backend-agnostic read: the source leaf may live on a device backend
         // (e.g. C1:Vulkan0). Never dereference t->data on the host.
-        ggml_backend_tensor_get(t, dev, 0, bytes);
+        tensor_read_host(t, dev, 0, bytes);
         e.resident_leaves.push_back({ t, buf, dev, bytes });
     }
 }

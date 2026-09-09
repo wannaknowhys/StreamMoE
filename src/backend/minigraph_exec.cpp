@@ -3,6 +3,7 @@
 #include "backend/moe_backend.h"
 #include "backend/mix_split.h"
 #include "backend/scatter_plan.h"
+#include "backend/tensor_io.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -42,6 +43,23 @@ struct parsed_node_t {
 // argsort layers (L3+) use a large nb[1] (e.g. 1024 bytes) with sparse rows.
 #define MOE_ID_AT(ids, t, k) \
     (*(const int32_t*)((const char*)(ids)->data + (size_t)(t) * (ids)->nb[1] + (size_t)(k) * (ids)->nb[0]))
+
+// Host image of a tensor for host-side inspection (iron rule): returns t->data
+// when host-resident, else a backend-agnostic copy in `buf`. Never dereference
+// t->data directly - the tensor may live on a device backend.
+static const uint8_t * host_image(const ggml_tensor * t, std::vector<uint8_t> & buf) {
+    if (!t->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
+        return static_cast<const uint8_t *>(t->data);
+    }
+    buf.resize(ggml_nbytes(t));
+    tensor_read_host(t, buf.data(), 0, buf.size());
+    return buf.data();
+}
+
+// Read an ids element from a host byte image honoring the tensor's row stride.
+static inline int32_t moe_id_at(const uint8_t * base, const ggml_tensor * ids, int t, int k) {
+    return *(const int32_t *)(base + (size_t) t * ids->nb[1] + (size_t) k * ids->nb[0]);
+}
 
 parsed_node_t parse_weight_name(const char* name) {
     parsed_node_t r;
@@ -561,10 +579,12 @@ static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
     if (c.dev && host_data) {
         const size_t bytes = ggml_nbytes(l);
         const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
-        if (c.dev->stage_map) std::memcpy(c.dev->stage_map + off, host_data, bytes);
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
         l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+        // Backend-agnostic upload into the stage buffer (iron rule). The fake
+        // base pointer makes the stage buffer's set_tensor resolve `off`.
+        tensor_write_host(l, host_data, 0, bytes);
     } else {
         l->data = const_cast<void *>(host_data);
     }
@@ -961,12 +981,15 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     const uint32_t n_expert = sched.topology().n_expert;
     const uint32_t n_pools  = sched.n_pools();
 
-    // Compact routing ids (MOE_ID_AT honors the real row stride: hash layers are
-    // compact, argsort layers are sparse). build_mix_plan wants [t*n_k + k].
+    // Compact routing ids (honors the real row stride: hash layers are compact,
+    // argsort layers are sparse). build_mix_plan wants [t*n_k + k]. ids may live
+    // on a device backend (gating on C1:Vulkan0) - use a host image (iron rule).
+    std::vector<uint8_t> ids_host;
+    const uint8_t * ids_bytes = host_image(ids, ids_host);
     std::vector<int32_t> ids_compact((size_t) n_k * n_t, 0);
     for (uint32_t t = 0; t < n_t; ++t) {
         for (uint32_t k = 0; k < n_k; ++k) {
-            ids_compact[(size_t) t * n_k + k] = MOE_ID_AT(ids, (int) t, (int) k);
+            ids_compact[(size_t) t * n_k + k] = moe_id_at(ids_bytes, ids, (int) t, (int) k);
         }
     }
 
@@ -1385,9 +1408,11 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         if (!pn.ok) continue;
         const ggml_tensor * ids = cn->src[2];
         if (!ids->data) continue;
+        std::vector<uint8_t> ids_host;
+        const uint8_t * ib = host_image(ids, ids_host);
         for (int t = 0; t < ids->ne[1]; ++t)
             for (int k = 0; k < ids->ne[0]; ++k) {
-                const int32_t e = MOE_ID_AT(ids, t, k);
+                const int32_t e = moe_id_at(ib, ids, t, k);
                 if (e >= 0 && e < static_cast<int32_t>(topo.n_expert)) add_key(pn.layer, static_cast<uint32_t>(e));
             }
     }
