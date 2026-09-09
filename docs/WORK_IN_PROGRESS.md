@@ -536,11 +536,41 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
         `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67（记录 380.5 / 17.81）。
       - 回归/性能（2026-09-09，P1-c/d/e 后）：三配置仍 **IDENTICAL**、单测 6/6；bench 同款
         **pp 391.9 / tg 18.66**（与 c/d/e 前同量级，符合预期——hygiene 不改算力）。
-- [ ] **P1b 查 ACC/CONT/SUM_ROWS 为何这么慢**：perf logger（`GGML_VK_PERF_LOGGER=1`）实测
-      2-token 一层：ACC 983us、CONT×2 986us、SUM_ROWS 510us、GET_ROWS×2 732us——都比
-      4~32K 元素的应有时间高几个数量级。都在同一设备 arena、**非跨设备**。疑点：`acc.comp`
-      的 nb2/nb3 索引分解、CONT/SUM_ROWS 通用 shader、或 perf logger 把算子间停顿归到前一个 op。
-      注：单 round 满宽时 SUM_ROWS（专家折叠）已产出 per-token 结果，ACC 只是拷贝——两步都可去。
+- [ ] **P1b fold 路径按桶 token 数二选一（per-k add 链 vs SUM_ROWS）**：
+      - 现状 `append_expert_fold` = `permute → cont(转置) → sum_rows → cont_2d`。**约束**：转置
+        CONT 删不掉而不动 SUM_ROWS——Vulkan `sum_rows` shader 只认连续 ne0（无 nb00；CPU 也
+        assert nb0==4），转置视图喂不进去。要删转置 = 换掉 SUM_ROWS。
+      - 实测（2026-09-09，olmoe 2048-token ubatch，单桶全 VRAM，dbg+perf logger）首图 9 节点：
+        mm 194ms(92%, 1041-1074 GFLOPS) / GLU 6.6ms / MUL 1.8ms / **CONT×2 2.7ms** /
+        **SUM_ROWS 6.5ms（读 134MB → ~20.6 GB/s，带宽极差）**。route-B fold 共 **9.2ms/层 = 4.4%**。
+        转置 CONT 本身不慢（搬 268MB → ~196 GB/s）；慢的是 SUM_ROWS + 小 `cont_2d`（固定开销）。
+      - **方案**：按本桶 `n_active`（或 fold 总字节 `n_active*w_b*d_out`）选路径——
+        大 n_active（prefill）走 **per-k view+add 链**（上游形状：无 CONT/SUM_ROWS，`w_b-1` 个 ADD，
+        带宽效率高、数值顺序=上游）；小 n_active（decode）保留 SUM_ROWS（节点少、固定开销低）。
+      - **实测交叉点（2026-09-09，dbg+perf logger，olmoe 单桶全 VRAM，热图平均）**：fold 耗时
+        （SUM_ROWS+CONT×2 vs 7×ADD）：
+
+        | n_t | SUM_ROWS 路径 | ADD 链 | SR/ADD |
+        | ---: | ---: | ---: | ---: |
+        | 1 | 375us | 2265us | 0.17 |
+        | 16 | 486us | 889us | 0.55 |
+        | 64 | 794us | 987us | 0.80 |
+        | 256 | 2273us | 2136us | 1.06 |
+        | 1024 | 6964us | 5062us | 1.38 |
+        | 2048 | 9253us | 6300us | 1.47 |
+
+        **交叉点 n_t ≈ 256**：小桶 SUM_ROWS 赢（n_t=1 快 6×），大桶 ADD 赢（2048 快 1.47×）。
+      - [x] **转正（2026-09-09）**：`append_expert_fold` 按 `fold_bytes = n_active*w_b*d_out*4`
+            选择——`>= 16MB` 走 per-k view+add 链（ping-pong 两缓冲），否则 SUM_ROWS 路径。
+            `STREAM_MOE_TMP_FOLD_ADD`/`_SUM` 保留为 dbg 强制开关。
+      - 验证：L0 隔离（gemma129，dump moe_out，ADD vs SUM）**maxAbs 7.6e-6 ≤ 1e-5 / cos≈1.0**
+            （ADD 本身正确）；端到端 129-token 回归走 SUM 路径 **IDENTICAL**（11.6MB < 16MB）；
+            单测 **6/6**。bench olmoe prefill3000 `place-c1c2-exp5`（ub512→ADD）**pp 385.2 / tg 18.99**
+            vs SUM 版 391.9 / 18.66——净收益 ~1.5%（fold 只占层 ~4%），在 run 噪声内。
+      - 备注：端到端 ADD vs SUM 会出现专家翻转放大（部分 token cos 0.9-0.99），与 route-B vs
+            上游同量级（已知 gate 噪声）；L0 隔离证明是 ULP，非 bug。
+      - 备注：旧 perf logger 2-token 数（ACC 983us/CONT 986us/SUM_ROWS 510us）疑似把算子间停顿
+        归到前一 op，不作判据；ACC 已随 P1-b 单 target 直写去掉。
 - [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
       应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
       用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。

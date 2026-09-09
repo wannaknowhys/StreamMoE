@@ -662,6 +662,36 @@ static ggml_tensor * append_expert_fold(bucket_build_t & b, ggml_tensor * weight
     const int64_t ne0 = weighted->ne[0];   // d_out
     const int64_t nw  = weighted->ne[1];   // w_b (experts per token)
     const int64_t nt  = weighted->ne[2];   // n_active tokens
+    // Fold path by size (docs/WORK_IN_PROGRESS P1b, measured 2026-09-09): small
+    // folds keep the SUM_ROWS reduction (3 ops, low fixed cost - decode); large
+    // folds use the per-k view+add chain (upstream fold shape, no CONT/SUM_ROWS;
+    // ~1.5x faster at 2048 tokens, crossover ~16MB of weighted data). Both are
+    // numerically equivalent within the relaxed gate (different sum order).
+    const size_t fold_bytes = (size_t) nw * (size_t) ne0 * (size_t) nt * sizeof(float);
+    bool use_add = nw >= 2 && fold_bytes >= (16u * 1024 * 1024);
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_FOLD_ADD")) use_add = nw >= 2;
+    if (std::getenv("STREAM_MOE_TMP_FOLD_SUM")) use_add = false;
+#endif
+    if (use_add) {
+        // Ping-pong two [d_out, n_active] buffers across the per-expert adds.
+        ggml_tensor * accA = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, ne0, nt);
+        b.bind_fresh(accA, (size_t)(ne0 * nt) * sizeof(float), false);
+        ggml_tensor * accB = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, ne0, nt);
+        b.bind_fresh(accB, (size_t)(ne0 * nt) * sizeof(float), false);
+        ggml_tensor * cur = ggml_view_2d(c.ctx, weighted, ne0, nt, weighted->nb[2], 0);
+        for (int64_t s = 1; s < nw; ++s) {
+            ggml_tensor * v = ggml_view_2d(c.ctx, weighted, ne0, nt,
+                                           weighted->nb[2], (size_t) s * weighted->nb[1]);
+            ggml_tensor * add = ggml_add(c.ctx, cur, v);
+            ggml_tensor * dst = (s & 1) ? accA : accB;
+            add->data   = dst->data;
+            add->buffer = dst->buffer;
+            ggml_build_forward_expand(c.gf, add);
+            cur = add;
+        }
+        return cur;
+    }
     ggml_tensor * p   = ggml_permute(c.ctx, weighted, 1, 0, 2, 3);   // view: [nw, d_out, n_active]
     ggml_tensor * pc  = ggml_cont(c.ctx, p);                         // contiguous [nw, d_out, n_active]
     b.bind_fresh(pc, (size_t)(nw * ne0 * nt) * sizeof(float), false);
