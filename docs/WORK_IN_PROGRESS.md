@@ -571,6 +571,25 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
             上游同量级（已知 gate 噪声）；L0 隔离证明是 ULP，非 bug。
       - 备注：旧 perf logger 2-token 数（ACC 983us/CONT 986us/SUM_ROWS 510us）疑似把算子间停顿
         归到前一 op，不作判据；ACC 已随 P1-b 单 target 直写去掉。
+- [ ] **接缝（跨 backend）成本——混合放置的真正瓶颈（2026-09-09 实测）**：
+      - 现象：olmoe `place-c1`（C1 dense 在 Vulkan、专家 RAM/CPU）**19.5 t/s** vs `place-cpu` 40.0 /
+        `stock-vulkan` 41.3；`place-cpu ≈ stock-cpu` → **route-B MoE 引擎本身不亏**，慢在混合放置。
+      - `[COPY]` 计时（vendored sched 跨 split 拷贝点，`SM_COPY_TMR` 门控，包住前置 sync）：
+        `cur`（`ffn_norm-N` 8KB）每次 **1.58ms = sync 1.41 + copy 0.17**；全部拷贝每 token
+        **41ms = sync 30 + copy 10.6**。`ffn_moe_out`（8KB 回写）才 **0.003ms**；`topk/weights`（32B）
+        ~0.17ms（同样 sync 主导）。
+      - 结论：**慢的不是拷贝字节，是每层 host 停等 GPU dense 的 `ggml_backend_synchronize`**。
+        上游 dense+MoE 同设备一条命令流（流水）；混合放置逐层 GPU↔host 乒乓、完全串行。
+      - **两个方向（用户 2026-09-09 定，记录待做）**：
+        - **A 消灭 sync**：dense 与 MoE 同设备（都在 GPU 或都在 CPU），消除跨 backend 每层等待；
+          或流水（不等 dense 完成）。放置问题，非拷贝问题。
+        - **B 降低 copy**：170us/8KB（~47MB/s）本身也差；同设备接缝零拷贝可连这 170us 一起省。
+      - **根因定位（2026-09-09，排除法 + `SM_REP100`）**：C1 dense 每图（38 节点）有 **~0.7ms 固定
+        基础 lag**（一次 graph_compute 把真实节点跑 100 遍 → per_rep 0.65-0.93ms；正常 1× ≈1.4ms），
+        16 图/token → ~11ms/token 基础 lag。**已逐一排除**：GGUF（原版文件）、构建（route-B build
+        `-ngl 99` = 89us = 上游）、buft（都 Vulkan0）、显存类型（都 devlocal=1 hostvis=1 rebar）、
+        权重布局/字节（nb 一致、模型字节喂微基准仍慢）、verify tag（`chain=1` 全 `ffn_moe_*`）、shader。
+        → 慢在**整模型大图被切成逐层小图**，每次 `graph_compute` 的固定开销 × 层数。
 - [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
       应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
       用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。
