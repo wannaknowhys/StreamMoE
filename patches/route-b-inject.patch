@@ -281,20 +281,21 @@ index e9fe3592d..1149ae5af 100644
      };
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c34700ff5..8c033f22d 100644
+index c34700ff5..66f17d01f 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -5,6 +5,9 @@
+@@ -5,6 +5,10 @@
  #include "llama-hparams.h"
  #include "llama-impl.h"
  #include "llama-mmap.h"
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "tsc_timer.h"
++namespace stream_moe { const char * route_b_dense_device(const char * spec, int il, int n_layer_all); }
 +#endif
  #include "llama-cparams.h"
  #include "llama-model-loader.h"
  
-@@ -1370,6 +1373,9 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+@@ -1370,6 +1374,9 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
  }
  
  bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -304,6 +305,40 @@ index c34700ff5..8c033f22d 100644
      const auto & split_mode   = params.split_mode;
      const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
      const auto & tensor_split = params.tensor_split;
+@@ -1450,6 +1457,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
++#ifdef STREAM_MOE_ROUTE_B
++        // Dense placement owns C1 layers and the output layer (C2 tail) when
++        // --dense-placement is set (docs/DENSE_PLACEMENT.md).
++        if (params.dense_placement) {
++            const char * dn = stream_moe::route_b_dense_device(params.dense_placement, il, n_layer_all);
++            if (dn && std::string(dn) != "CPU") {
++                for (const auto & d : devices) {
++                    if (std::string(dn) == ggml_backend_dev_name(d.dev)) {
++                        LLAMA_LOG_DEBUG("load_tensors: layer %3d dense-placed on %s, is_swa = %d\n", il, dn, is_swa);
++                        return {d.dev, &pimpl->gpu_buft_list.at(d.dev)};
++                    }
++                }
++                LLAMA_LOG_WARN("load_tensors: dense placement device '%s' not in model devices; layer %d on CPU\n", dn, il);
++            }
++            return {cpu_dev, &pimpl->cpu_buft_list};
++        }
++#endif
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+             return {cpu_dev, &pimpl->cpu_buft_list};
+@@ -2633,6 +2657,9 @@ llama_model_params llama_model_default_params() {
+         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
+         /*.main_gpu                    =*/ 0,
+         /*.tensor_split                =*/ nullptr,
++#ifdef STREAM_MOE_ROUTE_B
++        /*.dense_placement             =*/ nullptr,
++#endif
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
 diff --git a/src/llama.cpp b/src/llama.cpp
 index 1609fec88..f5d3d826f 100644
 --- a/src/llama.cpp

@@ -14,3 +14,7 @@
     // KV placement as a collection, e.g. "RAM,VRAM0,VRAM1" (multi-replica
     // mirrors are a future feature; today only the first element is honored)
     std::vector<std::string> kv_placement;
+
+    // Dense placement (docs/DENSE_PLACEMENT.md, Phase 1a): "C1:<dev>,C2:<dev>"
+    // (GLOBAL = C2 alias; RAM/CPU = host). Empty = all dense on CPU.
+    std::string dense_placement;

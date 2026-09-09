@@ -58,6 +58,13 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **deepseek 设备实测（2026-09-08）**：`RAM:71680 + Vulkan0:1024`（80 槽）、95-token prefill-from，设备 round `dev=1` 真在 Vulkan 上跑；对 CPU 桶引擎/上游基线 **embd cos 0.9999998 / hidden cos 0.99999997**（cos gate 内），expert_history 8.6% flip（允许），退出 0 泄漏。→ 设备路径对 gemma + deepseek 均成立。
 - **C4 resident 复制（2026-09）**：闭包分析（`moe_chain_verify_graph`）结束时把被闭包使用、非 per-expert、≤1 MiB 的叶子（gemma `ffn_down_exps.scale` 512 B/层）**一次性复制到每个有专家池的设备**（`stream_moe_backend_replicate_leaf`）；per-device 图绑定常驻副本（`bucket_ext_leaf` 命中 unwrap 后的根）而非每 build 重新 staging。gemma RAM8G+VRAM256M 实测：resident 路径与 staging 路径产物**逐字节一致**，cos 对 CPU 仍 ~0.98（既有 flip 噪声）。
 
+### dense 位置管理 Phase 1a（2026-09-08，docs/DENSE_PLACEMENT.md）
+
+- `--dense-placement C1:<dev>,C2:<dev>`：整体 C1 / 整体 C2 选设备（RAM/CPU/Vulkan0/...）。经 `llama_model_params.dense_placement` → `get_layer_buft_list` route-b 钩子（`stream_moe::route_b_dense_device`）设置 `dev_layer`，KV 自动跟随（`offload_kqv`）。
+- `--expert-backend` 下 `-ngl` 报错退出；设备名非法报错退出；不传 placement 默认 dense 全 CPU。
+- 实测 gemma-4-26B 129-token prefill-from：默认 / `C1:RAM,C2:RAM` 逐字节 IDENTICAL；`C1:Vulkan0,C2:Vulkan0` 30 C1 + 输出层上 Vulkan0，hidden cos ~0.986（已知后端噪声量级）；`C1:RAM,C2:Vulkan0` / `C1:Vulkan0,C2:RAM` ~0.9999。DeepSeek C1 放不进 RX590 8G（dense 11.66 GB），目标 P100 16G。
+- patch 重生成 + 临时 worktree apply 逐字节复现（20 文件）。
+
 ### prefill 导出（2026-08-31，cb_eval 图内抓取 + 参数化）
 
 - **机制**：`--export-dir <dir>` 参数替代 `LLM_EXPORT_DIR` env（llama_context_params.export_dir，`common_context_params_to_llama` 传递；`run_export.js` 已适配传参）。

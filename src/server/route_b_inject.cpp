@@ -368,4 +368,89 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
     return false;
 }
 
+namespace {
+
+// Case-insensitive equality of a token against a key of known length.
+bool placement_key_eq(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 32);
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Parse one "KEY:VALUE" item out of "K1:V1,K2:V2,...". Returns false when the
+// key is absent (out untouched). Whitespace around key/value is trimmed.
+bool placement_lookup(const char* spec, const char* key, std::string& out) {
+    if (!spec) return false;
+    const size_t klen = std::strlen(key);
+    const char* p = spec;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+        const char* end = std::strchr(p, ',');
+        if (!end) end = p + std::strlen(p);
+        const char* colon = p;
+        while (colon < end && *colon != ':') ++colon;
+        if (colon < end) {
+            const char* ks = p;
+            const char* ke = colon;
+            while (ks < ke && (*ks == ' ' || *ks == '\t')) ++ks;
+            while (ke > ks && (ke[-1] == ' ' || ke[-1] == '\t')) --ke;
+            if (static_cast<size_t>(ke - ks) == klen && placement_key_eq(ks, key, klen)) {
+                const char* ds = colon + 1;
+                const char* de = end;
+                while (ds < de && (*ds == ' ' || *ds == '\t')) ++ds;
+                while (de > ds && (de[-1] == ' ' || de[-1] == '\t')) --de;
+                out.assign(ds, de);
+                return true;
+            }
+        }
+        p = end;
+    }
+    return false;
+}
+
+bool placement_is_host(const std::string& dev) {
+    return dev.empty() || dev == "RAM" || dev == "ram" || dev == "CPU" || dev == "cpu";
+}
+
+} // namespace
+
+bool route_b_dense_placement_validate(const char* spec) {
+    if (!spec || !*spec) return true;
+    std::string dev;
+    for (const char* key : { "C1", "C2", "GLOBAL" }) {
+        if (!placement_lookup(spec, key, dev)) continue;
+        if (placement_is_host(dev)) continue;
+        if (!ggml_backend_dev_by_name(dev.c_str())) {
+            std::fprintf(stderr, "route B: --dense-placement device '%s' (key %s) not found\n",
+                         dev.c_str(), key);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool route_b_dense_placement_uses_gpu(const char* spec) {
+    std::string dev;
+    for (const char* key : { "C1", "C2", "GLOBAL" }) {
+        if (!placement_lookup(spec, key, dev)) continue;
+        if (!placement_is_host(dev)) return true;
+    }
+    return false;
+}
+
+const char* route_b_dense_device(const char* spec, int il, int n_layer_all) {
+    static thread_local std::string out;
+    out.clear();
+    const bool is_output = (il == n_layer_all);
+    if (!placement_lookup(spec, is_output ? "C2" : "C1", out) && is_output) {
+        placement_lookup(spec, "GLOBAL", out);   // C2 alias
+    }
+    if (placement_is_host(out)) return "CPU";
+    return out.c_str();
+}
+
 } // namespace stream_moe

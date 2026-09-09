@@ -20,14 +20,14 @@
             // route B owns where experts compute. Keep llama.cpp from
             // auto-offloading host compute to a GPU backend (op_offload):
             // it steals VRAM for device compute buffers and pulls CPU-numeric
-            // runs through device kernels even at -ngl 0.
+            // runs through device kernels even at -ngl 0. Dense placement on a
+            // GPU re-enables op_offload in common.cpp (weightless dense ops
+            // must follow their weights).
             params.no_op_offload = true;
-            // n_gpu_layers defaults to -1 (auto = offload every layer), which
-            // makes a RAM-only run still allocate ~2.5 GB of GPU buffers.
-            // route B decides expert placement itself and dense placement is a
-            // future concern (docs/TODO.md) - default to no layer offload; an
-            // explicit later --gpu-layers N overrides this in arg order.
-            params.n_gpu_layers = 0;
+            // Dense placement is owned by route B: -ngl is rejected at load
+            // time and --dense-placement decides per category. Do NOT set
+            // n_gpu_layers here - the default (-1) is the "user did not pass
+            // -ngl" sentinel the validator checks (docs/DENSE_PLACEMENT.md).
         }
     ));
     add_opt(common_arg(
@@ -97,6 +97,16 @@
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
+        }
+    ));
+
+    add_opt(common_arg(
+        {"--dense-placement"}, "<C1:dev,C2:dev>",
+        "StreamMoE: dense placement (docs/DENSE_PLACEMENT.md). C1 = per-layer dense "
+        "(all layers), C2 = global dense (output layer; alias GLOBAL). dev = RAM | CPU | "
+        "Vulkan0 | ... Empty = all dense on CPU. -ngl is rejected under --expert-backend.",
+        [](common_params & params, const std::string & value) {
+            params.dense_placement = value;
         }
     ));
 

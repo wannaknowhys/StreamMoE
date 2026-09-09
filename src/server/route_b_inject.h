@@ -34,4 +34,16 @@ llama_model_tensor_buft_override* route_b_setup(
 // tensors / unknown names are a no-op. Returns true if the tensor was filled.
 bool route_b_fill_dense(const char* tensor_name, void* data);
 
+// Dense placement (docs/DENSE_PLACEMENT.md, Phase 1a). `spec` is
+// "C1:<dev>,C2:<dev>" (GLOBAL = C2 alias; RAM/CPU = host). Called from the
+// vendored common.cpp / llama-model.cpp while building/loading the model.
+//   validate : parse and check every named device exists; false on error.
+//   uses_gpu : true if any named device is not RAM/CPU.
+//   device   : device name for layer `il` (C1) or the output layer
+//              (`il == n_layer_all`, C2); "CPU" when unset. The returned
+//              pointer is stable until the next call on the same thread.
+bool         route_b_dense_placement_validate(const char* spec);
+bool         route_b_dense_placement_uses_gpu(const char* spec);
+const char * route_b_dense_device(const char* spec, int il, int n_layer_all);
+
 } // namespace stream_moe

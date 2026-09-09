@@ -15,4 +15,25 @@
             }
             params.tensor_buft_overrides.push_back({ nullptr, nullptr }); // terminator
         }
+
+        // Dense placement (docs/DENSE_PLACEMENT.md): route B owns dense residency,
+        // so the loader's contiguous -ngl is not accepted. --dense-placement
+        // decides C1/C2. Dense on a GPU needs op_offload so weightless dense ops
+        // follow their weights (re-enabled after --expert-backend set it off).
+        if (params.n_gpu_layers != -1) {
+            fprintf(stderr, "route B: -ngl/--gpu-layers is not accepted with --expert-backend; "
+                            "use --dense-placement C1:<dev>,C2:<dev> instead\n");
+            exit(1);
+        }
+        mparams.n_gpu_layers = 0;   // dense default CPU; --dense-placement overrides
+        if (!params.dense_placement.empty()) {
+            if (!stream_moe::route_b_dense_placement_validate(params.dense_placement.c_str())) {
+                fprintf(stderr, "route B: invalid --dense-placement '%s'\n", params.dense_placement.c_str());
+                exit(1);
+            }
+            mparams.dense_placement = params.dense_placement.c_str();
+            if (stream_moe::route_b_dense_placement_uses_gpu(params.dense_placement.c_str())) {
+                params.no_op_offload = false;
+            }
+        }
     }
