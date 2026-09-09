@@ -504,10 +504,25 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 （冷启专家装载）+ `burst_tail` 5.4s（CPU 图+设备 sync+acc 回读+host fold）+ `burst_rounds`
 0.08s（host 规划+紧凑图构建+提交）。
 
-- [ ] **P1 gather 改区间**：满宽 round（单池、`n_active==n_t`、`order` 恒等）跳过 per-token
-      `ggml_get_rows` gather + 出口 scatter，改连续区间切片/直引用；非满宽（跨池/token 子集）
-      才保留 index-gather。现状 `bucket_gather_cur`（minigraph_exec.cpp:655）/
-      `bucket_gather_per_slot`（:621）全是逐元素 `get_rows`，恒等时白干。
+- [ ] **P1 满宽/单设备直通（省略条件分两类）**：
+      - **展宽类**（把 full `[d,n_t]` 选/展成紧凑 `[d,w_b,n_active]`）→ **满宽可省**：
+        - `GET_ROWS(cur)`：满宽是恒等置换，直接引用原 cur。
+        - `GET_ROWS(权重)`：满宽 `w_b==n_k, n_active==n_t`，目标布局与源 `ffn_moe_weights`
+          一致，直接拿源张量当壳子（改指针/形状）。
+      - **多 device 类**（per-device 部分和 + 合并）→ **本层单 device 可省**：
+        - `ACC`（scatter-add 进 `acc_d`）：单 device 单 round 时只是拷贝。
+        - `acc_d` 清零 + host `layer_fold`：单 device 时是拷贝。
+        - → 单 device 时 `SUM_ROWS` 结果可**直接写 `moe_out`**，省掉 ACC + layer_fold。
+      - 其余不在这两类：`SUM_ROWS`（专家轴折叠，始终需要）、`CONT×2`（给 fold 铺路，
+        看 `sum_rows`/出口能否吃 strided 视图）。
+      - 关系：当前设计下**单 pool ⇒ 单 round ⇒ 满宽**（`build_mix_plan` 单池退化为一个满宽
+        round），所以单 device 的常见路径两类条件同时满足。
+      现状 `bucket_gather_cur`（minigraph_exec.cpp:655）/`bucket_gather_per_slot`（:621）。
+- [ ] **P1b 查 ACC/CONT/SUM_ROWS 为何这么慢**：perf logger（`GGML_VK_PERF_LOGGER=1`）实测
+      2-token 一层：ACC 983us、CONT×2 986us、SUM_ROWS 510us、GET_ROWS×2 732us——都比
+      4~32K 元素的应有时间高几个数量级。都在同一设备 arena、**非跨设备**。疑点：`acc.comp`
+      的 nb2/nb3 索引分解、CONT/SUM_ROWS 通用 shader、或 perf logger 把算子间停顿归到前一个 op。
+      注：单 round 满宽时 SUM_ROWS（专家折叠）已产出 per-token 结果，ACC 只是拷贝——两步都可去。
 - [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
       应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
       用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。
