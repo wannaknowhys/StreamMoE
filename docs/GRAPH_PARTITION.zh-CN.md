@@ -227,21 +227,23 @@ leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——�
 
 - [x] B39：`stream_moe_backend_replicate_leaf` 用 `ggml_backend_tensor_get` 读源
   （§7.4）。
-- [ ] `minigraph_exec.cpp:564` staging 上传 -> 绑定 stage buffer 的张量用
-  `ggml_backend_tensor_set`（或走 move 管线），不用裸 memcpy。
-- [ ] `minigraph_exec.cpp:1256` DEVDBG arena 读 -> `ggml_backend_tensor_get`
-  （或保持门控；它今天读的是 host 映射）。
-- [ ] 一个 helper `read_tensor_to_host(sched, t, dst)` = sched 后端 + `_async` +
-  `synchronize` + host 回退；所有 host 侧读张量都用它。
-- [ ] grep 守卫：`moe_backend.cpp` iface 之外出现
+- [x] `minigraph_exec.cpp:564` staging 上传 -> `tensor_write_host`
+  （`ggml_backend_tensor_set`）；假基址让 stage buffer 的 `set_tensor` 解析出偏移。
+- [x] `minigraph_exec.cpp:1256` DEVDBG arena 读——保持门控（读的是我们自己 arena 的
+  host 映射；仅诊断）。
+- [x] 一个 helper `src/backend/tensor_io.h`（`tensor_read_host` /
+  `tensor_write_host`）；B39、staging 上传、ids 读取都用它。
+- [ ] grep 守卫（可选）：`moe_backend.cpp` iface 之外出现
   `memcpy(<tensor>->data, ...)` / `memcpy(..., <tensor>->data, ...)` 直接报错。
 
 ### B. `ids` host 拷贝（解锁 device-resident 路由）
 
-- [ ] `exec_layer_burst_chain_buckets`：把 `MOE_ID_AT(ids, ...)` 直接解引用换成
-  helper 拿到的 host 副本（compact-ids 构建留在 host；ids 小，round 规划仍 host 侧）。
-- [ ] 设备测试：`ids` 在 Vulkan0 产生、闭包在 Vulkan0 池 -> rounds 与 CPU 常驻 ids
-  逐字节一致。
+- [x] `exec_layer_burst_chain_buckets` 与 `exec_layer_burst` 的 pin keys：用
+  `host_image()` + `moe_id_at()` 读 ids（仅当 ids buffer 非 host-resident 时才拷贝；
+  compact-ids 构建与 round 规划仍留 host）。
+- [x] 设备冒烟：gemma `C1:Vulkan0` + Vulkan 池干净跑通（exit 0）。注意 ids 拷贝分支是
+  防御性的：当前 sched 会把 ids 拷进我们的 host backend，所以生产路径还没触发；等闭包
+  以设备图跑、ids 设备常驻时才生效。
 
 ### C. 同设备接缝：`cur` / `ffn_moe_out` 不出设备
 

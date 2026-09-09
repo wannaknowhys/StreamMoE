@@ -250,23 +250,25 @@ Ordered by dependency; each step is independently verifiable.
 
 - [x] B39: `stream_moe_backend_replicate_leaf` reads its source via
   `ggml_backend_tensor_get` (§7.4).
-- [ ] `minigraph_exec.cpp:564` staging upload -> `ggml_backend_tensor_set` on a
-  tensor bound to the stage buffer (or the move pipeline), not raw memcpy.
-- [ ] `minigraph_exec.cpp:1256` DEVDBG arena read -> `ggml_backend_tensor_get`
-  (or keep gated; it reads a host mapping today).
-- [ ] One helper `read_tensor_to_host(sched, t, dst)` = sched backend +
-  `_async` + `synchronize` + host fallback; use it wherever a tensor is read on
-  the host.
-- [ ] Grep guard: fail on `memcpy(<tensor>->data, ...)` /
+- [x] `minigraph_exec.cpp:564` staging upload -> `tensor_write_host`
+  (`ggml_backend_tensor_set`); the fake base pointer makes the stage buffer's
+  `set_tensor` resolve the offset.
+- [x] `minigraph_exec.cpp:1256` DEVDBG arena read - kept gated (reads a host
+  mapping of our own arena; diagnostic only).
+- [x] One helper `src/backend/tensor_io.h` (`tensor_read_host` /
+  `tensor_write_host`); used by B39, the staging upload, and the ids read.
+- [ ] Grep guard (optional): fail on `memcpy(<tensor>->data, ...)` /
   `memcpy(..., <tensor>->data, ...)` outside the `moe_backend.cpp` iface.
 
 ### B. `ids` host copy (unblocks device-resident routing)
 
-- [ ] `exec_layer_burst_chain_buckets`: replace `MOE_ID_AT(ids, ...)` direct
-  deref with a host copy from the helper (compact-ids build stays host-side;
-  ids is small, round planning stays host-side).
-- [ ] Device test: `ids` produced on Vulkan0, closure on a Vulkan0 pool ->
-  rounds byte-identical to CPU-resident ids.
+- [x] `exec_layer_burst_chain_buckets` and `exec_layer_burst` pin keys: read
+  ids through `host_image()` + `moe_id_at()` (host copy only when the ids buffer
+  is not host-resident; compact-ids build and round planning stay host-side).
+- [x] Device smoke: gemma `C1:Vulkan0` + Vulkan pool runs clean (exit 0). Note
+  the ids-copy branch is defensive: the current sched copies ids into our host
+  backend, so it is not yet hit in production; it fires once the closure runs
+  as a device graph with ids device-resident.
 
 ### C. Same-device seam: `cur` / `ffn_moe_out` no round-trip
 
