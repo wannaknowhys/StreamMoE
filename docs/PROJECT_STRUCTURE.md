@@ -42,6 +42,7 @@ StreamMoE/
 | `REPACK_DIVERGENCE_DEBUG.md` / `.zh-CN.md`                   | repack vs 普通内核路径差异的 bit 级排查                                                      |
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md`                           | 待办 / 可执行程序路线图                                                                      |
 | `DENSE_PLACEMENT.md` / `.zh-CN.md`                           | dense 位置管理（C1/C2 驻留、`--dense-placement` 参数、计算/搬迁 lag 判据、静态 vs 动态迁移） |
+| `GRAPH_PARTITION.md` / `.zh-CN.md`                           | 整图分区（`STREAM_MOE_TMP_GRAPH_DUMP` 全图 dump、C1/gating/专家闭包/C2 四区域、接缝 external leaves、buft 标记、同设备接缝与 C1 闭包化） |
 | `BENCHMARK.md` / `.zh-CN.md`                                 | 布局吞吐基准（`tools/run_bench.js`：cold/steady、jsonl 多轮、原版对比、结果结构）             |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
