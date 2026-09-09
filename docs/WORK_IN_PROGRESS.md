@@ -489,3 +489,29 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
   clamp/swiglu + 6 外 leaf/层）。对 CPU 桶引擎基线 `deepseek_hi_moe` 与上游 `deepseek_hi_up` 均
   **embd cos 0.9999998 / hidden cos 0.99999997**（cos gate 内）；expert_history 6297/73530
   （8.6%）flip（允许，gate 边界）；退出 0 泄漏、无错误。→ 设备路径对 deepseek 闭包成立。
+
+### P. 执行器性能收尾（2026-09-09，进行中）
+
+背景：bench olmoe prefill3000（warm 中位数，RX590）：
+
+| 指标 | stock-vulkan | place-c1c2-exp5 | place-cpu |
+| :--- | ---: | ---: | ---: |
+| pp (prefill) | 466.3 | 380.5 (82%) | — |
+| tg (decode) | 38.39 | **17.81 (46%)** | 32.15 (对 stock-cpu 32.99 = 97%) |
+
+关键判据：**CPU 路径 decode（32.15）反而比 GPU 设备路径（17.81）快** → decode 差距不是算力，
+是每层设备执行器的固定开销。探针（dbg+TMR，cold 单次 prefill）：`burst` 8.2s = `pin` 2.7s
+（冷启专家装载）+ `burst_tail` 5.4s（CPU 图+设备 sync+acc 回读+host fold）+ `burst_rounds`
+0.08s（host 规划+紧凑图构建+提交）。
+
+- [ ] **P1 gather 改区间**：满宽 round（单池、`n_active==n_t`、`order` 恒等）跳过 per-token
+      `ggml_get_rows` gather + 出口 scatter，改连续区间切片/直引用；非满宽（跨池/token 子集）
+      才保留 index-gather。现状 `bucket_gather_cur`（minigraph_exec.cpp:655）/
+      `bucket_gather_per_slot`（:621）全是逐元素 `get_rows`，恒等时白干。
+- [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
+      应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
+      用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。
+- 备注：**C（同设备接缝）被 sched 拷贝挡住**——实测 exec 时 `cur` 是 `STREAMMOE_HOST`
+  （`[seam] cur 'STREAMMOE#ffn_norm-0 (reshaped)#0' buft=STREAMMOE_HOST`），即 dense cur 已被
+  sched 拷到我们的 host backend，不是设备上的生产者；"绑定生产者 buffer" 需把我们的 compute
+  buft 改成设备 buft（或改 sched 分配），架构级改动，暂缓。
