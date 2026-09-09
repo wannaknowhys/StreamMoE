@@ -95,13 +95,13 @@ ggml_backend_buffer_t host_buft_alloc_buffer(ggml_backend_buffer_type_t buft, si
     iface.get_base = [](ggml_backend_buffer_t b) -> void* {
         return static_cast<host_buf_ctx*>(b->context)->ptr;
     };
-    iface.memset_tensor = [](ggml_backend_buffer_t, ggml_tensor* t, uint8_t v, size_t o, size_t s) {
+    iface.memset_tensor = [](ggml_backend_buffer_t, ggml_tensor* t, uint8_t v, size_t o, size_t s) {  // iron-rule-exempt: host buft iface
         std::memset(reinterpret_cast<char*>(t->data) + o, v, s);
     };
-    iface.set_tensor = [](ggml_backend_buffer_t, ggml_tensor* t, const void* d, size_t o, size_t s) {
+    iface.set_tensor = [](ggml_backend_buffer_t, ggml_tensor* t, const void* d, size_t o, size_t s) {  // iron-rule-exempt: host buft iface
         std::memcpy(reinterpret_cast<char*>(t->data) + o, d, s);
     };
-    iface.get_tensor = [](ggml_backend_buffer_t, const ggml_tensor* t, void* d, size_t o, size_t s) {
+    iface.get_tensor = [](ggml_backend_buffer_t, const ggml_tensor* t, void* d, size_t o, size_t s) {  // iron-rule-exempt: host buft iface
         std::memcpy(d, reinterpret_cast<const char*>(t->data) + o, s);
     };
     iface.clear = [](ggml_backend_buffer_t b, uint8_t v) {

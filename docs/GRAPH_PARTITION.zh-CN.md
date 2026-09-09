@@ -233,8 +233,9 @@ leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——�
   host 映射；仅诊断）。
 - [x] 一个 helper `src/backend/tensor_io.h`（`tensor_read_host` /
   `tensor_write_host`）；B39、staging 上传、ids 读取都用它。
-- [ ] grep 守卫（可选）：`moe_backend.cpp` iface 之外出现
-  `memcpy(<tensor>->data, ...)` / `memcpy(..., <tensor>->data, ...)` 直接报错。
+- [x] grep 守卫：`scripts/check_tensor_data.js`（Node，零依赖）扫 `src/` + `patches/`
+  里的 `memcpy/memmove/memset(...->data...)`；已挂到 `build.bat test`，也可独立运行。
+  合法行（或其后一行）加 `iron-rule-exempt` 标记豁免（后端 iface）。当前 0 命中。
 
 ### B. `ids` host 拷贝（解锁 device-resident 路由）
 

@@ -257,8 +257,10 @@ Ordered by dependency; each step is independently verifiable.
   mapping of our own arena; diagnostic only).
 - [x] One helper `src/backend/tensor_io.h` (`tensor_read_host` /
   `tensor_write_host`); used by B39, the staging upload, and the ids read.
-- [ ] Grep guard (optional): fail on `memcpy(<tensor>->data, ...)` /
-  `memcpy(..., <tensor>->data, ...)` outside the `moe_backend.cpp` iface.
+- [x] Grep guard: `scripts/check_tensor_data.js` (Node, zero-dep) scans `src/` +
+  `patches/` for `memcpy/memmove/memset(...->data...)`; wired into `build.bat test`
+  and runnable standalone. Exempt a line (or the next line) with the marker
+  `iron-rule-exempt` (backend iface). Current: 0 violations.
 
 ### B. `ids` host copy (unblocks device-resident routing)
 

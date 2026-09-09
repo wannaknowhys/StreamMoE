@@ -148,6 +148,9 @@ echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
 :test
+rem  iron-rule guard (docs/GRAPH_PARTITION.md): no raw tensor-data memcpy
+node scripts\check_tensor_data.js
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 if not exist "%LLAMA_BUILD%\src\llama.lib" (
     echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
     exit /b 1
