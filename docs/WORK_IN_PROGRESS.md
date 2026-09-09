@@ -511,6 +511,26 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 - [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
       应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
       用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。
+
+  **实测（2026-09-09，olmoe place-c1c2-exp5，dbg+TMR）**：
+  - 计时桶（`STREAM_MOE_TMR`，dbg only）：`burst_{dec,pre}`（整层 exec）→ `pin_{dec,pre}`
+    （`sched.pin_layer`）+ `chain_rounds_{dec,pre}`（host 规划+紧凑图构建+提交）+
+    `chain_tail_{dec,pre}`（层尾：`tail_sync`/`tail_read`/`tail_fold`）。
+  - **冷态**：`pin_dec` 8.9ms/层（~80% of burst）；`evict=0 / move=0`，全是 free-slot 冷装载。
+    逐层全 pin+unpin 预暖（`STREAM_MOE_TMP_PREWARM`）后 `pin_dec`→0.001ms、Generation 4.4→15.1 t/s。
+    （预驻留/交换属独立模块，后续做。）
+  - **热态**：`burst_dec` 1.78ms/层 = `pin` 0.001 + `chain_rounds` 0.09 + `chain_tail` 1.67；
+    `chain_tail` = **`tail_sync` 1.68ms** + `tail_read` 0.16 + `tail_fold` 0.001。
+  - **sync 慢在哪**：fence 返回本身 ~0.04ms（`STREAM_MOE_TMP_SYNC_SPIN` 夹逼：spin 1.5ms 后
+    sync 0.3ms，spin+sync≈1.8ms 恒定；sleep 5ms 后 sync 0.04ms）。**慢的是"里面"——等提交的设备图
+    完成，每层固定一次**。
+  - **根因**：上游整模型一条命令流，`llama-context.cpp:2921` 每 token 一次
+    `sched_graph_compute_async`、`:747` 每 token 一次 sync；我们闭包是**每层一个独立 backend
+    split**、每层回 host fold → **每 token 16 次提交+sync**。
+  - **方向**：减少每 token 的提交次数（跨层攒批/流水），而非优化 host 侧（0.25ms/层）或 fence。
+  - 诊断 env：`STREAM_MOE_TMR`、`STREAM_MOE_TMP_PREWARM`、`STREAM_MOE_TMP_SYNC_SPIN`。
+  - 待定：这 1.7ms 是"GPU 真在算"还是"驱动提交管线延迟"——需在 vendored vulkan 里加 timestamp
+    query（gated + patch 记录）才能区分；见下条。
 - 备注：**C（同设备接缝）被 sched 拷贝挡住**——实测 exec 时 `cur` 是 `STREAMMOE_HOST`
   （`[seam] cur 'STREAMMOE#ffn_norm-0 (reshaped)#0' buft=STREAMMOE_HOST`），即 dense cur 已被
   sched 拷到我们的 host backend，不是设备上的生产者；"绑定生产者 buffer" 需把我们的 compute
