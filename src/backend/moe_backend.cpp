@@ -475,7 +475,9 @@ void stream_moe_backend_replicate_leaf(const ggml_tensor* t) {
         if (!buf) continue;
         void* dev = stmoe_vk_buffer_host_ptr(buf);
         if (!dev) { ggml_backend_buffer_free(buf); continue; }
-        std::memcpy(dev, t->data, bytes);
+        // Backend-agnostic read: the source leaf may live on a device backend
+        // (e.g. C1:Vulkan0). Never dereference t->data on the host.
+        ggml_backend_tensor_get(t, dev, 0, bytes);
         e.resident_leaves.push_back({ t, buf, dev, bytes });
     }
 }
