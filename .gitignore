@@ -30,6 +30,9 @@ memwatch_*.log
 # Runtime data
 temp/
 
+# Private local env / scripts (real machine paths, prebuilt binaries - never commit)
+private/
+
 # baseline regression artifacts (large binaries - local only, like model disk)
 baseline_regression/baseline/*.bin
 baseline_regression/baseline/*.json

@@ -1,13 +1,16 @@
 @echo off
-rem Local machine paths for run_export / convert. COPY this to temp\sm_env.bat
-rem (temp\ is gitignored - the local file with real paths is NEVER committed).
-rem Fill in your own paths after each '='.
+rem Local machine paths for run_export / run_bench / convert. COPY this to
+rem temp\sm_env.bat (or private\env.bat) - those dirs are gitignored, so the
+rem local file with real paths is NEVER committed. Fill in your paths after '='.
 set SM_GEMMA_ORIG=
 set SM_GEMMA_V2=
 set SM_GEMMA_V1=
 set SM_DS_MAIN=
 set SM_DS_DRAFT=
 set SM_DS_V1=
+set SM_OLMOE=
 set SM_JSONL_CN=
 set SM_JSONL_EN=
 set SM_OUT_ROOT=
+rem Stock upstream llama.cpp llama-server.exe (Vulkan build), for run_bench stock-* engines.
+set SM_UPSTREAM_BIN=
