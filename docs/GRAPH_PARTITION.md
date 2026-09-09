@@ -12,15 +12,21 @@
 > (C1/C2/C3/C4), `docs/M2_DEVICE_EXECUTOR.md` (per-device executor),
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`.
 
-> **Iron rule - data movement (2026-09-09)**: never dereference or `memcpy` a
-> `ggml_tensor::data` on the host. A tensor's data may live on any backend
-> (device-only memory, or a host mapping). Always use the backend-agnostic
-> copies `ggml_backend_tensor_get` / `ggml_backend_tensor_set` (and `_2d`
-> variants); mid-graph use `_async` + `ggml_backend_synchronize`, resolving the
-> backend with `ggml_backend_sched_get_tensor_backend` (the pattern in
-> `llama-context.cpp:1806` `export_capture_experts`). Raw `memcpy` is legal only
-> for byte arenas we own that are NOT ggml tensors (expert-pool slots, staging,
-> scratch) and inside a backend's own `iface` implementation. See §7.4.
+> **Iron rule - data movement (2026-09-09)**:
+> 1. **ggml tensor bytes**: never dereference or `memcpy` `ggml_tensor::data` on
+>    the host. Use the backend-agnostic `ggml_backend_tensor_get` / `_set`
+>    (`_2d`; `_async` + `ggml_backend_synchronize` mid-graph, backend via
+>    `ggml_backend_sched_get_tensor_backend`; see `export_capture_experts`,
+>    `llama-context.cpp:1806`).
+> 2. **Our own raw arenas** (expert-pool slots, DIO staging, scratch): route
+>    through the existing move pipeline (async DIO + scheduler copy worker +
+>    per-pool DMA reader), not ad-hoc `memcpy`. That pipeline owns those bytes;
+>    ad-hoc copies duplicate its accounting and lose the device path.
+> 3. **Backend `iface`** (`get_tensor`/`set_tensor`/`clear`): this IS the
+>    backend's own engine (device DMA or host memcpy) - legitimate.
+> 4. **Non-tensor memory** (struct init/`memset`, guid/name copies): negligible
+>    and libc is fine, but keep it out of per-token hot paths.
+> See §7.4 for the bug this rule comes from.
 
 ## 1. How the map is produced
 
@@ -235,3 +241,53 @@ it should move to `ggml_backend_tensor_set` when the seam becomes tensor-based.
 4. gemma `C1:Vulkan0 + pool` load crash (BUG_TRACKER B39) - **FIXED** 2026-09-09
    by the backend-agnostic copy rule (§7.4); the seam can now be exercised on a
    shared device.
+
+## 9. Implementation checklist
+
+Ordered by dependency; each step is independently verifiable.
+
+### A. Data-movement hygiene (do first, small)
+
+- [x] B39: `stream_moe_backend_replicate_leaf` reads its source via
+  `ggml_backend_tensor_get` (§7.4).
+- [ ] `minigraph_exec.cpp:564` staging upload -> `ggml_backend_tensor_set` on a
+  tensor bound to the stage buffer (or the move pipeline), not raw memcpy.
+- [ ] `minigraph_exec.cpp:1256` DEVDBG arena read -> `ggml_backend_tensor_get`
+  (or keep gated; it reads a host mapping today).
+- [ ] One helper `read_tensor_to_host(sched, t, dst)` = sched backend +
+  `_async` + `synchronize` + host fallback; use it wherever a tensor is read on
+  the host.
+- [ ] Grep guard: fail on `memcpy(<tensor>->data, ...)` /
+  `memcpy(..., <tensor>->data, ...)` outside the `moe_backend.cpp` iface.
+
+### B. `ids` host copy (unblocks device-resident routing)
+
+- [ ] `exec_layer_burst_chain_buckets`: replace `MOE_ID_AT(ids, ...)` direct
+  deref with a host copy from the helper (compact-ids build stays host-side;
+  ids is small, round planning stays host-side).
+- [ ] Device test: `ids` produced on Vulkan0, closure on a Vulkan0 pool ->
+  rounds byte-identical to CPU-resident ids.
+
+### C. Same-device seam: `cur` / `ffn_moe_out` no round-trip
+
+- [ ] Device-identity map: `ggml_backend_get_device` / `ggml_backend_dev_name`;
+  expose dense `dev_layer[il].dev` and the pool device.
+- [ ] `cur`: if the producing norm device == pool device, bind the closure's cur
+  leaf to the producer buffer (no staging); else stage.
+- [ ] `ffn_moe_out`: keep `acc_d` on device, do the fold + residual add
+  on-device; read back only the final layer output (or keep it resident when the
+  consumer shares the device).
+- [ ] Verify: same-device path vs staged path byte-IDENTICAL.
+
+### D. Multi-outlet whole-layer package (end-state)
+
+- [ ] Generalise `collect_chain` -> `collect_closure(gf, seed_pred, stop_pred,
+  ...)`; expert = `(is_routed_mm, is_output_name)`, whole-layer =
+  `(is_layer_node, layer_output)`.
+- [ ] Package shape: C1 prefix (1 device) -> fan-out `cur` to per-device expert
+  closures -> fan-in `ffn_moe_out` (§7.3).
+- [ ] Reuse the M2-2 per-device graph + `EXPERT_MOVE_PIPELINE` move machinery;
+  C1 execution takeover (attention/KV/dense MLP) is the large piece - gate it on
+  dynamic/split C1 only.
+- [ ] Verify: per-device graph correctness + no external consumer of any layer-L
+  intermediate except the layer output.

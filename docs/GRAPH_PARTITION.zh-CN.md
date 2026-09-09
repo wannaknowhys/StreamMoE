@@ -11,13 +11,20 @@
 >（C1/C2/C3/C4）、`docs/M2_DEVICE_EXECUTOR.md`（每设备执行器）、
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`。
 
-> **铁律 - 数据搬运（2026-09-09）**：永远不要在 host 上解引用或 `memcpy` 一个
-> `ggml_tensor::data`。张量的数据可能在任何后端（设备独显存，或 host 映射）。一律用
-> 后端无关拷贝：`ggml_backend_tensor_get` / `ggml_backend_tensor_set`（及 `_2d` 变体）；
-> mid-graph 用 `_async` + `ggml_backend_synchronize`，后端用
-> `ggml_backend_sched_get_tensor_backend` 取（见 `llama-context.cpp:1806`
-> `export_capture_experts` 的写法）。裸 `memcpy` 只对**我们自己拥有、且不是 ggml 张量**
-> 的字节区（专家池槽、staging、scratch）以及后端自己的 `iface` 实现合法。来源见 §7.4。
+> **铁律 - 数据搬运（2026-09-09）**：
+> 1. **ggml 张量字节**：永远不要在 host 上解引用或 `memcpy` `ggml_tensor::data`。
+>    一律用后端无关拷贝 `ggml_backend_tensor_get` / `_set`（`_2d`；mid-graph 用
+>    `_async` + `ggml_backend_synchronize`，后端用
+>    `ggml_backend_sched_get_tensor_backend` 取；见 `llama-context.cpp:1806`
+>    `export_capture_experts`）。
+> 2. **我们自己的裸字节区**（专家池槽、DIO staging、scratch）：走现有 move 管线
+>    （async DIO + scheduler 拷贝 worker + per-pool DMA reader），不要裸 `memcpy`。
+>    那块字节归管线所有，裸拷贝会绕过它的记账、也丢掉设备路径。
+> 3. **后端 `iface`**（`get_tensor`/`set_tensor`/`clear`）：这本来就是后端自己的引擎
+>    （设备 DMA 或 host memcpy），合法。
+> 4. **非张量内存**（结构体 init/`memset`、guid/名字拷贝）：可忽略，libc 即可，但别放进
+>    每 token 的热路径。
+> 来源见 §7.4。
 
 ## 1. 地图怎么来的
 
@@ -211,3 +218,47 @@ leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——�
    多少必须重写。
 4. gemma `C1:Vulkan0 + 池` load 崩溃（BUG_TRACKER B39）——**2026-09-09 已修**，
    靠后端无关拷贝铁律（§7.4）；接缝现在可以在共享设备上验证。
+
+## 9. 实现清单
+
+按依赖排序；每步可独立验证。
+
+### A. 数据搬运卫生（先做，小）
+
+- [x] B39：`stream_moe_backend_replicate_leaf` 用 `ggml_backend_tensor_get` 读源
+  （§7.4）。
+- [ ] `minigraph_exec.cpp:564` staging 上传 -> 绑定 stage buffer 的张量用
+  `ggml_backend_tensor_set`（或走 move 管线），不用裸 memcpy。
+- [ ] `minigraph_exec.cpp:1256` DEVDBG arena 读 -> `ggml_backend_tensor_get`
+  （或保持门控；它今天读的是 host 映射）。
+- [ ] 一个 helper `read_tensor_to_host(sched, t, dst)` = sched 后端 + `_async` +
+  `synchronize` + host 回退；所有 host 侧读张量都用它。
+- [ ] grep 守卫：`moe_backend.cpp` iface 之外出现
+  `memcpy(<tensor>->data, ...)` / `memcpy(..., <tensor>->data, ...)` 直接报错。
+
+### B. `ids` host 拷贝（解锁 device-resident 路由）
+
+- [ ] `exec_layer_burst_chain_buckets`：把 `MOE_ID_AT(ids, ...)` 直接解引用换成
+  helper 拿到的 host 副本（compact-ids 构建留在 host；ids 小，round 规划仍 host 侧）。
+- [ ] 设备测试：`ids` 在 Vulkan0 产生、闭包在 Vulkan0 池 -> rounds 与 CPU 常驻 ids
+  逐字节一致。
+
+### C. 同设备接缝：`cur` / `ffn_moe_out` 不出设备
+
+- [ ] 设备身份映射：`ggml_backend_get_device` / `ggml_backend_dev_name`；暴露 dense
+  `dev_layer[il].dev` 与池设备。
+- [ ] `cur`：产生它的 norm 设备 == 池设备时，把闭包的 cur 叶子绑到生产者 buffer
+  （不 staging）；否则 staging。
+- [ ] `ffn_moe_out`：`acc_d` 留在设备上，fold + 残差 ADD 在设备侧；只回读最终层输出
+  （消费者同设备则也常驻）。
+- [ ] 验证：同设备路径 vs staging 路径逐字节一致。
+
+### D. 多出口整层包（终态）
+
+- [ ] 把 `collect_chain` 泛化成 `collect_closure(gf, seed_pred, stop_pred, ...)`；
+  专家 = `(is_routed_mm, is_output_name)`，整层 = `(is_layer_node, layer_output)`。
+- [ ] 包形状：C1 前段（1 设备）-> `cur` 扇出到 per-device 专家闭包 -> `ffn_moe_out`
+  扇入（§7.3）。
+- [ ] 复用 M2-2 每设备图 + `EXPERT_MOVE_PIPELINE` 搬迁机制；C1 执行接管
+  （attention/KV/dense MLP）是最大块——只在动态/拆分 C1 时启用。
+- [ ] 验证：每设备图正确性 + 除层输出外没有外部消费者读任何第 L 层中间量。
