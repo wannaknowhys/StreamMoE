@@ -514,23 +514,28 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
             `cell_full` + `bucket_direct_leaf`；device 加源紧凑性判断，否则回退 gather）。连续优化待补。
       - [x] **P1-b 单 target**：ACC 直写 `moe_out`（CPU 绑 `per_token->data` / device 单次 `tensor_get`），
             跳过 host `layer_fold`；多 target 路径不变。
-      - [ ] **P1-c scratch**：per-backend grow-only host scratch（i32+f32，verify 定容），替换
-            `mm_ids_pool`/`fold_buf`/`ids_exp`/`ids_slot`/`t_round`/`order`/局部 `idx`。
-      - [ ] **P1-d `mix_plan` 并入 scratch**：`build_mix_plan` 写 flat ids/scatter，rounds 变 span；
-            同步改 `test_mix_plan`。
-      - [ ] **P1-e `twin`/`gather_cache` 换定长数组**（闭包 ≤ ~20 节点/桶）。
-      - [ ] **P1-f 回归**：默认单 pool 对 HEAD 干净构建 **IDENTICAL**；`STREAM_MOE_TMP_BUCKET_ROUNDS=1`
-            宽松 gate；TMR 前后对拍。
+      - [x] **P1-c scratch**：`thread_local exec_scratch_t`（grow-only，每层 reset + 按需一次
+            reserve），`i32`（t_round/ids_exp/ids_slot/gather idx）+ `f32`（CPU fold + gather 输出）
+            替换 `mm_ids_pool`/`fold_buf`/`ids_exp`/`ids_slot`/`t_round`/局部 `idx`。**坑**：f32 估算
+            一开始漏了 gather 输出（CPU `bind_fresh(...,false)` 也走 f32）→ `sum_rows` dst 越界崩溃
+            （0xC0000005，lldb 定位 ops.cpp:1487）；补上后三配置 IDENTICAL。
+      - [x] **P1-d `mix_plan` 并入 scratch**：`mix_round_t` 变 `{pool,width,n_active,off}` span，
+            `build_mix_plan` 写调用方 flat `plan_ids/plan_scatter/plan_rounds`；`scatter_plan_t` 同理
+            （`out_order/out_segs`）；`test_mix_plan`/`test_scatter_plan` 同步适配。
+      - [x] **P1-e `twin`/`gather_cache` 换定长数组**（`MAX_TWIN=64`/`MAX_GATHER=16` 线性查，
+            `clear_round()` 每桶清）。
+      - [x] **P1-f 回归**：`build.bat test main` **6/6**（含 mix_plan/scatter_plan 新接口）；
+            纯 CPU / `RAM:8192,Vulkan0:256` / `RAM:8192,Vulkan0:4096` 三配置对 HEAD **IDENTICAL**
+            （embd/hidden/KV + expert_history）。
       - [x] **P1-g device arena 估算**：把每轮 bump（fold `pc`/`s`/`acc` + cur gather + per-slot
-            gather，`bind_fresh(...,false)` 全部消费者）**之和**并入 `arena_bytes`，删掉固定 32MB slack
-            （原 slack 不覆盖大 prefill 的 fold 临时，理论越界；未观察到破坏疑似 host-visible 越界不 fault）。
-            验证：129 设备回归（256/4096）仍 **IDENTICAL**；olmoe prefill3000 `place-c1c2-exp5` 跑通
-            （pp 391.0 / tg 18.81），无崩溃。注：fold 中间量在 device 侧是 arena 尾部 bump（CPU 侧是
-            独立 `fold_buf` heap），**不在 result_bytes**——只有链孪生用 result_bytes/out_off。
-      - 回归（2026-09-09，P1-a/b 后）：纯 CPU / `RAM:8192,Vulkan0:256` / `RAM:8192,Vulkan0:4096`
-        三配置对 HEAD 二进制 **IDENTICAL**（embd/hidden/KV + expert_history）。bench olmoe
-        prefill3000 `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67
-        （记录 380.5 / 17.81）。
+            gather，`bind_fresh(...,false)` 全部消费者）**之和**并入 `arena_bytes`，删掉固定 32MB slack。
+            验证：129 设备回归（256/4096）**IDENTICAL**；olmoe prefill3000 `place-c1c2-exp5` 跑通。
+            注：fold 中间量在 device 侧是 arena 尾部 bump（CPU 侧是 scratch f32），**不在 result_bytes**
+            ——只有链孪生用 result_bytes/out_off。
+      - 回归/性能（2026-09-09，P1-a/b/g 后）：三配置对 HEAD **IDENTICAL**。bench olmoe prefill3000
+        `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67（记录 380.5 / 17.81）。
+      - 回归/性能（2026-09-09，P1-c/d/e 后）：三配置仍 **IDENTICAL**、单测 6/6；bench 同款
+        **pp 391.9 / tg 18.66**（与 c/d/e 前同量级，符合预期——hygiene 不改算力）。
 - [ ] **P1b 查 ACC/CONT/SUM_ROWS 为何这么慢**：perf logger（`GGML_VK_PERF_LOGGER=1`）实测
       2-token 一层：ACC 983us、CONT×2 986us、SUM_ROWS 510us、GET_ROWS×2 732us——都比
       4~32K 元素的应有时间高几个数量级。都在同一设备 arena、**非跨设备**。疑点：`acc.comp`

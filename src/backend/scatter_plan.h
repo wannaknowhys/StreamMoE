@@ -10,6 +10,9 @@
 // so scatter_plan decides a tight order (order[]) that permutes the per-token
 // columns, then decomposes the token-to-dst map into few arithmetic runs
 // (segs[]). Each seg costs exactly one ggml_acc_inplace.
+//
+// Storage is caller-owned (grow-only, reused across layers); the plan points
+// into it.
 
 #include <cstdint>
 #include <vector>
@@ -31,17 +34,18 @@ struct scatter_plan_t {
     // Tight order: new per-token column i (0..n_active-1) was originally the
     // active-token entry `order[i]` (index into the input `t` sequence). The
     // cur-copy layer gathers cur columns in this order.
-    std::vector<uint32_t> order;
-    // Acc runs over the tight order (in tight order, disjoint, cover all
-    // n_active columns). segs.back() ends at src == n_active.
-    std::vector<scatter_seg_t> segs;
-    uint32_t n_active = 0;
-    uint32_t n_t      = 0;
+    const uint32_t *      order = nullptr;
+    const scatter_seg_t * segs  = nullptr;
+    uint32_t              n_order = 0;
+    uint32_t              n_segs  = 0;
+    uint32_t              n_active = 0;
+    uint32_t              n_t      = 0;
 };
 
 // Build the plan for one bucket. `t[0..n_active)` = original token id of each
 // active column (a order, i.e. t[a] = scatter[a*w_b].t). n_t = layer token
-// count (bounds: dst+delta*(len-1) < n_t).
+// count (bounds: dst+delta*(len-1) < n_t). out_order / out_segs are cleared and
+// filled; they are the caller's grow-only buffers.
 //
 // Deterministic greedy (docs/SCATTER_PLAN.md §4): repeatedly extract the
 // longest remaining arithmetic run of token ids. Tie-break: largest run len,
@@ -49,10 +53,12 @@ struct scatter_plan_t {
 // extraction order and each run's values ascending.
 //
 // Invalid input (null t with n_active>0, any t[i] >= n_t, duplicate token id)
-// returns a plan with empty order/segs and n_active left at the input value -
-// callers distinguish "no work" (n_active==0) from "rejected" (n_active>0 but
-// order empty). The rectangle peel never produces duplicates (each round owns
-// one disjoint slot slice per active token), so a duplicate is an input error.
-scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t);
+// returns a plan with n_order==0 and n_active left at the input value - callers
+// distinguish "no work" (n_active==0) from "rejected" (n_active>0, n_order==0).
+// The rectangle peel never produces duplicates (each round owns one disjoint
+// slot slice per active token), so a duplicate is an input error.
+scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t,
+                                  std::vector<uint32_t>& out_order,
+                                  std::vector<scatter_seg_t>& out_segs);
 
 } // namespace stream_moe

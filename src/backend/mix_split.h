@@ -20,11 +20,11 @@
 //
 // mm calls per pool = number of distinct nonzero bucket counts (<= n_k).
 //
-// The output ids for a round are emitted in llama layout (row = token, k
-// fastest): out_ids[a*width + s] = expert id of the s-th slot of round token
-// a. The scatter sidecar records, for that same (a,s), the original (t,k) the
-// slot belongs to, so the executor can write the mm result column back to the
-// main-graph dst at its real (k + t*n_k) position.
+// Storage is flat + caller-owned (grow-only, reused across layers): each round
+// is a span {off, width, n_active} into out_ids / out_scatter, so the planner
+// does no per-round allocation. ids are in llama layout (row = token, k
+// fastest): ids[off + a*width + s] = expert id of the s-th slot of round token
+// a; scatter[off + a*width + s] records the original (t,k) that slot came from.
 
 #include <cstdint>
 #include <vector>
@@ -37,20 +37,20 @@ struct mix_scatter_t {
     uint32_t k = 0;   // original slot index within that token (into n_k)
 };
 
-// One full-rectangle sub-mm for a pool.
+// One full-rectangle sub-mm for a pool: a span into the flat ids/scatter arrays.
 struct mix_round_t {
-    uint32_t               pool  = 0;   // device pool this round computes
-    uint32_t               width = 0;   // rectangle height = slots per token
-    std::vector<int32_t>   ids;         // llama layout [width, n_active] of expert ids
-    std::vector<mix_scatter_t> scatter; // length width * n_active, (a*width+s) aligned with ids
-    uint32_t               n_active = 0; // tokens in this round (ids.size()/width)
+    uint32_t pool     = 0;   // device pool this round computes
+    uint32_t width    = 0;   // rectangle height = slots per token
+    uint32_t n_active = 0;   // tokens in this round
+    uint32_t off      = 0;   // cell offset into ids/scatter (off + a*width + s)
 };
 
-// Per-pool peeling result, in peel order.
+// Per-pool peeling result: pointers into the caller-owned flat storage.
 struct mix_plan_t {
-    std::vector<mix_round_t> rounds;
-    // per (pool, token) hit count, for diagnostics / FLOPS checks.
-    std::vector<uint32_t>    buckets;   // flattened [n_pools][n_expert_used+1]
+    const int32_t *       ids     = nullptr;
+    const mix_scatter_t * scatter = nullptr;
+    const mix_round_t *   rounds  = nullptr;
+    uint32_t              n_rounds = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_tokens      = 0;
     uint32_t n_pools       = 0;
@@ -61,7 +61,14 @@ struct mix_plan_t {
 // A token counts a pool hit when expert_pool[ids[t][k]] == pool. Experts with
 // expert_pool[] == -1 (unknown) are never scheduled. Pools with an all-zero
 // bucket produce no rounds.
+//
+// out_ids / out_scatter / out_rounds are cleared and filled; they are the
+// caller's grow-only buffers (capacity retained across calls). The returned
+// plan points into them and is valid until the next call.
 mix_plan_t build_mix_plan(const int32_t* ids, uint32_t n_expert_used, uint32_t n_tokens,
-                          const int32_t* expert_pool, uint32_t n_expert, uint32_t n_pools);
+                          const int32_t* expert_pool, uint32_t n_expert, uint32_t n_pools,
+                          std::vector<int32_t>& out_ids,
+                          std::vector<mix_scatter_t>& out_scatter,
+                          std::vector<mix_round_t>& out_rounds);
 
 } // namespace stream_moe

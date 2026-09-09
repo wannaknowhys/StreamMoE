@@ -279,12 +279,14 @@ offsets:
   `push_back`.
 - `twin`/`gather_cache`: closure is <= ~20 nodes/bucket, so fixed small arrays
   with linear scan can replace the `unordered_map`s.
-- **Ownership / sizing (decided 2026-09-09)**: not per-layer; one grow-only
-  buffer in the per-backend `moe_backend_ctx` (same lifetime / same
-  "one graph_compute at a time" assumption as the existing exec arena). Within a
-  layer it is **written at build, then read-only**; the next layer's build
-  overwrites it. verify (assign) computes `required_bytes` from the current `n_t`
-  / per-layer `max n_k` and reserves once; exec only bumps (no grow).
+- **Ownership / sizing (decided 2026-09-09)**: not per-layer; a
+  `thread_local exec_scratch_t` (one per executing thread, reused within the
+  single-layer-serial exec). Within a layer it is **written at build, then
+  read-only**; reset and overwritten across layers. Per layer the exact `i32`/
+  `f32` need is computed from `n_t` and the actual rounds and **reserved once**;
+  exec only bumps (no grow; reserving first keeps leaf data pointers stable).
+  **Implementation trap**: the `f32` need must include the gather outputs (CPU
+  `bind_fresh(...,false)` also uses `f32`); missing them overruns `sum_rows`.
 - **mix_plan storage (decided 2026-09-09)**: flat `ids` (i32) + `scatter`
   (`mix_scatter_t`), used length = actual `sum width*n_active`; `mix_round_t`
   becomes `{pool,width,n_active,ids_off,scatter_off}` and rounds use a **fixed

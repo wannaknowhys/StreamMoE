@@ -222,10 +222,11 @@ dispatch/图开销或 perf logger 归因——印证 P2"瓶颈是每层 submit+s
 - f32 段：CPU fold 临时，替代 `fold_buf`；device 侧仍走 arena。
 - `t_round`/`order`/局部 `idx` 改为 scratch 切片（指针+长度），不再 `push_back`。
 - `twin`/`gather_cache`：闭包 ≤ ~20 节点/桶，可换定长小数组线性查，替掉 `unordered_map`。
-- **归属/定容（2026-09-09 定）**：不是 per-layer；一块 grow-only 缓冲挂在 per-backend
-  `moe_backend_ctx`（与现有 exec arena 同生命周期/同"每 `graph_compute` 串行"假设）。
-  层内 **build 时写、之后只读**，跨层被下一层 build 覆盖。verify（assign）按当前 `n_t` /
-  各层 `max n_k` 算 `required_bytes` 一次 reserve，exec 只 bump 不扩容（省 grow）。
+- **归属/定容（2026-09-09 定）**：不是 per-layer；`thread_local exec_scratch_t`（每执行线程一块，
+  单层串行内复用）。层内 **build 时写、之后只读**，跨层 reset + 覆盖。每层按当前 `n_t` / 各轮
+  实际 round 算 `i32`/`f32` need，**一次 reserve**，exec 只 bump 不扩容（省 grow；预留后叶子
+  data 指针不移动）。**实现坑**：`f32` need 必须含 gather 输出（CPU `bind_fresh(...,false)` 也走
+  f32），漏了会在 `sum_rows` 写越界。
 - **mix_plan 存储（2026-09-09 定）**：flat `ids`（i32）+ `scatter`（`mix_scatter_t`），
   用量按实际 `Σ width*n_active`；`mix_round_t` 换 `{pool,width,n_active,ids_off,scatter_off}`，
   rounds 用**定长 span 数组**（cap `n_pools*n_k`）。

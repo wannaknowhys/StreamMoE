@@ -37,14 +37,18 @@ peel_bounds_t peel_bounds(const std::vector<uint32_t>& bucket) {
 } // namespace
 
 mix_plan_t build_mix_plan(const int32_t* ids, uint32_t n_expert_used, uint32_t n_tokens,
-                          const int32_t* expert_pool, uint32_t n_expert, uint32_t n_pools) {
+                          const int32_t* expert_pool, uint32_t n_expert, uint32_t n_pools,
+                          std::vector<int32_t>& out_ids,
+                          std::vector<mix_scatter_t>& out_scatter,
+                          std::vector<mix_round_t>& out_rounds) {
+    out_ids.clear();
+    out_scatter.clear();
+    out_rounds.clear();
+
     mix_plan_t plan;
     plan.n_expert_used = n_expert_used;
     plan.n_tokens      = n_tokens;
     plan.n_pools       = n_pools;
-
-    const size_t n_bucket = static_cast<size_t>(n_expert_used) + 1;
-    plan.buckets.assign(static_cast<size_t>(n_pools) * n_bucket, 0);
 
     if (!ids || n_tokens == 0 || n_expert_used == 0 || !expert_pool) return plan;
 
@@ -77,12 +81,11 @@ mix_plan_t build_mix_plan(const int32_t* ids, uint32_t n_expert_used, uint32_t n
     for (uint32_t p = 0; p < n_pools; ++p) {
         const size_t pi = static_cast<size_t>(p);
         // bucket histogram for this pool
-        std::vector<uint32_t> bucket(n_bucket, 0);
+        std::vector<uint32_t> bucket(static_cast<size_t>(n_expert_used) + 1, 0);
         for (uint32_t t = 0; t < n_tokens; ++t) {
             const uint32_t c = hit_count[pi][t];
             if (c > n_expert_used) continue;   // defensive
             bucket[c]++;
-            plan.buckets[pi * n_bucket + c]++;
         }
         // The pool's per-token hits, in (t, k) order, grouped by count value:
         // reorder hits so rounds can slice contiguous runs. We rebuild as a
@@ -114,12 +117,10 @@ mix_plan_t build_mix_plan(const int32_t* ids, uint32_t n_expert_used, uint32_t n
                 if (hit_count[pi][t] >= vj) active.push_back(t);
             }
             if (active.empty() || w == 0) continue;
-            mix_round_t r;
-            r.pool     = p;
-            r.width    = w;
-            r.n_active = static_cast<uint32_t>(active.size());
-            r.ids.reserve(static_cast<size_t>(r.n_active) * w);
-            r.scatter.reserve(static_cast<size_t>(r.n_active) * w);
+            const uint32_t off = static_cast<uint32_t>(out_ids.size());
+            const uint32_t n_active = static_cast<uint32_t>(active.size());
+            out_ids.reserve(out_ids.size() + static_cast<size_t>(n_active) * w);
+            out_scatter.reserve(out_scatter.size() + static_cast<size_t>(n_active) * w);
             // llama layout: row = token (a), k fastest. For each active token,
             // its ks slice [v[j-1], v[j]) are this round's slots.
             const uint32_t vprev = bounds.v[j - 1];
@@ -127,13 +128,18 @@ mix_plan_t build_mix_plan(const int32_t* ids, uint32_t n_expert_used, uint32_t n
                 const auto & ks = ks_of[t];
                 for (uint32_t s = vprev; s < vj; ++s) {
                     const uint32_t k = ks[s];
-                    r.ids.push_back(ids[static_cast<size_t>(t) * n_expert_used + k]);
-                    r.scatter.push_back({ t, k });
+                    out_ids.push_back(ids[static_cast<size_t>(t) * n_expert_used + k]);
+                    out_scatter.push_back({ t, k });
                 }
             }
-            plan.rounds.push_back(std::move(r));
+            out_rounds.push_back({ p, w, n_active, off });
         }
     }
+
+    plan.ids      = out_ids.data();
+    plan.scatter  = out_scatter.data();
+    plan.rounds   = out_rounds.data();
+    plan.n_rounds = static_cast<uint32_t>(out_rounds.size());
     return plan;
 }
 

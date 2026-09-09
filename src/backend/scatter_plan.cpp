@@ -52,7 +52,12 @@ void best_run(const uint8_t* in_set, const std::vector<uint32_t>& rem,
 
 } // namespace
 
-scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t) {
+scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t,
+                                  std::vector<uint32_t>& out_order,
+                                  std::vector<scatter_seg_t>& out_segs) {
+    out_order.clear();
+    out_segs.clear();
+
     scatter_plan_t plan;
     plan.n_active = n_active;
     plan.n_t      = n_t;
@@ -69,8 +74,6 @@ scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t
         const uint32_t v = t[i];
         if (v >= n_t || seen[v]) {
             // Reject: out-of-range or duplicate token id -> empty plan.
-            plan.order.clear();
-            plan.segs.clear();
             return plan;
         }
         seen[v]  = 1;
@@ -80,7 +83,7 @@ scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t
     }
     std::sort(rem.begin(), rem.end());
 
-    uint32_t tight = 0;   // running tight-order column offset == order.size()
+    uint32_t tight = 0;   // running tight-order column offset == out_order.size()
     while (!rem.empty()) {
         const uint32_t minv = rem.front();
         const uint32_t maxv = rem.back();
@@ -99,13 +102,13 @@ scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t
         seg.dst   = start;
         seg.len   = len;
         seg.delta = d;
-        plan.segs.push_back(seg);
+        out_segs.push_back(seg);
 
         // The run's values ascending become the next tight columns; append
-        // each one's original index to `order`.
+        // each one's original index to `out_order`.
         for (uint32_t i = 0; i < len; ++i) {
             const uint32_t v = start + i * d;
-            plan.order.push_back(idx_of[v]);
+            out_order.push_back(idx_of[v]);
             in_set[v] = 0;
         }
         tight += len;
@@ -117,6 +120,10 @@ scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t
         }
     }
 
+    plan.order  = out_order.data();
+    plan.segs   = out_segs.data();
+    plan.n_order = static_cast<uint32_t>(out_order.size());
+    plan.n_segs  = static_cast<uint32_t>(out_segs.size());
     return plan;
 }
 

@@ -107,43 +107,72 @@ static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer
     return -1;
 }
 
+// Per-thread grow-only scratch for one layer's executor temporaries
+// (docs/BUCKET_FAST_PATH §9.2): integer ids/indices, CPU fold scratch, and the
+// flat mix/scatter plan storage. Reset per layer; the buckets engine reserves
+// the layer's need up front so a leaf's data pointer never moves mid-build.
+struct exec_scratch_t {
+    std::vector<int32_t>       i32;          // ids / indices / t_round (bump)
+    std::vector<float>         f32;          // CPU fold scratch (bump)
+    std::vector<int32_t>       plan_ids;     // mix_plan flat ids
+    std::vector<mix_scatter_t> plan_scatter; // mix_plan flat scatter
+    std::vector<mix_round_t>   plan_rounds;  // mix_plan rounds (spans)
+    std::vector<uint32_t>      sp_order;     // scatter_plan tight order
+    std::vector<scatter_seg_t> sp_segs;      // scatter_plan acc runs
+    size_t i32_used = 0, f32_used = 0;
+    void reset() {
+        i32_used = 0; f32_used = 0;
+        plan_ids.clear(); plan_scatter.clear(); plan_rounds.clear();
+        sp_order.clear(); sp_segs.clear();
+    }
+    int32_t * a32(size_t n) { int32_t * p = i32.data() + i32_used; i32_used += n; return p; }
+    float   * af32(size_t n) { float * p = f32.data() + f32_used; f32_used += n; return p; }
+};
+static thread_local exec_scratch_t g_scratch;
+
 #ifdef STREAM_MOE_TEMP
 // Test-only forced split (docs/BUCKET_EXEC_TOKEN_SUBSET.md SS3): turn the real
 // plan's single full round into SCATTERED token-subset rounds so the subset path
 // (cur gather + index-gather weights + scatter_plan reorder) is exercised on the
 // CPU engine. Splits BOTH axes by parity so (t,k) is non-contiguous. Throwaway
 // validation code - delete once the subset path is verified.
-static std::vector<mix_round_t> test_split_rounds(
+static mix_plan_t test_split_rounds(
         const int32_t * ids, uint32_t n_k, uint32_t n_t,
-        const int32_t * expert_pool, uint32_t n_expert, uint32_t n_pools) {
-    mix_plan_t base = build_mix_plan(ids, n_k, n_t, expert_pool, n_expert, n_pools);
-    if (base.rounds.size() != 1 || base.rounds[0].width != n_k ||
+        const int32_t * expert_pool, uint32_t n_expert, uint32_t n_pools,
+        exec_scratch_t & sc) {
+    mix_plan_t base = build_mix_plan(ids, n_k, n_t, expert_pool, n_expert, n_pools,
+                                     sc.plan_ids, sc.plan_scatter, sc.plan_rounds);
+    if (base.n_rounds != 1 || base.rounds[0].width != n_k ||
         base.rounds[0].n_active != n_t) {
-        return base.rounds;
+        return base;
     }
     const uint32_t ksplit = (n_k % 2u == 0u) ? 2u : 1u;
     const uint32_t kw     = (ksplit == 2u) ? n_k / 2u : n_k;
-    std::vector<mix_round_t> out;
+    const uint32_t base_pool = base.rounds[0].pool;
+    sc.plan_ids.clear(); sc.plan_scatter.clear(); sc.plan_rounds.clear();
     for (uint32_t kp = 0; kp < ksplit; ++kp) {
         for (uint32_t tp = 0; tp < 2u; ++tp) {
-            mix_round_t r;
-            r.pool  = base.rounds[0].pool;
-            r.width = kw;
-            for (uint32_t t = tp; t < n_t; t += 2u) ++r.n_active;
-            if (r.n_active == 0 || kw == 0) continue;
-            r.ids.reserve((size_t) r.n_active * kw);
-            r.scatter.reserve((size_t) r.n_active * kw);
+            uint32_t n_active = 0;
+            for (uint32_t t = tp; t < n_t; t += 2u) ++n_active;
+            if (n_active == 0 || kw == 0) continue;
+            const uint32_t off = static_cast<uint32_t>(sc.plan_ids.size());
             for (uint32_t t = tp; t < n_t; t += 2u) {
                 for (uint32_t s = 0; s < kw; ++s) {
                     const uint32_t k = (ksplit == 2u) ? (2u * s + kp) : s;
-                    r.ids.push_back(ids[(size_t) t * n_k + k]);
-                    r.scatter.push_back({ t, k });
+                    sc.plan_ids.push_back(ids[(size_t) t * n_k + k]);
+                    sc.plan_scatter.push_back({ t, k });
                 }
             }
-            out.push_back(std::move(r));
+            sc.plan_rounds.push_back({ base_pool, kw, n_active, off });
         }
     }
-    return out;
+    mix_plan_t plan;
+    plan.ids      = sc.plan_ids.data();
+    plan.scatter  = sc.plan_scatter.data();
+    plan.rounds   = sc.plan_rounds.data();
+    plan.n_rounds = static_cast<uint32_t>(sc.plan_rounds.size());
+    plan.n_expert_used = n_k; plan.n_tokens = n_t; plan.n_pools = n_pools;
+    return plan;
 }
 #endif
 
@@ -442,11 +471,8 @@ struct chain_ctx_t {
     // in-flight bucket geometry (full-width today: w == ids->ne[0])
     int64_t                    w_b = 0;   // experts per token in this bucket
     int64_t                    n_t = 0;   // tokens (full-width == ids->ne[1])
-    // slot-local ids buffers per mm, kept alive until graph_compute (their
-    // data pointers feed ids leaves; vector moves keep the heap data address).
-    std::vector<std::vector<int32_t>> mm_ids_pool;
-    // float buffers for no_alloc fold intermediates (kept alive until compute)
-    std::vector<std::vector<float>>    fold_buf;
+    // grow-only per-layer scratch (ids/index/fold buffers + plan storage)
+    exec_scratch_t *           scratch = nullptr;
     // fold_repl: skip the anonymous per-topk fold + moe_out on the graph and
     // produce them via append_expert_fold + exit memcpy instead. Off = the old
     // IDENTICAL whole-clone behaviour (bring-up gate).
@@ -513,27 +539,47 @@ struct bucket_build_t {
     // makes bucket N+1's chain reuse bucket N's dead regions (M2 §7.2.1).
     int64_t seq = -1;
     // routing ids (expert ids) for the bucket rows [w_b, n_active], t-major,
-    // and slot-local translation [w_b, n_active]
-    std::vector<int32_t>   ids_exp;     // kept alive (leaf data ptr)
-    std::vector<int32_t>   ids_slot;    // kept alive (mm leaf data ptr)
+    // and slot-local translation [w_b, n_active] - scratch slices (stable until
+    // the layer's graph_compute).
+    int32_t *              ids_exp  = nullptr;
+    int32_t *              ids_slot = nullptr;
     const ggml_tensor *    ids = nullptr;     // main routing ids (read-only, full)
     const ggml_tensor *    ids_data = nullptr;   // full main ids data (read-only)
     int64_t ids_ne0 = 0, ids_ne1 = 0;
-    // current round (mix_plan): r->ids / r->scatter are the round's column set.
+    // current round (mix_plan): r->off + a*width + s indexes the flat ids/scatter.
     // t_round[a] = original token of round column a (a order); order[i] = the
-    // round column of tight column i (scatter_plan). gather_cache dedups the
-    // per-round external gather nodes (cleared per round; nodes stay in c.gf).
+    // round column of tight column i (scatter_plan).
     const mix_round_t *        r = nullptr;
-    std::vector<uint32_t>      t_round;
-    std::vector<uint32_t>      order;
-    std::unordered_map<const ggml_tensor*, ggml_tensor*> gather_cache;
-    // main node -> compact twin (op built at w_b width, data pinned into the
-    // layer result arena when the closure has a layout, else c->fold_buf)
-    std::unordered_map<const ggml_tensor*, ggml_tensor*> twin;
+    uint32_t *                 t_round = nullptr;   // scratch slice (n_active)
+    const uint32_t *           order   = nullptr;   // scatter_plan tight order
+    // fixed-size per-round dedup tables (closure <= ~20 nodes, gathers <= ~4);
+    // replaces the former unordered_maps (no per-round allocation).
+    static constexpr int MAX_TWIN = 64, MAX_GATHER = 16;
+    struct kv_t { const ggml_tensor * k; ggml_tensor * v; };
+    kv_t twin_arr[MAX_TWIN];   int n_twin   = 0;
+    kv_t gather_arr[MAX_GATHER]; int n_gather = 0;
+    ggml_tensor * twin_get(const ggml_tensor * k) const {
+        for (int i = 0; i < n_twin; ++i) if (twin_arr[i].k == k) return twin_arr[i].v;
+        return nullptr;
+    }
+    void twin_put(const ggml_tensor * k, ggml_tensor * v) { twin_arr[n_twin++] = { k, v }; }
+    ggml_tensor * gather_get(const ggml_tensor * k) const {
+        for (int i = 0; i < n_gather; ++i) if (gather_arr[i].k == k) return gather_arr[i].v;
+        return nullptr;
+    }
+    void gather_put(const ggml_tensor * k, ggml_tensor * v) { gather_arr[n_gather++] = { k, v }; }
+    void clear_round() { n_twin = 0; n_gather = 0; }
+    // flat plan accessors (round span r->off into the scratch plan storage)
+    const mix_scatter_t & scat(uint32_t a, int64_t s) const {
+        return c->scratch->plan_scatter[(size_t) r->off + (size_t) a * r->width + (size_t) s];
+    }
+    const int32_t & rid(uint32_t a, int64_t s) const {
+        return c->scratch->plan_ids[(size_t) r->off + (size_t) a * r->width + (size_t) s];
+    }
     // diagnostics: how many twin outputs landed in the arena vs heap fallback
     int64_t n_arena = 0, n_heap = 0;
     // small helper: fresh float buffer kept alive until graph_compute
-    float * buf(size_t n) { c->fold_buf.emplace_back(n, 0.0f); return c->fold_buf.back().data(); }
+    float * buf(size_t n) { return c->scratch->af32(n); }
     // Output region for the twin of the current closure node (b.seq). When the
     // layer has a verify layout the twin lands at arena + out_off[seq]; returns
     // nullptr if the layout is unavailable or the node has no slot -> caller
@@ -666,21 +712,19 @@ static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tenso
     int64_t sne[4] = { 1, (int64_t) span, 1, 1 };
     size_t  snb[4] = { esz, esz, span * esz, span * esz };
     ggml_tensor * flat = bucket_upload_leaf(c, m->type, sne, snb, m->data);
-    std::vector<int32_t> idx((size_t) b.w_b * b.n_active);
+    const int64_t n = (int64_t) b.w_b * b.n_active;
+    int32_t * idx = c.scratch->a32((size_t) n);
     for (int64_t i = 0; i < b.n_active; ++i) {
         const uint32_t a = b.order[(size_t) i];
         for (int64_t s = 0; s < b.w_b; ++s) {
-            const mix_scatter_t & sc = b.r->scatter[(size_t) a * b.w_b + (size_t) s];
+            const mix_scatter_t & sc = b.scat(a, s);
             idx[(size_t) i * b.w_b + (size_t) s] =
                 (int32_t)((sc.k * stride_k + sc.t * stride_t) / esz);
         }
     }
-    c.mm_ids_pool.push_back(std::move(idx));
-    const int64_t n = (int64_t) b.w_b * b.n_active;
     int64_t ine[4] = { n, 1, 1, 1 };
     size_t  inb[4] = { 4, (size_t) n * 4, (size_t) n * 4, (size_t) n * 4 };
-    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb,
-                                                c.mm_ids_pool.back().data());
+    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb, idx);
     ggml_tensor * gr = ggml_get_rows(c.ctx, flat, idx_leaf);
     b.bind_fresh(gr, (size_t) b.w_b * b.n_active * sizeof(float), false);
     return ggml_reshape_3d(c.ctx, gr, 1, b.w_b, b.n_active);
@@ -704,16 +748,14 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     size_t  snb[4] = { m->nb[0], m->nb[2], m->nb[2] * (size_t) n_t,
                        m->nb[2] * (size_t) n_t };
     ggml_tensor * src2d = bucket_upload_leaf(c, m->type, sne, snb, m->data);
-    std::vector<int32_t> idx((size_t) b.n_active);
+    int32_t * idx = c.scratch->a32((size_t) b.n_active);
     for (int64_t i = 0; i < b.n_active; ++i) {
         idx[(size_t) i] = (int32_t) b.t_round[b.order[(size_t) i]];
     }
-    c.mm_ids_pool.push_back(std::move(idx));
     int64_t ine[4] = { b.n_active, 1, 1, 1 };
     size_t  inb[4] = { 4, (size_t) b.n_active * 4, (size_t) b.n_active * 4,
                        (size_t) b.n_active * 4 };
-    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb,
-                                                c.mm_ids_pool.back().data());
+    ggml_tensor * idx_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ine, inb, idx);
     ggml_tensor * gr = ggml_get_rows(c.ctx, src2d, idx_leaf);
     b.bind_fresh(gr, (size_t) d * b.n_active * sizeof(float), false);
     return ggml_reshape_3d(c.ctx, gr, d, 1, b.n_active);
@@ -727,11 +769,9 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
     chain_ctx_t & c = *b.c;
     const int64_t n_k = b.ids_ne0;
     if (m->ne[0] == 1 && m->ne[1] == n_k) {
-        auto it = b.gather_cache.find(m);
-        if (it == b.gather_cache.end()) {
-            it = b.gather_cache.emplace(m, bucket_gather_per_slot(b, m)).first;
-        }
-        return it->second;
+        ggml_tensor * g = b.gather_get(m);
+        if (!g) { g = bucket_gather_per_slot(b, m); b.gather_put(m, g); }
+        return g;
     }
     if (c.dev) {
         // resident C4 lookup keys on the unwrapped producer root (verify
@@ -763,9 +803,8 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
 
 // Leaf twin of a chain producer `p` (already built) narrowed to the bucket.
 static ggml_tensor * bucket_twin_leaf(bucket_build_t & b, const ggml_tensor * p) {
-    auto it = b.twin.find(p);
-    if (it == b.twin.end()) return nullptr;
-    const ggml_tensor * t = it->second;
+    const ggml_tensor * t = b.twin_get(p);
+    if (!t) return nullptr;
     int64_t ne[4]; size_t nb[4];
     for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
     return bucket_ref_leaf(*b.c, t->type, ne, nb, t->data, t->buffer);
@@ -787,9 +826,8 @@ static ggml_tensor * bucket_src_leaf(bucket_build_t & b, const ggml_tensor * src
         root = root->src[0];
     }
     if (root) {
-        auto it = b.twin.find(root);
-        if (it != b.twin.end()) {
-            const ggml_tensor * t = it->second;
+        const ggml_tensor * t = b.twin_get(root);
+        if (t) {
             int64_t ne[4]; size_t nb[4];
             for (int i = 0; i < 4; ++i) { ne[i] = t->ne[i]; nb[i] = t->nb[i]; }
             // apply the outermost view's d-slice: ne0 (d rows) from the src view
@@ -827,12 +865,11 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
 
     // ids leaf data already staged in b.ids_slot (slot - slot_begin), t-major
     // [w_b, n_active]; feed with the leaf's shape.
-    c.mm_ids_pool.push_back(b.ids_slot);
     int64_t ne_ids[4] = { b.w_b, b.n_active, 1, 1 };
     size_t nb_ids[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, 0 };
     nb_ids[3] = nb_ids[2];
     ggml_tensor * ids_leaf = bucket_upload_leaf(c, GGML_TYPE_I32, ne_ids, nb_ids,
-                                                c.mm_ids_pool.back().data());
+                                                b.ids_slot);
 
     ggml_tensor * w3d = ggml_new_tensor_3d(c.ctx, w->type, w->ne[0], w->ne[1], 1);
     w3d->ne[2] = static_cast<int32_t>(sp->n_slots);
@@ -855,11 +892,8 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
     if (!cur_leaf) {
         // External shared activation: gather the token axis (GPU shape: each
         // bucket owns its cur copy). Cached per round (gate + up mm share it).
-        auto it = b.gather_cache.find(cur);
-        if (it == b.gather_cache.end()) {
-            it = b.gather_cache.emplace(cur, bucket_gather_cur(b, cur)).first;
-        }
-        cur_leaf = it->second;
+        cur_leaf = b.gather_get(cur);
+        if (!cur_leaf) { cur_leaf = bucket_gather_cur(b, cur); b.gather_put(cur, cur_leaf); }
         if (!cur_leaf) return nullptr;
     }
     ggml_tensor * mm = ggml_mul_mat_id(c.ctx, w3d, cur_leaf, ids_leaf);
@@ -876,7 +910,7 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
     mm->nb[2] = (size_t)(w->ne[1] * b.w_b) * 4;
     mm->nb[3] = mm->nb[2] * (size_t) b.n_active;
     ggml_build_forward_expand(c.gf, mm);
-    b.twin[nd] = mm;
+    b.twin_put(nd, mm);
     return mm;
 }
 
@@ -923,18 +957,17 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
         if (!src) continue;
         ggml_tensor * lf = nullptr;
         if (nd->op == GGML_OP_GET_ROWS && s == 1 && src->type == GGML_TYPE_I32) {
-            // ids leaf must point at a buffer kept alive until graph_compute: the
-            // per-bucket member is overwritten by the next bucket's assign().
-            c.mm_ids_pool.push_back(b.ids_exp);
+            // ids leaf points at the scratch ids_exp (stable until graph_compute)
             int64_t sne[4] = { b.w_b, b.n_active, 1, 1 };
             size_t snb[4] = { 4, (size_t)(b.w_b) * 4, (size_t)(b.w_b * b.n_active) * 4, (size_t)(b.w_b * b.n_active) * 4 };
-            lf = bucket_upload_leaf(c, GGML_TYPE_I32, sne, snb, c.mm_ids_pool.back().data());
+            lf = bucket_upload_leaf(c, GGML_TYPE_I32, sne, snb, b.ids_exp);
 #ifdef STREAM_MOE_TEMP
             if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
+                const size_t n_exp = (size_t) b.w_b * b.n_active;
                 int32_t mn = INT32_MAX, mx = INT32_MIN;
-                for (size_t q = 0; q < b.ids_exp.size(); ++q) { mn = std::min(mn, b.ids_exp[q]); mx = std::max(mx, b.ids_exp[q]); }
+                for (size_t q = 0; q < n_exp; ++q) { mn = std::min(mn, b.ids_exp[q]); mx = std::max(mx, b.ids_exp[q]); }
                 fprintf(stderr, "[chain_buckets] GET_ROWS ids_exp[%zu] range [%d,%d] src0=",
-                        b.ids_exp.size(), mn, mx);
+                        n_exp, mn, mx);
                 fprintf(stderr, "%s", (nd->src[0] && nd->src[0]->name) ? nd->src[0]->name : "?");
                 fprintf(stderr, " s0ne=[%lld,%lld,%lld,%lld] out_ne=[%lld,%lld,%lld]\n",
                         (long long) (nd->src[0] ? nd->src[0]->ne[0] : 0),
@@ -952,7 +985,7 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
     }
     b.bind_fresh(cl, nf * sizeof(float), true);
     ggml_build_forward_expand(c.gf, cl);
-    b.twin[nd] = cl;
+    b.twin_put(nd, cl);
     return cl;
 }
 
@@ -1043,20 +1076,24 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 
     // Round list: real build_mix_plan rounds (single RAM pool degenerates to one
     // full round); STREAM_MOE_TEMP may force the test-only scattered split.
-    std::vector<mix_round_t> rounds;
+    // Flat storage lives in the per-layer scratch (grow-only, no per-round alloc).
+    exec_scratch_t & sc = g_scratch;
+    sc.reset();
+    mix_plan_t plan;
 #ifdef STREAM_MOE_TEMP
     const char * split_env = std::getenv("STREAM_MOE_TMP_BUCKET_ROUNDS");
     if (split_env && *split_env) {
-        rounds = test_split_rounds(ids_compact.data(), n_k, n_t, expert_pool.data(),
-                                   n_expert, n_pools);
+        plan = test_split_rounds(ids_compact.data(), n_k, n_t, expert_pool.data(),
+                                 n_expert, n_pools, sc);
     } else
 #endif
     {
-        mix_plan_t plan = build_mix_plan(ids_compact.data(), n_k, n_t,
-                                         expert_pool.data(), n_expert, n_pools);
-        rounds = std::move(plan.rounds);
+        plan = build_mix_plan(ids_compact.data(), n_k, n_t, expert_pool.data(),
+                              n_expert, n_pools, sc.plan_ids, sc.plan_scatter, sc.plan_rounds);
     }
-    if (rounds.empty()) {
+    const mix_round_t * rounds   = plan.rounds;
+    const uint32_t      n_rounds = plan.n_rounds;
+    if (n_rounds == 0) {
         LOG_ERROR("stream_moe: chain_buckets empty round list L" << layer);
 #ifdef STREAM_MOE_TEMP
         {
@@ -1101,8 +1138,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     }
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
-        fprintf(stderr, "[chain_buckets] L%d: n_k=%u n_t=%u -> %zu rounds\n",
-                layer, n_k, n_t, rounds.size());
+        fprintf(stderr, "[chain_buckets] L%d: n_k=%u n_t=%u -> %u rounds\n",
+                layer, n_k, n_t, n_rounds);
     }
 #endif
 
@@ -1124,6 +1161,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     c.ctx   = ctx;   c.cpu   = cpu;   c.sched = &sched;
     c.topo  = &sched.topology();
     c.layer = layer; c.pins  = &pins; c.ex    = ex;
+    c.scratch = &sc;
     c.fold_repl = true;
     c.w_b = n_k; c.n_t = n_t; c.d_out = d_out;
 
@@ -1141,7 +1179,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #else
     const bool force_cpu_dev = false;
 #endif
-    for (const auto & r : rounds) {
+    for (uint32_t ri = 0; ri < n_rounds; ++ri) {
+        const mix_round_t & r = rounds[ri];
         if (force_cpu_dev) break;
         if (r.pool == 0 || r.width == 0 || r.n_active == 0) continue;
         if (dev_targets.count(r.pool)) continue;
@@ -1156,7 +1195,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     const size_t acc_sz = (size_t)(d_out * n_t);
     const size_t acc_bytes = acc_sz * sizeof(float);
     size_t stage_est = 32u * 1024 * 1024;
-    for (const auto & r : rounds) {
+    for (uint32_t ri = 0; ri < n_rounds; ++ri) {
+        const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
         const size_t cells = (size_t) r.width * r.n_active;
         stage_est += (size_t) d_in * n_t * sizeof(float)   // cur full source
@@ -1182,9 +1222,39 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
         if (n_per_slot < 2) n_per_slot = 2;   // safety margin (tiny vs the fold)
     }
+    // Executor scratch (P1-c): reserve the layer's exact i32/f32 need once so
+    // the bump never reallocates a leaf's data pointer mid-build. CPU targets
+    // fold into f32; device targets use their arena bump.
+    {
+        size_t i32_need = 0, f32_need = 0;
+        for (uint32_t ri = 0; ri < n_rounds; ++ri) {
+            const mix_round_t & r = rounds[ri];
+            if (r.width == 0 || r.n_active == 0) continue;
+            const size_t cells = (size_t) r.width * r.n_active;
+            i32_need += 2 * cells + 2 * r.n_active + (size_t) n_per_slot * cells;
+            device_target_t * dt = nullptr;
+            if (r.pool != 0) {
+                auto it = dev_targets.find(r.pool);
+                if (it != dev_targets.end()) dt = &it->second;
+            }
+            if (!dt) {
+                // CPU target: fold pc/s/acc + cur/per-slot gather outputs all
+                // land in the f32 scratch (bind_fresh(..., false)).
+                f32_need += cells * (size_t) d_out + 2 * (size_t) d_out * r.n_active
+                          + (size_t) d_in * r.n_active + (size_t) n_per_slot * cells;
+            }
+        }
+        if (!ex->layout_ok) {
+            // twins fall back to the f32 scratch when verify had no layout
+            for (const auto * cn : ex->compute) f32_need += (ggml_nbytes(cn) + 3) / 4;
+        }
+        sc.i32.resize(i32_need + 64);
+        sc.f32.resize(f32_need + 64);
+    }
     auto align64 = [](size_t x) { return (x + 63u) & ~size_t(63u); };
     std::unordered_map<uint32_t, size_t> pool_bump;
-    for (const auto & r : rounds) {
+    for (uint32_t ri = 0; ri < n_rounds; ++ri) {
+        const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
         const size_t cells = (size_t) r.width * r.n_active;
         size_t b = align64(cells * (size_t) d_out * sizeof(float))            // pc [w,d,nt]
@@ -1222,7 +1292,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     // Single-target fast path (docs/BUCKET_FAST_PATH): one round covering the
     // whole (t,k) grid -> per_token IS the layer output. Skip ACC + host fold and
     // write it to moe_out directly (CPU: bind data; device: one D2H readback).
-    const bool single_target = (rounds.size() == 1 &&
+    const bool single_target = (n_rounds == 1 &&
                                 rounds[0].n_active == n_t && rounds[0].width == n_k);
     ggml_tensor * moe_out = nullptr;
     for (const auto * cn : ex->compute) {
@@ -1296,7 +1366,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     tmr_acc_t & _tt = (n_t == 1) ? g_tail_dec : g_tail_pre;
     auto _ch_t0 = std::chrono::steady_clock::now();
 #endif
-    for (size_t ri = 0; ri < rounds.size(); ++ri) {
+    for (uint32_t ri = 0; ri < n_rounds; ++ri) {
         const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
         device_target_t * dt = nullptr;
@@ -1313,26 +1383,30 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 
         // scatter_plan: t_round[a] = original token of round column a; order[i]
         // = round column of tight column i; segs = acc arithmetic runs.
-        b.t_round.resize(r.n_active);
+        b.t_round = reinterpret_cast<uint32_t *>(c.scratch->a32(r.n_active));
         for (uint32_t a = 0; a < r.n_active; ++a) {
-            b.t_round[a] = r.scatter[(size_t) a * r.width].t;
+            b.t_round[a] = b.scat(a, 0).t;
         }
-        scatter_plan_t sp = build_scatter_plan(b.t_round.data(), r.n_active, n_t);
-        if (sp.order.size() != r.n_active) {
+        scatter_plan_t sp = build_scatter_plan(b.t_round, r.n_active, n_t,
+                                               c.scratch->sp_order, c.scratch->sp_segs);
+        if (sp.n_order != r.n_active) {
             LOG_ERROR("stream_moe: chain_buckets scatter_plan failed L" << layer
                       << " round " << ri << " (n_active " << r.n_active << ")");
             return GGML_STATUS_FAILED;
         }
-        b.order = std::move(sp.order);
+        b.order = sp.order;
 
         // tight-order ids (expert id + pool-local slot id).
-        b.ids_exp.assign((size_t) r.width * r.n_active, 0);
-        b.ids_slot.assign((size_t) r.width * r.n_active, 0);
+        const size_t n_cells = (size_t) r.width * r.n_active;
+        b.ids_exp  = c.scratch->a32(n_cells);
+        b.ids_slot = c.scratch->a32(n_cells);
+        std::fill(b.ids_exp,  b.ids_exp  + n_cells, 0);
+        std::fill(b.ids_slot, b.ids_slot + n_cells, 0);
         bool ok = true;
         for (uint32_t i = 0; i < r.n_active && ok; ++i) {
             const uint32_t a = b.order[i];
             for (uint32_t s = 0; s < r.width; ++s) {
-                const int32_t e = r.ids[(size_t) a * r.width + s];
+                const int32_t e = b.rid(a, s);
                 if (e < 0 || e >= static_cast<int32_t>(n_expert)) { ok = false; break; }
                 const int32_t slot = pin_slot(pins, (uint32_t) layer, (uint32_t) e);
                 if (slot < 0) { ok = false; break; }
@@ -1346,17 +1420,11 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         if (!ok) { LOG_ERROR("stream_moe: chain_buckets ids staging failed L" << layer); return GGML_STATUS_FAILED; }
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG")) {
-            fprintf(stderr, "[chain_buckets]   r%zu: pool=%u dev=%d w_b=%u n_active=%u segs=%zu\n",
-                    ri, r.pool, dt ? 1 : 0, r.width, r.n_active, sp.segs.size());
+            fprintf(stderr, "[chain_buckets]   r%zu: pool=%u dev=%d w_b=%u n_active=%u segs=%u\n",
+                    ri, r.pool, dt ? 1 : 0, r.width, r.n_active, sp.n_segs);
         }
 #endif
-        // Keep the round's ids copies alive until graph_compute (append-only pool).
-        c.mm_ids_pool.push_back(b.ids_exp);
-        c.mm_ids_pool.push_back(b.ids_slot);
-        b.ids_exp  = c.mm_ids_pool[c.mm_ids_pool.size() - 2];
-        b.ids_slot = c.mm_ids_pool[c.mm_ids_pool.size() - 1];
-        b.twin.clear();
-        b.gather_cache.clear();
+        b.clear_round();
         b.n_arena = 0; b.n_heap = 0;
         ggml_tensor * last = append_bucket_chain_compact(b);
         if (!last) { LOG_ERROR("stream_moe: chain_buckets append failed L" << layer); return GGML_STATUS_FAILED; }
@@ -1383,7 +1451,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 acc->data = c.acc_d.data();
             }
             const size_t col = (size_t)(c.d_out) * 4;
-            for (const auto & seg : sp.segs) {
+            for (uint32_t si = 0; si < sp.n_segs; ++si) {
+                const scatter_seg_t & seg = sp.segs[si];
                 if (seg.len == 0) continue;
                 ggml_tensor * pv = ggml_view_2d(c.ctx, per_token, c.d_out, seg.len,
                                                 per_token->nb[1], (size_t) seg.src * per_token->nb[1]);

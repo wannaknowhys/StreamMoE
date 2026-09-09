@@ -21,6 +21,23 @@ namespace {
 
 const int32_t SENT = -1;   // sentinel mark: "no expert / not touched"
 
+// Owning storage + plan view (the plan points into the vectors, so keep both
+// together - never move/copy after build).
+struct sp_t {
+    std::vector<uint32_t>      order;
+    std::vector<scatter_seg_t> segs;
+    scatter_plan_t             plan;
+    void build(const uint32_t* t, uint32_t n_active, uint32_t n_t) {
+        plan = build_scatter_plan(t, n_active, n_t, order, segs);
+    }
+    uint32_t n_order() const { return plan.n_order; }
+    uint32_t n_segs()  const { return plan.n_segs; }
+    uint32_t ord(uint32_t i) const { return plan.order[i]; }
+    const scatter_seg_t& seg(uint32_t i) const { return plan.segs[i]; }
+    bool order_empty() const { return plan.n_order == 0; }
+    bool segs_empty()  const { return plan.n_segs == 0; }
+};
+
 // Deterministic LCG so the grid is reproducible.
 struct lcg_t {
     uint64_t s;
@@ -58,23 +75,24 @@ bool run_scatter_check(const std::vector<uint32_t>& t, const std::vector<int32_t
     TEST_ASSERT(k == n_active, "hit count == active count");
 
     const uint64_t r0 = tsc_now();
-    scatter_plan_t plan = build_scatter_plan(t.data(), n_active, n_t);
+    sp_t sp;
+    sp.build(t.data(), n_active, n_t);
     const uint64_t r1 = tsc_now();
 
     // step 4: order is a permutation of [0, n_active).
-    TEST_ASSERT(plan.order.size() == n_active, "order size == n_active");
+    TEST_ASSERT(sp.n_order() == n_active, "order size == n_active");
     std::vector<uint8_t> seen(n_active, 0);
     for (uint32_t i = 0; i < n_active; ++i) {
-        TEST_ASSERT(plan.order[i] < n_active, "order[i] in range");
-        TEST_ASSERT(!seen[plan.order[i]], "order is a permutation (no dup)");
-        seen[plan.order[i]] = 1;
+        TEST_ASSERT(sp.ord(i) < n_active, "order[i] in range");
+        TEST_ASSERT(!seen[sp.ord(i)], "order is a permutation (no dup)");
+        seen[sp.ord(i)] = 1;
     }
 
     // steps 5-6: compact via order; must hold each mark 1..k exactly once.
     std::vector<int32_t> compact(n_active, SENT);
     std::vector<uint8_t> have(n_active, 0);   // have[m-1] for mark m
     for (uint32_t i = 0; i < n_active; ++i) {
-        const uint32_t tv = t[plan.order[i]];
+        const uint32_t tv = t[sp.ord(i)];
         TEST_ASSERT(tv < n_t, "t[order[i]] < n_t");
         const int32_t val = truth[tv];
         TEST_ASSERT(val != SENT, "compact has no sentinel (only hits present)");
@@ -87,18 +105,19 @@ bool run_scatter_check(const std::vector<uint32_t>& t, const std::vector<int32_t
     // step 7: scatter compact back through segs into a fresh sentinel target.
     std::vector<int32_t> target(n_t, SENT);
     uint32_t src_next = 0;
-    for (const auto& seg : plan.segs) {
+    for (uint32_t si = 0; si < sp.n_segs(); ++si) {
+        const scatter_seg_t& seg = sp.seg(si);
         TEST_ASSERT(seg.src == src_next, "segs are contiguous, cover all src");
         TEST_ASSERT(seg.len >= 1, "seg len >= 1");
         TEST_ASSERT(seg.delta >= 1, "seg delta >= 1");
         TEST_ASSERT(seg.dst + (uint64_t)(seg.len - 1) * seg.delta < n_t, "seg dst arithmetic fits n_t");
         for (uint32_t i = 0; i < seg.len; ++i) {
-            const uint32_t si = seg.src + i;
+            const uint32_t s_i = seg.src + i;
             const uint32_t di = seg.dst + i * seg.delta;
-            TEST_ASSERT(si < n_active, "seg src in range");
+            TEST_ASSERT(s_i < n_active, "seg src in range");
             TEST_ASSERT(di < n_t, "seg dst in range");
-            TEST_ASSERT(di == t[plan.order[si]], "seg dst == token id of that tight column");
-            target[di] = compact[si];
+            TEST_ASSERT(di == t[sp.ord(s_i)], "seg dst == token id of that tight column");
+            target[di] = compact[s_i];
         }
         src_next = seg.src + seg.len;
     }
@@ -107,8 +126,8 @@ bool run_scatter_check(const std::vector<uint32_t>& t, const std::vector<int32_t
     // step 8: full-width elementwise equivalence.
     for (uint32_t v = 0; v < n_t; ++v) TEST_ASSERT(target[v] == truth[v], "target == truth elementwise");
 
-    std::printf("total=%u active=%u segs=%zu dt=%lldns\n",
-                n_t, n_active, plan.segs.size(),
+    std::printf("total=%u active=%u segs=%u dt=%lldns\n",
+                n_t, n_active, sp.n_segs(),
                 (long long)tsc_delta_ns(r1 - r0));
     return true;
 }
@@ -138,14 +157,15 @@ static bool test_full_consecutive() {
     const uint32_t n_t = 6;
     std::vector<uint32_t> t = { 0, 1, 2, 3, 4, 5 };
     std::vector<int32_t> truth = { 1, 2, 3, 4, 5, 6 };
-    scatter_plan_t plan = build_scatter_plan(t.data(), (uint32_t)t.size(), n_t);
-    TEST_ASSERT(plan.segs.size() == 1, "one seg");
-    if (!plan.segs.empty()) {
-        TEST_ASSERT(plan.segs[0].len == 6, "seg len 6");
-        TEST_ASSERT(plan.segs[0].delta == 1, "seg delta 1");
-        TEST_ASSERT(plan.segs[0].dst == 0, "seg dst 0");
+    sp_t sp;
+    sp.build(t.data(), (uint32_t)t.size(), n_t);
+    TEST_ASSERT(sp.n_segs() == 1, "one seg");
+    if (sp.n_segs() >= 1) {
+        TEST_ASSERT(sp.seg(0).len == 6, "seg len 6");
+        TEST_ASSERT(sp.seg(0).delta == 1, "seg delta 1");
+        TEST_ASSERT(sp.seg(0).dst == 0, "seg dst 0");
     }
-    for (uint32_t i = 0; i < t.size(); ++i) TEST_ASSERT(plan.order[i] == i, "order identity");
+    for (uint32_t i = 0; i < t.size(); ++i) TEST_ASSERT(sp.ord(i) == i, "order identity");
     return run_scatter_check(t, truth, n_t);
 }
 
@@ -159,13 +179,14 @@ static bool test_motivating_sparse() {
     for (uint32_t v = 0; v < n_t; ++v)
         if (v == 2 || v == 4 || v == 5 || v == 6 || v == 9) truth[v] = (int32_t)(++j);
 
-    scatter_plan_t plan = build_scatter_plan(t.data(), (uint32_t)t.size(), n_t);
-    TEST_ASSERT(plan.segs.size() == 2, "2 segs (better than natural 3)");
-    if (plan.segs.size() == 2) {
+    sp_t sp;
+    sp.build(t.data(), (uint32_t)t.size(), n_t);
+    TEST_ASSERT(sp.n_segs() == 2, "2 segs (better than natural 3)");
+    if (sp.n_segs() == 2) {
         // greedy: longest run {4,5,6} d=1 (len3 beats {2,4,6} by smaller delta
         // on the len-3 tie), then pair {2,9} d=7.
-        TEST_ASSERT(plan.segs[0].len == 3 && plan.segs[0].delta == 1 && plan.segs[0].dst == 4, "seg0 {4,5,6} d1");
-        TEST_ASSERT(plan.segs[1].len == 2 && plan.segs[1].delta == 7 && plan.segs[1].dst == 2, "seg1 {2,9} d7");
+        TEST_ASSERT(sp.seg(0).len == 3 && sp.seg(0).delta == 1 && sp.seg(0).dst == 4, "seg0 {4,5,6} d1");
+        TEST_ASSERT(sp.seg(1).len == 2 && sp.seg(1).delta == 7 && sp.seg(1).dst == 2, "seg1 {2,9} d7");
     }
     return run_scatter_check(t, truth, n_t);
 }
@@ -178,20 +199,22 @@ static bool test_input_order_invariant() {
     std::vector<uint32_t> shuf = { 2, 0, 9, 5, 4, 6 };
 
     const auto mk = [&](const std::vector<uint32_t>& t) {
-        scatter_plan_t p = build_scatter_plan(t.data(), (uint32_t)t.size(), n_t);
+        sp_t sp;
+        sp.build(t.data(), (uint32_t)t.size(), n_t);
         // the value sequence of the tight order (order applied to t)
         std::vector<uint32_t> vals;
-        for (uint32_t i = 0; i < t.size(); ++i) vals.push_back(t[p.order[i]]);
+        for (uint32_t i = 0; i < t.size(); ++i) vals.push_back(t[sp.ord(i)]);
         return vals;
     };
     const auto v0 = mk(asc), v1 = mk(rev), v2 = mk(shuf);
     TEST_ASSERT(v0 == v1 && v1 == v2, "tight value sequence identical across input orders");
-    const auto segs_asc  = build_scatter_plan(asc.data(), (uint32_t)asc.size(), n_t).segs;
-    const auto segs_shuf = build_scatter_plan(shuf.data(), (uint32_t)shuf.size(), n_t).segs;
-    bool same = segs_asc.size() == segs_shuf.size();
-    for (size_t i = 0; same && i < segs_asc.size(); ++i)
-        same = segs_asc[i].len == segs_shuf[i].len && segs_asc[i].delta == segs_shuf[i].delta &&
-               segs_asc[i].dst == segs_shuf[i].dst;
+
+    sp_t sa; sa.build(asc.data(),  (uint32_t)asc.size(),  n_t);
+    sp_t ss; ss.build(shuf.data(), (uint32_t)shuf.size(), n_t);
+    bool same = sa.n_segs() == ss.n_segs();
+    for (uint32_t i = 0; same && i < sa.n_segs(); ++i)
+        same = sa.seg(i).len == ss.seg(i).len && sa.seg(i).delta == ss.seg(i).delta &&
+               sa.seg(i).dst == ss.seg(i).dst;
     TEST_ASSERT(same, "segs identical across input orders");
 
     std::vector<int32_t> truth(n_t, SENT);
@@ -202,18 +225,18 @@ static bool test_input_order_invariant() {
 // ---- duplicate / out-of-range token ids are rejected -----------------------
 static bool test_reject_invalid() {
     std::vector<uint32_t> dup = { 1, 1, 2 };
-    scatter_plan_t p1 = build_scatter_plan(dup.data(), 3, 4);
-    TEST_ASSERT(p1.order.empty() && p1.segs.empty() && p1.n_active == 3, "duplicate rejected (n_active kept)");
+    sp_t p1; p1.build(dup.data(), 3, 4);
+    TEST_ASSERT(p1.order_empty() && p1.segs_empty() && p1.plan.n_active == 3, "duplicate rejected (n_active kept)");
 
     std::vector<uint32_t> oor = { 0, 4 };
-    scatter_plan_t p2 = build_scatter_plan(oor.data(), 2, 4);
-    TEST_ASSERT(p2.order.empty() && p2.segs.empty(), "out-of-range rejected");
+    sp_t p2; p2.build(oor.data(), 2, 4);
+    TEST_ASSERT(p2.order_empty() && p2.segs_empty(), "out-of-range rejected");
 
-    scatter_plan_t p3 = build_scatter_plan(nullptr, 3, 4);
-    TEST_ASSERT(p3.order.empty() && p3.segs.empty(), "null t rejected");
+    sp_t p3; p3.build(nullptr, 3, 4);
+    TEST_ASSERT(p3.order_empty() && p3.segs_empty(), "null t rejected");
 
-    scatter_plan_t p4 = build_scatter_plan(nullptr, 0, 4);
-    TEST_ASSERT(p4.order.empty() && p4.segs.empty() && p4.n_active == 0, "empty input valid empty plan");
+    sp_t p4; p4.build(nullptr, 0, 4);
+    TEST_ASSERT(p4.order_empty() && p4.segs_empty() && p4.plan.n_active == 0, "empty input valid empty plan");
     return true;
 }
 
@@ -221,12 +244,14 @@ static bool test_reject_invalid() {
 static bool test_order_seg_consistency() {
     const uint32_t n_t = 16;
     std::vector<uint32_t> t = { 1, 3, 5, 9, 10, 11, 0 };
-    scatter_plan_t plan = build_scatter_plan(t.data(), (uint32_t)t.size(), n_t);
+    sp_t sp;
+    sp.build(t.data(), (uint32_t)t.size(), n_t);
     uint32_t tight = 0;
-    for (const auto& seg : plan.segs) {
+    for (uint32_t si = 0; si < sp.n_segs(); ++si) {
+        const scatter_seg_t& seg = sp.seg(si);
         TEST_ASSERT(seg.src == tight, "segs contiguous");
         for (uint32_t i = 0; i < seg.len; ++i) {
-            const uint32_t expected_dst = t[plan.order[seg.src + i]];
+            const uint32_t expected_dst = t[sp.ord(seg.src + i)];
             TEST_ASSERT(expected_dst == seg.dst + i * seg.delta, "segs dst arithmetic == token ids");
         }
         tight += seg.len;
