@@ -950,9 +950,14 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     for (const auto * cn : ex->compute) {
         if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { ids = cn->src[2]; break; }
     }
-    if (!ids || !ids->data) return GGML_STATUS_FAILED;
+    if (!ids) return GGML_STATUS_FAILED;
     const uint32_t n_k = static_cast<uint32_t>(ids->ne[0]);
     const uint32_t n_t = static_cast<uint32_t>(ids->ne[1]);
+    // Empty chain: the last layer is narrowed to the requested output tokens
+    // (inp_out_ids), so a non-final prefill ubatch has zero output tokens and
+    // its MoE is a 0-token no-op in llama.cpp. There is nothing to execute.
+    if (n_t == 0 || n_k == 0) return GGML_STATUS_SUCCESS;
+    if (!ids->data) return GGML_STATUS_FAILED;
     const uint32_t n_expert = sched.topology().n_expert;
     const uint32_t n_pools  = sched.n_pools();
 
@@ -989,6 +994,45 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     }
     if (rounds.empty()) {
         LOG_ERROR("stream_moe: chain_buckets empty round list L" << layer);
+#ifdef STREAM_MOE_TEMP
+        {
+            size_t id_bad = 0, pool_bad = 0, valid = 0, total = (size_t) n_k * n_t;
+            int32_t id_min = 0, id_max = 0;
+            bool first = true;
+            for (uint32_t t = 0; t < n_t; ++t) {
+                for (uint32_t k = 0; k < n_k; ++k) {
+                    const int32_t e = ids_compact[(size_t) t * n_k + k];
+                    if (first) { id_min = id_max = e; first = false; }
+                    if (e < id_min) id_min = e;
+                    if (e > id_max) id_max = e;
+                    if (e < 0 || e >= (int32_t) n_expert) { ++id_bad; continue; }
+                    const int32_t p = expert_pool[e];
+                    if (p < 0 || p >= (int32_t) n_pools) { ++pool_bad; continue; }
+                    ++valid;
+                }
+            }
+            int n_pins = (int) pins.size(), n_pins_pool = 0;
+            for (const auto & h : pins)
+                if ((int) h.pool >= 0 && (int) h.pool < (int) n_pools) ++n_pins_pool;
+            fprintf(stderr, "[chain_buckets] EMPTY L%d: n_k=%u n_t=%u n_expert=%u n_pools=%u "
+                    "total=%zu id[min=%d max=%d bad=%zu] pool_bad=%zu valid=%zu pins=%d pins_pool=%d\n",
+                    layer, n_k, n_t, n_expert, n_pools, total, id_min, id_max, id_bad,
+                    pool_bad, valid, n_pins, n_pins_pool);
+            for (const auto * cn : ex->compute) {
+                if (!cn || cn->op != GGML_OP_MUL_MAT_ID) continue;
+                const ggml_tensor * i2 = cn->src[2];
+                fprintf(stderr, "[chain_buckets]   MMID '%s' w='%s' ne=[%lld,%lld,%lld] "
+                        "ids ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] data=%p\n",
+                        cn->name ? cn->name : "?",
+                        cn->src[0] && cn->src[0]->name ? cn->src[0]->name : "?",
+                        (long long) cn->ne[0], (long long) cn->ne[1], (long long) cn->ne[2],
+                        i2 ? (long long) i2->ne[0] : -1, i2 ? (long long) i2->ne[1] : -1,
+                        i2 ? (long long) i2->ne[2] : -1,
+                        i2 ? i2->nb[0] : (size_t) 0, i2 ? i2->nb[1] : (size_t) 0,
+                        i2 ? i2->nb[2] : (size_t) 0, i2 ? i2->data : nullptr);
+            }
+        }
+#endif
         return GGML_STATUS_FAILED;
     }
 #ifdef STREAM_MOE_TEMP
@@ -1352,6 +1396,11 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         LOG_ERROR("stream_moe: burst keys layer mismatch (" << keys[0].layer << " vs " << layer << ")");
         return GGML_STATUS_FAILED;
     }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_CHAIN_DEBUG"))
+        fprintf(stderr, "[burst] L%d: keys=%zu n_expert=%u\n",
+                layer, keys.size(), topo.n_expert);
+#endif
     uint64_t needed[BITMAP_WORDS] = { 0 };
     for (const auto & k : keys) expert_scheduler::bit_set(needed, k.expert);
     batch_await_t await;

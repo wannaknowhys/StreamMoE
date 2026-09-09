@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-08（token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e —— per-device 整链 GPU 执行 + async/CPU 重叠，RAM-only IDENTICAL、RAM8G+VRAM256M 设备混跑 cos 0.982）。维护者每阶段收尾更新"当前状态"与"下一步"。
+> **最近更新**：2026-09-09（**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
 
 ---
 
@@ -57,6 +57,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **回归口径**：纯 RAM 默认对当前 HEAD 干净构建 **IDENTICAL**；RAM8G+VRAM256M 设备混跑对同分区 CPU **cos 0.982**（与已知 0.986 冻结基线 flip 噪声同量级；**用户 2026-09-08 决定不追这个差距**）。诊断 env 见 WIP O。
 - **deepseek 设备实测（2026-09-08）**：`RAM:71680 + Vulkan0:1024`（80 槽）、95-token prefill-from，设备 round `dev=1` 真在 Vulkan 上跑；对 CPU 桶引擎/上游基线 **embd cos 0.9999998 / hidden cos 0.99999997**（cos gate 内），expert_history 8.6% flip（允许），退出 0 泄漏。→ 设备路径对 gemma + deepseek 均成立。
 - **C4 resident 复制（2026-09）**：闭包分析（`moe_chain_verify_graph`）结束时把被闭包使用、非 per-expert、≤1 MiB 的叶子（gemma `ffn_down_exps.scale` 512 B/层）**一次性复制到每个有专家池的设备**（`stream_moe_backend_replicate_leaf`）；per-device 图绑定常驻副本（`bucket_ext_leaf` 命中 unwrap 后的根）而非每 build 重新 staging。gemma RAM8G+VRAM256M 实测：resident 路径与 staging 路径产物**逐字节一致**，cos 对 CPU 仍 ~0.98（既有 flip 噪声）。
+- **最后一层 0-token no-op 修复（2026-09-09，B38）**：非末尾 prefill ubatch 的 `n_outputs=0` → 最后一层 MoE ids `ne=[n_k,0,1]`（olmoe.cpp 用 `inp_out_ids` 收窄），桶引擎原来报 `chain_buckets empty round list` → Compute error（prompt > n_ubatch 必现，en.json < 512 不触发）。`exec_layer_burst_chain_buckets` 对 `n_t==0` 直接返回 SUCCESS（等价 upstream 0-token op）。olmoe place-cpu prefill3000 FAIL→OK（pp 208.9/tg 32.15）；默认 ub512 与 `-ub 4096` 生成逐字节相同。
 
 ### dense 位置管理 Phase 1a（2026-09-08，docs/DENSE_PLACEMENT.md）
 
