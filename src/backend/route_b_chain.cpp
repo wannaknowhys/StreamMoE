@@ -661,6 +661,35 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
             (g_even_max + g_odd_max) / (1024 * 1024));
 #endif
 
+#ifdef STREAM_MOE_TEMP
+    // Whole-graph structural dump (STREAM_MOE_TMP_GRAPH_DUMP=1). One line per
+    // compute node and per leaf (weight/input), with the assigned buft when the
+    // tensor already has a buffer (weights do; compute nodes get theirs later at
+    // sched split). chain=L when the node is in the privatised MoE closure of
+    // layer L, else -1. Used to map C1/C2/expert regions per model.
+    if (getenv("STREAM_MOE_TMP_GRAPH_DUMP")) {
+        auto bname = [](const ggml_tensor * t) -> const char * {
+            return t->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)) : "-";
+        };
+        fprintf(stderr, "[gdump] graph n_nodes=%d n_leafs=%d\n", gf->n_nodes, gf->n_leafs);
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            const ggml_tensor * nd = gf->nodes[i];
+            fprintf(stderr, "[gdump] N %4d %-16s %-34s ne=[%lld,%lld,%lld,%lld] bytes=%zu chain=%d buft=%s\n",
+                    i, ggml_op_name(nd->op), nd->name ? nd->name : "?",
+                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3],
+                    ggml_nbytes(nd), chain[i] ? layer[i] : -1, bname(nd));
+        }
+        for (int i = 0; i < gf->n_leafs; ++i) {
+            const ggml_tensor * t = gf->leafs[i];
+            fprintf(stderr, "[gdump] L %4d %-16s %-44s ne=[%lld,%lld,%lld,%lld] bytes=%zu buft=%s\n",
+                    i, ggml_op_name(t->op), t->name ? t->name : "?",
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    ggml_nbytes(t), bname(t));
+        }
+        fflush(stderr);
+    }
+#endif
+
     // ---- external-consumer check: no node OUTSIDE the chain may reference a
     // chain node except the moe_out end (which post-norm/dense legitimately
     // consumes). Topology-only - no name heuristics, no unnamed exemptions.
