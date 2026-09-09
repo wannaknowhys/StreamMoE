@@ -1,0 +1,13 @@
+{
+  "engine": "place-cpu",
+  "bin": "StreamMoE",
+  "extra": [
+    "--expert-backend",
+    "--fit",
+    "off",
+    "--moe-expert-pools",
+    "RAM:${pool}",
+    "--dense-placement",
+    "C1:RAM,C2:RAM"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "engine": "stock-cpu",
+  "binPath": "${SM_UPSTREAM_BIN}",
+  "extra": [
+    "--fit",
+    "off",
+    "--n-gpu-layers",
+    "0"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "input": "bench_long",
+  "promptFile": "benchmark/prompts/en_long.jsonl",
+  "promptRepeat": 4,
+  "ctx": 16384,
+  "threads": 16,
+  "nPredict": 128,
+  "warmup": 1,
+  "repeat": 3
+}

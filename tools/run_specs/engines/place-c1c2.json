@@ -1,0 +1,13 @@
+{
+  "engine": "place-c1c2",
+  "bin": "StreamMoE",
+  "extra": [
+    "--expert-backend",
+    "--fit",
+    "off",
+    "--moe-expert-pools",
+    "RAM:${pool}",
+    "--dense-placement",
+    "C1:Vulkan0,C2:Vulkan0"
+  ]
+}

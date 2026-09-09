@@ -1,0 +1,13 @@
+{
+  "engine": "place-exp5",
+  "bin": "StreamMoE",
+  "extra": [
+    "--expert-backend",
+    "--fit",
+    "off",
+    "--moe-expert-pools",
+    "RAM:${pool},Vulkan0:5120",
+    "--dense-placement",
+    "C1:RAM,C2:RAM"
+  ]
+}

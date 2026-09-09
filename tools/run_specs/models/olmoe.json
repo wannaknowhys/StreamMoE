@@ -1,0 +1,6 @@
+{
+  "model": "olmoe",
+  "modelPath": "${SM_OLMOE}",
+  "draft": null,
+  "pool": 8192
+}
