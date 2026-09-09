@@ -33,6 +33,9 @@ temp/
 # Private local env / scripts (real machine paths, prebuilt binaries - never commit)
 private/
 
+# Benchmark results (local run artifacts; tools/run_bench.js default output)
+benchmark/results/
+
 # baseline regression artifacts (large binaries - local only, like model disk)
 baseline_regression/baseline/*.bin
 baseline_regression/baseline/*.json

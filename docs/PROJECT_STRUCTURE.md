@@ -42,6 +42,7 @@ StreamMoE/
 | `REPACK_DIVERGENCE_DEBUG.md` / `.zh-CN.md`                   | repack vs 普通内核路径差异的 bit 级排查                                                      |
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md`                           | 待办 / 可执行程序路线图                                                                      |
 | `DENSE_PLACEMENT.md` / `.zh-CN.md`                           | dense 位置管理（C1/C2 驻留、`--dense-placement` 参数、计算/搬迁 lag 判据、静态 vs 动态迁移） |
+| `BENCHMARK.md` / `.zh-CN.md`                                 | 布局吞吐基准（`tools/run_bench.js`：cold/steady、jsonl 多轮、原版对比、结果结构）             |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
 
@@ -59,10 +60,11 @@ StreamMoE/
 ## 4. benchmark/（prompts 与 results 分离）
 
 - `benchmark/prompts/*.jsonl`：输入数据集（`long_horizon_prompts.jsonl` / `_zh.jsonl`）。
-- `benchmark/results/`：每次运行的两件套按 `_<tag>` 后缀命名，同一次运行的产物同后缀：
-  - `conversation_real_<tag>.txt`（完整对话转写）
-  - `profile_real_<tag>.jsonl`（逐轮遥测）
+- `benchmark/results/`：**整个目录已 gitignore**（本机运行产物，不入库）。含：
+  - `run_long_horizon_test.bat` 的 `conversation_real_<tag>.txt` / `profile_real_<tag>.jsonl`
+  - `run_bench.js` 的 `bench_<ts>.jsonl` / `SM_BENCH_OUT` 指定的文件
 - 过期的 mock 时代结果已删除（BENCHMARK_REPORT*.md / conversation_* / profile_70G_ram* 等）。
+- 布局基准用法与结果结构见 `docs/BENCHMARK.md`。
 
 ## 5. patches/（一次性补丁）
 
