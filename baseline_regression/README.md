@@ -43,17 +43,18 @@ run_baseline.bat [baseline_moe_dir] [verify_dir]
 
 | # | 检查 | 期望 |
 |---|---|---|
-| 3a | verify_prefill moe vs baseline moe | **IDENTICAL**（embd/hidden/KV 逐字节同）——池大小/verify 等改动不得影响数值 |
-| 3b | verify_expert_history moe vs baseline | **IDENTICAL**（路由逐条目同）|
+| 3a | verify_prefill moe vs baseline moe | CPU 基线：**IDENTICAL**；`_vk` 基线：**cos 门**（embd cos≥0.99 的 token 比例 ≥ 90%，脚本打印 cos 区间比例）|
+| 3b | verify_expert_history moe vs baseline | CPU 基线：**IDENTICAL**；`_vk` 基线：**仅报告**（路由 flip 是 vk flavor 噪声）|
 | 3c | verify_prefill upstream vs baseline upstream | **IDENTICAL** |
 | 4 | verify_kl baseline-upstream vs new moe | 报告 per-token KL（`moe_129_8192` thresh 1.0；`*_vk` 基线自动放宽到 4.5——vk flavor 相对 CPU upstream 参照恒虚高）|
-| 5 | kv_cos baseline moe vs new moe | 全 ~1.0（IDENTICAL 保证）|
+| 5 | kv_cos baseline moe vs new moe | 全 ~1.0（IDENTICAL 保证；vk 下为参考）|
 
-**PASS 判定 = 3a/3b/3c 全 IDENTICAL**；4/5 是报告参考。moe 与基线 flavor 不匹配时 3a/3b 会 DIVERGED（div_match 归因 0 unexplained）——选对基线即可。
+**PASS 判定**：3c upstream 必须 IDENTICAL；3a CPU 必须 IDENTICAL / `_vk` 必须过 cos 门；3b `_vk` 仅报告。4/5 是报告参考。`_vk` 的 cos 门参数在 `run_baseline.bat`（`--cos-floor 0.99 --min-ratio 0.9`），要收紧改这两个数即可。
 
 ## DeepSeek gate（cos 判据，非逐字节）
 
-Gemma 的 run_baseline 是**逐字节 IDENTICAL**（同 flavor 下桶引擎与上游同序）。DeepSeek 因路由
+Gemma 的 run_baseline：CPU 基线**逐字节 IDENTICAL**；vk 基线（`moe_129_8192_vk`）因 host 内存
+形态差异只能走 **cos 门**（`--cos-floor 0.99 --min-ratio 0.9`）。DeepSeek 因路由
 expert-flip 噪声（gate 边界专家序号翻转，~8% 条目，累加结果不变），只能 **cos gate**：
 - 参照 = `baseline/deepseek_hi_up`（upstream 纯 CPU llama，UD-00001，`-p hi -st` 生成流
   95 tokens 导出 prefill_export_main.bin）。

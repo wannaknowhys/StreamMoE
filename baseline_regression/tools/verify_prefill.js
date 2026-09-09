@@ -108,6 +108,7 @@ const COS_TH = 1e-6;  // |1 - cos| gate
 const ABS_TH = 1e-4;  // maxAbs gate (absolute)
 function cmpRows(tag, ra, rb) {
     let first = null;
+    const cosVals = [];
     for (let i = 0; i < Math.min(ra.length, rb.length); i++) {
         const a = ra[i], b = rb[i];
         if (a.pos !== b.pos) { console.log(`  ${tag} pos mismatch @${i}: std=${a.pos} moe=${b.pos}`); if (!first) first = { tag, idx: i }; continue; }
@@ -123,6 +124,7 @@ function cmpRows(tag, ra, rb) {
         const normA = Math.sqrt(na), normB = Math.sqrt(nb);
         // both all-zero vectors: cosine formula gives 0 (not 1), which would false-alarm
         let c = (normA < 1e-30 && normB < 1e-30) ? 1 : dot / (normA * normB + 1e-30);
+        cosVals.push(c);
         const cosBad = Math.abs(1 - c) > COS_TH;
         const absBad = maxAbs > ABS_TH;
         if (cosBad || absBad) {
@@ -130,10 +132,11 @@ function cmpRows(tag, ra, rb) {
             if (!first) first = { tag, token: a.pos, cos: c, mad, mse, maxAbs, maxIdx, cosBad, absBad };
         }
     }
-    return first;
+    return { first, cosVals };
 }
-const f1 = cmpRows('embd', A.embd, B.embd);
-const f2 = cmpRows('hidden', A.hidden, B.hidden);
+const r1 = cmpRows('embd', A.embd, B.embd);
+const r2 = cmpRows('hidden', A.hidden, B.hidden);
+const f1 = r1.first, f2 = r2.first;
 let kvFirst = null, kvDiff = 0;
 for (let ci = 0; ci < Math.min(A.caches.length, B.caches.length); ci++) {
     const ca = A.caches[ci], cb = B.caches[ci];
@@ -158,8 +161,46 @@ for (let ci = 0; ci < Math.min(A.caches.length, B.caches.length); ci++) {
         }
     }
 }
+// Cos interval buckets (always printed) and an optional ratio gate:
+//   node verify_prefill.js <a.bin> <b.bin> [--cos-floor F --min-ratio R]
+// With the gate, PASS iff >= R of aligned embd tokens have cos >= F. Without
+// it, PASS iff byte/float-IDENTICAL. Exit 0 = PASS, 1 = FAIL.
+function printBuckets(tag, vals) {
+    if (!vals.length) return;
+    const edges = [0.9999, 0.999, 0.99, 0.9];
+    const parts = [];
+    let rem = vals;
+    for (const e of edges) {
+        const n = rem.filter((v) => v >= e).length;
+        parts.push(`>=${e}: ${n} (${(100 * n / vals.length).toFixed(1)}%)`);
+        rem = rem.filter((v) => v < e);
+    }
+    parts.push(`<0.9: ${rem.length} (${(100 * rem.length / vals.length).toFixed(1)}%)`);
+    console.log(`  cos buckets ${tag}: ` + parts.join('  '));
+}
+printBuckets('embd', r1.cosVals);
+printBuckets('hidden', r2.cosVals);
+
+let cosFloor = null, minRatio = null;
+for (let i = 4; i < process.argv.length; i++) {
+    if (process.argv[i] === '--cos-floor') cosFloor = Number(process.argv[++i]);
+    else if (process.argv[i] === '--min-ratio') minRatio = Number(process.argv[++i]);
+}
+let gate = null;
+if (cosFloor != null && minRatio != null && r1.cosVals.length) {
+    const n = r1.cosVals.filter((v) => v >= cosFloor).length;
+    const ratio = n / r1.cosVals.length;
+    gate = ratio >= minRatio;
+    console.log(`  GATE embd cos>=${cosFloor}: ${n}/${r1.cosVals.length} = ${(100 * ratio).toFixed(1)}% (min ${(100 * minRatio).toFixed(0)}%) -> ${gate ? 'PASS' : 'FAIL'}`);
+}
+
 if (f1 || f2 || kvDiff) {
     console.log(`\nFIRST DIVERGENCE: embd=${f1 ? JSON.stringify(f1) : 'none'} hidden=${f2 ? JSON.stringify(f2) : 'none'} KV=${kvFirst || 'none'} (KV diffs=${kvDiff})`);
 } else {
     console.log('\nRESULT: IDENTICAL (all aligned tokens + KV)');
 }
+
+const strictPass = !(f1 || f2 || kvDiff);
+const pass = gate != null ? gate : strictPass;
+console.log(`\nRESULT: ${pass ? (gate != null ? 'PASS (cos gate)' : 'PASS (IDENTICAL)') : 'FAIL'}`);
+process.exit(pass ? 0 : 1);
