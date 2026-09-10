@@ -157,7 +157,7 @@ host staging）。一个通用 **index-gather** 助手服务三者：把连续�
   `[1, width, n_active]`。这就是通用 index-gather 节点（BUCKET_EXEC_TOKEN_SUBSET §2.1a）。
 - **acc 循环**（取代 `exec_layer_burst_chain_buckets` 里的 offset-0 单次 acc）：对每个
   seg 做一次 `ggml_acc_inplace(acc_d, per_token_col_slice, nb1=delta*d_out*4,
-offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。
+  offset=dst*d_out*4)`。src 切片在 `per_token` 里连续，因为链按 tight 序跑。
 
 ## 6. 单元测试（计划）
 

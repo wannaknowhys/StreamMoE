@@ -1,4 +1,4 @@
-﻿# StreamMoE 待办任务清单 (TODO.md)
+# StreamMoE 待办任务清单 (TODO.md)
 
 > 本文档用于持续跟踪 StreamMoE 下一阶段的核心研发、淘汰调度策略与评测实验任务。
 > 阶段 1/2/3 为 mock 时代任务，已随真实引擎落地而完成；描述已更新为现状（原 kv_cache_manager / SMKV 等模块已删除）。

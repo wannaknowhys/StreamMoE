@@ -57,7 +57,7 @@ Three disjoint spec categories; any duplicate key across them aborts.
 | Category | Keys |
 | :------- | :--- |
 | model | `model`, `modelPath`, `draft?`, `pool?` |
-| engine | `engine`, `bin` \| `binPath`, `extra?` |
+| engine | `engine`, `bin` &#124; `binPath`, `extra?` |
 | task  | `input`, plus single/jsonl fields below |
 
 Engine = binary + placement args:

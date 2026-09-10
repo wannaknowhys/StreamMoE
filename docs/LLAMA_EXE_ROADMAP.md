@@ -1,4 +1,4 @@
-﻿# StreamMoE 可执行程序生态全景规划与路线图 (LLAMA_EXE_ROADMAP.md)
+# StreamMoE 可执行程序生态全景规划与路线图 (LLAMA_EXE_ROADMAP.md)
 
 > **目标**：全面对标并超越 `llama.cpp` 的可执行程序矩阵，打造基于 StreamMoE 极致内存卸载内核的端到端工具链生态。
 

@@ -52,7 +52,7 @@ node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <sp
 | 类别 | 键 |
 | :--- | :--- |
 | model | `model`、`modelPath`、`draft?`、`pool?` |
-| engine | `engine`、`bin` \| `binPath`、`extra?` |
+| engine | `engine`、`bin` &#124; `binPath`、`extra?` |
 | task | `input`，加下面的 single/jsonl 字段 |
 
 engine = 二进制 + placement 参数：

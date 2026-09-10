@@ -158,10 +158,11 @@ Algorithm (n_active tokens, values in [0, n_t)):
    rectangle peel never produces; reject as an input error otherwise).
 2. Repeat until the value set is empty:
    a. For every candidate delta from 1 upward (delta such that the token value
-   can appear again, i.e. any two values in the set), count the longest
-   chain of equal-delta in-set values: `len(delta) = max over v of
-#{k >= 0 : v + k*delta in set}`. delta is unbounded above but only
-   deltas <= (max-min) matter; scan deltas that actually divide a pair.
+      can appear again, i.e. any two values in the set), count the longest
+      chain of equal-delta in-set values:
+      `len(delta) = max over v of #{k >= 0 : v + k*delta in set}`. delta is
+      unbounded above but only deltas <= (max-min) matter; scan deltas that
+      actually divide a pair.
    b. Pick the delta with the largest `len(delta)` (ties: smallest delta, then
    smallest start value - deterministic).
    c. Emit one seg for that run; remove its values from the set.

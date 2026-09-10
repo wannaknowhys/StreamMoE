@@ -1,4 +1,4 @@
-﻿# Work In Progress - patch 体系手术 + 收尾
+# Work In Progress - patch 体系手术 + 收尾
 
 > **上一轮：全部完成（2026-09-03）**。patch 体系已对齐工作区（干净 apply 逐字节一致）、ASan 整合进 build.bat、文档同步。
 > **本轮（2026-09-04）**：v2 块内张量对齐 + SoA pool 布局改造定案并落地（K1-K5）；批量 pin（L1-L6，纯 RAM 0.11s IDENTICAL）；**M 节设计定稿**（驱逐 + move 管线，docs/EXPERT_MOVE_PIPELINE.md）。v1 sections-v1 否决。
@@ -403,8 +403,8 @@ handle.pool` 直接从 pin 返回的 handle 取（`pin_layer` 本就 per-expert 
   2. 任意 (t,k) 权重（`weights_norm`）= **通用 flat index-gather 节点**：`[1,n_k,n_t]`
      reshape `[1,n_k*n_t]`，i32 leaf `idx[i*w+s]=k+t*n_k`，get_rows，reshape
      `[1,w,n_active]`。取代 `bucket_ext_leaf` 的连续-k 切片。
-  3. 测试分桶 = `minigraph_exec.cpp` 内 `static` 助手，**定义 + 调用点都 `#ifdef
-STREAM_MOE_TEMP`**（只有 `StreamMoE_dump_dbg` 带宏）；k 奇偶 × t 奇偶 = 4 round
+  3. 测试分桶 = `minigraph_exec.cpp` 内 `static` 助手，**定义 + 调用点都
+     `#ifdef STREAM_MOE_TEMP`**（只有 `StreamMoE_dump_dbg` 带宏）；k 奇偶 × t 奇偶 = 4 round
      （刻意非连续 k），验证完即删。不建 `bucket_split.h/.cpp`、不写离线 UT。
   4. 删 `tmp_split_blocks`/`tmp_blk_t`（旧测试 cut 族，现无条件编译）。
 - 任务（实施中，principle 14：全写完再统一回归）：
