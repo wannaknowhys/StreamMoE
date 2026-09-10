@@ -543,6 +543,55 @@ bool is_view_op(const ggml_tensor * n) {
            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_CONT;
 }
 
+// Layer suffix of a llama node name ("ffn_norm-3", "Qcur-3 (reshaped)" -> 3).
+// -1 when the name has no trailing "-<digits>" (anonymous node_*, leaves).
+static int name_layer_suffix(const char * name) {
+    if (!name || !name[0]) return -1;
+    std::string s(name);
+    const size_t sp = s.rfind(" (");
+    if (sp != std::string::npos && s.back() == ')') s.resize(sp);
+    const size_t dash = s.rfind('-');
+    if (dash == std::string::npos || dash + 1 >= s.size()) return -1;
+    for (size_t i = dash + 1; i < s.size(); ++i)
+        if (s[i] < '0' || s[i] > '9') return -1;
+    return atoi(s.c_str() + dash + 1);
+}
+
+// Attribute every compute node of `gf` to its layer (ROUTE_B_LAYER_OWNERSHIP.md
+// L1). Named nodes carry llama's "-<il>" suffix; anonymous nodes (node_*, the
+// per-topk convergence adds) inherit from an attributed producer. Unattributed
+// nodes are model inputs / weights / the output head (external to any layer).
+// Graph order is preserved inside each layer's list.
+[[maybe_unused]] static void collect_layer_nodes(const ggml_cgraph * gf,
+                                std::map<int, std::vector<ggml_tensor*>> & out) {
+    out.clear();
+    const int N = gf->n_nodes;
+    std::vector<int> lay(N, -1);
+    std::unordered_map<const ggml_tensor*, int> idx;
+    idx.reserve((size_t) N * 2);
+    for (int i = 0; i < N; ++i) {
+        lay[i] = name_layer_suffix(gf->nodes[i]->name);
+        idx[gf->nodes[i]] = i;
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < N; ++i) {
+            if (lay[i] >= 0) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                auto it = idx.find(gf->nodes[i]->src[s]);
+                if (it != idx.end() && lay[it->second] >= 0) {
+                    lay[i] = lay[it->second];
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < N; ++i)
+        if (lay[i] >= 0) out[lay[i]].push_back(gf->nodes[i]);
+}
+
 // Privatised chain closure over one built graph: forward BFS from every routed
 // expert MUL_MAT_ID anchor along consumers, stopping expansion at ffn_moe_out
 // (the chain end - included, its own consumers excluded). Used by both verify
@@ -685,6 +734,49 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
                     i, ggml_op_name(t->op), t->name ? t->name : "?",
                     (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
                     ggml_nbytes(t), bname(t));
+        }
+        fflush(stderr);
+    }
+#endif
+
+#ifdef STREAM_MOE_TEMP
+    // Whole-layer capture dump (ROUTE_B_LAYER_OWNERSHIP.md L1,
+    // STREAM_MOE_TMP_LAYER_DUMP=1): per-layer node counts and every cross-layer
+    // consumer edge. A layer's output (e.g. l_out-L) is expected to have exactly
+    // one cross-layer edge L -> L+1; anything else is a partition violation.
+    if (getenv("STREAM_MOE_TMP_LAYER_DUMP")) {
+        std::map<int, std::vector<ggml_tensor*>> layers;
+        collect_layer_nodes(gf, layers);
+        std::unordered_map<const ggml_tensor*, int> nl;
+        for (auto & kv : layers) for (auto * nd : kv.second) nl[nd] = kv.first;
+        int n_unattr = 0;
+        for (int i = 0; i < N; ++i) if (!nl.count(gf->nodes[i])) ++n_unattr;
+        fprintf(stderr, "[layerdump] graph n_nodes=%d layers=%zu unattributed=%d\n",
+                N, layers.size(), n_unattr);
+        for (auto & kv : layers) {
+            const int L = kv.first;
+            size_t bytes = 0;
+            for (auto * nd : kv.second) bytes += ggml_nbytes(nd);
+            std::map<std::pair<int, std::string>, int> edges;
+            for (auto * nd : kv.second) {
+                for (int j = 0; j < N; ++j) {
+                    const ggml_tensor * cj = gf->nodes[j];
+                    if (cj->op == GGML_OP_NONE) continue;
+                    bool uses = false;
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) if (cj->src[s] == nd) { uses = true; break; }
+                    if (!uses) continue;
+                    auto it = nl.find(cj);
+                    const int cl = (it == nl.end()) ? -2 : it->second;
+                    if (cl == L) continue;
+                    edges[{cl, std::string(nd->name ? nd->name : "?") + " -> " +
+                                (cj->name ? cj->name : "?")}]++;
+                }
+            }
+            fprintf(stderr, "[layerdump] L%d: nodes=%zu bytes=%zu cross_edges=%zu\n",
+                    L, kv.second.size(), bytes, edges.size());
+            for (auto & e : edges)
+                fprintf(stderr, "[layerdump]   L%d -> %d : %s (x%d)\n",
+                        L, e.first.first, e.first.second.c_str(), e.second);
         }
         fflush(stderr);
     }
