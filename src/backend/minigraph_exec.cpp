@@ -98,6 +98,107 @@ static bool is_view_op(const ggml_tensor * n) {
            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_CONT;
 }
 
+// Pure aliases (no data movement): they share the producer's buffer, so a clone
+// graph may skip them and let consumers read the aliased producer directly.
+// CONT is NOT an alias - it is a real contiguous copy with its own buffer
+// (ggml_cont -> ggml_dup_tensor) and must be executed like any compute node.
+static bool is_alias_op(const ggml_tensor * n) {
+    return n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+           n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_PERMUTE;
+}
+
+static const ggml_tensor * g_dbg_pos = nullptr;   // debug canary (positions leaf)
+
+// Debug dump capture: per-clone DUP into a dedicated (non-reused) buffer so the
+// value read after graph_compute is the node's real output, not a reused slot.
+static std::vector<uint8_t> g_dump_scratch;
+struct dump_rec_t { const char * name; enum ggml_op op; enum ggml_type type; size_t off; };
+static std::vector<dump_rec_t> g_dump_recs;
+
+static void dbg_canary(int32_t layer, const char * stage) {
+#ifdef STREAM_MOE_TEMP
+    if (g_dbg_pos && std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && g_dbg_pos->data)
+        fprintf(stderr, "[canary] L%d %-6s pos=%lld\n", layer, stage,
+                (long long) *(const int64_t *) g_dbg_pos->data);
+#else
+    (void) layer; (void) stage;
+#endif
+}
+
+// Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2): run a run of
+// main-graph DENSE compute nodes on `backend` (CPU: dense is host-resident).
+// The nodes are executed directly (no clone): they write their own
+// sched-allocated buffers, and their srcs are the main tensors. The graph is a
+// flat list in graph order (topological), so the backend executes them in that
+// order. Views are skipped; consumers reference the view's data directly.
+static enum ggml_status run_dense_nodes(ggml_context * ctx, ggml_backend_t backend,
+                                        const std::vector<ggml_tensor*> & nodes,
+                                        bool expand) {
+    if (nodes.empty()) return GGML_STATUS_SUCCESS;
+#ifdef STREAM_MOE_TEMP
+    const bool dump = std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") != nullptr;
+#else
+    const bool dump = false;
+#endif
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes.size() * 8 + 64, false);
+    int added = 0;
+    size_t dump_off = 0;
+    if (dump) {
+        size_t total = 0;
+        for (ggml_tensor * nd : nodes)
+            if (nd && !is_alias_op(nd) && nd->data) total += ggml_nbytes(nd) + 64;
+        g_dump_scratch.assign(total + 4096, 0);
+        g_dump_recs.clear();
+    }
+    for (ggml_tensor * nd : nodes) {
+        if (!nd || is_alias_op(nd) || !nd->data) continue;
+        if (nd->op == GGML_OP_SET_ROWS && nd->src[1] && !g_dbg_pos) g_dbg_pos = nd->src[1];
+        ggml_tensor * cl = ggml_new_tensor_4d(ctx, nd->type, nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
+        for (int i = 0; i < 4; ++i) cl->nb[i] = nd->nb[i];
+        cl->op = nd->op;
+        std::memcpy(cl->op_params, nd->op_params, GGML_MAX_OP_PARAMS);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            ggml_tensor * lf = ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            for (int i = 0; i < 4; ++i) lf->nb[i] = src->nb[i];
+            lf->data = src->data;
+            cl->src[s] = lf;
+        }
+        cl->data = nd->data;
+        ggml_build_forward_expand(gf, cl);
+        ++added;
+        if (dump) {
+            // Dedicated DUP node: capture this clone's real output before the
+            // gallocr can reuse its slot for a later node.
+            dump_off = (dump_off + 63) & ~size_t(63);
+            ggml_tensor * dp = ggml_dup(ctx, cl);
+            dp->data = g_dump_scratch.data() + dump_off;
+            g_dump_recs.push_back({ nd->name, nd->op, nd->type, dump_off });
+            ggml_build_forward_expand(gf, dp);
+            dump_off += ggml_nbytes(cl);
+        }
+    }
+    (void) expand;
+    if (added == 0) return GGML_STATUS_SUCCESS;
+    const enum ggml_status st = ggml_backend_graph_compute(backend, gf);
+    if (dump) {
+        for (const auto & r : g_dump_recs) {
+            const uint8_t * base = g_dump_scratch.data() + r.off;
+            if (r.type == GGML_TYPE_F32) {
+                const float * p = (const float *) base;
+                fprintf(stderr, "[dnode] %-24s %-12s %.6f\n", r.name ? r.name : "?",
+                        ggml_op_name(r.op), p[0]);
+            } else if (r.type == GGML_TYPE_I32) {
+                const int32_t * p = (const int32_t *) base;
+                fprintf(stderr, "[dnode] %-24s %-12s %d\n", r.name ? r.name : "?",
+                        ggml_op_name(r.op), p[0]);
+            }
+        }
+    }
+    return st;
+}
+
 
 // Slot of a pinned (layer, expert), or -1.
 static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer, uint32_t expert) {
@@ -129,7 +230,6 @@ struct exec_scratch_t {
     float   * af32(size_t n) { float * p = f32.data() + f32_used; f32_used += n; return p; }
 };
 static thread_local exec_scratch_t g_scratch;
-
 #ifdef STREAM_MOE_TEMP
 // Test-only forced split (docs/BUCKET_EXEC_TOKEN_SUBSET.md SS3): turn the real
 // plan's single full round into SCATTERED token-subset rounds so the subset path
@@ -978,7 +1078,7 @@ static ggml_tensor * append_op_bucket(bucket_build_t & b, ggml_tensor * nd) {
     ggml_tensor * cl = ggml_new_tensor_4d(c.ctx, nd->type, ne[0], ne[1], ne[2], ne[3]);
     for (int i = 0; i < 4; ++i) cl->nb[i] = nb[i];
     cl->op = nd->op;
-    for (size_t i = 0; i < GGML_MAX_OP_PARAMS; ++i) cl->op_params[i] = nd->op_params[i];
+    std::memcpy(cl->op_params, nd->op_params, GGML_MAX_OP_PARAMS);
     // per-src resolution. GET_ROWS src1 = ids: replace with the bucket ids_exp
     // subset (expert ids, i32, t-major [w_b, n_active]) - get_rows gathers rows
     // of the REPEAT scale table by expert id.
@@ -1686,6 +1786,14 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
 #ifdef STREAM_MOE_TEMP
+    // Debug: count ubatches (one per exec_layer_burst(layer=0)); dump all layers
+    // of the 3rd token then stop.
+    static int g_ubatch = 0;
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0) {
+        if (++g_ubatch > 3) { std::fflush(stderr); std::exit(0); }
+    }
+#endif
+#ifdef STREAM_MOE_TEMP
     int64_t _n_t = 0;
     for (const auto * cn : ex->compute)
         if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { _n_t = cn->src[2]->ne[1]; break; }
@@ -1756,6 +1864,102 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                     : lt->src[0]->data;
     }
 
+    // L2 whole-layer ownership: run the dense head (layer nodes not in the MoE
+    // closure and not downstream of ffn_moe_out) so cur/ids/weights are
+    // materialised before pinning. The dense tail (downstream of ffn_moe_out)
+    // runs after the burst. Layers without a captured whole-layer list keep the
+    // MoE-only path (device dense).
+    std::vector<ggml_tensor*> dense_head, dense_tail;
+    const std::vector<ggml_tensor*> * lns = moe_chain_layer_nodes(layer);
+    {
+        if (lns && ex) {
+            std::unordered_map<const ggml_tensor*, size_t> lidx;
+            lidx.reserve(lns->size() * 2);
+            for (size_t i = 0; i < lns->size(); ++i) lidx[(*lns)[i]] = i;
+            auto in_closure = [&](const ggml_tensor * t) {
+                for (const auto * cn : ex->compute) if (cn == t) return true;
+                return false;
+            };
+            const ggml_tensor * out = nullptr;
+            for (const auto * cn : ex->compute)
+                if (cn && cn->name && strstr(cn->name, "ffn_moe_out")) { out = cn; break; }
+            std::vector<char> down(lns->size(), 0);
+            auto seed = lidx.find(out);
+            if (seed != lidx.end()) down[seed->second] = 1;
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (size_t i = 0; i < lns->size(); ++i) {
+                    if (down[i]) continue;
+                    const ggml_tensor * nd = (*lns)[i];
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        auto pit = lidx.find(nd->src[s]);
+                        if (pit != lidx.end() && down[pit->second]) { down[i] = 1; changed = true; break; }
+                    }
+                }
+            }
+            for (size_t i = 0; i < lns->size(); ++i) {
+                ggml_tensor * nd = (*lns)[i];
+                if (in_closure(nd)) continue;
+                if (down[i]) dense_tail.push_back(nd);
+                else         dense_head.push_back(nd);
+            }
+        }
+    }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0) {
+        fprintf(stderr, "[split] L%d lns=%zu head=%zu tail=%zu closure=%zu\n", layer,
+                lns ? lns->size() : 0, dense_head.size(), dense_tail.size(),
+                ex ? ex->compute.size() : 0);
+        for (auto * nd : dense_head) fprintf(stderr, "[split]  H %s\n", nd->name ? nd->name : "?");
+        for (auto * nd : dense_tail) fprintf(stderr, "[split]  T %s\n", nd->name ? nd->name : "?");
+        if (ex) for (auto * nd : ex->compute) fprintf(stderr, "[split]  C %s\n", nd->name ? nd->name : "?");
+    }
+#endif
+    {
+        const enum ggml_status hst = run_dense_nodes(ctx, cpu, dense_head, false);
+        if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
+    }
+    dbg_canary(layer, "head");
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0 && ex) {
+        for (const auto * cn : ex->compute) {
+            if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[1] && cn->src[1]->data) {
+                const float * p = (const float *) cn->src[1]->data;
+                const ggml_tensor * vs = cn->src[1]->view_src;
+                fprintf(stderr, "[cur] %s data=%p off=%zu view_src=%s(%p) v=%.6f %.6f %.6f\n",
+                        cn->src[1]->name ? cn->src[1]->name : "?", cn->src[1]->data,
+                        cn->src[1]->view_offs,
+                        vs ? (vs->name ? vs->name : "?") : "-", vs ? vs->data : nullptr,
+                        p[0], p[1], p[2]);
+                break;
+            }
+        }
+        for (auto * nd : dense_head) {
+            if (nd->name && strncmp(nd->name, "norm-0", 6) == 0 && nd->op == GGML_OP_RMS_NORM &&
+                nd->src[0] && nd->src[0]->data) {
+                const float * q = (const float *) nd->src[0]->data;
+                fprintf(stderr, "[embd] %s %.6f %.6f %.6f\n",
+                        nd->src[0]->name ? nd->src[0]->name : "?", q[0], q[1], q[2]);
+                break;
+            }
+        }
+        for (const auto & el : ex->external_leaves) {
+            const ggml_tensor * t = el.tensor;
+            if (!t || !t->data) continue;
+            if (t->type == GGML_TYPE_F32) {
+                const float * p = (const float *) t->data;
+                fprintf(stderr, "[ext] %-6s %-26s f32 %.6f %.6f %.6f\n",
+                        el.role ? el.role : "?", t->name ? t->name : "?", p[0], p[1], p[2]);
+            } else if (t->type == GGML_TYPE_I32) {
+                const int32_t * p = (const int32_t *) t->data;
+                fprintf(stderr, "[ext] %-6s %-26s i32 %d %d %d\n",
+                        el.role ? el.role : "?", t->name ? t->name : "?", p[0], p[1], p[2]);
+            }
+        }
+    }
+#endif
+
     // Pin the layer's whole active expert set (all mm nodes share the ids).
     // Batch semantics: ONE request carrying the whole layer's expert bitmap;
     // missing experts load concurrently (IOCP n-way), exec wakes once.
@@ -1817,6 +2021,33 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // The compact-chain bucket engine is the only executor: a full-width single
     // bucket by default (no env), or an env-selected multi-bucket cut.
     const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
+    dbg_canary(layer, "burst");
+    // L2 whole-layer ownership: run the dense tail (residual / post-norm / dense
+    // MLP) after moe_out is materialised.
+    if (st == GGML_STATUS_SUCCESS && !dense_tail.empty()) {
+        const enum ggml_status tst = run_dense_nodes(ctx, cpu, dense_tail, false);
+        if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
+    }
+    dbg_canary(layer, "tail");
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer >= 0) {
+        const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);
+        if (all) {
+            for (auto * nd : *all) {
+                if (!nd || is_alias_op(nd) || !nd->data) continue;
+                if (nd->type == GGML_TYPE_F32) {
+                    const float * p = (const float *) nd->data;
+                    fprintf(stderr, "[node] L%d %-24s %-12s %.6f\n", layer, nd->name ? nd->name : "?",
+                            ggml_op_name(nd->op), p[0]);
+                } else if (nd->type == GGML_TYPE_I32) {
+                    const int32_t * p = (const int32_t *) nd->data;
+                    fprintf(stderr, "[node] L%d %-24s %-12s %d\n", layer, nd->name ? nd->name : "?",
+                            ggml_op_name(nd->op), p[0]);
+                }
+            }
+        }
+    }
+#endif
 #ifdef STREAM_MOE_TEMP
     auto _unpin_t0 = std::chrono::steady_clock::now();
 #endif
@@ -1831,6 +2062,11 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
 // privatised node; later same-layer splits are no-ops (already produced by the
 // burst). An un-captured MUL_MAT_ID (layer < 0) is a hard error - the legacy
 // per-split path is gone.
+// Whole-layer ownership entry (docs/ROUTE_B_LAYER_OWNERSHIP.md L2): the split
+// may span many layers (all layer nodes are our backend -> one split for the
+// whole graph). Run every layer present, once, in first-seen order. A view
+// split is a no-op (its data pointers were fixed by the burst); an un-captured
+// routed MUL_MAT_ID is a hard error.
 enum ggml_status moe_exec_mul_mat_id(
     ggml_context* ctx,
     ggml_backend_t cpu_backend,
@@ -1840,34 +2076,56 @@ enum ggml_status moe_exec_mul_mat_id(
     int n_threads)
 {
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
+    if (is_alias_op(nodes[0])) return GGML_STATUS_SUCCESS;
 
-    const ggml_tensor * first = nodes[0];
-    // View/layout splits of captured producers are no-ops: the layer burst
-    // already fixed their data pointers (input_layouts) and computed the whole
-    // chain. They reach us because the scheduler follows view_src of a
-    // privatised mm output; there is nothing to execute here.
-    if (is_view_op(first)) return GGML_STATUS_SUCCESS;
-
-    const int32_t layer = moe_chain_layer_of_node(first);
-    if (layer < 0) {
-        fprintf(stderr,
-                "[stream_moe] un-captured MUL_MAT_ID: node='%s' w='%s' op=%s ne=[%lld,%lld,%lld] n_nodes=%d\n",
-                first->name ? first->name : "(anon)",
-                first->src[0] && first->src[0]->name ? first->src[0]->name : "?",
-                ggml_op_name(first->op),
-                (long long) first->ne[0], (long long) first->ne[1], (long long) first->ne[2],
-                n_nodes);
-        LOG_ERROR("stream_moe: un-captured MUL_MAT_ID split reached the executor (no legacy path)");
-        return GGML_STATUS_FAILED;
+    std::vector<int32_t> layers;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * nd = nodes[i];
+        if (!nd || is_alias_op(nd)) continue;
+        const int32_t L = moe_chain_layer_of_node(nd);
+        if (L < 0) {
+            if (nd->op == GGML_OP_MUL_MAT_ID && nd->src[0] && nd->src[0]->name &&
+                strstr(nd->src[0]->name, "_exps")) {
+                fprintf(stderr,
+                        "[stream_moe] un-captured MUL_MAT_ID: node='%s' w='%s' op=%s n_nodes=%d\n",
+                        nd->name ? nd->name : "(anon)",
+                        nd->src[0]->name ? nd->src[0]->name : "?",
+                        ggml_op_name(nd->op), n_nodes);
+                LOG_ERROR("stream_moe: un-captured MUL_MAT_ID split reached the executor (no legacy path)");
+                return GGML_STATUS_FAILED;
+            }
+            continue;   // not a layer node (external / view / model I/O)
+        }
+        bool seen = false;
+        for (int32_t x : layers) if (x == L) { seen = true; break; }
+        if (!seen) layers.push_back(L);
     }
-    const int32_t idx = moe_chain_layer_index(layer, first);
-    static thread_local int32_t g_bl = -1;
-    if (idx > 0 && g_bl == layer) {
-        return GGML_STATUS_SUCCESS;   // already produced by this pass's burst
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+        fprintf(stderr, "[exec] n_nodes=%d first=%s layers=", n_nodes,
+                (nodes[0] && nodes[0]->name) ? nodes[0]->name : "?");
+        for (int32_t L : layers) fprintf(stderr, "%d ", L);
+        fprintf(stderr, "\n");
     }
-    const enum ggml_status st = exec_layer_burst(layer, ctx, cpu_backend, sched, n_threads);
-    g_bl = layer;
-    return st;
+#endif
+    for (int32_t L : layers) {
+        // The scheduler may split a layer's nodes across several splits (e.g.
+        // the attention-score subgraph). Burst the whole layer only from the
+        // split that contains the layer's FIRST node; later same-layer splits
+        // are no-ops (the burst already produced them).
+        const std::vector<ggml_tensor*> * ln = moe_chain_layer_nodes(L);
+        const moe_layer_exec_t * ex = moe_chain_layer_exec(L);
+        const ggml_tensor * first_node = (ln && !ln->empty()) ? ln->front()
+                                     : (ex && !ex->compute.empty()) ? ex->compute.front()
+                                     : nullptr;
+        if (!first_node) continue;
+        bool has_first = false;
+        for (int i = 0; i < n_nodes && !has_first; ++i) if (nodes[i] == first_node) has_first = true;
+        if (!has_first) continue;
+        const enum ggml_status st = exec_layer_burst(L, ctx, cpu_backend, sched, n_threads);
+        if (st != GGML_STATUS_SUCCESS) return st;
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 } // namespace stream_moe

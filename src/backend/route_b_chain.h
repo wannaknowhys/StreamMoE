@@ -95,4 +95,14 @@ const moe_layer_exec_t * moe_chain_layer_exec(int32_t layer);
 // Index of `node` inside its layer's exec sequence, or -1.
 int32_t moe_chain_layer_index(int32_t layer, const ggml_tensor * node);
 
+// Whole-layer capture (docs/ROUTE_B_LAYER_OWNERSHIP.md L2): all compute nodes of
+// `layer` (dense + MoE), graph order. nullptr when the layer was not captured.
+// Layer attribution: llama name suffix "-<il>", anonymous nodes inherit from
+// their producers.
+const std::vector<ggml_tensor*> * moe_chain_layer_nodes(int32_t layer);
+
+// Debug-only: whole-layer capture populated on every build (both the whole-layer
+// and the MoE-only path). Used to dump per-node contents for A/B comparison.
+const std::vector<ggml_tensor*> * moe_chain_layer_nodes_all(int32_t layer);
+
 } // namespace stream_moe

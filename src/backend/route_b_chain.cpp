@@ -26,6 +26,11 @@ constexpr size_t kResidentLeafMaxBytes = 1u << 20;   // 1 MiB
 // Whole-layer burst capture: per-layer privatised compute sequence from the
 // last graph build (see moe_chain_assign_backend).
 std::map<int, moe_layer_exec_t> g_layer_exec;
+// Whole-layer node capture (dense + MoE, graph order) from the last build.
+std::map<int, std::vector<ggml_tensor*>> g_layer_nodes;
+// Debug-only: whole-layer capture populated on EVERY build (both paths), so the
+// executor can dump per-node contents even on the MoE-only baseline path.
+std::map<int, std::vector<ggml_tensor*>> g_layer_nodes_all;
 }
 
 void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
@@ -50,8 +55,11 @@ namespace {
 bool is_routed_mm(const ggml_tensor * n);
 int  mm_layer(const ggml_tensor * n);
 bool is_view_op(const ggml_tensor * n);
+bool is_alias_op(const ggml_tensor * n);
 void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
                    std::vector<int>& layer, int& n_anchors);
+void collect_layer_nodes(const ggml_cgraph * gf,
+                         std::map<int, std::vector<ggml_tensor*>> & out);
 } // namespace
 
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
@@ -148,6 +156,45 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             n++;
         }
     }
+
+    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2): capture every
+    // compute node of each layer (dense + MoE) and assign it to our backend, so
+    // dense and MoE form ONE split and the layer's activations stay under our
+    // control (the executor runs the dense head/tail around the MoE burst).
+    // Only layers whose dense weights are host-resident are taken over: with a
+    // device compute buft the executor would need the device path (later
+    // milestone); device-dense layers keep the MoE-only split.
+    //
+    // DEBUG ONLY (STREAM_MOE_TEMP): L2 is not numerically correct yet (the
+    // output-token reduction path diverges), so production builds must keep the
+    // MoE-only split. The capture itself (g_layer_nodes_all) is debug-only too.
+#ifdef STREAM_MOE_TEMP
+    const bool no_whole = std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") != nullptr;
+    collect_layer_nodes(gf, g_layer_nodes_all);
+    if (!no_whole) {
+        std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
+        g_layer_nodes.clear();
+        for (auto & kv : all) {
+            bool dense_host = true;
+            for (auto * nd : kv.second) {
+                for (int s = 0; s < GGML_MAX_SRC && dense_host; ++s) {
+                    const ggml_tensor * src = nd->src[s];
+                    if (!src) continue;
+                    ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
+                    if (buf && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buf)))
+                        dense_host = false;
+                }
+                if (!dense_host) break;
+            }
+            if (!dense_host) continue;
+            g_layer_nodes[kv.first] = kv.second;
+            for (auto * nd : kv.second) {
+                if (is_alias_op(nd)) continue;
+                ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
+            }
+        }
+    }
+#endif
 #ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",
             n_anchors, n, tot_bytes / (1024 * 1024));
@@ -462,12 +509,27 @@ int32_t moe_chain_layer_of_node(const ggml_tensor * node) {
             if (cn == node) return kv.first;
         }
     }
+    for (const auto & kv : g_layer_nodes) {
+        for (const auto * cn : kv.second) {
+            if (cn == node) return kv.first;
+        }
+    }
     return -1;
 }
 
 const moe_layer_exec_t * moe_chain_layer_exec(int32_t layer) {
     auto it = g_layer_exec.find(layer);
     return it == g_layer_exec.end() ? nullptr : &it->second;
+}
+
+const std::vector<ggml_tensor*> * moe_chain_layer_nodes(int32_t layer) {
+    auto it = g_layer_nodes.find(layer);
+    return it == g_layer_nodes.end() ? nullptr : &it->second;
+}
+
+const std::vector<ggml_tensor*> * moe_chain_layer_nodes_all(int32_t layer) {
+    auto it = g_layer_nodes_all.find(layer);
+    return it == g_layer_nodes_all.end() ? nullptr : &it->second;
 }
 
 int32_t moe_chain_layer_index(int32_t layer, const ggml_tensor * node) {
@@ -543,6 +605,13 @@ bool is_view_op(const ggml_tensor * n) {
            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_CONT;
 }
 
+// Pure aliases only (see minigraph_exec.cpp): CONT is a real copy, not a view,
+// so whole-layer ownership must assign it like any other compute node.
+[[maybe_unused]] bool is_alias_op(const ggml_tensor * n) {
+    return n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+           n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_PERMUTE;
+}
+
 // Layer suffix of a llama node name ("ffn_norm-3", "Qcur-3 (reshaped)" -> 3).
 // -1 when the name has no trailing "-<digits>" (anonymous node_*, leaves).
 static int name_layer_suffix(const char * name) {
@@ -573,11 +642,18 @@ static int name_layer_suffix(const char * name) {
         lay[i] = name_layer_suffix(gf->nodes[i]->name);
         idx[gf->nodes[i]] = i;
     }
+    // Producer propagation attributes anonymous in-layer nodes (node_*, the
+    // per-topk adds, ...). Stop at the last suffixed node: the model output head
+    // (result_norm / result_output) depends on the last layer's output but is
+    // C2, not part of that layer.
+    int last_suffixed = -1;
+    for (int i = 0; i < N; ++i) if (lay[i] >= 0) last_suffixed = i;
     bool changed = true;
     while (changed) {
         changed = false;
         for (int i = 0; i < N; ++i) {
             if (lay[i] >= 0) continue;
+            if (i > last_suffixed) continue; // C2 output head: not part of any layer
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 auto it = idx.find(gf->nodes[i]->src[s]);
                 if (it != idx.end() && lay[it->second] >= 0) {

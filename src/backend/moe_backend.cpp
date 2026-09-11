@@ -148,6 +148,12 @@ int g_threads = 1;
 
 static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
     size_t need = 16 * 1024 * 1024; // base + graph/overhead margin
+#ifdef STREAM_MOE_TEMP
+    // Whole-layer ownership (L2, DEBUG ONLY): the executor clones the dense
+    // head/tail nodes into the arena ctx (tensor + up to GGML_MAX_SRC data leaves
+    // + a graph per run). Budget a generous per-node allowance.
+    need += (size_t) n_nodes * 16 * 1024;
+#endif
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
         if (!nd || nd->op != GGML_OP_MUL_MAT_ID) continue;
@@ -266,12 +272,21 @@ ggml_backend_buffer_type_t moe_dev_get_buffer_type(ggml_backend_dev_t dev) {
 }
 
 bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+#ifdef STREAM_MOE_TEMP
+    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2, DEBUG ONLY):
+    // our backend also owns dense nodes whose weights live in CPU/GPU buffers,
+    // so it must accept every buft. Production keeps the MoE-only split and the
+    // original, strict buft filtering below.
+    (void) dev; (void) buft;
+    return true;
+#else
     auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
     if (buft == ctx->host_buft) return true;
     for (const auto& eb : ctx->expert_bufts) {
         if (buft == eb) return true;
     }
     return false;
+#endif
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
