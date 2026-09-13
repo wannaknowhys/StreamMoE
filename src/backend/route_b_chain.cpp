@@ -13,6 +13,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 namespace stream_moe {
 
@@ -26,6 +31,7 @@ ggml_backend_buffer_t g_arena = nullptr;
 size_t g_arena_cap = 0;
 size_t g_arena_closure_off = 0;   // byte offset of the closure block inside g_arena
 size_t g_arena_closure_size = 0;
+int    g_dump_ubatch = -1;        // bin-dump ubatch subdirectory index
 
 bool is_alias_op(const ggml_tensor * n);   // defined later in this file
 
@@ -368,6 +374,37 @@ bool route_b_whole_layer_active() {
 #else
     return false;
 #endif
+}
+
+void route_b_begin_ubatch() {
+#ifdef STREAM_MOE_TEMP
+    ++g_dump_ubatch;
+#endif
+}
+
+void route_b_dump_node_bin(int layer, const char * name, const char * op,
+                           int type, int64_t ne0, int64_t ne1, const void * data, size_t nb) {
+    const char * dir = std::getenv("STREAM_MOE_TMP_BIN_DIR");
+    if (!dir || !*dir || !name || !data || nb == 0) return;
+    std::string nm = name;
+    for (char & c : nm) if (c == '/' || c == '\\' || c == ':' || c == ' ' || c == '*') c = '_';
+    char sub[64];
+    std::snprintf(sub, sizeof(sub), "ub%d", g_dump_ubatch);
+    std::string udir = std::string(dir) + "/" + sub;
+#ifdef _WIN32
+    _mkdir(udir.c_str());
+#else
+    mkdir(udir.c_str(), 0755);
+#endif
+    std::string base = udir + "/" + nm;
+    FILE * f = std::fopen((base + ".bin").c_str(), "wb");
+    if (f) { std::fwrite(data, 1, nb, f); std::fclose(f); }
+    FILE * m = std::fopen((base + ".meta").c_str(), "w");
+    if (m) {
+        std::fprintf(m, "layer=%d name=%s op=%s type=%d ne0=%lld ne1=%lld nb=%zu\n",
+                     layer, name, op ? op : "?", type, (long long) ne0, (long long) ne1, nb);
+        std::fclose(m);
+    }
 }
 
 namespace {

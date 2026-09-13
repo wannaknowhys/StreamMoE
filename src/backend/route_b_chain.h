@@ -62,6 +62,13 @@ bool route_b_in_arena(const void * p);
 // report the layer device as the StreamMoE backend so resolve() keeps fused ops.
 bool route_b_whole_layer_active();
 
+// Debug: write a node's full bytes to <STREAM_MOE_TMP_BIN_DIR>/ub<N>/<name>.bin
+// (+ .meta). Used for offline cos comparison of whole-layer vs baseline.
+void route_b_dump_node_bin(int layer, const char * name, const char * op,
+                           int type, int64_t ne0, int64_t ne1, const void * data, size_t nb);
+// Debug: start a new ubatch (bumps the bin-dump subdirectory index).
+void route_b_begin_ubatch();
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).

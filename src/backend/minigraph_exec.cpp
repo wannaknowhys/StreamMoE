@@ -157,6 +157,37 @@ static enum ggml_status run_dense_nodes(ggml_context * ctx, ggml_backend_t backe
         ggml_tensor * nd = nodes[nidx];
         if (!nd || is_alias_op(nd) || !nd->data) continue;
         if (nd->op == GGML_OP_SET_ROWS && nd->src[1] && !g_dbg_pos) g_dbg_pos = nd->src[1];
+#ifdef STREAM_MOE_TEMP
+        {
+            const char * tr = std::getenv("STREAM_MOE_TMP_TRACE_NODE");
+            if (tr && *tr && nd->name && std::strcmp(nd->name, tr) == 0) {
+                fprintf(stderr, "[trace] '%s' op=%s out_data=%p\n", nd->name, ggml_op_name(nd->op), nd->data);
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = nd->src[s];
+                    if (!src) continue;
+                    double v0 = 0.0;
+                    if (src->data) {
+                        if (src->type == GGML_TYPE_F32) v0 = *(const float *) src->data;
+                        else if (src->type == GGML_TYPE_I32) v0 = (double) *(const int32_t *) src->data;
+                    }
+                    fprintf(stderr, "[trace]   src[%d] '%s' op=%s type=%s ne=[%lld,%lld] data=%p v0=%.6g\n",
+                            s, src->name ? src->name : "?", ggml_op_name(src->op),
+                            ggml_type_name(src->type), (long long) src->ne[0], (long long) src->ne[1],
+                            src->data, v0);
+                }
+            }
+        }
+#endif
+#ifdef STREAM_MOE_TEMP
+        if (dump && nd->op == GGML_OP_GET_ROWS && nd->src[0] && nd->src[1] &&
+            nd->src[1]->type == GGML_TYPE_I32 && nd->src[1]->data) {
+            const int32_t * ids = static_cast<const int32_t*>(nd->src[1]->data);
+            fprintf(stderr, "[getrows] out='%s' src0='%s'(%s,rows=%lld) ids[0..3]=%d %d %d %d\n",
+                    nd->name ? nd->name : "?", nd->src[0]->name ? nd->src[0]->name : "?",
+                    ggml_type_name(nd->src[0]->type), (long long) nd->src[0]->ne[1],
+                    ids[0], ids[1], ids[2], ids[3]);
+        }
+#endif
         ggml_tensor * cl = ggml_new_tensor_4d(ctx, nd->type, nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
         for (int i = 0; i < 4; ++i) cl->nb[i] = nd->nb[i];
         cl->op = nd->op;
@@ -1822,6 +1853,9 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
 #ifdef STREAM_MOE_TEMP
+    if (layer == 0 && std::getenv("STREAM_MOE_TMP_BIN_DIR")) route_b_begin_ubatch();
+#endif
+#ifdef STREAM_MOE_TEMP
     // Debug: count ubatches (one per exec_layer_burst(layer=0)); dump all layers
     // of the 3rd token then stop.
     static int g_ubatch = 0;
@@ -2042,15 +2076,17 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         if (all) {
             for (auto * nd : *all) {
                 if (!nd || is_alias_op(nd) || !nd->data) continue;
-                if (nd->type == GGML_TYPE_F32) {
-                    const float * p = (const float *) nd->data;
-                    fprintf(stderr, "[node] L%d %-24s %-12s %.6f\n", layer, nd->name ? nd->name : "?",
-                            ggml_op_name(nd->op), p[0]);
-                } else if (nd->type == GGML_TYPE_I32) {
-                    const int32_t * p = (const int32_t *) nd->data;
-                    fprintf(stderr, "[node] L%d %-24s %-12s %d\n", layer, nd->name ? nd->name : "?",
-                            ggml_op_name(nd->op), p[0]);
-                }
+                route_b_dump_node_bin(layer, nd->name, ggml_op_name(nd->op), (int) nd->type,
+                                      nd->ne[0], nd->ne[1], nd->data, ggml_nbytes(nd));
+                const size_t nb = ggml_nbytes(nd);
+                const uint8_t * bp = (const uint8_t *) nd->data;
+                uint64_t h = 1469598103934665603ull;
+                for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
+                double v0 = 0.0;
+                if (nd->type == GGML_TYPE_F32) v0 = *(const float *) nd->data;
+                else if (nd->type == GGML_TYPE_I32) v0 = (double) *(const int32_t *) nd->data;
+                fprintf(stderr, "[node] L%d %-26s %-12s %016llx v0=%.6g\n", layer,
+                        nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h, v0);
             }
         }
     }

@@ -1,4 +1,5 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 2309a77b5..89a640459 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -19,7 +20,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
  #ifdef STREAM_MOE_ROUTE_B
  #include "stmoe_routeb_lctx_includes.frag"
  #endif
-@@ -19,9 +25,16 @@
+@@ -19,9 +25,19 @@
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
@@ -31,12 +32,15 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 +
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +// STREAM_MOE_TEMP: graph-eval-callback export (defined near the export section)
++#ifdef STREAM_MOE_TEMP
++namespace stream_moe { void route_b_dump_node_bin(int layer, const char *, const char *, int, int64_t, int64_t, const void *, size_t); void route_b_begin_ubatch(); }
++#endif
 +static bool moe_export_eval_cb(ggml_tensor * t, bool ask, void * ud);
 +#endif
  
  //
  // llama_context
-@@ -118,7 +131,9 @@ llama_context::llama_context(
+@@ -118,7 +134,9 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
@@ -47,7 +51,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -142,6 +157,20 @@ llama_context::llama_context(
+@@ -142,6 +160,20 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -68,7 +72,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -485,6 +514,11 @@ llama_context::~llama_context() {
+@@ -485,6 +517,11 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
@@ -80,7 +84,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1367,10 +1401,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1367,10 +1404,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              ret = GGML_STATUS_FAILED;
              return nullptr;
          }
@@ -102,7 +106,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1638,11 +1683,370 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1638,11 +1686,397 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -118,6 +122,33 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 +        if (!ctx->export_prev_cb_eval(t, ask, ctx->export_prev_cb_eval_ud)) return false;
 +    }
 +    if (ask) return true;
++#ifdef STREAM_MOE_TEMP
++    // Route-B whole-layer diagnostic (env-gated, permanent): dump every node's
++    // full bytes right after it is computed. STREAM_MOE_TMP_BIN_DIR enables it;
++    // ubatch subdirectories avoid overwriting across decodes. Used for offline
++    // cos comparison against the whole-layer executor's own dump.
++    if (std::getenv("STREAM_MOE_TMP_BIN_DIR") && t && t->name && std::strcmp(t->name, "embd") == 0) {
++        stream_moe::route_b_begin_ubatch();
++    }
++    if ((std::getenv("STREAM_MOE_TMP_CB_HASH") || std::getenv("STREAM_MOE_TMP_BIN_DIR")) && t && t->name && t->data) {
++        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(ctx->get_sched(), t);
++        const size_t nb = ggml_nbytes(t);
++        std::vector<uint8_t> buf(nb);
++        if (b) { ggml_backend_tensor_get_async(b, t, buf.data(), 0, nb); ggml_backend_synchronize(b); }
++        else   { std::memcpy(buf.data(), t->data, nb); }
++        stream_moe::route_b_dump_node_bin(-1, t->name, ggml_op_name(t->op), (int) t->type,
++                                          t->ne[0], t->ne[1], buf.data(), nb);
++        if (std::getenv("STREAM_MOE_TMP_CB_HASH")) {
++            uint64_t h = 1469598103934665603ull;
++            for (size_t i = 0; i < nb; ++i) { h ^= buf[i]; h *= 1099511628211ull; }
++            double v0 = 0.0;
++            if (t->type == GGML_TYPE_F32) v0 = *(const float *) buf.data();
++            else if (t->type == GGML_TYPE_I32) v0 = (double) *(const int32_t *) buf.data();
++            std::fprintf(stderr, "[cbhash] %-30s %-12s %016llx v0=%.6g\n", t->name,
++                    ggml_op_name(t->op), (unsigned long long) h, v0);
++        }
++    }
++#endif
 +    if (t == ctx->export_t_embd)   { ctx->export_capture_embd(t);   return true; }
 +    if (t == ctx->export_t_hidden) { ctx->export_capture_hidden(t); return true; }
 +    if (t == ctx->export_t_logits) { ctx->export_capture_logits(t); return true; }
@@ -473,7 +504,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -1942,6 +2346,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1942,6 +2376,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -493,7 +524,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1969,6 +2386,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1969,6 +2416,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -501,7 +532,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          }
  
          n_outputs_prev += n_outputs;
-@@ -3544,6 +3962,9 @@ llama_context_params llama_context_default_params() {
+@@ -3547,6 +3995,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -511,7 +542,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3565,6 +3986,9 @@ llama_context_params llama_context_default_params() {
+@@ -3568,6 +4019,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
