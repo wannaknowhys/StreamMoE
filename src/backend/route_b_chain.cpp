@@ -21,6 +21,13 @@
 
 namespace stream_moe {
 
+// Best-fit-decreasing interval packing (defined below). Declared here so
+// layout_arena (in the anonymous namespace) can use it.
+static size_t pack_interval(const std::vector<ggml_tensor*> & nodes,
+                            const std::vector<int> & start,
+                            const std::vector<int> & end,
+                            std::vector<int64_t> & out_off);
+
 namespace {
 void * g_fullalloc_buf = nullptr;
 size_t g_fullalloc_cap = 0;
@@ -237,19 +244,47 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
     }
 
-    size_t carry_size = 0;
-    std::unordered_map<const ggml_tensor*, size_t> carry_off;
-    for (auto & kv : g_layer_nodes)
-        for (auto * nd : kv.second) {
-            // Only nodes that OWN a fresh output buffer may be pre-allocated.
-            // A node whose output is a view (view_src != NULL) aliases another
-            // tensor (in-place ops like SET_ROWS, or VIEW/RESHAPE/...), so its
-            // data must follow that tensor - never move it to the arena.
-            if (nd->view_src || !carry.count(nd)) continue;
-            carry_size = (carry_size + 63) & ~size_t(63);
-            carry_off[nd] = carry_size;
-            carry_size += ggml_nbytes(nd);
+    // ---- carry split: cross-1 (double-buffered pipeline) + cross-N (retained)
+    // cross-1 = layer L's output consumed by L+1. Buffers indexed by L%2 so O_L
+    // and O_{L+1} coexist at L+1's tail (residual read + next output write).
+    // Only nodes that OWN a fresh output buffer may be pre-allocated; a view
+    // (view_src != NULL) aliases another tensor, so its data must follow it.
+    std::vector<ggml_tensor*> c1, cN;
+    for (const ggml_tensor * nd : carry) {
+        if (nd->view_src) continue;
+        auto cit = nlayer.find(nd);
+        auto mit = max_consumer.find(nd);
+        if (cit == nlayer.end() || mit == max_consumer.end()) continue;
+        if (mit->second - cit->second <= 1) c1.push_back(const_cast<ggml_tensor*>(nd));
+        else                                cN.push_back(const_cast<ggml_tensor*>(nd));
+    }
+    std::map<int, size_t> c1_layer_bytes;
+    for (ggml_tensor * nd : c1) c1_layer_bytes[nlayer[nd]] += ggml_nbytes(nd);
+    size_t c1_buf = 0;
+    for (auto & kv : c1_layer_bytes) c1_buf = std::max(c1_buf, kv.second);
+    c1_buf = (c1_buf + 63) & ~size_t(63);
+    const size_t carry1_size = 2 * c1_buf;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off;
+    {
+        std::map<int, size_t> cur;
+        for (ggml_tensor * nd : c1) {
+            const int L = nlayer[nd];
+            size_t & off = cur[L];
+            off = (off + 63) & ~size_t(63);
+            carry1_off[nd] = (L % 2 ? c1_buf : 0) + off;
+            off += ggml_nbytes(nd);
         }
+    }
+    // cross-N: retained (packed; empty for the current three models).
+    size_t carryN_size = 0;
+    std::unordered_map<const ggml_tensor*, size_t> carryN_off;
+    if (!cN.empty()) {
+        std::vector<int> s(cN.size()), e(cN.size());
+        for (size_t i = 0; i < cN.size(); ++i) { s[i] = (int) i; e[i] = (int) cN.size(); }
+        std::vector<int64_t> o;
+        carryN_size = pack_interval(cN, s, e, o);
+        for (size_t i = 0; i < cN.size(); ++i) carryN_off[cN[i]] = (size_t) o[i];
+    }
 
     // closure node -> offset inside the closure block (the packed result layout)
     std::unordered_map<const ggml_tensor*, size_t> closure_off;
@@ -260,17 +295,60 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
                 closure_off[ex.compute[i]] = (size_t) ex.out_off[i];
     }
 
+    // ---- compact: per-layer interval packing of the layer's dense head/tail
+    // (non-carry, non-closure, non-view). Time axis = EXECUTION order (head,
+    // closure barrier, tail), NOT graph order: the closure runs after the whole
+    // head, so a head node consumed by the closure is live until the barrier.
+    // Size = max over layers.
     size_t compact_size = 0;
     std::unordered_map<const ggml_tensor*, size_t> compact_off;
     for (auto & kv : g_layer_nodes) {
-        size_t off = 0;
-        for (auto * nd : kv.second) {
-            if (nd->view_src || carry.count(nd) || closure_off.count(nd)) continue;
-            off = (off + 63) & ~size_t(63);
-            compact_off[nd] = off;
-            off += ggml_nbytes(nd);
+        const moe_layer_plan_t * plan = moe_chain_layer_plan(kv.first);
+        const moe_layer_exec_t * ex = moe_chain_layer_exec(kv.first);
+        std::unordered_map<const ggml_tensor*, int> etime;
+        int H = 0;
+        if (plan) for (ggml_tensor * h : plan->head) etime[h] = H++;
+        if (ex)   for (ggml_tensor * c : ex->compute) etime[c] = H;   // closure barrier
+        int T = H + 1;
+        if (plan) for (ggml_tensor * t : plan->tail) etime[t] = T++;
+        std::unordered_map<const ggml_tensor*, int> last_etime;
+        for (auto & ep : etime) {
+            const ggml_tensor * node = ep.first;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = node->src[s];
+                if (!src) continue;
+                auto it = last_etime.find(src);
+                if (it == last_etime.end()) last_etime[src] = ep.second;
+                else if (it->second < ep.second) it->second = ep.second;
+            }
         }
-        compact_size = std::max(compact_size, off);
+        std::vector<ggml_tensor*> cns;
+        std::vector<int> cstart;
+        for (ggml_tensor * nd : kv.second) {
+            if (nd->view_src || carry.count(nd) || closure_off.count(nd)) continue;
+            auto et = etime.find(nd);
+            if (et == etime.end()) continue;
+            cns.push_back(nd);
+            cstart.push_back(et->second);
+        }
+        if (cns.empty()) continue;
+        std::vector<int> cend(cns.size());
+        for (size_t k = 0; k < cns.size(); ++k) {
+            auto it = last_etime.find(cns[k]);
+            cend[k] = it != last_etime.end() ? std::max(it->second, cstart[k]) : T;
+        }
+        std::vector<int64_t> o;
+        size_t lb;
+        if (std::getenv("STREAM_MOE_TMP_COMPACT_PACK")) {
+            lb = pack_interval(cns, cstart, cend, o);
+        } else {
+            size_t off = 0;
+            o.resize(cns.size());
+            for (size_t k = 0; k < cns.size(); ++k) { off = (off + 63) & ~size_t(63); o[k] = (int64_t) off; off += ggml_nbytes(cns[k]); }
+            lb = off;
+        }
+        compact_size = std::max(compact_size, lb);
+        for (size_t k = 0; k < cns.size(); ++k) compact_off[cns[k]] = (size_t) o[k];
     }
 
     // closure block: max over layers of the executor's need (result_bytes when
@@ -287,7 +365,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         closure_size = std::max(closure_size, need);
     }
 
-    const size_t need = carry_size + compact_size + closure_size + 4096;
+    const size_t need = carry1_size + carryN_size + compact_size + closure_size + 4096;
     if (need > g_arena_cap) {
         if (g_arena) ggml_backend_buffer_free(g_arena);
         g_arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(our_backend), need);
@@ -295,21 +373,41 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     }
     if (!g_arena) return;
     char * base = static_cast<char*>(ggml_backend_buffer_get_base(g_arena));
-    g_arena_closure_off  = carry_size + compact_size;
+    const size_t off_carryN  = carry1_size;
+    const size_t off_compact = carry1_size + carryN_size;
+    g_arena_closure_off  = off_compact + compact_size;
     g_arena_closure_size = closure_size;
 
     for (auto & kv : g_layer_nodes) {
         for (auto * nd : kv.second) {
             if (nd->view_src) continue;   // view/in-place: data follows view_src
             nd->buffer = g_arena;
-            auto cit = carry_off.find(nd);
-            if (cit != carry_off.end()) { nd->data = base + cit->second; continue; }
+            auto c1i = carry1_off.find(nd);
+            if (c1i != carry1_off.end()) { nd->data = base + c1i->second; continue; }
+            auto cNi = carryN_off.find(nd);
+            if (cNi != carryN_off.end()) { nd->data = base + off_carryN + cNi->second; continue; }
             auto mit = compact_off.find(nd);
-            if (mit != compact_off.end()) { nd->data = base + carry_size + mit->second; continue; }
+            if (mit != compact_off.end()) { nd->data = base + off_compact + mit->second; continue; }
             auto clo = closure_off.find(nd);
             if (clo != closure_off.end()) { nd->data = base + g_arena_closure_off + clo->second; continue; }
         }
     }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+        for (auto & kv : g_layer_nodes)
+            for (auto * nd : kv.second) {
+                if (nd->view_src) continue;
+                if (!carry1_off.count(nd) && !carryN_off.count(nd) && !compact_off.count(nd) && !closure_off.count(nd))
+                    fprintf(stderr, "[route_b_cap] UNASSIGNED '%s' op=%s\n",
+                            nd->name ? nd->name : "?", ggml_op_name(nd->op));
+                if (!nd->data) continue;
+                const char * p = (const char*) nd->data;
+                if (p < base || p + ggml_nbytes(nd) > base + need)
+                    fprintf(stderr, "[route_b_cap] OOB '%s' off=%zu sz=%zu need=%zu\n",
+                            nd->name ? nd->name : "?", (size_t)(p - base), ggml_nbytes(nd), need);
+            }
+    }
+#endif
     // second pass: nodes whose output aliases another tensor (view/in-place)
     // follow the view_src chain to the root's data + accumulated offsets.
     // NOTE: resolve via view_src, not src[0] (SET_ROWS stores its sources in a
@@ -327,24 +425,32 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
     }
     if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
-        fprintf(stderr, "==== arena plan: carry=%zu compact=%zu closure=%zu total=%zu ====\n",
-                carry_size, compact_size, closure_size, g_arena_cap);
-        fprintf(stderr, "---- cross-layer (carry) %zu nodes ----\n", carry_off.size());
-        for (auto & kv : carry_off)
+        fprintf(stderr, "==== arena plan: carry1=%zu carryN=%zu compact=%zu closure=%zu total=%zu ====\n",
+                carry1_size, carryN_size, compact_size, closure_size, g_arena_cap);
+        fprintf(stderr, "---- cross-1 (carry1) %zu nodes ----\n", carry1_off.size());
+        for (auto & kv : carry1_off)
+            fprintf(stderr, "  %-30s L%-3d off=%zu sz=%zu\n", kv.first->name ? kv.first->name : "(anon)",
+                    route_b_official_layer(kv.first), kv.second, ggml_nbytes(kv.first));
+        fprintf(stderr, "---- cross-N (carryN) %zu nodes ----\n", carryN_off.size());
+        for (auto & kv : carryN_off)
             fprintf(stderr, "  %-30s L%-3d off=%zu sz=%zu\n", kv.first->name ? kv.first->name : "(anon)",
                     route_b_official_layer(kv.first), kv.second, ggml_nbytes(kv.first));
         fprintf(stderr, "---- compute graph (%d nodes) ----\n", gf->n_nodes);
         for (int i = 0; i < gf->n_nodes; ++i) {
             const ggml_tensor * nd = gf->nodes[i];
             const char * region = "-"; size_t off = 0;
-            auto c = carry_off.find(nd);
-            if (c != carry_off.end()) { region = "carry"; off = c->second; }
+            auto a = carry1_off.find(nd);
+            if (a != carry1_off.end()) { region = "carry1"; off = a->second; }
             else {
-                auto m = compact_off.find(nd);
-                if (m != compact_off.end()) { region = "compact"; off = carry_size + m->second; }
+                auto b = carryN_off.find(nd);
+                if (b != carryN_off.end()) { region = "carryN"; off = off_carryN + b->second; }
                 else {
-                    auto l = closure_off.find(nd);
-                    if (l != closure_off.end()) { region = "closure"; off = carry_size + compact_size + l->second; }
+                    auto m = compact_off.find(nd);
+                    if (m != compact_off.end()) { region = "compact"; off = off_compact + m->second; }
+                    else {
+                        auto l = closure_off.find(nd);
+                        if (l != closure_off.end()) { region = "closure"; off = g_arena_closure_off + l->second; }
+                    }
                 }
             }
             fprintf(stderr, "  [%4d] %-30s %-14s L%-3d %-8s off=%zu\n", i,
@@ -365,9 +471,9 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         fflush(stderr);
     }
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
-        fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry=%zu compact=%zu closure=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
-                (long long) n_tok, carry_size, compact_size, closure_size,
-                carry_size + compact_size + closure_size + 4096, g_arena_cap, carry.size());
+        fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry1=%zu carryN=%zu compact=%zu closure=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
+                (long long) n_tok, carry1_size, carryN_size, compact_size, closure_size,
+                carry1_size + carryN_size + compact_size + closure_size + 4096, g_arena_cap, carry.size());
 }
 }
 
@@ -466,6 +572,51 @@ void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
 void collect_layer_nodes(const ggml_cgraph * gf,
                          std::map<int, std::vector<ggml_tensor*>> & out);
 } // namespace
+
+// Best-fit-decreasing interval packing. nodes[i]'s output is live over the
+// integer interval [start[i], end[i]] (end = last reader, or the list size when
+// never read). Blocks are placed by size descending, each at the lowest offset
+// whose bytes do not collide with an already-placed block whose live interval
+// overlaps. Fills out_off[i] and returns the total block size. Used by the MoE
+// closure result layout, the compact region and the carry region.
+static size_t pack_interval(const std::vector<ggml_tensor*> & nodes,
+                            const std::vector<int> & start,
+                            const std::vector<int> & end,
+                            std::vector<int64_t> & out_off) {
+    const size_t C = nodes.size();
+    out_off.assign(C, -1);
+    if (C == 0) return 0;
+    struct blk_t { int64_t off; size_t size; int start, end, ni; };
+    std::vector<int> order(C);
+    for (size_t i = 0; i < C; ++i) order[i] = (int) i;
+    std::sort(order.begin(), order.end(), [&](int x, int y) {
+        const size_t sx = nodes[x] ? ggml_nbytes(nodes[x]) : 0;
+        const size_t sy = nodes[y] ? ggml_nbytes(nodes[y]) : 0;
+        if (sx != sy) return sx > sy;
+        return x < y;
+    });
+    std::vector<blk_t> placed;
+    int64_t arena = 0;
+    for (const int ni : order) {
+        const size_t nb = nodes[ni] ? ggml_nbytes(nodes[ni]) : 0;
+        const int s = start[ni], e = end[ni];
+        int64_t off = 0;
+        for (;;) {
+            int64_t furthest = -1;
+            for (const auto & p : placed) {
+                if (e < p.start || p.end < s) continue;
+                if (off < (int64_t)(p.off + (int64_t) p.size) && (int64_t) p.off < off + (int64_t) nb)
+                    furthest = std::max(furthest, p.off + (int64_t) p.size);
+            }
+            if (furthest < 0) break;
+            off = furthest;
+        }
+        placed.push_back({ off, nb, s, e, ni });
+        arena = std::max(arena, off + (int64_t) nb);
+    }
+    for (const auto & p : placed) out_off[p.ni] = p.off;
+    return (size_t) arena;
+}
 
 bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
     if (!gf || !sched || !our_backend) return false;
@@ -602,9 +753,7 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             }
         }
     }
-    // [carry][compact][closure] arena; every captured node points at it so the
-    // scheduler does not reserve a whole-graph compute buffer.
-    layout_arena(our_backend, gf);
+    // Build the per-layer plans (head/tail/moe) from the capture.
     build_layer_plans();
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
@@ -705,54 +854,17 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
                 if (p >= 0 && p < c && last_use[p] < 0) last_use[p] = c;
             }
         }
-        // Result-buffer layout by best-fit decreasing (offline interval packing,
-        // docs layout_sim sim.js): place nodes in size-descending order; each
-        // node gets the lowest offset whose byte range does not collide with any
-        // already-placed result whose live interval [i, last_use] overlaps it.
-        // Larger blocks land first so small blocks fill the gaps left behind -
-        // reaches the lower bound (peak simultaneous-live bytes) on gemma and
-        // deepseek (~6-20% below the old exec-order first-fit slot allocator).
-        // Outputs absolute per-node offsets into one per-layer block.
-        struct blk_t { int64_t off = 0; size_t size = 0; int start = 0, end = 0; };
-        std::vector<int> order(C);
-        for (size_t i = 0; i < C; ++i) order[i] = (int) i;
-        std::sort(order.begin(), order.end(), [&](int x, int y) {
-            const size_t sx = comp[x] ? ggml_nbytes(comp[x]) : 0;
-            const size_t sy = comp[y] ? ggml_nbytes(comp[y]) : 0;
-            if (sx != sy) return sx > sy;             // larger first
-            return x < y;
-        });
-        std::vector<blk_t> placed;
-        int64_t arena = 0;
-        for (const int ni : order) {
-            const size_t nb = comp[ni] ? ggml_nbytes(comp[ni]) : 0;
-            const int start = ni;
-            const int end = last_use[ni] < 0 ? (int) C : last_use[ni];
-            int64_t off = 0;
-            for (;;) {
-                // blocks whose interval overlaps [start,end] AND whose bytes
-                // overlap [off, off+nb) block this offset
-                int64_t furthest = -1;
-                for (const auto & p : placed) {
-                    const bool t_ov = !(end < p.start || p.end < start);
-                    if (!t_ov) continue;
-                    const bool s_ov = off < (int64_t)(p.off + (int64_t) p.size) &&
-                                      (int64_t) p.off < off + (int64_t) nb;
-                    if (s_ov) furthest = std::max(furthest, p.off + (int64_t) p.size);
-                }
-                if (furthest < 0) break;   // no overlapping block: this off fits
-                off = furthest;            // jump past the blocker
-            }
-            placed.push_back({ off, nb, start, end });
-            arena = std::max(arena, off + (int64_t) nb);
-        }
+        // Result-buffer layout by best-fit decreasing interval packing
+        // (pack_interval; docs layout_sim sim.js): reaches the peak
+        // simultaneous-live lower bound on gemma/deepseek.
+        std::vector<int> pstart(C), pend(C);
         for (size_t i = 0; i < C; ++i) {
-            // recover per-node offset from placed (order maps to node id)
-            for (const auto & p : placed) if (p.start == (int) i) { ex.out_off[i] = p.off; break; }
+            pstart[i] = (int) i;
+            pend[i] = last_use[i] < 0 ? (int) C : last_use[i];
         }
+        ex.result_bytes = pack_interval(comp, pstart, pend, ex.out_off);
         // ---- layout self-check (always): results whose live intervals overlap
         // in exec time must not share byte ranges. Violation -> per-node bump.
-        ex.result_bytes = (size_t) arena;
         ex.layout_ok = true;
         for (size_t a = 0; a < C && ex.layout_ok; ++a) {
             for (size_t b = a + 1; b < C; ++b) {
@@ -827,6 +939,11 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             stream_moe_backend_replicate_leaf(t);
         }
     }
+
+    // [carry][compact][closure] arena: assign every captured node its buffer/
+    // data. Runs after the closure result layout so the packed closure size is
+    // used. docs/PER_DEVICE_ARENA.md.
+    layout_arena(our_backend, gf);
 #ifdef STREAM_MOE_TEMP
     if (getenv("STREAM_MOE_CAP_DUMP")) {
         fprintf(stderr, "\n=== [cap-dump] result-buffer layout (interval, node-level) ===\n");
