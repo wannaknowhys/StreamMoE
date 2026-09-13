@@ -9,27 +9,29 @@
 
 ## 1. Problem
 
-The debug whole-layer path has two blockers, both from the same root: route B
+The debug whole-layer path has three blockers, all from the same root: route B
 **claims nodes through the scheduler** instead of **owning the layer and
 executing it internally**.
 
 1. **DeepSeek OOM / crash.** Assigning every layer node to our backend makes the
    scheduler reserve a single `STREAMMOE_HOST` compute buffer (~97 GiB) for the
-   whole graph; on top of the expert pool this exceeds RAM -> allocation failure
-   (`--moe-ram-pool 81920`) or `0xC0000005` (`8192`).
+   whole graph (no cross-layer reuse); on top of the expert pool this exceeds
+   RAM -> allocation failure (`--moe-ram-pool 81920`) or `0xC0000005` (`8192`).
 2. **olmoe divergence.** The last layer contains the `inp_out_ids` output-token
    reduction (`get_rows`); it is captured into the layer and executed by
    `run_dense_nodes`, corrupting the output. Bisect: L0-L14 alone are identical
    to baseline, L15 alone diverges; excluding L15 restores correct output.
+3. **Flash attention disabled.** Whole-layer mode turns `FLASH_ATTN_EXT` into a
+   manual `kq/kqv` path, materializing the `O(B^2)` score matrix (see 4.9).
 
 ## 2. Goal / non-goals
 
-Goal: route B owns each layer; the scheduler sees only model I/O; each layer is
-executed internally with its own arena; the last-layer narrowing is handled
-explicitly.
+Goal: route B owns each layer (and, as a later stage, C2); the scheduler sees
+only model I/O; each layer is executed internally with one reusable arena; the
+last-layer narrowing is handled explicitly; flash attention is preserved.
 
-Non-goals: C2 (`token_embd` / `output`) placement policy; writing dense kernels
-(dense is delegated to the device/CPU backend).
+Non-goals: writing dense kernels (dense ops are delegated to the device/CPU
+backend); changing C1/C2 placement semantics.
 
 ## 3. Architecture
 
@@ -37,8 +39,16 @@ Non-goals: C2 (`token_embd` / `output`) placement policy; writing dense kernels
 - `graph_compute` walks the graph **layer by layer** using a build-time
   `LayerPlan`.
 - Per layer: `dense head -> MoE burst -> dense tail`, then the layer is complete.
-- Layer activations live in **route B's own arena**, not in the scheduler's
-  compute buffer.
+- **One arena buffer per device, sized to the worst-case (largest) layer, reused
+  across layers.** "Per-layer" below refers to the *layout analysis* (offsets),
+  not to separate backing allocations.
+- Dataflow: the KV cache is resident (llama-owned, not in our arena); our arena
+  holds only the transient per-layer activations; only the hidden state `X` and
+  the residual cross layer boundaries. Hence worst-case-layer sizing suffices.
+- Why the debug path gives ~97 GiB: `ggml_backend_sched` sizes its compute buffer
+  over the whole graph and does not reuse across layers. **We do not rely on
+  gallocr**: our own arena plus pre-allocated buffers (4.2) bound the memory to
+  one worst-case layer.
 - The scheduler's compute buffer covers only model I/O (`embd`, `logits`).
 
 ## 4. Mechanisms
@@ -66,25 +76,51 @@ struct moe_layer_plan {
 Source of truth: a **side channel** registered by `llm_build_context` while it
 builds each layer / MoE subgraph (see 4.4), not string matching.
 
-### 4.2 Per-layer arena + pre-allocated buffers (fixes DeepSeek)
+### 4.2 Pre-allocated buffers (fixes DeepSeek)
 
 The scheduler treats a tensor that **already has a buffer** as pre-allocated
 (`ggml-backend.cpp:911` assigns it to the buffer's backend; `:927` never
-allocates it). Therefore:
+allocates it).
 
-- route B owns a **per-layer arena** (a `ggml_backend_buffer` whose buft is
-  registered to our backend);
-- before scheduling, route B points each layer node's `buffer`/`data` at the
-  arena;
-- the scheduler assigns those tensors to our backend and **does not allocate
-  them** in the compute buffer -> the compute buffer stays bounded (model I/O
-  only);
+**Prototype result** (`temp/proto_prealloc.cpp`, CPU backend, 32 live
+intermediates of 256 KiB): control compute buffer 8,912,896 B -> with the
+intermediates pre-allocated 786,432 B, and 32/32 preset `data` pointers survive
+`ggml_backend_sched_alloc_graph`. Mechanism confirmed.
+
+Plan:
+
+- one **arena** `ggml_backend_buffer` per device (buft registered to our backend);
+- before scheduling, point each layer node's `buffer`/`data` at the arena;
+- the scheduler assigns those tensors to our backend and does not allocate them;
 - `graph_compute` executes them in place.
 
-Open: arena sizing (layer liveness), one arena vs one grow-only arena, device
-variant (device-local arena, reuse `M2_DEVICE_EXECUTOR`).
+**CPU caveat:** the current closure path sets only `data`
+(`minigraph_exec.cpp:730`), not `buffer`. Both must be set, or the scheduler
+still allocates. The device path already sets `buffer` (`:724`).
 
-### 4.3 No-clone dense execution (fixes olmoe)
+### 4.3 Arena layout: closure separate, head+tail merged
+
+The MoE closure must stay separate from a unified dense packing, because its
+execution is special:
+
+- the bucket engine **rebuilds a mini-graph per bucket/round** (transient
+  tensors, currently in a bump region);
+- `ffn_moe_out` / the fold is a **dedicated output** written by the closure;
+- the **anonymous per-topk adds** (`node_NNN ADD`) are closure nodes computed by
+  the bucket engine.
+
+All three are already handled by the closure's own layout
+(`ex.out_off` / `ex.result_bytes`) + bump, which is the IDENTICAL production
+path. So:
+
+- **closure segment**: unchanged (existing layout + bump); the only change is to
+  also set `buffer` on its main-graph outputs;
+- **dense segment (head + tail)**: one new pre-allocated interval packing on
+  C1's device. Head and tail are **merged in one analysis** (same device; head
+  outputs stay live into the tail, so a unified packing reaches the peak);
+- one arena buffer, sized to the worst-case layer, reused across layers.
+
+### 4.4 No-clone dense execution (fixes olmoe)
 
 Execute the **original nodes** (`nd`), not `ggml_dup` clones with hand-filled
 `data`/`nb`/`view`. Because route B owns the whole graph (one split), the
@@ -92,17 +128,15 @@ scheduler never executes our nodes; we run them ourselves, so there is no double
 execution. A `LayerExecutionState {NOT_STARTED, RUNNING, COMPLETE}` guarantees
 once-only and asserts on duplicate concurrent execution.
 
-This removes the second execution semantics that broke the last-layer reduction.
-
-### 4.4 Explicit layer boundary (side channel)
+### 4.5 Explicit layer boundary (side channel)
 
 `llm_build_context` knows the layer index and the MoE span while building.
-Register `layer_span_t {begin, moe_begin, moe_end, end}` per layer into a
-side channel. This deletes `name_layer_suffix`, `last_suffixed`,
+Register `layer_span_t {begin, moe_begin, moe_end, end}` per layer into a side
+channel. This deletes `name_layer_suffix`, `last_suffixed`,
 `moe_chain_layer_of_node`, `ffn_moe_out` string matching, and the
 `has_first`/`first_node` split heuristic (review items A1/A2/A5/E1/E2/E4).
 
-### 4.5 op classification
+### 4.6 op classification
 
 Three classes (absorbs review item E3):
 
@@ -111,7 +145,7 @@ Three classes (absorbs review item E3):
 - `MATERIALIZING`: `CONT / DUP / CAST` - real copy, must execute.
 - `COMPUTE`: everything else.
 
-### 4.6 Last-layer output-token narrowing (explicit)
+### 4.7 Last-layer output-token narrowing (explicit)
 
 The last layer contains (e.g. `olmoe.cpp`):
 
@@ -130,37 +164,64 @@ These `GET_ROWS` narrow the token dimension to `n_outputs`. The executor
   (`ffn_inp`, MoE pin / mix-plan / arena, tail all use the narrowed count);
 - the arena / pin budget for that layer is computed from the narrowed count.
 
-This is what makes whole-layer ownership correct for the last layer.
-
-### 4.7 tracer separation
+### 4.8 tracer separation + clean allocation failure
 
 Move canary / dump / `fprintf` out of `run_dense_nodes` / `exec_layer_burst`
-into an injectable tracer (no-op by default). Keeps the hot path clean and
-removes the long-lived debug globals.
+into an injectable tracer (no-op by default). On arena / buffer allocation
+failure, return a clear `GGML_STATUS_FAILED` with an actionable message (never a
+bare `0xC0000005`).
 
-### 4.8 Clean allocation failure
+### 4.9 Flash attention MUST be preserved
 
-When an arena / buffer allocation fails, return a clear `GGML_STATUS_FAILED`
-with an actionable message (never a bare `0xC0000005`).
+The current whole-layer path turns `FLASH_ATTN_EXT` into manual `kq / softmax /
+kqv`, which materializes the `O(B^2)` score matrix. Per-layer estimates (f32,
+`h` heads):
+
+| model | B | head (linear + attn) | closure | tail |
+|---|---|---|---|---|
+| gemma | 2048 | **900 MB (132 + 768)** | 77 MB | 60 MB |
+| olmoe | 2048 | **864 MB (96 + 768)** | 48 MB | 40 MB |
+| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB | 80 MB |
+
+The attention term dominates and scales as `B^2`. Route B owns the layer but
+**delegates** ops it does not implement; `FLASH_ATTN_EXT` must be delegated to
+the device/CPU backend so the score matrix is never materialized. This is a hard
+requirement (also a D item).
+
+### 4.10 C2 takeover (later stage)
+
+Today `--dense-placement C2:<dev>` only sets the placement buft
+(`route_b_dense_device`, `route_b_inject.cpp:445`); the C2 nodes are still
+executed by llama, **not owned** by route B. So the route-B-layer -> C2 seam can
+still copy even on the same device.
+
+Target: route B also owns the C2 activations (pre-allocated in the arena), so
+C1 and C2 on the same device are copy-free. Space is independent until a unified
+liveness analysis merges C1/C2 (they do not overlap in time).
 
 ## 5. D problems (must be designed, not automatic)
 
 | D problem | How this design addresses it |
 |---|---|
-| Whole-graph single-backend compute buffer | Pre-allocated per-layer arena buffers (4.2) -> scheduler compute buffer stays bounded |
-| Last-layer `inp_out_ids` semantics | Explicit narrowing support (4.6) |
-| `supports_buft` / `supports_op` vs ownership | route B declares the arena buft + expert bufts; no blanket accept |
-| dense execution order / data readiness | route B controls execution order internally; `LayerExecutionState` + asserts |
-| debug scaffold on the hot path | tracer separation (4.7) |
+| Whole-graph single-backend compute buffer | One worst-case-layer arena, reused (3, 4.2) |
+| Last-layer `inp_out_ids` semantics | Explicit narrowing support (4.7) |
+| Flash attention must stay on | Delegate `FLASH_ATTN_EXT` (4.9) |
+| C2 seam copies | C2 takeover (4.10) |
+| `supports_buft` / `supports_op` vs ownership | route B declares the arena buft + expert bufts |
+| dense execution order / data readiness | internal order + `LayerExecutionState` + asserts |
+| debug scaffold on the hot path | tracer separation (4.8) |
 | allocation failure crash | clean error path (4.8) |
 
 ## 6. Milestones
 
 - **R1** LayerPlan + explicit boundary (no behavior change; keep MoE-only).
 - **R2** No-clone dense execution + `LayerExecutionState` -> fixes olmoe.
-- **R3** Per-layer pre-allocated arena -> fixes DeepSeek.
+- **R3** Worst-case-layer pre-allocated arena (closure separate, head+tail
+  merged) -> fixes DeepSeek.
 - **R4** Last-layer narrowing explicit support.
-- **R5** op classification + tracer separation.
+- **R5** Preserve flash attention (delegate `FLASH_ATTN_EXT`).
+- **R6** C2 takeover (own C2 activations) -> copy-free C1/C2 on one device.
+- **R7** op classification + tracer separation.
 
 Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 
@@ -170,10 +231,12 @@ Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 - Whole-layer olmoe equals baseline (coherent output, hidden cos ~1.0).
 - DeepSeek whole-layer loads and passes the cos gate (`baseline/deepseek_hi_up`).
 - Logged scheduler compute-buffer size stays bounded (model I/O only).
+- **Build-time debug log** of per-layer head / closure / tail bytes (to see the
+  real numbers for the three models at a chosen ubatch).
 
 ## 8. Open questions
 
-1. Arena liveness/sizing: one arena per layer vs one grow-only arena.
+1. Arena liveness/sizing: one grow-only arena vs exact worst-case measurement.
 2. Device-local arena (DMA) for the GPU phase - reuse `M2_DEVICE_EXECUTOR`.
-3. Scheduler split behavior when most tensors are pre-allocated.
-4. Multi-device: per-device arenas + the ids D2H join.
+3. Multi-device: per-device arenas + the ids D2H join.
+4. C2 ownership: own C2 activations only, or also its weights (C1 pool reuse)?

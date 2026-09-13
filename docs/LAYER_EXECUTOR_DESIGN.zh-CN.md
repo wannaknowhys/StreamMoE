@@ -9,30 +9,37 @@
 
 ## 1. 问题
 
-debug 整层路径有两个拦路虎，根因相同：route B **通过 scheduler 认领节点**，而不是
+debug 整层路径有三个拦路虎，根因相同：route B **通过 scheduler 认领节点**，而不是
 **拥有层、在内部执行它**。
 
 1. **DeepSeek OOM / 崩溃**：把每层节点都划给我们的 backend，scheduler 会为整图预留
-   一整块 `STREAMMOE_HOST` compute buffer（约 97 GiB）；叠上专家池超过内存 ->
-   分配失败（`--moe-ram-pool 81920`）或 `0xC0000005`（`8192`）。
-2. **olmoe 发散**：最后一层含 `inp_out_ids` 输出 token 收窄（`get_rows`），它被捕获进
-   层里并被 `run_dense_nodes` 执行，破坏输出。bisect：L0–L14 单独接管与基线一致，
+   一整块 `STREAMMOE_HOST` compute buffer（约 97 GiB，且不做跨层复用）；叠上专家池
+   超过内存 -> 分配失败（`--moe-ram-pool 81920`）或 `0xC0000005`（`8192`）。
+2. **olmoe 发散**：最后一层含 `inp_out_ids` 输出 token 收窄（`get_rows`），它被捕获
+   进层里并被 `run_dense_nodes` 执行，破坏输出。bisect：L0–L14 单独接管与基线一致，
    L15 单独接管发散；排除 L15 即恢复正常。
+3. **flash attention 被关**：整层模式把 `FLASH_ATTN_EXT` 变成手动 `kq/kqv`，落地
+   `O(B^2)` 的 score 矩阵（见 4.9）。
 
 ## 2. 目标 / 非目标
 
-目标：route B 拥有每一层；scheduler 只看到模型 I/O；每层在自己的 arena 里内部执行；
-最后一层的收窄被显式处理。
+目标：route B 拥有每一层（后续阶段还包括 C2）；scheduler 只看到模型 I/O；每层用
+**一块可复用的 arena** 内部执行；最后一层的收窄被显式处理；**保住 flash attention**。
 
-非目标：C2（`token_embd` / `output`）的放置策略；自己写 dense 内核（dense 委托给
-设备/CPU backend）。
+非目标：自己写 dense 内核（dense 委托给设备/CPU backend）；改变 C1/C2 的放置语义。
 
 ## 3. 架构
 
 - 我们的 backend 拥有整图 -> **一个 split**。
 - `graph_compute` 按**逐层**方式走图，由构建期算好的 `LayerPlan` 驱动。
 - 每层：`dense head -> MoE burst -> dense tail`，然后该层完成。
-- 层的激活住在 **route B 自己的 arena**，不在 scheduler 的 compute buffer 里。
+- **每设备一块 arena，按 worst-case（最大）一层 sizing，跨层复用**。下文说的
+  "per-layer" 指**布局分析**（offset），不是每层各一块承载内存。
+- 数据流：KV cache 常驻（归 llama，不在我们 arena）；我们的 arena 只放**当层临时
+  激活**；跨层只传隐藏态 `X` 和残差。所以按最坏一层 sizing 就够。
+- 为什么 debug 路径是 ~97 GiB：`ggml_backend_sched` 按**整图**算它的 compute buffer
+  且不跨层复用。**我们不依赖 gallocr**：自己的 arena + 预分配 buffer（4.2）把内存
+  限制在一层 worst-case。
 - scheduler 的 compute buffer 只覆盖模型 I/O（`embd`、`logits`）。
 
 ## 4. 机制
@@ -57,40 +64,58 @@ struct moe_layer_plan {
 ```
 
 事实来源：由 `llm_build_context` 在构建每层 / 每个 MoE 子图时注册的**显式 side
-channel**（见 4.4），不靠字符串匹配。
+channel**（见 4.5），不靠字符串匹配。
 
-### 4.2 每层 arena + 预分配 buffer（解 DeepSeek）
+### 4.2 预分配 buffer（解 DeepSeek）
 
 scheduler 把**已经有 buffer** 的 tensor 当作 pre-allocated（`ggml-backend.cpp:911`
-把它归给该 buffer 的 backend；`:927` 绝不为它分配）。因此：
+把它归给该 buffer 的 backend；`:927` 绝不为它分配）。
 
-- route B 拥有一个**每层 arena**（一个 `ggml_backend_buffer`，其 buft 注册到我们
-  的 backend）；
-- 调度前，route B 把每层节点的 `buffer`/`data` 指向该 arena；
-- scheduler 把这些 tensor 归给我们，且**不在 compute buffer 里为它们分配** ->
-  compute buffer 保持有界（只剩模型 I/O）；
+**原型结果**（`temp/proto_prealloc.cpp`，CPU backend，32 个 256 KiB 同时存活中间量）：
+控制组 compute buffer 8,912,896 B -> 预分配后 786,432 B，且 32/32 preset `data`
+指针在 `ggml_backend_sched_alloc_graph` 后全部保留。机制成立。
+
+计划：
+
+- 每设备一块 **arena** `ggml_backend_buffer`（buft 注册到我们的 backend）；
+- 调度前，把每层节点的 `buffer`/`data` 指向该 arena；
+- scheduler 把这些 tensor 归给我们，且不为它们分配；
 - `graph_compute` 原地执行它们。
 
-待定：arena 大小（层的生命周期）、单 arena vs 单个 grow-only arena、设备变体
-（device-local arena，复用 `M2_DEVICE_EXECUTOR`）。
+**CPU 注意**：现有闭包路径只设 `data`（`minigraph_exec.cpp:730`），没设 `buffer`。
+两个都要设，否则 scheduler 仍会分配。设备路径本来就设了 `buffer`（`:724`）。
 
-### 4.3 不 clone 的 dense 执行（解 olmoe）
+### 4.3 arena 布局：闭包独立，head+tail 合并
+
+MoE 闭包必须与统一的 dense packing 分开，因为它的执行很特殊：
+
+- bucket 引擎**每个 bucket/round 重建一张 mini-graph**（临时 tensor，现在走 bump）；
+- `ffn_moe_out` / fold 是**专门的输出**，由闭包写；
+- **匿名 per-topk add**（`node_NNN ADD`）是闭包节点，由 bucket 引擎算。
+
+这三样现在都由闭包自己的布局（`ex.out_off` / `ex.result_bytes`）+ bump 管着，就是
+production IDENTICAL 的路径。所以：
+
+- **闭包段**：不动（现有 layout + bump）；唯一改动是给它的主图输出也设 `buffer`；
+- **dense 段（head + tail）**：新建一个预分配 interval packing，放在 **C1 所在设备**。
+  head 和 tail **合并分析**（同 device；head 输出要活到 tail 读，统一 packing 达 peak）；
+- 一块 arena buffer，按 worst-case 一层 sizing，跨层复用。
+
+### 4.4 不 clone 的 dense 执行（解 olmoe）
 
 执行**原始节点**（`nd`），而不是 `ggml_dup` 出来、再手工填 `data`/`nb`/`view` 的
 clone。因为 route B 拥有整图（一个 split），scheduler 从不执行我们的节点；我们自己
-跑，所以没有重复执行。用 `LayerExecutionState {NOT_STARTED, RUNNING, COMPLETE}`
-保证一次且仅一次，并在重复并发执行时 assert。
+跑，没有重复执行。用 `LayerExecutionState {NOT_STARTED, RUNNING, COMPLETE}` 保证
+一次且仅一次，并在重复并发执行时 assert。
 
-这去掉了那套破坏最后一层归约的第二执行语义。
-
-### 4.4 显式层边界（side channel）
+### 4.5 显式层边界（side channel）
 
 `llm_build_context` 构建时知道层号和 MoE 段。每层注册
-`layer_span_t {begin, moe_begin, moe_end, end}` 到一个 side channel。由此可删掉
+`layer_span_t {begin, moe_begin, moe_end, end}` 到 side channel。由此删掉
 `name_layer_suffix`、`last_suffixed`、`moe_chain_layer_of_node`、`ffn_moe_out`
-字符串匹配、以及 `has_first`/`first_node` 的 split 启发式（评审项 A1/A2/A5/E1/E2/E4）。
+字符串匹配、以及 `has_first`/`first_node` 启发式（评审项 A1/A2/A5/E1/E2/E4）。
 
-### 4.5 op 三分类
+### 4.6 op 三分类
 
 三类（吸收评审项 E3）：
 
@@ -99,7 +124,7 @@ clone。因为 route B 拥有整图（一个 split），scheduler 从不执行�
 - `MATERIALIZING`：`CONT / DUP / CAST` —— 真拷贝，必须执行。
 - `COMPUTE`：其余。
 
-### 4.6 最后一层输出 token 收窄（显式）
+### 4.7 最后一层输出 token 收窄（显式）
 
 最后一层含（如 `olmoe.cpp`）：
 
@@ -117,36 +142,58 @@ if (il == n_layer - 1 && inp_out_ids) {
   arena、tail 都用收窄后的计数）；
 - 该层的 arena / pin 预算按收窄后的计数算。
 
-这就是让最后一层整层所有权正确的关键。
+### 4.8 tracer 分离 + 分配失败干净报错
 
-### 4.7 tracer 分离
+把 canary / dump / `fprintf` 从 `run_dense_nodes` / `exec_layer_burst` 抽出，做成可
+注入的 tracer（默认 no-op）。arena / buffer 分配失败时返回清晰的
+`GGML_STATUS_FAILED` + 可操作信息（绝不裸崩 `0xC0000005`）。
 
-把 canary / dump / `fprintf` 从 `run_dense_nodes` / `exec_layer_burst` 里抽出，做成
-可注入的 tracer（默认 no-op）。热路径保持干净，去掉长寿的 debug 全局量。
+### 4.9 flash attention 必须保留
 
-### 4.8 分配失败干净报错
+当前整层路径把 `FLASH_ATTN_EXT` 变成手动 `kq / softmax / kqv`，落地 `O(B^2)` 的
+score 矩阵。每层估算（f32，`h` 个头）：
 
-arena / buffer 分配失败时返回清晰的 `GGML_STATUS_FAILED` + 可操作信息（绝不裸崩
-`0xC0000005`）。
+| 模型 | B | head（linear + attn） | closure | tail |
+|---|---|---|---|---|
+| gemma | 2048 | **900 MB (132 + 768)** | 77 MB | 60 MB |
+| olmoe | 2048 | **864 MB (96 + 768)** | 48 MB | 40 MB |
+| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB | 80 MB |
+
+attention 项占大头且随 `B^2` 增长。route B 拥有层但**委托**它不实现的操作；
+`FLASH_ATTN_EXT` 必须委托给设备/CPU backend，让 score 矩阵永不落地。这是硬要求
+（也是 D 类项）。
+
+### 4.10 C2 接管（后续阶段）
+
+目前 `--dense-placement C2:<dev>` 只设放置 buft（`route_b_dense_device`，
+`route_b_inject.cpp:445`）；C2 节点仍由 llama 执行，**没被 route B own**。所以
+route-B 层 -> C2 那道缝，同 device 也可能拷。
+
+目标：route B 也拥有 C2 激活（预分配进 arena），使 C1 与 C2 同 device 时无拷贝。
+空间在统一 liveness 分析合并前各自独立（两者时间上不重叠）。
 
 ## 5. D 类问题（必须专门设计，不会自动消失）
 
 | D 问题 | 本设计如何应对 |
 |---|---|
-| 整图单 backend compute buffer | 每层 arena 预分配 buffer（4.2）-> scheduler compute buffer 保持有界 |
-| 最后一层 `inp_out_ids` 语义 | 显式收窄支持（4.6） |
-| `supports_buft` / `supports_op` 与 ownership | route B 声明 arena buft + expert buft；不无条件接受 |
-| dense 执行顺序 / data 就绪 | route B 内部控制执行顺序；`LayerExecutionState` + assert |
-| debug 脚手架焊在热路径 | tracer 分离（4.7） |
+| 整图单 backend compute buffer | 一块 worst-case 一层 arena、跨层复用（3、4.2） |
+| 最后一层 `inp_out_ids` 语义 | 显式收窄支持（4.7） |
+| flash attention 必须保留 | 委托 `FLASH_ATTN_EXT`（4.9） |
+| C2 缝拷贝 | C2 接管（4.10） |
+| `supports_buft` / `supports_op` 与 ownership | route B 声明 arena buft + expert buft |
+| dense 执行顺序 / data 就绪 | 内部控制顺序 + `LayerExecutionState` + assert |
+| debug 脚手架焊在热路径 | tracer 分离（4.8） |
 | 分配失败崩溃 | 干净错误路径（4.8） |
 
 ## 6. 里程碑
 
 - **R1** LayerPlan + 显式边界（行为不变；保持 MoE-only）。
 - **R2** 不 clone 的 dense 执行 + `LayerExecutionState` -> 解 olmoe。
-- **R3** 每层预分配 arena -> 解 DeepSeek。
+- **R3** worst-case 一层预分配 arena（闭包独立，head+tail 合并）-> 解 DeepSeek。
 - **R4** 最后一层收窄显式支持。
-- **R5** op 三分类 + tracer 分离。
+- **R5** 保留 flash attention（委托 `FLASH_ATTN_EXT`）。
+- **R6** C2 接管（own C2 激活）-> 同 device C1/C2 无拷贝。
+- **R7** op 三分类 + tracer 分离。
 
 每个里程碑都保持生产（MoE-only）路径数值 **IDENTICAL**。
 
@@ -156,10 +203,12 @@ arena / buffer 分配失败时返回清晰的 `GGML_STATUS_FAILED` + 可操作�
 - 整层 olmoe 与基线一致（输出正常，hidden cos ~1.0）。
 - DeepSeek 整层能加载并通过 cos 门（`baseline/deepseek_hi_up`）。
 - 打印的 scheduler compute-buffer 大小保持有界（只剩模型 I/O）。
+- **构建期 debug log**：打印每层 head / closure / tail 字节（用于看三模型在指定
+  ubatch 下的真实数值）。
 
 ## 8. 待定问题
 
-1. arena 生命周期/大小：每层一个 arena vs 单个 grow-only arena。
+1. arena 生命周期/大小：单个 grow-only arena vs 精确 worst-case 测量。
 2. 设备侧 arena（DMA）用于 GPU 阶段 —— 复用 `M2_DEVICE_EXECUTOR`。
-3. 大量 tensor 被预分配后 scheduler split 的行为。
-4. 多设备：每设备 arena + ids D2H join。
+3. 多设备：每设备 arena + ids D2H join。
+4. C2 接管：只 own C2 激活，还是连权重也进池（复用 C1 池）？
