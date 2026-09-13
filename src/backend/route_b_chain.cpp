@@ -368,6 +368,7 @@ bool is_routed_mm(const ggml_tensor * n);
 int  mm_layer(const ggml_tensor * n);
 bool is_view_op(const ggml_tensor * n);
 bool is_alias_op(const ggml_tensor * n);
+bool is_fused_op(enum ggml_op op);
 void collect_chain(const ggml_cgraph * gf, std::vector<char>& chain,
                    std::vector<int>& layer, int& n_anchors);
 void collect_layer_nodes(const ggml_cgraph * gf,
@@ -520,6 +521,9 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             g_layer_nodes[kv.first] = kv.second;
             for (auto * nd : kv.second) {
                 if (is_alias_op(nd)) continue;
+                // Do not force-claim fused ops (see is_fused_op): claiming one
+                // flips llama_context::resolve to the decomposed path.
+                if (is_fused_op(nd->op)) continue;
                 ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
             }
         }
@@ -951,6 +955,22 @@ bool is_view_op(const ggml_tensor * n) {
 [[maybe_unused]] bool is_alias_op(const ggml_tensor * n) {
     return n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
            n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_PERMUTE;
+}
+
+// Fused ops that llama_context::resolve probes against the layer's device: if
+// such a node is force-claimed to a backend different from the layer's device,
+// resolve disables the fused path and the model silently decomposes to primitive
+// ops (e.g. deepseek4 DSV4_HC_*). Whole-layer must leave these to llama.
+bool is_fused_op(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_HC_COMB:
+            return true;
+        default:
+            return false;
+    }
 }
 
 // Layer suffix of a llama node name ("ffn_norm-3", "Qcur-3 (reshaped)" -> 3).

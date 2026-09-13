@@ -197,6 +197,23 @@ static enum ggml_status run_dense_nodes(ggml_context * ctx, ggml_backend_t backe
     }
     (void) expand;
     if (added == 0) return GGML_STATUS_SUCCESS;
+#ifdef STREAM_MOE_TEMP
+    if (dump && !nodes.empty()) {
+        static bool first = true;
+        if (first) {
+            first = false;
+            const ggml_tensor * nd = nodes[0];
+            fprintf(stderr, "[firstnode] '%s' op=%s data=%p in_arena=%d\n",
+                    nd->name ? nd->name : "?", ggml_op_name(nd->op), nd->data, route_b_in_arena(nd->data));
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = nd->src[s];
+                if (!src) continue;
+                fprintf(stderr, "[firstnode]   src[%d] '%s' op=%s data=%p in_arena=%d\n",
+                        s, src->name ? src->name : "?", ggml_op_name(src->op), src->data, route_b_in_arena(src->data));
+            }
+        }
+    }
+#endif
     const enum ggml_status st = ggml_backend_graph_compute(backend, gf);
     if (dump) {
         for (const auto & r : g_dump_recs) {
