@@ -274,19 +274,19 @@ ggml_backend_buffer_type_t moe_dev_get_buffer_type(ggml_backend_dev_t dev) {
 bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
 #ifdef STREAM_MOE_TEMP
     // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2, DEBUG ONLY):
-    // our backend also owns dense nodes whose weights live in CPU/GPU buffers,
-    // so it must accept every buft. Production keeps the MoE-only split and the
-    // original, strict buft filtering below.
-    (void) dev; (void) buft;
-    return true;
-#else
+    // accept host bufts so the scheduler keeps the layer's dense nodes on our
+    // backend (we run dense on CPU). Device bufts are NOT accepted. When
+    // whole-layer is disabled keep the strict production filtering, so the
+    // NO_WHOLE_LAYER baseline is not perturbed.
+    if (!std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") && ggml_backend_buft_is_host(buft))
+        return true;
+#endif
     auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
     if (buft == ctx->host_buft) return true;
     for (const auto& eb : ctx->expert_bufts) {
         if (buft == eb) return true;
     }
     return false;
-#endif
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
