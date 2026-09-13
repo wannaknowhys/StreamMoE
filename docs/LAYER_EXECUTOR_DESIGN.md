@@ -258,6 +258,16 @@ liveness analysis merges C1/C2 (they do not overlap in time).
 
 Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 
+**Landed (2026-09-13):**
+- **R1** official layer channel + build-time LayerPlan + consumer gate:
+  `6c1c99b`, `011948b`.
+- **R4** out-ids narrowing re-attributed to the consumer layer: `cb3e59d` -
+  **fixes the olmoe whole-layer divergence** (bisect: L0-L14 fine, L15 alone
+  diverged; the narrowing `get_rows(inpSA, inp_out_ids)` reads the previous
+  layer's output and was attributed to L14 by producer propagation, so L14's
+  tail executed it; re-attributing it to L15 makes the whole-layer output match
+  the baseline).
+
 ## 7. Validation gates
 
 - Production pure-RAM **IDENTICAL** (gemma, olmoe) via `baseline_regression`.

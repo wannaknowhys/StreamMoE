@@ -305,6 +305,10 @@ ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
 
 整层接管会**顺带把 attention 从 `FLASH_ATTN_EXT` 全局降级为手动 `kq/kqv`**（baseline L0 = `node_25 FLASH_ATTN_EXT`，whole L0 = `kq/kqv/kqv_out`）。这是 `supports_buft`/ownership 影响图构造的旁证。L0–L14 数值不受影响，**不是**本次发散主因，但需单独确认原因。
 
+### 5.5 已解决（2026-09-13，`cb3e59d`）
+
+把该收窄节点**重归到消费者层**后，olmoe 整层接管输出与基线一致（`Hello! How can I help you today? ...`）。做法：`GET_ROWS` 且 `src[0]` 是计算节点（非权重 leaf）、`src[1]` 是 graph input（`GGML_TENSOR_FLAG_INPUT`）= out-ids 收窄；用消费者层覆盖生产者传播的结果（`node_899`/`node_979` L14 → L15）。同时修掉了 consumer gate 报的 "L14 有 2 个跨层节点"。见 `LAYER_EXECUTOR_DESIGN.md` R4。
+
 ---
 
 ## 六、Bug 分类

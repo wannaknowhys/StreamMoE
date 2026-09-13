@@ -222,6 +222,12 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 
 每个里程碑都保持生产（MoE-only）路径数值 **IDENTICAL**。
 
+**已落地（2026-09-13）：**
+- **R1** 官方层号 channel + 构建期 LayerPlan + consumer gate：`6c1c99b`、`011948b`。
+- **R4** 收窄节点重归到消费者层：`cb3e59d` —— **修好了 olmoe 整层发散**（bisect：L0–L14
+  正常，L15 单独发散；`get_rows(inpSA, inp_out_ids)` 读上一层输出、被生产者传播归到 L14，
+  于是 L14 的 tail 执行了它；重归到 L15 后整层输出与基线一致）。
+
 ## 7. 验证门
 
 - 生产纯 RAM **IDENTICAL**（gemma、olmoe），走 `baseline_regression`。
