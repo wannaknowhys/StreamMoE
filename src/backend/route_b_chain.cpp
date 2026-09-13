@@ -180,7 +180,11 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     std::unordered_map<const ggml_tensor*, size_t> carry_off;
     for (auto & kv : g_layer_nodes)
         for (auto * nd : kv.second) {
-            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS || !carry.count(nd)) continue;
+            // Only nodes that OWN a fresh output buffer may be pre-allocated.
+            // A node whose output is a view (view_src != NULL) aliases another
+            // tensor (in-place ops like SET_ROWS, or VIEW/RESHAPE/...), so its
+            // data must follow that tensor - never move it to the arena.
+            if (nd->view_src || !carry.count(nd)) continue;
             carry_size = (carry_size + 63) & ~size_t(63);
             carry_off[nd] = carry_size;
             carry_size += ggml_nbytes(nd);
@@ -200,7 +204,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     for (auto & kv : g_layer_nodes) {
         size_t off = 0;
         for (auto * nd : kv.second) {
-            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS || carry.count(nd) || closure_off.count(nd)) continue;
+            if (nd->view_src || carry.count(nd) || closure_off.count(nd)) continue;
             off = (off + 63) & ~size_t(63);
             compact_off[nd] = off;
             off += ggml_nbytes(nd);
@@ -235,7 +239,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 
     for (auto & kv : g_layer_nodes) {
         for (auto * nd : kv.second) {
-            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS) continue;
+            if (nd->view_src) continue;   // view/in-place: data follows view_src
             nd->buffer = g_arena;
             auto cit = carry_off.find(nd);
             if (cit != carry_off.end()) { nd->data = base + cit->second; continue; }
@@ -245,15 +249,18 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             if (clo != closure_off.end()) { nd->data = base + g_arena_closure_off + clo->second; continue; }
         }
     }
-    // second pass: alias (view/layout) nodes follow their root's data + offsets
+    // second pass: nodes whose output aliases another tensor (view/in-place)
+    // follow the view_src chain to the root's data + accumulated offsets.
+    // NOTE: resolve via view_src, not src[0] (SET_ROWS stores its sources in a
+    // legacy order, src[0] is not the aliased tensor).
     for (auto & kv : g_layer_nodes) {
         for (auto * nd : kv.second) {
-            if (!is_alias_op(nd)) continue;
+            if (!nd->view_src) continue;
             const ggml_tensor * t = nd;
             int64_t off = 0;
-            while (t && is_alias_op(t) && t->src[0]) {
+            while (t && t->view_src) {
                 if (t->op == GGML_OP_VIEW) off += t->view_offs;
-                t = t->src[0];
+                t = t->view_src;
             }
             if (t && t->data) nd->data = static_cast<char*>(t->data) + off;
         }
