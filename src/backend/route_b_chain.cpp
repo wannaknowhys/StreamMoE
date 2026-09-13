@@ -41,6 +41,7 @@ size_t g_arena_closure_size = 0;
 int    g_dump_ubatch = -1;        // bin-dump ubatch subdirectory index
 
 bool is_alias_op(const ggml_tensor * n);   // defined later in this file
+bool is_view_op(const ggml_tensor * n);    // defined later in this file
 
 // C4 replication cap: closure-used non-per-expert leaves at or below this size
 // are copied once into every device pool (gemma per-expert scale = 512 B/layer).
@@ -317,6 +318,10 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = node->src[s];
                 if (!src) continue;
+                // unwrap view/layout chains: a consumer may read a VIEW of a
+                // compact producer, and the producer must stay live until then.
+                while (src && is_view_op(src)) src = src->src[0];
+                if (!src) continue;
                 auto it = last_etime.find(src);
                 if (it == last_etime.end()) last_etime[src] = ep.second;
                 else if (it->second < ep.second) it->second = ep.second;
@@ -339,6 +344,9 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
         std::vector<int64_t> o;
         size_t lb;
+        // Interval packing of the compact region is still not correct for every
+        // model (gemma diverges: a consumer is missed in the liveness model), so
+        // it stays opt-in until that is fixed.
         if (std::getenv("STREAM_MOE_TMP_COMPACT_PACK")) {
             lb = pack_interval(cns, cstart, cend, o);
         } else {
