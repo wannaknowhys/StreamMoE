@@ -208,8 +208,11 @@ static enum ggml_status run_dense_nodes(ggml_context * ctx, ggml_backend_t backe
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = nd->src[s];
                 if (!src) continue;
-                fprintf(stderr, "[firstnode]   src[%d] '%s' op=%s data=%p in_arena=%d\n",
-                        s, src->name ? src->name : "?", ggml_op_name(src->op), src->data, route_b_in_arena(src->data));
+                float v = 0.0f; bool has = false;
+                if (src->type == GGML_TYPE_F32 && src->data) { v = *(const float *) src->data; has = true; }
+                fprintf(stderr, "[firstnode]   src[%d] '%s' op=%s data=%p in_arena=%d v=%.6f%s\n",
+                        s, src->name ? src->name : "?", ggml_op_name(src->op), src->data,
+                        route_b_in_arena(src->data), v, has ? "" : " (n/a)");
             }
         }
     }
