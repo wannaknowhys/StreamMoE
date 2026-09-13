@@ -823,6 +823,35 @@ static int name_layer_suffix(const char * name) {
             }
         }
     }
+    // Out-ids narrowing (docs/LAYER_EXECUTOR_DESIGN.md 4.7): the last layer's
+    // `get_rows(x, inp_out_ids)` reads x (often the previous layer's output) and
+    // is consumed by the last layer. Producer propagation attributes it to the
+    // producer's layer; re-attribute to the consumer's layer.
+    {
+        std::unordered_map<const ggml_tensor*, int> consumer_layer;
+        consumer_layer.reserve((size_t) N);
+        for (int i = 0; i < N; ++i) {
+            if (lay[i] < 0) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = gf->nodes[i]->src[s];
+                if (!src) continue;
+                if (consumer_layer.find(src) == consumer_layer.end()) consumer_layer[src] = lay[i];
+            }
+        }
+        for (int i = 0; i < N; ++i) {
+            ggml_tensor * nd = gf->nodes[i];
+            if (nd->op != GGML_OP_GET_ROWS || !nd->src[0] || !nd->src[1]) continue;
+            if (nd->src[0]->op == GGML_OP_NONE) continue;                  // weight lookup (token embd), not a narrowing
+            if (!(nd->src[1]->flags & GGML_TENSOR_FLAG_INPUT)) continue;   // out-ids narrowing
+            auto it = consumer_layer.find(nd);
+            if (it != consumer_layer.end() && lay[i] != it->second) {
+                if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
+                    fprintf(stderr, "[route_b_verify] out-ids narrowing '%s' L%d -> consumer L%d\n",
+                            nd->name ? nd->name : "?", lay[i], it->second);
+                lay[i] = it->second;
+            }
+        }
+    }
     for (int i = 0; i < N; ++i)
         if (lay[i] >= 0) out[lay[i]].push_back(gf->nodes[i]);
 }
