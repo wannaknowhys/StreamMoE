@@ -107,7 +107,7 @@ static bool is_alias_op(const ggml_tensor * n) {
            n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_PERMUTE;
 }
 
-static const ggml_tensor * g_dbg_pos = nullptr;   // debug canary (positions leaf)
+static thread_local const ggml_tensor * g_dbg_pos = nullptr;   // debug canary (positions leaf)
 
 // Debug dump capture: per-clone DUP into a dedicated (non-reused) buffer so the
 // value read after graph_compute is the node's real output, not a reused slot.
@@ -150,16 +150,32 @@ static enum ggml_status run_dense_nodes(ggml_context * ctx, ggml_backend_t backe
         g_dump_scratch.assign(total + 4096, 0);
         g_dump_recs.clear();
     }
-    for (ggml_tensor * nd : nodes) {
+    std::unordered_map<const ggml_tensor*, size_t> pos;
+    pos.reserve(nodes.size() * 2);
+    for (size_t i = 0; i < nodes.size(); ++i) if (nodes[i]) pos[nodes[i]] = i;
+    for (size_t nidx = 0; nidx < nodes.size(); ++nidx) {
+        ggml_tensor * nd = nodes[nidx];
         if (!nd || is_alias_op(nd) || !nd->data) continue;
         if (nd->op == GGML_OP_SET_ROWS && nd->src[1] && !g_dbg_pos) g_dbg_pos = nd->src[1];
         ggml_tensor * cl = ggml_new_tensor_4d(ctx, nd->type, nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3]);
         for (int i = 0; i < 4; ++i) cl->nb[i] = nd->nb[i];
         cl->op = nd->op;
+        cl->flags = nd->flags;
         std::memcpy(cl->op_params, nd->op_params, GGML_MAX_OP_PARAMS);
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             ggml_tensor * src = nd->src[s];
             if (!src) continue;
+            auto pit = pos.find(src);
+            if (pit != pos.end() && pit->second >= nidx) {
+                LOG_ERROR("stream_moe: dense nodes out of topological order: '"
+                          << (nd->name ? nd->name : "?") << "' <- '" << (src->name ? src->name : "?") << "'");
+                return GGML_STATUS_FAILED;
+            }
+            if (!src->data) {
+                LOG_ERROR("stream_moe: dense node src without data: '"
+                          << (nd->name ? nd->name : "?") << "' <- '" << (src->name ? src->name : "?") << "'");
+                return GGML_STATUS_FAILED;
+            }
             ggml_tensor * lf = ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
             for (int i = 0; i < 4; ++i) lf->nb[i] = src->nb[i];
             lf->data = src->data;
@@ -1904,6 +1920,19 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                 if (down[i]) dense_tail.push_back(nd);
                 else         dense_head.push_back(nd);
             }
+#ifdef STREAM_MOE_TEMP
+            // Diagnostic (not a hard invariant): the MoE closure is not always a
+            // subset of the captured layer list (shared-expert / differently
+            // named nodes), so head+tail+closure != lns is expected. Report how
+            // many closure nodes fall outside the layer list.
+            if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+                size_t outside = 0;
+                for (const auto * cn : ex->compute) if (!lidx.count(cn)) ++outside;
+                if (outside)
+                    fprintf(stderr, "[split] L%d closure has %zu node(s) outside layer list (lns=%zu)\n",
+                            layer, outside, lns->size());
+            }
+#endif
         }
     }
 #ifdef STREAM_MOE_TEMP
@@ -2076,6 +2105,9 @@ enum ggml_status moe_exec_mul_mat_id(
     int n_threads)
 {
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
+#ifdef STREAM_MOE_TEMP
+    g_dbg_pos = nullptr;   // per-graph, not per-process (avoid stale pointer)
+#endif
     if (is_alias_op(nodes[0])) return GGML_STATUS_SUCCESS;
 
     std::vector<int32_t> layers;
