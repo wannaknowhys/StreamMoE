@@ -1899,9 +1899,14 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
             const ggml_tensor * out = nullptr;
             for (const auto * cn : ex->compute)
                 if (cn && cn->name && strstr(cn->name, "ffn_moe_out")) { out = cn; break; }
+            if (!out || !lidx.count(out)) {
+                LOG_ERROR("stream_moe: whole-layer L" << layer
+                          << ": ffn_moe_out not found in MoE closure/layer list; "
+                             "refusing to run (dense tail would be silently empty)");
+                return GGML_STATUS_FAILED;
+            }
             std::vector<char> down(lns->size(), 0);
-            auto seed = lidx.find(out);
-            if (seed != lidx.end()) down[seed->second] = 1;
+            down[lidx.find(out)->second] = 1;
             bool changed = true;
             while (changed) {
                 changed = false;
@@ -2108,7 +2113,6 @@ enum ggml_status moe_exec_mul_mat_id(
 #ifdef STREAM_MOE_TEMP
     g_dbg_pos = nullptr;   // per-graph, not per-process (avoid stale pointer)
 #endif
-    if (is_alias_op(nodes[0])) return GGML_STATUS_SUCCESS;
 
     std::vector<int32_t> layers;
     for (int i = 0; i < n_nodes; ++i) {
@@ -2116,12 +2120,14 @@ enum ggml_status moe_exec_mul_mat_id(
         if (!nd || is_alias_op(nd)) continue;
         const int32_t L = moe_chain_layer_of_node(nd);
         if (L < 0) {
-            if (nd->op == GGML_OP_MUL_MAT_ID && nd->src[0] && nd->src[0]->name &&
-                strstr(nd->src[0]->name, "_exps")) {
+            // An un-captured routed MUL_MAT_ID is a hard error: the legacy
+            // per-split path is gone, so silently skipping it would leave the
+            // layer's expert output uncomputed.
+            if (nd->op == GGML_OP_MUL_MAT_ID) {
                 fprintf(stderr,
                         "[stream_moe] un-captured MUL_MAT_ID: node='%s' w='%s' op=%s n_nodes=%d\n",
                         nd->name ? nd->name : "(anon)",
-                        nd->src[0]->name ? nd->src[0]->name : "?",
+                        (nd->src[0] && nd->src[0]->name) ? nd->src[0]->name : "?",
                         ggml_op_name(nd->op), n_nodes);
                 LOG_ERROR("stream_moe: un-captured MUL_MAT_ID split reached the executor (no legacy path)");
                 return GGML_STATUS_FAILED;
@@ -2147,9 +2153,12 @@ enum ggml_status moe_exec_mul_mat_id(
         // are no-ops (the burst already produced them).
         const std::vector<ggml_tensor*> * ln = moe_chain_layer_nodes(L);
         const moe_layer_exec_t * ex = moe_chain_layer_exec(L);
-        const ggml_tensor * first_node = (ln && !ln->empty()) ? ln->front()
-                                     : (ex && !ex->compute.empty()) ? ex->compute.front()
-                                     : nullptr;
+        // First non-alias node: aliases are never assigned to our backend, so
+        // they cannot appear in the split and would make has_first false.
+        const ggml_tensor * first_node = nullptr;
+        if (ln) for (auto * t : *ln) if (!is_alias_op(t)) { first_node = t; break; }
+        if (!first_node && ex)
+            for (auto * t : ex->compute) if (!is_alias_op(t)) { first_node = t; break; }
         if (!first_node) continue;
         bool has_first = false;
         for (int i = 0; i < n_nodes && !has_first; ++i) if (nodes[i] == first_node) has_first = true;
