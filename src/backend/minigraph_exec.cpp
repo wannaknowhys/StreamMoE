@@ -2065,6 +2065,22 @@ enum ggml_status moe_exec_mul_mat_id(
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
 #ifdef STREAM_MOE_TEMP
     g_dbg_pos = nullptr;   // per-graph, not per-process (avoid stale pointer)
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+        int in = 0, shown = 0;
+        for (int i = 0; i < n_nodes; ++i)
+            if (nodes[i] && nodes[i]->data && route_b_in_arena(nodes[i]->data)) ++in;
+        fprintf(stderr, "[arena_check] n_nodes=%d in_arena=%d (nodes[0]='%s' data=%p)\n",
+                n_nodes, in, (nodes[0] && nodes[0]->name) ? nodes[0]->name : "?",
+                nodes[0] ? nodes[0]->data : nullptr);
+        for (int i = 0; i < n_nodes && shown < 12; ++i) {
+            const ggml_tensor * nd = nodes[i];
+            if (!nd || (nd->data && route_b_in_arena(nd->data))) continue;
+            fprintf(stderr, "[arena_check] NOT-IN '%s' op=%s data=%p buf=%p\n",
+                    nd->name ? nd->name : "(anon)", ggml_op_name(nd->op), nd->data,
+                    (void*)(nd->buffer ? nd->buffer : nullptr));
+            ++shown;
+        }
+    }
 #endif
 
     std::vector<int32_t> layers;

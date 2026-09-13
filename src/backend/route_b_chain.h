@@ -53,6 +53,10 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes);
 void route_b_on_node(const ggml_tensor * node, int il);
 int  route_b_official_layer(const ggml_tensor * node);   // -1 when unknown
 
+// Debug: true when `p` lies inside the whole-layer arena (R3). Used to check
+// that the scheduler did not overwrite pre-allocated node data.
+bool route_b_in_arena(const void * p);
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).

@@ -20,6 +20,15 @@ namespace {
 void * g_fullalloc_buf = nullptr;
 size_t g_fullalloc_cap = 0;
 
+// Whole-layer arena (R3): one ggml_backend_buffer holding
+// [carry][compact][closure]. Null on the production (MoE-only) path.
+ggml_backend_buffer_t g_arena = nullptr;
+size_t g_arena_cap = 0;
+size_t g_arena_closure_off = 0;   // byte offset of the closure block inside g_arena
+size_t g_arena_closure_size = 0;
+
+bool is_alias_op(const ggml_tensor * n);   // defined later in this file
+
 // C4 replication cap: closure-used non-per-expert leaves at or below this size
 // are copied once into every device pool (gemma per-expert scale = 512 B/layer).
 constexpr size_t kResidentLeafMaxBytes = 1u << 20;   // 1 MiB
@@ -138,6 +147,160 @@ void verify_layer_consumers(const ggml_cgraph * gf) {
     if (backward)
         fprintf(stderr, "[route_b_verify] %d backward cross-layer edge(s)\n", backward);
 }
+
+// R3: lay out the whole-layer arena as [carry][compact][closure] and point every
+// captured node's buffer/data at it, so the scheduler skips them (no whole-graph
+// compute buffer). carry = captured tensor consumed in another layer (fixed,
+// first); compact = within-layer temporaries (per-layer bump, reused across
+// layers); closure = the MoE closure block (moe_chain_fullalloc_buffer returns
+// its base). docs/LAYER_EXECUTOR_DESIGN.md 4.2/4.3.
+void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
+    if (g_layer_nodes.empty()) return;
+
+    std::unordered_map<const ggml_tensor*, int> nlayer;
+    nlayer.reserve((size_t) gf->n_nodes * 2);
+    for (auto & kv : g_layer_nodes_all)
+        for (auto * nd : kv.second) nlayer[nd] = kv.first;
+
+    // carry: captured node consumed in a different layer
+    std::set<const ggml_tensor*> carry;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        auto it = nlayer.find(nd);
+        if (it == nlayer.end()) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            auto sit = nlayer.find(src);
+            if (sit != nlayer.end() && sit->second != it->second) carry.insert(src);
+        }
+    }
+
+    size_t carry_size = 0;
+    std::unordered_map<const ggml_tensor*, size_t> carry_off;
+    for (auto & kv : g_layer_nodes)
+        for (auto * nd : kv.second) {
+            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS || !carry.count(nd)) continue;
+            carry_size = (carry_size + 63) & ~size_t(63);
+            carry_off[nd] = carry_size;
+            carry_size += ggml_nbytes(nd);
+        }
+
+    // closure node -> offset inside the closure block (the packed result layout)
+    std::unordered_map<const ggml_tensor*, size_t> closure_off;
+    for (auto & kv : g_layer_exec) {
+        const moe_layer_exec_t & ex = kv.second;
+        for (size_t i = 0; i < ex.compute.size(); ++i)
+            if (ex.layout_ok && i < ex.out_off.size() && ex.out_off[i] >= 0)
+                closure_off[ex.compute[i]] = (size_t) ex.out_off[i];
+    }
+
+    size_t compact_size = 0;
+    std::unordered_map<const ggml_tensor*, size_t> compact_off;
+    for (auto & kv : g_layer_nodes) {
+        size_t off = 0;
+        for (auto * nd : kv.second) {
+            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS || carry.count(nd) || closure_off.count(nd)) continue;
+            off = (off + 63) & ~size_t(63);
+            compact_off[nd] = off;
+            off += ggml_nbytes(nd);
+        }
+        compact_size = std::max(compact_size, off);
+    }
+
+    // closure block: max over layers of the executor's need (result_bytes when
+    // the layout is valid, else the full per-node sum, mirroring exec_layer_burst)
+    size_t closure_size = 0;
+    for (auto & kv : g_layer_exec) {
+        const moe_layer_exec_t & ex = kv.second;
+        size_t need = ex.result_bytes;
+        if (!ex.layout_ok) {
+            need = 0;
+            for (const auto * cn : ex.compute)
+                if (!(cn->name && strstr(cn->name, "ffn_moe_out"))) need += ggml_nbytes(cn);
+        }
+        closure_size = std::max(closure_size, need);
+    }
+
+    const size_t need = carry_size + compact_size + closure_size + 4096;
+    if (need > g_arena_cap) {
+        if (g_arena) ggml_backend_buffer_free(g_arena);
+        g_arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(our_backend), need);
+        g_arena_cap = g_arena ? need : 0;
+    }
+    if (!g_arena) return;
+    char * base = static_cast<char*>(ggml_backend_buffer_get_base(g_arena));
+    g_arena_closure_off  = carry_size + compact_size;
+    g_arena_closure_size = closure_size;
+
+    for (auto & kv : g_layer_nodes) {
+        for (auto * nd : kv.second) {
+            if (is_alias_op(nd) || nd->op == GGML_OP_SET_ROWS) continue;
+            nd->buffer = g_arena;
+            auto cit = carry_off.find(nd);
+            if (cit != carry_off.end()) { nd->data = base + cit->second; continue; }
+            auto mit = compact_off.find(nd);
+            if (mit != compact_off.end()) { nd->data = base + carry_size + mit->second; continue; }
+            auto clo = closure_off.find(nd);
+            if (clo != closure_off.end()) { nd->data = base + g_arena_closure_off + clo->second; continue; }
+        }
+    }
+    // second pass: alias (view/layout) nodes follow their root's data + offsets
+    for (auto & kv : g_layer_nodes) {
+        for (auto * nd : kv.second) {
+            if (!is_alias_op(nd)) continue;
+            const ggml_tensor * t = nd;
+            int64_t off = 0;
+            while (t && is_alias_op(t) && t->src[0]) {
+                if (t->op == GGML_OP_VIEW) off += t->view_offs;
+                t = t->src[0];
+            }
+            if (t && t->data) nd->data = static_cast<char*>(t->data) + off;
+        }
+    }
+    if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
+        fprintf(stderr, "==== arena plan: carry=%zu compact=%zu closure=%zu total=%zu ====\n",
+                carry_size, compact_size, closure_size, g_arena_cap);
+        fprintf(stderr, "---- cross-layer (carry) %zu nodes ----\n", carry_off.size());
+        for (auto & kv : carry_off)
+            fprintf(stderr, "  %-30s L%-3d off=%zu sz=%zu\n", kv.first->name ? kv.first->name : "(anon)",
+                    route_b_official_layer(kv.first), kv.second, ggml_nbytes(kv.first));
+        fprintf(stderr, "---- compute graph (%d nodes) ----\n", gf->n_nodes);
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            const ggml_tensor * nd = gf->nodes[i];
+            const char * region = "-"; size_t off = 0;
+            auto c = carry_off.find(nd);
+            if (c != carry_off.end()) { region = "carry"; off = c->second; }
+            else {
+                auto m = compact_off.find(nd);
+                if (m != compact_off.end()) { region = "compact"; off = carry_size + m->second; }
+                else {
+                    auto l = closure_off.find(nd);
+                    if (l != closure_off.end()) { region = "closure"; off = carry_size + compact_size + l->second; }
+                }
+            }
+            fprintf(stderr, "  [%4d] %-30s %-14s L%-3d %-8s off=%zu\n", i,
+                    nd->name ? nd->name : "(anon)", ggml_op_name(nd->op),
+                    route_b_official_layer(nd), region, off);
+        }
+        fprintf(stderr, "---- MoE plan ----\n");
+        for (auto & kv : g_layer_exec) {
+            const moe_layer_exec_t & ex = kv.second;
+            fprintf(stderr, "  L%d: %zu nodes result_bytes=%zu layout_ok=%d\n",
+                    kv.first, ex.compute.size(), ex.result_bytes, (int) ex.layout_ok);
+            for (size_t i = 0; i < ex.compute.size(); ++i)
+                fprintf(stderr, "    c[%zu] %-26s %-12s out_off=%lld\n", i,
+                        ex.compute[i]->name ? ex.compute[i]->name : "(anon)",
+                        ggml_op_name(ex.compute[i]->op),
+                        (long long) (i < ex.out_off.size() ? ex.out_off[i] : -1));
+        }
+        fflush(stderr);
+    }
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
+        fprintf(stderr, "[route_b_verify] arena: carry=%zuMB compact=%zuMB closure=%zuMB total=%zuMB (carry=%zu nodes)\n",
+                carry_size / (1024*1024), compact_size / (1024*1024), closure_size / (1024*1024),
+                g_arena_cap / (1024*1024), carry.size());
+}
 }
 
 void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
@@ -149,6 +312,16 @@ void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
 }
 
 void * moe_chain_fullalloc_buffer(size_t need_bytes) {
+    // Whole-layer: the closure block lives inside the arena at a fixed offset
+    // (layout_arena set it), so the closure twins are pre-allocated there too.
+    if (g_arena) {
+        if (need_bytes > g_arena_closure_size) {
+            fprintf(stderr, "[route_b_cap] ERROR: closure block overflow need=%zu cap=%zu\n",
+                    need_bytes, g_arena_closure_size);
+            return nullptr;
+        }
+        return static_cast<char*>(ggml_backend_buffer_get_base(g_arena)) + g_arena_closure_off;
+    }
     if (!g_fullalloc_buf) return nullptr;   // set_full_alloc(layer_sum) must run first
     if (need_bytes > g_fullalloc_cap) {
         fprintf(stderr, "[route_b_cap] ERROR: full-alloc overflow need=%zu cap=%zu\n", need_bytes, g_fullalloc_cap);
@@ -167,6 +340,13 @@ int route_b_official_layer(const ggml_tensor * node) {
     if (!node) return -1;
     auto it = g_official_layer.find(node);
     return it == g_official_layer.end() ? -1 : it->second;
+}
+
+bool route_b_in_arena(const void * p) {
+    if (!g_arena || !p) return false;
+    const char * base = static_cast<const char*>(ggml_backend_buffer_get_base(g_arena));
+    const char * q = static_cast<const char*>(p);
+    return q >= base && q < base + g_arena_cap;
 }
 
 namespace {
@@ -331,6 +511,9 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             }
         }
     }
+    // R3: [carry][compact][closure] arena; every captured node points at it so
+    // the scheduler does not reserve a whole-graph compute buffer.
+    layout_arena(our_backend, gf);
     build_layer_plans();
 #endif
 #ifdef STREAM_MOE_CHAIN_DEBUG
