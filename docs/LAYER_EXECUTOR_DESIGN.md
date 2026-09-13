@@ -98,27 +98,57 @@ Plan:
 (`minigraph_exec.cpp:730`), not `buffer`. Both must be set, or the scheduler
 still allocates. The device path already sets `buffer` (`:724`).
 
-### 4.3 Arena layout: closure separate, head+tail merged
+### 4.3 Arena: three regions (carry / compact / closure)
 
-The MoE closure must stay separate from a unified dense packing, because its
-execution is special:
+One arena buffer per device, sized once (never re-grown - a grow would
+invalidate already-set `data` pointers), split into three fixed sub-regions:
 
-- the bucket engine **rebuilds a mini-graph per bucket/round** (transient
-  tensors, currently in a bump region);
-- `ffn_moe_out` / the fold is a **dedicated output** written by the closure;
-- the **anonymous per-topk adds** (`node_NNN ADD`) are closure nodes computed by
-  the bucket engine.
+```
+[ carry region (fixed base) ][ compact region ][ closure block ]
+```
 
-All three are already handled by the closure's own layout
-(`ex.out_off` / `ex.result_bytes`) + bump, which is the IDENTICAL production
-path. So:
+- **carry region (FIRST)**: every tensor whose live range crosses a layer
+  boundary (any depth) - the residual stream / layer output and boundary
+  transforms (e.g. the last layer's `inp_out_ids` narrowing). Fixed addresses,
+  never reused. Placed first so a change in the compact/closure sizes cannot move
+  carry addresses (carry pointers are live across layers).
+- **compact region**: within-layer temporaries, packed per layer and **reused**
+  across layers; size = max over layers. Same addresses every layer.
+- **closure block**: the existing MoE-closure layout (`ex.out_off` /
+  `ex.result_bytes`) + bump, reused across layers; size = max over layers.
 
-- **closure segment**: unchanged (existing layout + bump); the only change is to
-  also set `buffer` on its main-graph outputs;
-- **dense segment (head + tail)**: one new pre-allocated interval packing on
-  C1's device. Head and tail are **merged in one analysis** (same device; head
-  outputs stay live into the tail, so a unified packing reaches the peak);
-- one arena buffer, sized to the worst-case layer, reused across layers.
+Global (whole-graph) liveness is used only to **classify** carry vs within-layer,
+not to assign global addresses. Any cross-layer tensor goes to the carry region:
+keeping a cross-layer tensor in the compact region would let the next layer
+overwrite it before consumption (order-fragile - rejected).
+
+Reuse the existing packing: extract the best-fit interval packing currently in
+`moe_chain_verify_graph` (`route_b_chain.cpp:282-370`) into
+`pack(nodes, last_use) -> offsets, size`; call it for the closure block and the
+compact region. Do not write a second allocator.
+
+The closure stays separate because its execution is special:
+
+- the bucket engine rebuilds a mini-graph per bucket/round (transient tensors,
+  bump region);
+- `ffn_moe_out` / the fold is a dedicated output;
+- the anonymous per-topk adds (`node_NNN ADD`) are closure nodes.
+
+**Heterogeneous layers.** Every layer's plan and packing are computed
+independently; only the region sizes are shared (max / peak). Edge rules:
+
+- pure dense layer (no MoE): empty closure, the whole layer is dense;
+- no `ffn_moe_out`: use the closure's last node as the anchor;
+- different attention types (sliding-window / SSM): the head/tail split depends
+  only on the closure anchor, not on the attention op;
+- special layer indices: the official layer channel handles them;
+- multiple MoE subgraphs in one layer: currently one `ex` per layer; extend the
+  plan to a list if needed (open).
+
+Motivating example (consumer check, R1): the last layer's `inp_out_ids`
+`get_rows(inpSA, ...)` reads the previous layer's output and is consumed by the
+last layer; producer propagation attributes it to the previous layer. It is a
+carry (cross-1) and must live until the last layer consumes it.
 
 ### 4.4 No-clone dense execution (fixes olmoe)
 
@@ -216,8 +246,8 @@ liveness analysis merges C1/C2 (they do not overlap in time).
 
 - **R1** LayerPlan + explicit boundary (no behavior change; keep MoE-only).
 - **R2** No-clone dense execution + `LayerExecutionState` -> fixes olmoe.
-- **R3** Worst-case-layer pre-allocated arena (closure separate, head+tail
-  merged) -> fixes DeepSeek.
+- **R3** Pre-allocated three-region arena (carry first / compact reused / closure
+  block) -> fixes DeepSeek.
 - **R4** Last-layer narrowing explicit support.
 - **R5** Preserve flash attention (delegate `FLASH_ATTN_EXT`).
 - **R6** C2 takeover (own C2 activations) -> copy-free C1/C2 on one device.

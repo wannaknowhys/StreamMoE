@@ -85,21 +85,45 @@ scheduler 把**已经有 buffer** 的 tensor 当作 pre-allocated（`ggml-backen
 **CPU 注意**：现有闭包路径只设 `data`（`minigraph_exec.cpp:730`），没设 `buffer`。
 两个都要设，否则 scheduler 仍会分配。设备路径本来就设了 `buffer`（`:724`）。
 
-### 4.3 arena 布局：闭包独立，head+tail 合并
+### 4.3 arena：三段（carry / compact / closure）
 
-MoE 闭包必须与统一的 dense packing 分开，因为它的执行很特殊：
+每设备一块 arena buffer，**一次 sizing、永不增长**（增长会让已设的 `data` 指针失效），
+切成三个固定子区：
 
-- bucket 引擎**每个 bucket/round 重建一张 mini-graph**（临时 tensor，现在走 bump）；
-- `ffn_moe_out` / fold 是**专门的输出**，由闭包写；
-- **匿名 per-topk add**（`node_NNN ADD`）是闭包节点，由 bucket 引擎算。
+```
+[ carry region（最前，固定 base）][ compact region ][ closure block ]
+```
 
-这三样现在都由闭包自己的布局（`ex.out_off` / `ex.result_bytes`）+ bump 管着，就是
-production IDENTICAL 的路径。所以：
+- **carry region（最前）**：所有 live range **跨层**（无论跨几层）的 tensor——残差流 /
+  层输出，以及边界变换（如最后一层的 `inp_out_ids` 收窄）。地址固定、永不复用。**放最前**
+  是为了 compact/closure 大小变化时**不会移动 carry 地址**（carry 指针跨层存活）。
+- **compact region**：层内临时量，每层各 pack、**跨层复用**；大小 = 各层 max。每层地址相同。
+- **closure block**：现有 MoE 闭包布局（`ex.out_off` / `ex.result_bytes`）+ bump，跨层复用；
+  大小 = 各层 max。
 
-- **闭包段**：不动（现有 layout + bump）；唯一改动是给它的主图输出也设 `buffer`；
-- **dense 段（head + tail）**：新建一个预分配 interval packing，放在 **C1 所在设备**。
-  head 和 tail **合并分析**（同 device；head 输出要活到 tail 读，统一 packing 达 peak）；
-- 一块 arena buffer，按 worst-case 一层 sizing，跨层复用。
+全局（整图）liveness **只用来分类** carry vs 层内，不用来全局分配地址。任何跨层 tensor
+都进 carry region：若留在 compact region，下一层会在它被消费前覆盖它（顺序脆弱，否决）。
+
+**复用现有分配函数**：把 `moe_chain_verify_graph` 里的 best-fit interval packing
+（`route_b_chain.cpp:282-370`）抽成 `pack(nodes, last_use) -> offsets, size`，闭包段和
+compact 段都调它。不写第二份分配器。
+
+闭包独立的原因（执行特殊）：
+
+- bucket 引擎每个 bucket/round 重建 mini-graph（临时 tensor，走 bump）；
+- `ffn_moe_out` / fold 是专门输出；
+- 匿名 per-topk add（`node_NNN ADD`）是闭包节点。
+
+**异构层**：每层的 plan 和 packing 各自算；只有 region 大小共享（max / peak）。边界规则：
+
+- 纯 dense 层（无 MoE）：closure 空，整层都是 dense；
+- 无 `ffn_moe_out`：用闭包最后一个节点作锚点；
+- 不同 attention 类型（滑动窗 / SSM）：head/tail split 只依赖闭包锚点，与 attention op 无关；
+- 特殊层号：官方层号 channel 处理；
+- 一层多个 MoE 子图：当前每层一个 `ex`；需要时把 plan 扩成列表（待定）。
+
+**动机实例**（consumer 校验，R1）：最后一层的 `inp_out_ids` `get_rows(inpSA, ...)` 读上一层
+输出、被最后一层消费；生产者传播把它归到上一层。它是 carry（跨 1 层），必须活到最后一层消费。
 
 ### 4.4 不 clone 的 dense 执行（解 olmoe）
 
@@ -189,7 +213,7 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 
 - **R1** LayerPlan + 显式边界（行为不变；保持 MoE-only）。
 - **R2** 不 clone 的 dense 执行 + `LayerExecutionState` -> 解 olmoe。
-- **R3** worst-case 一层预分配 arena（闭包独立，head+tail 合并）-> 解 DeepSeek。
+- **R3** 三段预分配 arena（carry 最前 / compact 复用 / closure block）-> 解 DeepSeek。
 - **R4** 最后一层收窄显式支持。
 - **R5** 保留 flash attention（委托 `FLASH_ATTN_EXT`）。
 - **R6** C2 接管（own C2 激活）-> 同 device C1/C2 无拷贝。
