@@ -325,8 +325,18 @@ ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
 | C1 | `g_dbg_pos` 悬空/UAF | `thread_local` + 每次重置 | 否 |
 | D1 | 未捕获 `MUL_MAT_ID` 静默跳过 | 全部报错/warning | 是 |
 | E1 | 跨层匿名节点默默选一个 | 直接报错 | 否 |
-| E3 | `is_view_op`/`is_alias_op` 语义重叠 | 重命名/三分类 | 是（纯改名） |
-| NEW | DeepSeek 小池 `0xC0000005` 崩溃 | 分配失败路径加 guard | 是 |
+| E3 | `is_view_op`/`is_alias_op` 语义重叠 | ~~重命名~~ **归 C**（三分类 PURE_ALIAS/MATERIALIZING/COMPUTE 会一并做，不做一次性改名） | - |
+| NEW | DeepSeek 小池 `0xC0000005` 崩溃 | **归 C/D**（是"整图单 buffer"的症状，A 类补不了） | - |
+
+> **落地状态（2026-09-13）**：A 类已完成并推送：
+> - `2efbc98` route_b: per-layer whole-layer bisect switches
+> - `2c2f1b9` minigraph: harden whole-layer dense execution（B1/B2/B3/C1 + A4 诊断）
+> - `f000955` minigraph: whole-layer boundary robustness（A1/A2/A3）
+> - `aa94519` route_b: whole-layer capture hardening（B4/E1）
+> - `d97f1ec` moe_backend: gate whole-layer buft acceptance（B5）
+>
+> 验证：dbg build 下 olmoe（baseline/MAX=14 正确，MAX=15 已知乱码）+ gemma 正常；生产 `StreamMoE` 下 olmoe/gemma 正常。
+> 评审说错的 C2/C3/C4 未改。E3 与 DeepSeek 崩溃归入 C/D。
 
 ### 6.2 评审说错（不用改）
 
