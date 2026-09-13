@@ -116,6 +116,9 @@ invalidate already-set `data` pointers), split into three fixed sub-regions:
   across layers; size = max over layers. Same addresses every layer.
 - **closure block**: the existing MoE-closure layout (`ex.out_off` /
   `ex.result_bytes`) + bump, reused across layers; size = max over layers.
+  Internally the per-bucket scratch is **reused across buckets**, and the
+  accumulator has its **own independent address** (each bucket accumulates into
+  it).
 
 Global (whole-graph) liveness is used only to **classify** carry vs within-layer,
 not to assign global addresses. Any cross-layer tensor goes to the carry region:

@@ -99,7 +99,8 @@ scheduler 把**已经有 buffer** 的 tensor 当作 pre-allocated（`ggml-backen
   是为了 compact/closure 大小变化时**不会移动 carry 地址**（carry 指针跨层存活）。
 - **compact region**：层内临时量，每层各 pack、**跨层复用**；大小 = 各层 max。每层地址相同。
 - **closure block**：现有 MoE 闭包布局（`ex.out_off` / `ex.result_bytes`）+ bump，跨层复用；
-  大小 = 各层 max。
+  大小 = 各层 max。内部 per-bucket scratch 在多桶间**复用**，累加器**独立一个地址**
+  （每桶算完累加进去）。
 
 全局（整图）liveness **只用来分类** carry vs 层内，不用来全局分配地址。任何跨层 tensor
 都进 carry region：若留在 compact region，下一层会在它被消费前覆盖它（顺序脆弱，否决）。
