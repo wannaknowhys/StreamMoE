@@ -128,7 +128,28 @@ Two layers of work:
 3. **Device executor.** Execute C1/C2/closure on the placement device (D2D /
    transfer-queue for cross-device). Separate large workstream.
 
-## 7. Open questions
+## 7. Status (2026-09-14)
+
+**Phase 1 - carry split: LANDED.** `layout_arena` splits the carry region:
+cross-1 is double-buffered on layer parity (`2 x max boundary`), cross-N is
+retained. The closure best-fit interval packing is extracted into
+`pack_interval(nodes, start, end)` and reused for `carryN`; `layout_arena` now
+runs AFTER the closure result layout so the packed closure size is used.
+
+Measured at ubatch 512 (production build): deepseek carry 2630 MB -> ~67 MB,
+olmoe 62 MB -> ~0.25 MB, gemma 160 MB -> ~11 MB. The closure block also drops
+(olmoe ub1 278528 -> 131072 B). Verified: production `run_baseline` PASS;
+olmoe / gemma / deepseek whole-layer OK.
+
+**Compact pack: implemented but GATED OFF** (`STREAM_MOE_TMP_COMPACT_PACK`,
+default off = byte sum). The interval packing is correct (self-checked: no two
+overlapping-interval nodes share bytes), but the liveness model still lets a
+live node be overwritten, so the executor corrupts. The exact cause is open: the
+execution time axis (head -> closure barrier -> tail) is modelled, yet a
+simultaneously-live pair still shares a slot somewhere. The compact region
+stays a byte sum until this is resolved.
+
+## 8. Open questions
 
 1. Is 2 buffers enough for `carry1`, or do some layers need more (e.g. a
    boundary set read at both head and tail plus a same-layer second boundary)?

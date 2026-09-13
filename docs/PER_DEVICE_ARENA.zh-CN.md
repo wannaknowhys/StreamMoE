@@ -110,7 +110,23 @@ arena 用该设备的 buffer type；被 own 的 C1/C2 节点从每设备 arena �
    坍缩成一个设备（数值不变）。
 3. **设备执行器。** 在放置设备上执行 C1/C2/闭包（跨设备用 D2D / transfer-queue）。独立大工程。
 
-## 7. 待定问题
+## 7. 状态（2026-09-14）
+
+**Phase 1 —— carry 拆分：已落地。** `layout_arena` 把 carry 区拆开：cross-1 按层奇偶
+双缓冲（`2 × max 边界`），cross-N 保留。闭包的 best-fit 区间打包抽成
+`pack_interval(nodes, start, end)` 并复用于 `carryN`；`layout_arena` 现在在闭包结果布局
+**之后**运行，用上打包后的闭包大小。
+
+ubatch 512 实测（生产构建）：deepseek carry 2630 MB → ~67 MB，olmoe 62 MB → ~0.25 MB，
+gemma 160 MB → ~11 MB。闭包块也降（olmoe ub1 278528 → 131072 B）。验证：生产
+`run_baseline` PASS；olmoe / gemma / deepseek 整层 OK。
+
+**compact 打包：已实现但默认关闭**（`STREAM_MOE_TMP_COMPACT_PACK`，默认关 = 字节求和）。
+区间打包本身正确（自检：时间区间重叠的节点不共享字节），但 liveness 模型仍会让某个
+存活节点被覆盖，执行器崩。确切原因未定：执行时间轴（head → 闭包屏障 → tail）已建模，
+但仍有某对同时存活的节点共享了槽。未解决前 compact 区保持字节求和。
+
+## 8. 待定问题
 
 1. `carry1` 两个 buffer 够吗，还是某些层需要更多（边界集合在 head 和 tail 都读，外加同层
    第二个边界）？
