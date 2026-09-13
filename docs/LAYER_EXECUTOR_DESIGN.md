@@ -298,6 +298,32 @@ Validation: olmoe per-layer bisect all SAME; gemma SAME; DeepSeek whole-layer
 `-n 24` SAME vs baseline with a clean pool exit (0 leaks); production
 `run_baseline` PASS.
 
+**Promoted to production.** The whole-layer path is no longer gated behind
+`STREAM_MOE_TEMP`: `route_b_whole_layer_active()` is always true,
+`moe_dev_supports_buft` accepts host bufts, `moe_dev_supports_op` claims the
+fused ops, and the capture/arena/plan calls run unconditionally. Debug dumps
+stay `#ifdef STREAM_MOE_TEMP`. Production `run_baseline` PASS with the
+whole-layer executor.
+
+**Temporary activation space (arena `need`, host bufts).** Measured with the
+production build (`STREAM_MOE_TMP_DENSE_DEBUG=1`), prompt-driven prefill at a
+given ubatch (`-ub N`):
+
+| ubatch | olmoe | gemma | deepseek |
+| ---: | ---: | ---: | ---: |
+| 1 | ~1.0 MB | ~5.6 MB | ~9.8 MB |
+| 512 | ~0.5 GB | ~2.8 GB | ~4.1 GB |
+| 2048 | ~2.0 GB | - | - |
+
+Breakdown at ubatch 512 (carry / compact / closure): olmoe 62/218/142 MB,
+gemma 160/2498/198 MB, deepseek 2630/1300/248 MB. The arena holds every layer
+activation: `carry` = all cross-layer tensors (never reused - DeepSeek's
+residual stream / hyper-connections dominate), `compact` = the worst layer's
+dense head/tail (gemma's dense MLP + the C2 lm_head logits dominate), `closure`
+= the MoE closure block. This is the current conservative layout; within-layer
+liveness packing and dropping the C2 logits from the arena are the obvious
+reductions.
+
 ## 7. Validation gates
 
 - Production pure-RAM **IDENTICAL** (gemma, olmoe) via `baseline_regression`.

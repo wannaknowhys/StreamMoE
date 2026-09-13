@@ -149,13 +149,11 @@ int g_threads = 1;
 
 static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
     size_t need = 16 * 1024 * 1024; // base + graph/overhead margin
-#ifdef STREAM_MOE_TEMP
-    // Whole-layer ownership (L2, DEBUG ONLY): the dense head/tail run as graph
-    // views of the original nodes (no clone), so the arena holds only the bucket
+    // Whole-layer ownership: the dense head/tail run as a subgraph of the
+    // original nodes (no clone), so this scratch arena holds only the bucket
     // engine's transient tensors (budgeted per MUL_MAT_ID below). Keep a small
     // per-node margin for graph/tensor overhead.
     need += (size_t) n_nodes * 2 * 1024;
-#endif
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
         if (!nd || nd->op != GGML_OP_MUL_MAT_ID) continue;
@@ -273,15 +271,11 @@ ggml_backend_buffer_type_t moe_dev_get_buffer_type(ggml_backend_dev_t dev) {
 }
 
 bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-#ifdef STREAM_MOE_TEMP
-    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2, DEBUG ONLY):
-    // accept host bufts so the scheduler keeps the layer's dense nodes on our
-    // backend (we run dense on CPU). Device bufts are NOT accepted. When
-    // whole-layer is disabled keep the strict production filtering, so the
-    // NO_WHOLE_LAYER baseline is not perturbed.
-    if (!std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") && ggml_backend_buft_is_host(buft))
-        return true;
-#endif
+    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md): accept host bufts
+    // so the scheduler keeps the layer's dense nodes on our backend (we run
+    // dense on CPU). Device bufts are NOT accepted (device path is a later
+    // milestone; device-dense layers keep the MoE-only split).
+    if (ggml_backend_buft_is_host(buft)) return true;
     auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
     if (buft == ctx->host_buft) return true;
     for (const auto& eb : ctx->expert_bufts) {
@@ -297,14 +291,12 @@ bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
     if (!op || !op->src[0] || !op->src[0]->name) return false;
     const char* n = op->src[0]->name;
     if (!n[0]) return false;
-#ifdef STREAM_MOE_TEMP
     // Whole-layer ownership: claim llama's fused ops so llama_context::resolve
     // sees device_fused == dev_layer (both StreamMoE) and keeps the fused path
     // instead of decomposing to primitive ops (deepseek4 LIGHTNING_INDEXER /
     // DSV4_HC_*, flash attention).
     if (stream_moe::route_b_whole_layer_active() && stream_moe::route_b_is_fused_op(op->op))
         return true;
-#endif
     if (op->op == GGML_OP_MUL_MAT_ID) {
         return std::strstr(n, "_exps") != nullptr;
     }

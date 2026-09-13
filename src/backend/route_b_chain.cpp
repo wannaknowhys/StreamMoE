@@ -169,6 +169,13 @@ void verify_layer_consumers(const ggml_cgraph * gf) {
 void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     if (g_layer_nodes.empty()) return;
 
+    // Token count of this build (ids ne[1]) - for the arena-size debug log.
+    int64_t n_tok = -1;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        if (nd->op == GGML_OP_MUL_MAT_ID && nd->src[2]) { n_tok = nd->src[2]->ne[1]; break; }
+    }
+
     std::unordered_map<const ggml_tensor*, int> nlayer;
     nlayer.reserve((size_t) gf->n_nodes * 2);
     for (auto & kv : g_layer_nodes_all)
@@ -316,9 +323,9 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         fflush(stderr);
     }
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
-        fprintf(stderr, "[route_b_verify] arena: carry=%zuMB compact=%zuMB closure=%zuMB total=%zuMB (carry=%zu nodes)\n",
-                carry_size / (1024*1024), compact_size / (1024*1024), closure_size / (1024*1024),
-                g_arena_cap / (1024*1024), carry.size());
+        fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry=%zu compact=%zu closure=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
+                (long long) n_tok, carry_size, compact_size, closure_size,
+                carry_size + compact_size + closure_size + 4096, g_arena_cap, carry.size());
 }
 }
 
@@ -369,11 +376,9 @@ bool route_b_in_arena(const void * p) {
 }
 
 bool route_b_whole_layer_active() {
-#ifdef STREAM_MOE_TEMP
-    return std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") == nullptr;
-#else
-    return false;
-#endif
+    // Whole-layer ownership is the production path: route B owns every compute
+    // node, the scheduler sees one split, and all activations live in our arena.
+    return true;
 }
 
 void route_b_begin_ubatch() {
@@ -515,38 +520,19 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         }
     }
 
-    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md L2): capture every
-    // compute node of each layer (dense + MoE) and assign it to our backend, so
-    // dense and MoE form ONE split and the layer's activations stay under our
+    // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md): capture every
+    // compute node of each layer (dense + MoE + anonymous) and assign it to our
+    // backend, so the whole graph is ONE split and all activations stay under our
     // control (the executor runs the dense head/tail around the MoE burst).
     // Only layers whose dense weights are host-resident are taken over: with a
     // device compute buft the executor would need the device path (later
     // milestone); device-dense layers keep the MoE-only split.
-    //
-    // DEBUG ONLY (STREAM_MOE_TEMP): L2 is not numerically correct yet (the
-    // output-token reduction path diverges), so production builds must keep the
-    // MoE-only split. The capture itself (g_layer_nodes_all) is debug-only too.
-#ifdef STREAM_MOE_TEMP
-    const bool no_whole = std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") != nullptr;
     collect_layer_nodes(gf, g_layer_nodes_all);
-    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
-        fprintf(stderr, "[route_b_verify] official layer recorded for %zu/%d nodes\n",
-                g_official_layer.size(), gf->n_nodes);
     verify_layer_consumers(gf);
-    if (!no_whole) {
+    {
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
         for (auto & kv : all) {
-            // Per-layer bisect (debug): restrict whole-layer ownership to a
-            // single layer (STREAM_MOE_TMP_WHOLE_LAYER=L) or to a prefix
-            // (STREAM_MOE_TMP_WHOLE_LAYER_MAX=N, layers <= N). Other layers
-            // keep the MoE-only split.
-            {
-                const char * wone = std::getenv("STREAM_MOE_TMP_WHOLE_LAYER");
-                const char * wmax = std::getenv("STREAM_MOE_TMP_WHOLE_LAYER_MAX");
-                if (wone && *wone && kv.first != std::atoi(wone)) continue;
-                if (wmax && *wmax && kv.first > std::atoi(wmax)) continue;
-            }
             bool dense_host = true;
             for (auto * nd : kv.second) {
                 // Check the node's own output buffer too, not just its sources.
@@ -574,10 +560,14 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             }
         }
     }
-    // R3: [carry][compact][closure] arena; every captured node points at it so
-    // the scheduler does not reserve a whole-graph compute buffer.
+    // [carry][compact][closure] arena; every captured node points at it so the
+    // scheduler does not reserve a whole-graph compute buffer.
     layout_arena(our_backend, gf);
     build_layer_plans();
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
+        fprintf(stderr, "[route_b_verify] official layer recorded for %zu/%d nodes\n",
+                g_official_layer.size(), gf->n_nodes);
 #endif
 #ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",

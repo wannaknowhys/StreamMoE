@@ -249,6 +249,27 @@ embedding（层 0 之前）和 C2 输出头（末层之后）折进层 0 / 末�
 （输入 / KV / 权重）。验证：olmoe 逐层 bisect 全 SAME；gemma SAME；DeepSeek 整层
 `-n 24` 对 baseline SAME、池退出干净（0 泄漏）；生产 `run_baseline` PASS。
 
+**已转正。** 整层路径不再受 `STREAM_MOE_TEMP` 门控：`route_b_whole_layer_active()`
+恒真、`moe_dev_supports_buft` 接受 host buft、`moe_dev_supports_op` 认领 fused op、
+capture/arena/plan 调用无条件执行。调试 dump 仍留在 `#ifdef STREAM_MOE_TEMP`。生产
+`run_baseline` 用整层执行器 PASS。
+
+**临时激活空间（arena `need`，host buft）。** 用生产构建（`STREAM_MOE_TMP_DENSE_DEBUG=1`）、
+按给定 ubatch 的 prompt prefill（`-ub N`）实测：
+
+| ubatch | olmoe | gemma | deepseek |
+| ---: | ---: | ---: | ---: |
+| 1 | ~1.0 MB | ~5.6 MB | ~9.8 MB |
+| 512 | ~0.5 GB | ~2.8 GB | ~4.1 GB |
+| 2048 | ~2.0 GB | - | - |
+
+ubatch 512 分解（carry / compact / closure）：olmoe 62/218/142 MB，
+gemma 160/2498/198 MB，deepseek 2630/1300/248 MB。arena 装下每层全部激活：
+`carry` = 所有跨层张量（不复用——DeepSeek 的残差流/hyper-connection 占大头），
+`compact` = 最坏层的 dense head/tail（gemma 的 dense MLP + C2 lm_head logits 占大头），
+`closure` = MoE 闭包块。这是当前保守布局；层内 liveness 打包、以及把 C2 logits 移出
+arena 是明显的优化点。
+
 ## 7. 验证门
 
 - 生产纯 RAM **IDENTICAL**（gemma、olmoe），走 `baseline_regression`。
