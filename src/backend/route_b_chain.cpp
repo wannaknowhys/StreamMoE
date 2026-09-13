@@ -187,6 +187,10 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             }
             bool dense_host = true;
             for (auto * nd : kv.second) {
+                // Check the node's own output buffer too, not just its sources.
+                ggml_backend_buffer_t nbuf = nd->view_src ? nd->view_src->buffer : nd->buffer;
+                if (nbuf && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(nbuf)))
+                    dense_host = false;
                 for (int s = 0; s < GGML_MAX_SRC && dense_host; ++s) {
                     const ggml_tensor * src = nd->src[s];
                     if (!src) continue;
@@ -664,13 +668,20 @@ static int name_layer_suffix(const char * name) {
         for (int i = 0; i < N; ++i) {
             if (lay[i] >= 0) continue;
             if (i > last_suffixed) continue; // C2 output head: not part of any layer
+            int first = -1, other = -1;
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 auto it = idx.find(gf->nodes[i]->src[s]);
-                if (it != idx.end() && lay[it->second] >= 0) {
-                    lay[i] = lay[it->second];
-                    changed = true;
-                    break;
-                }
+                if (it == idx.end() || lay[it->second] < 0) continue;
+                if (first < 0) first = lay[it->second];
+                else if (lay[it->second] != first) other = lay[it->second];
+            }
+            if (first >= 0) {
+                if (other >= 0)
+                    fprintf(stderr, "[route_b_verify] cross-layer anonymous node '%s': "
+                            "producers span L%d and L%d (assigned L%d)\n",
+                            gf->nodes[i]->name ? gf->nodes[i]->name : "(anon)", first, other, first);
+                lay[i] = first;
+                changed = true;
             }
         }
     }
