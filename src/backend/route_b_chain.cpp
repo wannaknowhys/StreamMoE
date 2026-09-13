@@ -964,6 +964,7 @@ bool is_view_op(const ggml_tensor * n) {
 bool is_fused_op(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_LIGHTNING_INDEXER:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_DSV4_HC_COMB:
