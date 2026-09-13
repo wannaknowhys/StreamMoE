@@ -133,7 +133,13 @@ void verify_layer_consumers(const ggml_cgraph * gf) {
             if (sit == nlayer.end()) continue;       // external / model I/O
             if (sit->second == it->second) continue;
             if (sit->second < it->second) fwd[sit->second].insert(src);
-            else                          ++backward; // consumer in an earlier layer
+            else {                        // consumer in an earlier layer
+                ++backward;
+                if (backward <= 12)
+                    fprintf(stderr, "[route_b_verify] backward: consumer L%d '%s' (%s) <- src L%d '%s' (%s)\n",
+                            it->second, nd->name ? nd->name : "?", ggml_op_name(nd->op),
+                            sit->second, src->name ? src->name : "?", ggml_op_name(src->op));
+            }
         }
     }
     for (auto & kv : fwd) {
@@ -990,27 +996,25 @@ static int name_layer_suffix(const char * name) {
     // C2, not part of that layer.
     int last_suffixed = -1;
     for (int i = 0; i < N; ++i) if (lay[i] >= 0) last_suffixed = i;
+    std::vector<char> named(N, 0);
+    for (int i = 0; i < N; ++i) if (lay[i] >= 0) named[i] = 1;
+    // Anonymous nodes inherit their producers' layer. Use the MAX producer layer:
+    // a node is built during the iteration of its LATEST producer, so it reads
+    // the current layer's nodes plus the previous layer's output (a carry). The
+    // old "first producer" rule mis-assigned such nodes to the previous layer
+    // (e.g. deepseek4 hc nodes), which made them cross-layer in the wrong way.
     bool changed = true;
     while (changed) {
         changed = false;
         for (int i = 0; i < N; ++i) {
-            if (lay[i] >= 0) continue;
+            if (named[i]) continue;
             if (i > last_suffixed) continue; // C2 output head: not part of any layer
-            int first = -1, other = -1;
+            int best = lay[i];
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 auto it = idx.find(gf->nodes[i]->src[s]);
-                if (it == idx.end() || lay[it->second] < 0) continue;
-                if (first < 0) first = lay[it->second];
-                else if (lay[it->second] != first) other = lay[it->second];
+                if (it != idx.end() && lay[it->second] >= 0) best = std::max(best, lay[it->second]);
             }
-            if (first >= 0) {
-                if (other >= 0)
-                    fprintf(stderr, "[route_b_verify] cross-layer anonymous node '%s': "
-                            "producers span L%d and L%d (assigned L%d)\n",
-                            gf->nodes[i]->name ? gf->nodes[i]->name : "(anon)", first, other, first);
-                lay[i] = first;
-                changed = true;
-            }
+            if (best != lay[i]) { lay[i] = best; changed = true; }
         }
     }
     // Out-ids narrowing (docs/LAYER_EXECUTOR_DESIGN.md 4.7): the last layer's
