@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +35,109 @@ std::map<int, std::vector<ggml_tensor*>> g_layer_nodes_all;
 // Official layer index per node, recorded from llama's graph-build callback
 // (route_b_on_node). Populated during build, cleared by moe_chain_assign_backend.
 std::unordered_map<const ggml_tensor*, int> g_official_layer;
+// Build-time layer plans (docs/LAYER_EXECUTOR_DESIGN.md 4.1).
+std::map<int, moe_layer_plan_t> g_layer_plan;
+
+// Build the per-layer plan (head / MoE / tail / moe_out) from the captured layer
+// list + the MoE closure. Same split rule as the old runtime code in
+// exec_layer_burst: tail = forward closure of ffn_moe_out inside the layer;
+// head = the rest (minus the MoE closure itself).
+void build_layer_plans() {
+    g_layer_plan.clear();
+    for (auto & kv : g_layer_nodes) {
+        const int L = kv.first;
+        const std::vector<ggml_tensor*> & lns = kv.second;
+        moe_layer_plan_t plan;
+        plan.layer = L;
+        plan.all = lns;
+        auto ex_it = g_layer_exec.find(L);
+        const moe_layer_exec_t * ex = (ex_it != g_layer_exec.end()) ? &ex_it->second : nullptr;
+        plan.moe = ex;
+
+        std::unordered_map<const ggml_tensor*, size_t> lidx;
+        lidx.reserve(lns.size() * 2);
+        for (size_t i = 0; i < lns.size(); ++i) lidx[lns[i]] = i;
+        auto in_closure = [&](const ggml_tensor * t) {
+            if (!ex) return false;
+            for (const auto * cn : ex->compute) if (cn == t) return true;
+            return false;
+        };
+
+        const ggml_tensor * out = nullptr;
+        if (ex) for (const auto * cn : ex->compute)
+            if (cn && cn->name && strstr(cn->name, "ffn_moe_out")) { out = cn; break; }
+        plan.moe_out = const_cast<ggml_tensor*>(out);
+
+        std::vector<char> down(lns.size(), 0);
+        auto seed = out ? lidx.find(out) : lidx.end();
+        if (seed != lidx.end()) down[seed->second] = 1;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t i = 0; i < lns.size(); ++i) {
+                if (down[i]) continue;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    auto pit = lidx.find(lns[i]->src[s]);
+                    if (pit != lidx.end() && down[pit->second]) { down[i] = 1; changed = true; break; }
+                }
+            }
+        }
+        for (size_t i = 0; i < lns.size(); ++i) {
+            if (in_closure(lns[i])) continue;
+            if (down[i]) plan.tail.push_back(lns[i]);
+            else         plan.head.push_back(lns[i]);
+        }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+            size_t outside = 0;
+            for (const auto * cn : (ex ? ex->compute : std::vector<ggml_tensor*>{}))
+                if (!lidx.count(cn)) ++outside;
+            if (outside)
+                fprintf(stderr, "[route_b_verify] L%d closure has %zu node(s) outside layer list (lns=%zu)\n",
+                        L, outside, lns.size());
+        }
+#endif
+        g_layer_plan[L] = std::move(plan);
+    }
+}
+
+// Consumer check (docs/ROUTE_B_LAYER_OWNERSHIP.md 3.1 Check 1): a layer's
+// intermediate must not be consumed outside the layer, except the layer output
+// consumed by the next layer. Reports layers with more than one forward
+// cross-layer source and any backward edge. Diagnostics only (no hard fail).
+void verify_layer_consumers(const ggml_cgraph * gf) {
+    std::unordered_map<const ggml_tensor*, int> nlayer;
+    nlayer.reserve((size_t) gf->n_nodes * 2);
+    for (auto & kv : g_layer_nodes_all)
+        for (auto * nd : kv.second) nlayer[nd] = kv.first;
+
+    std::map<int, std::set<const ggml_tensor*>> fwd;   // layer -> nodes consumed by a later layer
+    int backward = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        auto it = nlayer.find(nd);
+        if (it == nlayer.end()) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            auto sit = nlayer.find(src);
+            if (sit == nlayer.end()) continue;       // external / model I/O
+            if (sit->second == it->second) continue;
+            if (sit->second < it->second) fwd[sit->second].insert(src);
+            else                          ++backward; // consumer in an earlier layer
+        }
+    }
+    for (auto & kv : fwd) {
+        if (kv.second.size() > 1) {
+            fprintf(stderr, "[route_b_verify] L%d has %zu nodes consumed by later layers:",
+                    kv.first, kv.second.size());
+            for (auto * t : kv.second) fprintf(stderr, " %s", t->name ? t->name : "?");
+            fprintf(stderr, "\n");
+        }
+    }
+    if (backward)
+        fprintf(stderr, "[route_b_verify] %d backward cross-layer edge(s)\n", backward);
+}
 }
 
 void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
@@ -186,11 +290,10 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
 #ifdef STREAM_MOE_TEMP
     const bool no_whole = std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") != nullptr;
     collect_layer_nodes(gf, g_layer_nodes_all);
-#ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
         fprintf(stderr, "[route_b_verify] official layer recorded for %zu/%d nodes\n",
                 g_official_layer.size(), gf->n_nodes);
-#endif
+    verify_layer_consumers(gf);
     if (!no_whole) {
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
@@ -228,6 +331,7 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             }
         }
     }
+    build_layer_plans();
 #endif
 #ifdef STREAM_MOE_CHAIN_DEBUG
     fprintf(stderr, "[route_b_verify] chain closure: anchors=%d, %d compute nodes assigned (%zu MB)\n",
@@ -566,6 +670,11 @@ const std::vector<ggml_tensor*> * moe_chain_layer_nodes(int32_t layer) {
 const std::vector<ggml_tensor*> * moe_chain_layer_nodes_all(int32_t layer) {
     auto it = g_layer_nodes_all.find(layer);
     return it == g_layer_nodes_all.end() ? nullptr : &it->second;
+}
+
+const moe_layer_plan_t * moe_chain_layer_plan(int32_t layer) {
+    auto it = g_layer_plan.find(layer);
+    return it == g_layer_plan.end() ? nullptr : &it->second;
 }
 
 int32_t moe_chain_layer_index(int32_t layer, const ggml_tensor * node) {

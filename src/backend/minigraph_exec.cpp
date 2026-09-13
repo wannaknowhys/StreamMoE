@@ -1887,58 +1887,11 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // MoE-only path (device dense).
     std::vector<ggml_tensor*> dense_head, dense_tail;
     const std::vector<ggml_tensor*> * lns = moe_chain_layer_nodes(layer);
-    {
-        if (lns && ex) {
-            std::unordered_map<const ggml_tensor*, size_t> lidx;
-            lidx.reserve(lns->size() * 2);
-            for (size_t i = 0; i < lns->size(); ++i) lidx[(*lns)[i]] = i;
-            auto in_closure = [&](const ggml_tensor * t) {
-                for (const auto * cn : ex->compute) if (cn == t) return true;
-                return false;
-            };
-            const ggml_tensor * out = nullptr;
-            for (const auto * cn : ex->compute)
-                if (cn && cn->name && strstr(cn->name, "ffn_moe_out")) { out = cn; break; }
-            if (!out || !lidx.count(out)) {
-                LOG_ERROR("stream_moe: whole-layer L" << layer
-                          << ": ffn_moe_out not found in MoE closure/layer list; "
-                             "refusing to run (dense tail would be silently empty)");
-                return GGML_STATUS_FAILED;
-            }
-            std::vector<char> down(lns->size(), 0);
-            down[lidx.find(out)->second] = 1;
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                for (size_t i = 0; i < lns->size(); ++i) {
-                    if (down[i]) continue;
-                    const ggml_tensor * nd = (*lns)[i];
-                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                        auto pit = lidx.find(nd->src[s]);
-                        if (pit != lidx.end() && down[pit->second]) { down[i] = 1; changed = true; break; }
-                    }
-                }
-            }
-            for (size_t i = 0; i < lns->size(); ++i) {
-                ggml_tensor * nd = (*lns)[i];
-                if (in_closure(nd)) continue;
-                if (down[i]) dense_tail.push_back(nd);
-                else         dense_head.push_back(nd);
-            }
-#ifdef STREAM_MOE_TEMP
-            // Diagnostic (not a hard invariant): the MoE closure is not always a
-            // subset of the captured layer list (shared-expert / differently
-            // named nodes), so head+tail+closure != lns is expected. Report how
-            // many closure nodes fall outside the layer list.
-            if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
-                size_t outside = 0;
-                for (const auto * cn : ex->compute) if (!lidx.count(cn)) ++outside;
-                if (outside)
-                    fprintf(stderr, "[split] L%d closure has %zu node(s) outside layer list (lns=%zu)\n",
-                            layer, outside, lns->size());
-            }
-#endif
-        }
+    // Build-time plan (docs/LAYER_EXECUTOR_DESIGN.md 4.1): head/tail are computed
+    // in moe_chain_assign_backend; the executor only consumes them.
+    if (const moe_layer_plan_t * plan = moe_chain_layer_plan(layer)) {
+        dense_head = plan->head;
+        dense_tail = plan->tail;
     }
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0) {

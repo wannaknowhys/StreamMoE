@@ -114,4 +114,20 @@ const std::vector<ggml_tensor*> * moe_chain_layer_nodes(int32_t layer);
 // and the MoE-only path). Used to dump per-node contents for A/B comparison.
 const std::vector<ggml_tensor*> * moe_chain_layer_nodes_all(int32_t layer);
 
+// Build-time layer plan (docs/LAYER_EXECUTOR_DESIGN.md 4.1): the layer's node
+// sets and boundaries, computed once at graph build. Replaces the runtime
+// head/tail split heuristic in exec_layer_burst.
+struct moe_layer_plan_t {
+    int32_t layer = -1;
+    std::vector<ggml_tensor*> all;   // all layer compute nodes (graph order)
+    std::vector<ggml_tensor*> head;  // dense before the MoE input
+    std::vector<ggml_tensor*> tail;  // dense after the MoE output
+    const moe_layer_exec_t * moe = nullptr;   // MoE closure (g_layer_exec)
+    ggml_tensor * moe_out = nullptr; // ffn_moe_out anchor
+    ggml_tensor * input   = nullptr; // layer input tensor (best-effort boundary)
+    ggml_tensor * output  = nullptr; // layer output tensor (best-effort boundary)
+};
+// Plan of an assigned layer, or nullptr when the layer was not captured.
+const moe_layer_plan_t * moe_chain_layer_plan(int32_t layer);
+
 } // namespace stream_moe
