@@ -175,6 +175,16 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
         for (auto & kv : all) {
+            // Per-layer bisect (debug): restrict whole-layer ownership to a
+            // single layer (STREAM_MOE_TMP_WHOLE_LAYER=L) or to a prefix
+            // (STREAM_MOE_TMP_WHOLE_LAYER_MAX=N, layers <= N). Other layers
+            // keep the MoE-only split.
+            {
+                const char * wone = std::getenv("STREAM_MOE_TMP_WHOLE_LAYER");
+                const char * wmax = std::getenv("STREAM_MOE_TMP_WHOLE_LAYER_MAX");
+                if (wone && *wone && kv.first != std::atoi(wone)) continue;
+                if (wmax && *wmax && kv.first > std::atoi(wmax)) continue;
+            }
             bool dense_host = true;
             for (auto * nd : kv.second) {
                 for (int s = 0; s < GGML_MAX_SRC && dense_host; ++s) {
