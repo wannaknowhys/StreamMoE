@@ -31,6 +31,9 @@ std::map<int, std::vector<ggml_tensor*>> g_layer_nodes;
 // Debug-only: whole-layer capture populated on EVERY build (both paths), so the
 // executor can dump per-node contents even on the MoE-only baseline path.
 std::map<int, std::vector<ggml_tensor*>> g_layer_nodes_all;
+// Official layer index per node, recorded from llama's graph-build callback
+// (route_b_on_node). Populated during build, cleared by moe_chain_assign_backend.
+std::unordered_map<const ggml_tensor*, int> g_official_layer;
 }
 
 void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
@@ -48,6 +51,18 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes) {
         return nullptr;
     }
     return g_fullalloc_buf;
+}
+
+// Official layer attribution, fed by llama's graph-build callback (see the
+// phase-1 anchor in llama-context.cpp::graph_get_cb).
+void route_b_on_node(const ggml_tensor * node, int il) {
+    if (node) g_official_layer[node] = il;
+}
+
+int route_b_official_layer(const ggml_tensor * node) {
+    if (!node) return -1;
+    auto it = g_official_layer.find(node);
+    return it == g_official_layer.end() ? -1 : it->second;
 }
 
 namespace {
@@ -171,6 +186,11 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
 #ifdef STREAM_MOE_TEMP
     const bool no_whole = std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") != nullptr;
     collect_layer_nodes(gf, g_layer_nodes_all);
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
+        fprintf(stderr, "[route_b_verify] official layer recorded for %zu/%d nodes\n",
+                g_official_layer.size(), gf->n_nodes);
+#endif
     if (!no_whole) {
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
@@ -513,6 +533,8 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
     }
 #endif
 
+    // Consumed; clear so the next graph build starts from a clean side channel.
+    g_official_layer.clear();
     return true;
 }
 
@@ -653,8 +675,15 @@ static int name_layer_suffix(const char * name) {
     std::unordered_map<const ggml_tensor*, int> idx;
     idx.reserve((size_t) N * 2);
     for (int i = 0; i < N; ++i) {
-        lay[i] = name_layer_suffix(gf->nodes[i]->name);
-        idx[gf->nodes[i]] = i;
+        ggml_tensor * nd = gf->nodes[i];
+        const int off = route_b_official_layer(nd);
+        const int nms = name_layer_suffix(nd->name);
+        if (off >= 0 && nms >= 0 && off != nms) {
+            fprintf(stderr, "[route_b_verify] layer mismatch node='%s': official=%d name=%d\n",
+                    nd->name ? nd->name : "?", off, nms);
+        }
+        lay[i] = off >= 0 ? off : nms;   // official primary, name suffix fallback
+        idx[nd] = i;
     }
     // Producer propagation attributes anonymous in-layer nodes (node_*, the
     // per-topk adds, ...). Stop at the last suffixed node: the model output head

@@ -44,6 +44,15 @@ bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sche
 void   moe_chain_set_full_alloc(size_t layer_sum_bytes);
 void * moe_chain_fullalloc_buffer(size_t need_bytes);
 
+// Official layer attribution (docs/LAYER_EXECUTOR_DESIGN.md 4.5): llama's graph
+// build calls cb(tensor, name, il) for every named node; the phase-1 anchor in
+// llama-context.cpp::graph_get_cb forwards (tensor, il) here. Populated during
+// model.build_graph(); consumed (and cleared) by moe_chain_assign_backend.
+// The official layer index is the primary source; the "-<il>" name suffix is the
+// fallback (kept for robustness / future name-format changes).
+void route_b_on_node(const ggml_tensor * node, int il);
+int  route_b_official_layer(const ggml_tensor * node);   // -1 when unknown
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).
