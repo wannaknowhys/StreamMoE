@@ -566,9 +566,10 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
             g_layer_nodes[kv.first] = kv.second;
             for (auto * nd : kv.second) {
                 if (is_alias_op(nd)) continue;
-                // Do not force-claim fused ops (see is_fused_op): claiming one
-                // flips llama_context::resolve to the decomposed path.
-                if (is_fused_op(nd->op)) continue;
+                // Fused ops (FLASH_ATTN_EXT / LIGHTNING_INDEXER / DSV4_HC_*) are
+                // claimed too: together with llama_model::dev_layer reporting the
+                // StreamMoE device, resolve() sees device_fused == dev_layer and
+                // keeps the fused path (moe_dev_supports_op also accepts them).
                 ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
             }
         }
@@ -1342,5 +1343,7 @@ bool moe_chain_verify_graph(ggml_cgraph * gf) {
     }
     return true;
 }
+
+bool route_b_is_fused_op(enum ggml_op op) { return is_fused_op(op); }
 
 } // namespace stream_moe

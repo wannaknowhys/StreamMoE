@@ -1,6 +1,7 @@
 #include "backend/moe_backend.h"
 #include "backend/minigraph.h"
 #include "backend/minigraph_exec.h"
+#include "backend/route_b_chain.h"
 #include "backend/scheduler.h"
 #include "backend/tensor_io.h"
 #include "common/logger.h"
@@ -296,6 +297,14 @@ bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
     if (!op || !op->src[0] || !op->src[0]->name) return false;
     const char* n = op->src[0]->name;
     if (!n[0]) return false;
+#ifdef STREAM_MOE_TEMP
+    // Whole-layer ownership: claim llama's fused ops so llama_context::resolve
+    // sees device_fused == dev_layer (both StreamMoE) and keeps the fused path
+    // instead of decomposing to primitive ops (deepseek4 LIGHTNING_INDEXER /
+    // DSV4_HC_*, flash attention).
+    if (stream_moe::route_b_whole_layer_active() && stream_moe::route_b_is_fused_op(op->op))
+        return true;
+#endif
     if (op->op == GGML_OP_MUL_MAT_ID) {
         return std::strstr(n, "_exps") != nullptr;
     }

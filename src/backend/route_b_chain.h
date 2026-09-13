@@ -62,6 +62,13 @@ bool route_b_in_arena(const void * p);
 // report the layer device as the StreamMoE backend so resolve() keeps fused ops.
 bool route_b_whole_layer_active();
 
+// True for llama's fused ops (FLASH_ATTN_EXT / LIGHTNING_INDEXER / DSV4_HC_*)
+// whose fusion llama_context::resolve probes against the layer's device.
+// Whole-layer ownership claims these so resolve() sees device_fused ==
+// dev_layer (both StreamMoE) and keeps the fused path instead of decomposing
+// to primitive ops.
+bool route_b_is_fused_op(enum ggml_op op);
+
 // Debug: write a node's full bytes to <STREAM_MOE_TMP_BIN_DIR>/ub<N>/<name>.bin
 // (+ .meta). Used for offline cos comparison of whole-layer vs baseline.
 void route_b_dump_node_bin(int layer, const char * name, const char * op,
