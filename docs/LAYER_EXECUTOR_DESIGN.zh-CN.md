@@ -224,9 +224,19 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 
 **已落地（2026-09-13）：**
 - **R1** 官方层号 channel + 构建期 LayerPlan + consumer gate：`6c1c99b`、`011948b`。
+- **R2** 不 clone 的 dense 执行 + `LayerExecutionState`。dense head/tail 用**原主图节点**
+  手工拼一个 `ggml_cgraph` 执行（不再 `ggml_dup` clone）；节点列表不必在主图里连续
+  （MoE closure 与 dense head 交错，`ggml_graph_view` 连续区间不可用）。
+  `LayerExecutionState` 按 **graph_compute 调用**重置、不是按 build：llama 跨 decode
+  复用已建图（`llama-context.cpp:1379`）且不再跑 `moe_chain_assign_backend`，状态挂在
+  构建期 plan 上会一直是 COMPLETE、后续 decode 全跳过。整层路径首见即执行（不再依赖
+  "first node 恰好在这个 split"）；MoE-only 路径保留 first-node 触发。
 - **R4** 收窄节点重归到消费者层：`cb3e59d` —— **修好了 olmoe 整层发散**（bisect：L0–L14
   正常，L15 单独发散；`get_rows(inpSA, inp_out_ids)` 读上一层输出、被生产者传播归到 L14，
   于是 L14 的 tail 执行了它；重归到 L15 后整层输出与基线一致）。
+
+R2 验证：olmoe 逐层 bisect L0–L15 全部 SAME；整层全开 / `MAX=14` / `MAX=15` 全部 SAME；
+gemma 整层 SAME；生产 `StreamMoE_dump` olmoe/gemma 不变。
 
 ## 7. 验证门
 

@@ -261,12 +261,26 @@ Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 **Landed (2026-09-13):**
 - **R1** official layer channel + build-time LayerPlan + consumer gate:
   `6c1c99b`, `011948b`.
+- **R2** no-clone dense execution + `LayerExecutionState`. The dense head/tail
+  run as a hand-assembled `ggml_cgraph` over the **original** main-graph nodes
+  (no `ggml_dup` clones); the list need not be contiguous in the main graph
+  (the MoE closure interleaves with the dense head, so a `ggml_graph_view` range
+  is not usable). `LayerExecutionState` is per-`graph_compute`-call, not
+  per-build: llama reuses the built graph across decodes
+  (`llama-context.cpp:1379`) without re-running `moe_chain_assign_backend`, so a
+  state kept on the build-time plan would stay COMPLETE and skip later decodes.
+  Whole-layer layers run on first sight (no "first node in this split"
+  dependency); the MoE-only path keeps the first-node trigger.
 - **R4** out-ids narrowing re-attributed to the consumer layer: `cb3e59d` -
   **fixes the olmoe whole-layer divergence** (bisect: L0-L14 fine, L15 alone
   diverged; the narrowing `get_rows(inpSA, inp_out_ids)` reads the previous
   layer's output and was attributed to L14 by producer propagation, so L14's
   tail executed it; re-attributing it to L15 makes the whole-layer output match
   the baseline).
+
+R2 validation: olmoe per-layer bisect L0-L15 all SAME as baseline; full
+whole-layer (all layers / `MAX=14` / `MAX=15`) SAME; gemma whole-layer SAME;
+production `StreamMoE_dump` olmoe/gemma unchanged.
 
 ## 7. Validation gates
 

@@ -12,18 +12,15 @@
 
 namespace stream_moe {
 
-// Executes the MoE weight ops in `nodes` (all from our buft) for one
-// graph_compute call. `nodes` must contain GGML_OP_MUL_MAT_ID (and eventually
-// GGML_OP_MUL_MAT for shared experts). Applies the route B pin lifecycle:
-//   - split containing only non-down nodes -> pin experts (no release)
-//   - split containing a down node -> wait_ready, then release after compute
+// Executes the privatised layer nodes of `cgraph` (all from our buft) for one
+// graph_compute call. The dense head/tail runs as a range of the ORIGINAL graph
+// nodes (ggml_graph_view) - no clone graph. Applies the route B pin lifecycle.
 // Returns ggml status.
 enum ggml_status moe_exec_mul_mat_id(
+    ggml_cgraph* cgraph,
     ggml_context* arena_ctx,
     ggml_backend_t cpu_backend,
     expert_scheduler& sched,
-    const ggml_tensor* const* nodes,
-    int n_nodes,
     int n_threads);
 
 } // namespace stream_moe

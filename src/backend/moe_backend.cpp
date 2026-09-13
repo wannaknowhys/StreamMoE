@@ -150,10 +150,11 @@ int g_threads = 1;
 static size_t estimate_scratch(const ggml_tensor* const* nodes, int n_nodes) {
     size_t need = 16 * 1024 * 1024; // base + graph/overhead margin
 #ifdef STREAM_MOE_TEMP
-    // Whole-layer ownership (L2, DEBUG ONLY): the executor clones the dense
-    // head/tail nodes into the arena ctx (tensor + up to GGML_MAX_SRC data leaves
-    // + a graph per run). Budget a generous per-node allowance.
-    need += (size_t) n_nodes * 16 * 1024;
+    // Whole-layer ownership (L2, DEBUG ONLY): the dense head/tail run as graph
+    // views of the original nodes (no clone), so the arena holds only the bucket
+    // engine's transient tensors (budgeted per MUL_MAT_ID below). Keep a small
+    // per-node margin for graph/tensor overhead.
+    need += (size_t) n_nodes * 2 * 1024;
 #endif
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* nd = nodes[i];
@@ -262,8 +263,7 @@ ggml_backend_t moe_dev_init_backend(ggml_backend_dev_t dev, const char*) {
 #endif
         if (!bctx->arena.reset()) return GGML_STATUS_FAILED;
 
-        return moe_exec_mul_mat_id(bctx->arena.ctx(), bctx->cpu, *sched,
-                                   nodes.data(), static_cast<int>(nodes.size()), g_threads);
+        return moe_exec_mul_mat_id(cgraph, bctx->arena.ctx(), bctx->cpu, *sched, g_threads);
     };
     return backend;
 }
