@@ -281,7 +281,7 @@ index e9fe3592d..1149ae5af 100644
      };
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c34700ff5..66f17d01f 100644
+index c34700ff5..d7a7de255 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -5,6 +5,10 @@
@@ -290,7 +290,7 @@ index c34700ff5..66f17d01f 100644
  #include "llama-mmap.h"
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "tsc_timer.h"
-+namespace stream_moe { const char * route_b_dense_device(const char * spec, int il, int n_layer_all); }
++namespace stream_moe { const char * route_b_dense_device(const char * spec, int il, int n_layer_all); bool route_b_whole_layer_active(); }
 +#endif
  #include "llama-cparams.h"
  #include "llama-model-loader.h"
@@ -329,7 +329,22 @@ index c34700ff5..66f17d01f 100644
          if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
              LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
              return {cpu_dev, &pimpl->cpu_buft_list};
-@@ -2633,6 +2657,9 @@ llama_model_params llama_model_default_params() {
+@@ -2089,6 +2113,14 @@ void llama_model::print_info() const {
+ }
+ 
+ ggml_backend_dev_t llama_model::dev_layer(int il) const {
++#ifdef STREAM_MOE_ROUTE_B
++    // Whole-layer (debug): report the StreamMoE backend as the layer device so
++    // llama_context::resolve sees a consistent device and keeps fused ops.
++    if (stream_moe::route_b_whole_layer_active()) {
++        ggml_backend_dev_t d = ggml_backend_dev_by_name("STREAMMOE");
++        if (d) return d;
++    }
++#endif
+     return pimpl->dev_layer.at(il).dev;
+ }
+ 
+@@ -2633,6 +2665,9 @@ llama_model_params llama_model_default_params() {
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,

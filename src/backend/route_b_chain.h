@@ -57,6 +57,11 @@ int  route_b_official_layer(const ggml_tensor * node);   // -1 when unknown
 // that the scheduler did not overwrite pre-allocated node data.
 bool route_b_in_arena(const void * p);
 
+// True when the debug whole-layer path is active (STREAM_MOE_TEMP build, not
+// disabled by STREAM_MOE_TMP_NO_WHOLE_LAYER). Used by llama_model::dev_layer to
+// report the layer device as the StreamMoE backend so resolve() keeps fused ops.
+bool route_b_whole_layer_active();
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).

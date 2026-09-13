@@ -362,6 +362,14 @@ bool route_b_in_arena(const void * p) {
     return q >= base && q < base + g_arena_cap;
 }
 
+bool route_b_whole_layer_active() {
+#ifdef STREAM_MOE_TEMP
+    return std::getenv("STREAM_MOE_TMP_NO_WHOLE_LAYER") == nullptr;
+#else
+    return false;
+#endif
+}
+
 namespace {
 // Forward declarations (definitions live further down the file).
 bool is_routed_mm(const ggml_tensor * n);
