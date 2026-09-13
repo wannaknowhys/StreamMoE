@@ -238,6 +238,17 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 R2 验证：olmoe 逐层 bisect L0–L15 全部 SAME；整层全开 / `MAX=14` / `MAX=15` 全部 SAME；
 gemma 整层 SAME；生产 `StreamMoE_dump` olmoe/gemma 不变。
 
+**R1 归属改造 —— 所有 compute 节点无条件收归（修好 DeepSeek 整层）。** 原来的部分归属
+在 producer 是 leaf/输入时会漏掉匿名 compute 节点（如 DeepSeek 的 `-INF` attention mask
+FILL）。这些节点留在 scheduler 的 buffer 池里，`ggml_gallocr` 把一块仍被图输入
+（`k_idxs`）使用的地址复用给了它，于是 mask FILL 覆盖了 KV 槽索引，末层 `set_rows` 断言。
+`collect_layer_nodes` 现在把**每个 compute 节点**都归属：named → 层；producer 传播
+（MAX producer 层）；**consumer 传播**（无归属匿名 → consumer 的层）；最近层兜底。
+不再有任何 un-owned compute 节点，整图 = 一个 split、所有激活在我们的 arena。这同时把
+embedding（层 0 之前）和 C2 输出头（末层之后）折进层 0 / 末层，scheduler 只管叶子
+（输入 / KV / 权重）。验证：olmoe 逐层 bisect 全 SAME；gemma SAME；DeepSeek 整层
+`-n 24` 对 baseline SAME、池退出干净（0 泄漏）；生产 `run_baseline` PASS。
+
 ## 7. 验证门
 
 - 生产纯 RAM **IDENTICAL**（gemma、olmoe），走 `baseline_regression`。

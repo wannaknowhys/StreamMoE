@@ -282,6 +282,22 @@ R2 validation: olmoe per-layer bisect L0-L15 all SAME as baseline; full
 whole-layer (all layers / `MAX=14` / `MAX=15`) SAME; gemma whole-layer SAME;
 production `StreamMoE_dump` olmoe/gemma unchanged.
 
+**R1 attribution - own every compute node (fixes DeepSeek whole-layer).** The
+partial attribution left anonymous compute nodes unowned when their producer was
+a leaf/input (e.g. the DeepSeek `-INF` attention-mask FILL). Those nodes stayed
+in the scheduler's buffer pool, and `ggml_gallocr` reused an address that was
+also live as a graph input (`k_idxs`), so the mask FILL overwrote the KV slot
+indices and the last layer's `set_rows` asserted. `collect_layer_nodes` now
+attributes every compute node: named -> layer; producer propagation (MAX
+producer layer); **consumer propagation** (unowned anonymous -> consumer's
+layer); nearest-layer fallback. No compute node is left unowned, so the whole
+graph is one split and all activations live in our arena. This also folds the
+embedding (pre-layer-0) and the C2 output head (post-last-layer) into layer 0 /
+the last layer, so the scheduler only manages leaves (inputs / KV / weights).
+Validation: olmoe per-layer bisect all SAME; gemma SAME; DeepSeek whole-layer
+`-n 24` SAME vs baseline with a clean pool exit (0 leaks); production
+`run_baseline` PASS.
+
 ## 7. Validation gates
 
 - Production pure-RAM **IDENTICAL** (gemma, olmoe) via `baseline_regression`.

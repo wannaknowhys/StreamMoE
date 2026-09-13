@@ -1057,31 +1057,68 @@ static int name_layer_suffix(const char * name) {
         lay[i] = off >= 0 ? off : nms;   // official primary, name suffix fallback
         idx[nd] = i;
     }
-    // Producer propagation attributes anonymous in-layer nodes (node_*, the
-    // per-topk adds, ...). Stop at the last suffixed node: the model output head
-    // (result_norm / result_output) depends on the last layer's output but is
-    // C2, not part of that layer.
-    int last_suffixed = -1;
-    for (int i = 0; i < N; ++i) if (lay[i] >= 0) last_suffixed = i;
+    // Whole-layer ownership: every COMPUTE node must belong to a layer, so the
+    // scheduler leaves us the whole graph (one split) and no node is left in the
+    // scheduler's buffer pool (that gap caused a mask FILL / k_idxs address
+    // collision). docs/LAYER_EXECUTOR_DESIGN.md 4.1.
     std::vector<char> named(N, 0);
     for (int i = 0; i < N; ++i) if (lay[i] >= 0) named[i] = 1;
-    // Anonymous nodes inherit their producers' layer. Use the MAX producer layer:
-    // a node is built during the iteration of its LATEST producer, so it reads
-    // the current layer's nodes plus the previous layer's output (a carry). The
-    // old "first producer" rule mis-assigned such nodes to the previous layer
-    // (e.g. deepseek4 hc nodes), which made them cross-layer in the wrong way.
+    // 1. Producer propagation: anonymous nodes inherit their producers' layer.
+    //    Use the MAX producer layer: a node is built during the iteration of its
+    //    LATEST producer, so it reads the current layer's nodes plus the previous
+    //    layer's output (a carry). The old "first producer" rule mis-assigned
+    //    such nodes to the previous layer (e.g. deepseek4 hc nodes).
     bool changed = true;
     while (changed) {
         changed = false;
         for (int i = 0; i < N; ++i) {
             if (named[i]) continue;
-            if (i > last_suffixed) continue; // C2 output head: not part of any layer
             int best = lay[i];
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 auto it = idx.find(gf->nodes[i]->src[s]);
                 if (it != idx.end() && lay[it->second] >= 0) best = std::max(best, lay[it->second]);
             }
             if (best != lay[i]) { lay[i] = best; changed = true; }
+        }
+    }
+    // 2. Consumer propagation: an unowned compute node inherits its consumers'
+    //    layer. Captures in-layer anonymous compute whose producer is a leaf or
+    //    graph input (e.g. the -INF attention-mask FILL), which producer
+    //    propagation cannot attribute.
+    {
+        std::unordered_map<const ggml_tensor*, std::vector<int>> consumers;
+        consumers.reserve((size_t) N * 2);
+        for (int i = 0; i < N; ++i)
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = gf->nodes[i]->src[s];
+                if (src) consumers[src].push_back(i);
+            }
+        bool ch = true;
+        while (ch) {
+            ch = false;
+            for (int i = 0; i < N; ++i) {
+                if (lay[i] >= 0 || gf->nodes[i]->op == GGML_OP_NONE) continue;
+                int best = -1;
+                auto it = consumers.find(gf->nodes[i]);
+                if (it != consumers.end())
+                    for (int c : it->second) if (lay[c] >= 0) best = std::max(best, lay[c]);
+                if (best >= 0) { lay[i] = best; ch = true; }
+            }
+        }
+    }
+    // 3. Fallback: any still-unowned compute node takes the nearest owned layer
+    //    (prefer the preceding one, else the following one). No compute node is
+    //    left unowned.
+    {
+        int cur = -1;
+        for (int i = 0; i < N; ++i) {
+            if (lay[i] >= 0) cur = lay[i];
+            else if (gf->nodes[i]->op != GGML_OP_NONE && cur >= 0) lay[i] = cur;
+        }
+        cur = -1;
+        for (int i = N - 1; i >= 0; --i) {
+            if (lay[i] >= 0) cur = lay[i];
+            else if (gf->nodes[i]->op != GGML_OP_NONE && cur >= 0) lay[i] = cur;
         }
     }
     // Out-ids narrowing (docs/LAYER_EXECUTOR_DESIGN.md 4.7): the last layer's
