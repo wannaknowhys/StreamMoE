@@ -195,6 +195,48 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
     }
 
+    // Carry distance analysis: for each cross-layer tensor, the max consumer
+    // layer minus its own layer. distance 1 = pipeline (reusable across layers);
+    // distance > 1 = must be retained (cross-N). DEBUG: report the split.
+    std::unordered_map<const ggml_tensor*, int> max_consumer;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        auto it = nlayer.find(nd);
+        if (it == nlayer.end()) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            auto sit = nlayer.find(src);
+            if (sit == nlayer.end() || sit->second == it->second) continue;
+            auto & m = max_consumer[src];
+            if (m < it->second) m = it->second;
+        }
+    }
+    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+        size_t c1_b = 0, cN_b = 0, c1_max = 0;
+        int c1_n = 0, cN_n = 0;
+        for (const ggml_tensor * nd : carry) {
+            if (nd->view_src) continue;
+            auto cit = nlayer.find(nd);
+            auto mit = max_consumer.find(nd);
+            if (cit == nlayer.end() || mit == max_consumer.end()) continue;
+            const size_t nb = ggml_nbytes(nd);
+            if (mit->second - cit->second <= 1) { ++c1_n; c1_b += nb; if (nb > c1_max) c1_max = nb; }
+            else                                  { ++cN_n; cN_b += nb; }
+        }
+        fprintf(stderr, "[route_b_verify] carry: cross-1 n=%d bytes=%zu (max=%zu) | cross-N n=%d bytes=%zu\n",
+                c1_n, c1_b, c1_max, cN_n, cN_b);
+        for (const ggml_tensor * nd : carry) {
+            if (nd->view_src) continue;
+            auto cit = nlayer.find(nd);
+            auto mit = max_consumer.find(nd);
+            if (cit == nlayer.end() || mit == max_consumer.end()) continue;
+            if (mit->second - cit->second > 1)
+                fprintf(stderr, "[route_b_verify]   cross-N '%s' L%d -> L%d sz=%zu\n",
+                        nd->name ? nd->name : "?", cit->second, mit->second, ggml_nbytes(nd));
+        }
+    }
+
     size_t carry_size = 0;
     std::unordered_map<const ggml_tensor*, size_t> carry_off;
     for (auto & kv : g_layer_nodes)
