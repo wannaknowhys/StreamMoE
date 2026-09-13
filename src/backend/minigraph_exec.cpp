@@ -156,6 +156,24 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
     return ggml_backend_graph_compute(backend, g);
 }
 
+#ifdef STREAM_MOE_TEMP
+// Mid-layer node dump (STREAM_MOE_TMP_STAGE_DUMP=1): FNV hash of each node's
+// current bytes, tagged with the execution stage, so a live node that gets
+// overwritten can be spotted before the layer ends.
+static void dump_node_hash(int layer, const char * stage, const std::vector<ggml_tensor*> & list) {
+    if (!std::getenv("STREAM_MOE_TMP_STAGE_DUMP")) return;
+    for (ggml_tensor * nd : list) {
+        if (!nd || is_alias_op(nd) || !nd->data) continue;
+        const size_t nb = ggml_nbytes(nd);
+        const uint8_t * bp = (const uint8_t *) nd->data;
+        uint64_t h = 1469598103934665603ull;
+        for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
+        fprintf(stderr, "[stage] %-5s L%d %-26s %-12s %016llx\n", stage, layer,
+                nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h);
+    }
+}
+#endif
+
 
 // Slot of a pinned (layer, expert), or -1.
 static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer, uint32_t expert) {
@@ -1852,6 +1870,9 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
     }
 #ifdef STREAM_MOE_TEMP
+    dump_node_hash(layer, "head", dense_head);
+#endif
+#ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0 && ex) {
         for (const auto * cn : ex->compute) {
             if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[1] && cn->src[1]->data) {
@@ -1951,12 +1972,18 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // The compact-chain bucket engine is the only executor: a full-width single
     // bucket by default (no env), or an env-selected multi-bucket cut.
     const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
+#ifdef STREAM_MOE_TEMP
+    dump_node_hash(layer, "moe", dense_head);   // head nodes still live at the tail?
+#endif
     // L2 whole-layer ownership: run the dense tail (residual / post-norm / dense
     // MLP) after moe_out is materialised.
     if (st == GGML_STATUS_SUCCESS && !dense_tail.empty()) {
         const enum ggml_status tst = run_dense_subgraph(ctx, cpu, dense_tail);
         if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
     }
+#ifdef STREAM_MOE_TEMP
+    dump_node_hash(layer, "tail", dense_tail);
+#endif
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer >= 0) {
         const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);

@@ -357,6 +357,13 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
         compact_size = std::max(compact_size, lb);
         for (size_t k = 0; k < cns.size(); ++k) compact_off[cns[k]] = (size_t) o[k];
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && kv.first == 0) {
+            for (size_t k = 0; k < cns.size(); ++k)
+                fprintf(stderr, "[cpack] L0 %-24s start=%d end=%d off=%lld sz=%zu\n",
+                        cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]));
+        }
+#endif
     }
 
     // closure block: max over layers of the executor's need (result_bytes when
