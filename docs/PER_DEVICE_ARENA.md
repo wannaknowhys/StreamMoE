@@ -174,15 +174,39 @@ superseded. (An even earlier "RelWithDebInfo sum == pack, 0 diffs" result was an
 artifact - every dbg run had `STREAM_MOE_TMP_COMPACT_PACK` set, so its "sum" runs
 were really pack runs.)
 
-Next: snapshot `embd` / `hidden` at their real compute time (or exclude exported
-tensors from arena reuse) so the prefill regression is valid with pack on.
+**Root cause of the stale read (found 2026-09-14).** With `cb_eval` installed the
+scheduler stops computing a split as a whole and walks it **node by node**
+(`ggml-backend.cpp:1747`), because the export callback returned `true` for every
+node. Under whole-layer ownership each 1-node view makes route B run the whole
+layer containing it (`exec_state` is per graph_compute call), so export mode was
+~8x slower (measured: prompt 4.2 -> 0.5 t/s) and the capture fired after the layer
+had already reused the slot.
+
+**Fix - LANDED (2026-09-14).**
+1. The export callback now returns `true` only for the tensors it actually reads
+   (`embd` / `hidden` / `logits` / routed `MUL_MAT_ID` ids), so the scheduler only
+   chunks at those points and route B runs a layer about once. Export overhead is
+   back to ~1.4x (prompt 4.3 -> 3.3 t/s; the residual is the per-layer MoE cut).
+2. Those tensors are declared to route B (`route_b_set_export_retained`) before
+   the layer capture, and `layout_arena` keeps them out of the reuse pool (pulled
+   into the retained `carryN` region). A post-split read then sees the computed
+   value. The expert-history ids need this too (their last-layer ids were reused
+   by the tail).
+
+Gated on `STREAM_MOE_PREFILL_EXPORT` (the callback) and on
+`STREAM_MOE_ROUTE_B && STREAM_MOE_PREFILL_EXPORT` (the retain API), so no code is
+compiled where it cannot be used.
+
+Verified (gemma v2, 129-token prefill-from, `StreamMoE_latest`, pack default ON):
+exported `embd` / `hidden` / KV and the expert history are **IDENTICAL** pack vs
+sum; top-4 logits stay bit-identical; pack matches the `moe_129_8192_vk` gate;
+production `run_baseline` (`StreamMoE_dump`, pack off) still PASS.
 
 **Repro.** Build `build.bat llamalibs StreamMoE_latest`, then the 129-token
-prefill-from with no env takes the packed path and `=0` takes byte sum. The
-exported `embd` differs, but the top-4 logits (the real output) do not - check
-both with `baseline_regression/tools/verify_prefill.js` and a top-4 comparator.
-For the `[cpack]` offset plan / `[stage]` node values use `StreamMoE_dump_dbg`
-(+ `STREAM_MOE_TMP_STAGE_DUMP=1 STREAM_MOE_TMP_COMPACT_DEBUG=1`).
+prefill-from with no env takes the packed path and `=0` takes byte sum; both now
+produce identical exports. For the `[cpack]` offset plan / `[stage]` node values
+use `StreamMoE_dump_dbg` (+ `STREAM_MOE_TMP_STAGE_DUMP=1
+STREAM_MOE_TMP_COMPACT_DEBUG=1`).
 
 ## 8. Open questions
 

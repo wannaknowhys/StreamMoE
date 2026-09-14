@@ -150,13 +150,31 @@ gemma 160 MB → ~11 MB。闭包块也降（olmoe ub1 278528 → 131072 B）。�
 "打包是坏的"结论作废。（更早的 "RelWithDebInfo sum == pack，0 diff" 也是假象：所有
 dbg 运行都开着 `STREAM_MOE_TMP_COMPACT_PACK`，其"sum"跑其实就是 pack 跑。）
 
-下一步：让导出在**真实计算时刻**快照 `embd` / `hidden`（或把导出张量排除出 arena 复用），
-使 pack 开时 prefill 回归重新有效。
+**读到陈旧值的根因（2026-09-14 定位）。** 装了 `cb_eval` 后，sched 不再整段算一个 split，
+而是**逐节点**走（`ggml-backend.cpp:1747`）——因为导出回调对所有节点都返回 `true`。
+整层拥有下每个 1-node view 都让 route B 把它所在整层跑一遍（`exec_state` 是 per
+graph_compute call 的），所以导出模式慢 ~8x（实测 prompt 4.2 → 0.5 t/s），且捕获发生在
+整层已复用槽之后。
+
+**修复 —— 已落地（2026-09-14）。**
+1. 导出回调只对它真正读取的张量（`embd` / `hidden` / `logits` / 路由 `MUL_MAT_ID` 的
+   ids）返回 `true`，于是 sched 只在那些点切块、route B 基本每层跑一次。导出开销回到
+   ~1.4x（prompt 4.3 → 3.3 t/s；剩余来自每层的 MoE 切点）。
+2. 这些张量在层捕获前声明给 route B（`route_b_set_export_retained`），`layout_arena`
+   把它们移出复用池（并入保留区 `carryN`）。于是 split 之后的读能看到算出来的值。
+   expert 历史的 ids 也需要（它最后一层的 ids 会被 tail 复用）。
+
+门控：回调挂 `STREAM_MOE_PREFILL_EXPORT`，保留 API 挂
+`STREAM_MOE_ROUTE_B && STREAM_MOE_PREFILL_EXPORT`，用不到的地方不编译。
+
+验证（gemma v2、129-token prefill-from、`StreamMoE_latest`、pack 默认开）：导出的
+`embd` / `hidden` / KV 与 expert history 在 pack vs sum 下 **IDENTICAL**；top-4 logits
+仍逐位相同；pack 对 `moe_129_8192_vk` gate 通过；生产 `run_baseline`（`StreamMoE_dump`，
+pack 关）仍 PASS。
 
 **复现。** `build.bat llamalibs StreamMoE_latest` 后跑 129-token prefill-from：不带 env
-走打包路径、`=0` 走字节求和。导出的 `embd` 会不同，但 top-4 logits（真正的输出）不会
-—— 用 `baseline_regression/tools/verify_prefill.js` 和一个 top-4 对比脚本一起看。
-要看 `[cpack]` offset 计划 / `[stage]` 节点值用 `StreamMoE_dump_dbg`
+走打包路径、`=0` 走字节求和；两者现在产物完全一致。要看 `[cpack]` offset 计划 /
+`[stage]` 节点值用 `StreamMoE_dump_dbg`
 （+ `STREAM_MOE_TMP_STAGE_DUMP=1 STREAM_MOE_TMP_COMPACT_DEBUG=1`）。
 
 ## 8. 待定问题
