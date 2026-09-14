@@ -165,3 +165,20 @@ build\<tag>\
 - **debug 代码永不进正式源码/patch**：临时调试打印做成独立 debug patch（`temp/debug-*.patch`，gitignored）——apply → 编译 debug → 用后 `apply -R` 还原，工作区永远回正式态。
 - **三层隔离**：源码 = 正式态（patch apply 后可重放）、patch = 正式功能差异、binary = tag 隔离（正式 vs `_debug`）。
 - **可复现**：正式 binary 必须能由"干净 patch 序列 + 编译"精确复现；对比实验固定 binary 只变输入（否则无法归因）。
+
+### 最新功能构建：latest vs dbg（2026-09-14）
+
+配套 `AGENTS.md` 第 15 条（**新功能遇 bug 严禁回滚，只前进不后退**）。in-progress 功能
+（如 compact 区间打包）在 `STREAM_MOE_LATEST` 下**默认开**，不再默认 gate off。
+
+| tag | 宏 | 新功能 | dbg dump/print | 用途 |
+| :-- | :-- | :-- | :-- | :-- |
+| `StreamMoE_dump` | 无 | 关（opt-in） | 无 | 稳定生产（`run_baseline` 必须绿） |
+| `StreamMoE_latest` | `STREAM_MOE_LATEST` | **默认开** | 无 | 体验/复现 bug 态（干净、无日志噪音） |
+| `StreamMoE_dump_dbg` | `STREAM_MOE_LATEST` + `STREAM_MOE_TEMP` | **默认开** | 有 | 体验 bug 态 + 诊断 dump/print |
+
+- `latest` 与 `dbg` 是同一个"最新功能"构建，**唯一区别**是 `dbg` 带 `STREAM_MOE_TEMP`
+  诊断代码（`[stage]`/`[cpack]`/`[one]` 等）。
+- 两者都用 RelWithDebInfo（`/O2 /Ob1 /Zi`，数值 ≈ Release）。
+- 诊断代码永远 `#ifdef STREAM_MOE_TEMP` 门控，只有 `dbg` 编进去；`latest` 编出的
+  binary 不含任何 dump/print。

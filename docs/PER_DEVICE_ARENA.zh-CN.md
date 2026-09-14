@@ -121,10 +121,58 @@ ubatch 512 实测（生产构建）：deepseek carry 2630 MB → ~67 MB，olmoe 
 gemma 160 MB → ~11 MB。闭包块也降（olmoe ub1 278528 → 131072 B）。验证：生产
 `run_baseline` PASS；olmoe / gemma / deepseek 整层 OK。
 
-**compact 打包：已实现但默认关闭**（`STREAM_MOE_TMP_COMPACT_PACK`，默认关 = 字节求和）。
-区间打包本身正确（自检：时间区间重叠的节点不共享字节），但 liveness 模型仍会让某个
-存活节点被覆盖，执行器崩。确切原因未定：执行时间轴（head → 闭包屏障 → tail）已建模，
-但仍有某对同时存活的节点共享了槽。未解决前 compact 区保持字节求和。
+**compact 打包：已实现、已确认是坏的、且在最新功能构建里保持默认开。** 生产
+`StreamMoE_dump` 保持 opt-in（`STREAM_MOE_TMP_COMPACT_PACK`，默认关 = 字节求和），
+回归保持绿；最新功能构建 `StreamMoE_latest` / `StreamMoE_dump_dbg` 默认**开**（按
+`AGENTS.md` 15：已落地的功能绝不回滚），让 bug 保持可复现；在那里 `=0` 可关。
+
+生产构建（`StreamMoE_dump`）gemma v2、129-token prefill-from、8 GB 池、ubatch 512，
+对 `moe_129_8192_vk` 基线实测：
+
+| compact 布局 | embd cos（token 0） | gate（>=0.99） |
+| :-- | --: | :-- |
+| 字节求和（默认） | 0.98631 | 121/129 PASS |
+| 区间打包（`=1`） | 0.01568 | 0/129 FAIL |
+
+即打包后的 compact 区会损坏输出。本轮排查已确定：
+
+- **区间打包本身不是元凶。** `[cpack]` plan 自检报告：无任何时间区间重叠的节点共享
+  字节；首个损坏节点（L0 head 的 `inp_scaled`）位于**独占** offset（`off=131072`），
+  没有任何其他节点用它 —— 不是"重叠覆盖"。
+- **liveness 模型不是（全部）原因。** `layout_arena` 把执行时间轴建模为
+  `head → 闭包屏障 → tail`，并合法地把死节点的槽给更晚的节点复用（`embd` end=1 /
+  `norm-0` start=2 共享 `off=0`）。该复用按模型合法，但打包运行在**独占槽**上也读到了
+  陈旧值（`inp_scaled = SCALE(embd)` 既不是正确 `embd`，也不是覆盖者的值）。
+- **已排除 CPU 融合。** 手搓 cgraph（`run_dense_subgraph`）从不填
+  `visited_hash_set`/`use_counts`，`ggml_cpu_try_fuse_ops` 看到 `use_count=0`，不融合。
+  `GGML_TENSOR_FLAG_COMPUTE` 也已被主图 build 置位，无节点被跳过。
+
+**注意 —— debug 构建在此不可作为判据。** 早前"RelWithDebInfo sum == pack，0 diff"
+的结论是假象：所有 `StreamMoE_dump_dbg` 运行实际上都开着
+`STREAM_MOE_TMP_COMPACT_PACK`（全部 `[cpack]` 日志都是打包 offset，如
+`inp_scaled off=131072`），其"sum"跑其实就是 pack 跑。生产构建才正确遵守该 env
+（`sum → off=45056` 顺序、`pack → off=131072` 复用）。本问题一律用生产构建排查。
+
+下一步：在**生产**构建上、同一 ubatch 做 1-node vs multi-node 对比（dump 手搓 cgraph
+的真实执行顺序，与 `plan->head` 对照），判断损坏在打包还是多节点 CPU 执行。
+
+**复现（bug 态）。** `build.bat llamalibs StreamMoE_latest` 后跑 129-token
+prefill-from：不带 env 就走坏的打包路径（`embd cos 0.01568`），带
+`STREAM_MOE_TMP_COMPACT_PACK=0` 走字节求和（`cos 0.98631`）。对 vk 基线验证：
+
+```bat
+build\StreamMoE_latest\llama-build\bin\llama-server.exe ^
+  -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf ^
+  --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin ^
+  --export-dir baseline_regression\temp_latest\moe ^
+  -c 2048 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup
+node baseline_regression\tools\verify_prefill.js ^
+  baseline_regression\baseline\moe_129_8192_vk\prefill_export_main.bin ^
+  baseline_regression\temp_latest\moe\prefill_export_main.bin --cos-floor 0.99 --min-ratio 0.9
+```
+
+要看 `[cpack]` offset 计划 / `[stage]` 节点值用 `StreamMoE_dump_dbg`
+（+ `STREAM_MOE_TMP_STAGE_DUMP=1 STREAM_MOE_TMP_COMPACT_DEBUG=1`）。
 
 ## 8. 待定问题
 
