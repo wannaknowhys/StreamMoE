@@ -141,68 +141,46 @@ olmoe 62 MB -> ~0.25 MB, gemma 160 MB -> ~11 MB. The closure block also drops
 (olmoe ub1 278528 -> 131072 B). Verified: production `run_baseline` PASS;
 olmoe / gemma / deepseek whole-layer OK.
 
-**Compact pack: implemented, CONFIRMED BROKEN, and kept ON in the latest build.**
+**Compact pack: NOT a math bug - it breaks the `--prefill-from` export capture.**
 Production `StreamMoE_dump` keeps it opt-in (`STREAM_MOE_TMP_COMPACT_PACK`,
-default off = byte sum) so its regression stays green. The latest-features build
-`StreamMoE_latest` / `StreamMoE_dump_dbg` defaults it **ON** (per `AGENTS.md` 15:
-a landed feature is never rolled back) so the bug stays reproducible;
-`STREAM_MOE_TMP_COMPACT_PACK=0` opts out there.
+default off = byte sum); the latest build `StreamMoE_latest` / `StreamMoE_dump_dbg`
+defaults it ON (`AGENTS.md` 15), `=0` opts out.
 
-Measured with the production build (`StreamMoE_dump`) on gemma v2, 129-token
-prefill-from, 8 GB pool, ubatch 512, against the `moe_129_8192_vk` baseline:
+Measured (gemma v2, 129-token prefill-from, 8 GB pool, vs `moe_129_8192_vk`):
 
-| compact layout | embd cos (token 0) | gate (>=0.99) |
+| compact layout | exported embd cos (tok 0) | top-4 logits |
 | :-- | --: | :-- |
-| byte sum (default) | 0.98631 | 121/129 PASS |
-| interval pack (`=1`) | 0.01568 | 0/129 FAIL |
+| byte sum (default) | 0.98631 | identical |
+| interval pack (`=1`) | 0.01568 | identical |
 
-So the packed compact region corrupts the output. What the investigation has
-established:
+The interval-pack "FAIL" is an **export artifact, not an inference bug**:
 
-- **The interval packing is not the fault.** The `[cpack]` plan self-check
-  reports no two overlapping-interval nodes sharing bytes, and the first
-  corrupted node (`inp_scaled`, L0 head) sits at an **exclusive** offset
-  (`off=131072`) that no other node uses - it is not an overwrite-by-overlap.
-- **The liveness model is not the (whole) story.** `layout_arena` models the
-  execution time axis as `head -> closure barrier -> tail`, and legally reuses a
-  dead node's slot for a later node (`embd` end=1 / `norm-0` start=2 share
-  `off=0`). That reuse is fine per the model, yet the packed run also reads a
-  stale value at an exclusive slot (`inp_scaled` = `SCALE(embd)` gets neither the
-  correct `embd` nor the overwriter's value).
-- **CPU fusion is ruled out.** The hand-assembled cgraph (`run_dense_subgraph`)
-  never populates `visited_hash_set`/`use_counts`, so `ggml_cpu_try_fuse_ops`
-  sees `use_count=0` and fuses nothing. `GGML_TENSOR_FLAG_COMPUTE` is also
-  already set by the main graph build, so no node is skipped.
+- **Generation is unaffected.** `llama-cli` with pack ON and pack OFF produces
+  the same output token-for-token (temp 0: identical "Paris." completion).
+- **The model output is identical.** The exported top-4 logits + logsumexp are
+  **bit-identical** pack vs sum (0/129 id mismatches, maxLogitDiff = 0,
+  maxLseDiff = 0). The KV caches are identical too (base + swa, 0 diffs).
+- **Only the exported `embd` / `hidden` differ.** `embd` is `t_embd` - the input
+  token embeddings, deterministic from the token ids, so it *cannot* legitimately
+  differ. Under whole-layer ownership it is a layer-0 node in the arena, and
+  compact packing reuses its slot for a later L0 node: `embd` and `norm-0` share
+  `off=0` / the same `data=` pointer (`[cpack]` / `[stage]`), while byte sum
+  gives every node a unique slot. The export reads the slot **after** route B has
+  already reused it, so it captures the overwriter's value.
 
-**Caution - the debug build is not a valid oracle here.** An earlier result
-("RelWithDebInfo sum == pack, 0 diffs") was an artifact: every
-`StreamMoE_dump_dbg` run had `STREAM_MOE_TMP_COMPACT_PACK` effectively set (all
-`[cpack]` logs show packed offsets, e.g. `inp_scaled off=131072`), so its "sum"
-runs were really pack runs. The production build honours the env correctly
-(`sum -> off=45056` sequential, `pack -> off=131072` reused). Use the production
-build for this investigation.
+So compact packing is correct for execution; the **prefill-export capture is
+incompatible with arena slot reuse**. The earlier "packing is broken" reading is
+superseded. (An even earlier "RelWithDebInfo sum == pack, 0 diffs" result was an
+artifact - every dbg run had `STREAM_MOE_TMP_COMPACT_PACK` set, so its "sum" runs
+were really pack runs.)
 
-Next: a 1-node vs multi-node comparison on the **production** build at the same
-ubatch (dump the real execution order of the hand-assembled cgraph and compare
-against `plan->head`) to decide whether the corruption is in the packing or in
-the multi-node CPU execution.
+Next: snapshot `embd` / `hidden` at their real compute time (or exclude exported
+tensors from arena reuse) so the prefill regression is valid with pack on.
 
-**Repro (bug state).** Build `build.bat llamalibs StreamMoE_latest`, then run the
-129-token prefill-from; with no env it takes the broken packed path
-(`embd cos 0.01568`), with `STREAM_MOE_TMP_COMPACT_PACK=0` it takes byte sum
-(`cos 0.98631`). Verify against the vk baseline:
-
-```bat
-build\StreamMoE_latest\llama-build\bin\llama-server.exe ^
-  -m N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2.gguf ^
-  --prefill-from baseline_regression\baseline\upstream_129\tokens_id.bin ^
-  --export-dir baseline_regression\temp_latest\moe ^
-  -c 2048 -t 16 --expert-backend --moe-ram-pool 8192 --fit off --no-warmup
-node baseline_regression\tools\verify_prefill.js ^
-  baseline_regression\baseline\moe_129_8192_vk\prefill_export_main.bin ^
-  baseline_regression\temp_latest\moe\prefill_export_main.bin --cos-floor 0.99 --min-ratio 0.9
-```
-
+**Repro.** Build `build.bat llamalibs StreamMoE_latest`, then the 129-token
+prefill-from with no env takes the packed path and `=0` takes byte sum. The
+exported `embd` differs, but the top-4 logits (the real output) do not - check
+both with `baseline_regression/tools/verify_prefill.js` and a top-4 comparator.
 For the `[cpack]` offset plan / `[stage]` node values use `StreamMoE_dump_dbg`
 (+ `STREAM_MOE_TMP_STAGE_DUMP=1 STREAM_MOE_TMP_COMPACT_DEBUG=1`).
 
