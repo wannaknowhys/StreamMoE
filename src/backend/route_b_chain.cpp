@@ -2,6 +2,7 @@
 
 #include "backend/alloc.h"
 #include "backend/moe_backend.h"
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -196,6 +197,43 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     nlayer.reserve((size_t) gf->n_nodes * 2);
     for (auto & kv : g_layer_nodes_all)
         for (auto * nd : kv.second) nlayer[nd] = kv.first;
+
+    // Per-device plan (docs/PER_DEVICE_ARENA.md 3): node -> device. The device
+    // owns the node's weight (dense layers -> their --dense-placement device,
+    // experts -> their pool device, via the weight buffer's device); weightless
+    // nodes inherit from a producer. The CPU device collapses to the host plan
+    // (route B's arena lives on our_backend). Computed here; the per-device
+    // buffers/regions land with the device executor.
+    ggml_backend_dev_t our_dev = ggml_backend_get_device(our_backend);
+    auto dev_key = [our_dev](ggml_backend_dev_t d) -> std::string {
+        if (!d) return "";
+        // The host plan is our own backend's device plus the CPU device; both are
+        // host memory. Only a real (non-host) device is a separate plan.
+        if (d == our_dev || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) return "";
+        const char * n = ggml_backend_dev_name(d);
+        return (n && *n) ? std::string(n) : std::string();
+    };
+    std::unordered_map<const ggml_tensor*, std::string> dev_of;
+    dev_of.reserve((size_t) gf->n_nodes * 2);
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        if (nlayer.find(nd) == nlayer.end()) continue;
+        std::string d; bool found = false;
+        for (int s = 0; s < GGML_MAX_SRC && !found; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src || !src->buffer || !src->buffer->buft) continue;
+            ggml_backend_dev_t wd = ggml_backend_buft_get_device(src->buffer->buft);
+            if (!wd) continue;
+            d = dev_key(wd); found = true;
+        }
+        if (!found) {
+            for (int s = 0; s < GGML_MAX_SRC && !found; ++s) {
+                auto it = dev_of.find(nd->src[s]);
+                if (it != dev_of.end()) { d = it->second; found = true; }
+            }
+        }
+        dev_of[nd] = d;   // "" = host
+    }
 
     // carry: captured node consumed in a different layer
     std::set<const ggml_tensor*> carry;
@@ -517,6 +555,31 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry1=%zu carryN=%zu compact=%zu closure=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
                 (long long) n_tok, carry1_size, carryN_size, compact_size, closure_size,
                 carry1_size + carryN_size + compact_size + closure_size + 4096, g_arena_cap, carry.size());
+
+    // Per-device plan report (node -> device, and the raw bytes the device would
+    // hold per region). The packing is still global today, so this is a split
+    // preview, not the final per-device packed size (that lands with the
+    // per-device buffers). One line per device; CPU-only = one line.
+    if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
+        struct acc_t { size_t n=0, carry1=0, carryN=0, compact=0, closure=0; };
+        std::map<std::string, acc_t> acc;
+        for (auto & kv : dev_of) {
+            const ggml_tensor * nd = kv.first;
+            acc_t & a = acc[kv.second];
+            ++a.n;
+            if (carry1_off.count(nd))       a.carry1  += ggml_nbytes(nd);
+            else if (carryN_off.count(nd))  a.carryN  += ggml_nbytes(nd);
+            else if (compact_off.count(nd)) a.compact += ggml_nbytes(nd);
+            else if (closure_off.count(nd)) a.closure += ggml_nbytes(nd);
+        }
+        fprintf(stderr, "==== per-device plan (%zu device(s)) ====\n", acc.size());
+        for (auto & kv : acc) {
+            const acc_t & a = kv.second;
+            fprintf(stderr, "  dev=%-12s nodes=%-5zu carry1=%-9zu carryN=%-9zu compact=%-9zu closure=%-9zu\n",
+                    kv.first.empty() ? "CPU(host)" : kv.first.c_str(),
+                    a.n, a.carry1, a.carryN, a.compact, a.closure);
+        }
+    }
 }
 }
 
