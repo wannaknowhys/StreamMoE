@@ -39,6 +39,7 @@ size_t g_arena_cap = 0;
 size_t g_arena_closure_off = 0;   // byte offset of the closure block inside g_arena
 size_t g_arena_closure_size = 0;
 int    g_dump_ubatch = -1;        // bin-dump ubatch subdirectory index
+int    g_build_id = 0;            // layout_arena call counter (per-build seed)
 
 bool is_alias_op(const ggml_tensor * n);   // defined later in this file
 bool is_view_op(const ggml_tensor * n);    // defined later in this file
@@ -176,6 +177,7 @@ void verify_layer_consumers(const ggml_cgraph * gf) {
 // its base). docs/LAYER_EXECUTOR_DESIGN.md 4.2/4.3.
 void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     if (g_layer_nodes.empty()) return;
+    ++g_build_id;
 
     // Token count of this build (ids ne[1]) - for the arena-size debug log.
     int64_t n_tok = -1;
@@ -345,9 +347,17 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         std::vector<int64_t> o;
         size_t lb;
         // Interval packing of the compact region is still not correct for every
-        // model (gemma diverges: a consumer is missed in the liveness model), so
-        // it stays opt-in until that is fixed.
-        if (std::getenv("STREAM_MOE_TMP_COMPACT_PACK")) {
+        // model (gemma diverges), so in production it stays opt-in (byte sum).
+        // The latest-features build (STREAM_MOE_LATEST) defaults it ON so the bug
+        // stays reproducible (AGENTS.md 15: never roll a feature back); env
+        // STREAM_MOE_TMP_COMPACT_PACK=0 opts out there.
+#ifdef STREAM_MOE_LATEST
+        const char * cp = std::getenv("STREAM_MOE_TMP_COMPACT_PACK");
+        const bool pack_compact = !(cp && cp[0] == '0');
+#else
+        const bool pack_compact = std::getenv("STREAM_MOE_TMP_COMPACT_PACK") != nullptr;
+#endif
+        if (pack_compact) {
             lb = pack_interval(cns, cstart, cend, o);
         } else {
             size_t off = 0;
@@ -360,8 +370,8 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && kv.first == 0) {
             for (size_t k = 0; k < cns.size(); ++k)
-                fprintf(stderr, "[cpack] L0 %-24s start=%d end=%d off=%lld sz=%zu\n",
-                        cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]));
+                fprintf(stderr, "[cpack] b%d L0 %-24s start=%d end=%d off=%lld sz=%zu ptr=%p\n",
+                        g_build_id, cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]), (const void *) cns[k]);
         }
 #endif
     }
@@ -543,6 +553,8 @@ bool route_b_whole_layer_active() {
     // node, the scheduler sees one split, and all activations live in our arena.
     return true;
 }
+
+int route_b_build_id() { return g_build_id; }
 
 void route_b_begin_ubatch() {
 #ifdef STREAM_MOE_TEMP

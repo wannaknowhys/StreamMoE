@@ -147,6 +147,24 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
         }
     }
 #endif
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_SUBGRAPH_ONE")) {
+        for (ggml_tensor * nd : nodes) {
+            ggml_cgraph * g1 = ggml_new_graph_custom(ctx, 4, false);
+            if (!g1) return GGML_STATUS_ALLOC_FAILED;
+            g1->nodes[g1->n_nodes++] = nd;
+            const enum ggml_status s1 = ggml_backend_graph_compute(backend, g1);
+            if (s1 != GGML_STATUS_SUCCESS) return s1;
+            const size_t nb = ggml_nbytes(nd);
+            const uint8_t * bp = (const uint8_t *) nd->data;
+            uint64_t h = 1469598103934665603ull;
+            for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
+            fprintf(stderr, "[one] b%d %-26s %-12s %016llx\n", route_b_build_id(),
+                    nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+#endif
     ggml_cgraph * g = ggml_new_graph_custom(ctx, nodes.size() + 8, false);
     if (!g) {
         LOG_ERROR("stream_moe: dense subgraph build failed");
@@ -168,8 +186,13 @@ static void dump_node_hash(int layer, const char * stage, const std::vector<ggml
         const uint8_t * bp = (const uint8_t *) nd->data;
         uint64_t h = 1469598103934665603ull;
         for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
-        fprintf(stderr, "[stage] %-5s L%d %-26s %-12s %016llx\n", stage, layer,
-                nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h);
+        char vbuf[80] = "";
+        if (nd->type == GGML_TYPE_F32 && nb >= 4) {
+            const float * fp = (const float *) bp;
+            snprintf(vbuf, sizeof(vbuf), " v=[%.5g %.5g %.5g %.5g]", fp[0], fp[1], fp[2], fp[3]);
+        }
+        fprintf(stderr, "[stage] b%d %-5s L%d %-26s %-12s %016llx data=%p%s\n", route_b_build_id(), stage, layer,
+                nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h, nd->data, vbuf);
     }
 }
 #endif

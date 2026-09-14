@@ -76,6 +76,10 @@ void route_b_dump_node_bin(int layer, const char * name, const char * op,
 // Debug: start a new ubatch (bumps the bin-dump subdirectory index).
 void route_b_begin_ubatch();
 
+// Debug: monotonic build counter (incremented by layout_arena per graph build),
+// so per-build dumps can be told apart.
+int route_b_build_id();
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).
