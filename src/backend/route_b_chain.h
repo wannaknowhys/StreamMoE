@@ -80,6 +80,16 @@ void route_b_begin_ubatch();
 // so per-build dumps can be told apart.
 int route_b_build_id();
 
+#if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
+// Prefill export: tensors the export reads after graph compute (via the sched
+// eval callback). Whole-layer ownership reuses arena slots inside a layer, so
+// that post-split read can land on an overwritten slot; layout_arena keeps these
+// in the retained (never-reused) region instead. Replaced on every graph build;
+// pass an empty list when not exporting. Only the route_b + prefill intersection
+// needs it (route_b-only has no observer, prefill-only has no slot reuse).
+void route_b_set_export_retained(const std::vector<const struct ggml_tensor *> & ts);
+#endif
+
 // Verify the graph: collect hidden MoE-chain intermediates and scan the whole
 // graph for external consumers. Returns true on pass; on violation logs and
 // exits the process (fail-fast, no escape hatch).

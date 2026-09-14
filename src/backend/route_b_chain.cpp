@@ -40,6 +40,12 @@ size_t g_arena_closure_off = 0;   // byte offset of the closure block inside g_a
 size_t g_arena_closure_size = 0;
 int    g_dump_ubatch = -1;        // bin-dump ubatch subdirectory index
 int    g_build_id = 0;            // layout_arena call counter (per-build seed)
+#if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
+// Tensors the prefill export reads after compute (route_b_set_export_retained).
+// layout_arena keeps them out of the reuse pool so the export's post-split read
+// sees the computed value. Refreshed on every graph build.
+static std::vector<const ggml_tensor*> g_export_retained;
+#endif
 
 bool is_alias_op(const ggml_tensor * n);   // defined later in this file
 bool is_view_op(const ggml_tensor * n);    // defined later in this file
@@ -261,6 +267,18 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (mit->second - cit->second <= 1) c1.push_back(const_cast<ggml_tensor*>(nd));
         else                                cN.push_back(const_cast<ggml_tensor*>(nd));
     }
+#if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
+    // Prefill-export observed tensors must stay live until the export reads them
+    // (after the split): pull them out of carry1 (double-buffered) and the compact
+    // reuse pool into the retained carryN region. Only captured layer nodes get a
+    // slot; a tensor the sched owns directly is already read at the right time.
+    for (const ggml_tensor * t : g_export_retained) {
+        if (nlayer.find(t) == nlayer.end()) continue;
+        carry.insert(t);
+        c1.erase(std::remove(c1.begin(), c1.end(), t), c1.end());
+        if (std::find(cN.begin(), cN.end(), t) == cN.end()) cN.push_back(const_cast<ggml_tensor*>(t));
+    }
+#endif
     std::map<int, size_t> c1_layer_bytes;
     for (ggml_tensor * nd : c1) c1_layer_bytes[nlayer[nd]] += ggml_nbytes(nd);
     size_t c1_buf = 0;
@@ -555,6 +573,18 @@ bool route_b_whole_layer_active() {
 }
 
 int route_b_build_id() { return g_build_id; }
+
+#if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
+void route_b_set_export_retained(const std::vector<const ggml_tensor*> & ts) {
+    g_export_retained.clear();
+    for (const ggml_tensor * t : ts) {
+        // A view aliases its root's slot; retain the root (that is what would be
+        // reused). layout_arena's view pass then gives the view the right data.
+        while (t && t->view_src) t = t->view_src;
+        if (t) g_export_retained.push_back(t);
+    }
+}
+#endif
 
 void route_b_begin_ubatch() {
 #ifdef STREAM_MOE_TEMP

@@ -1,5 +1,5 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2309a77b5..89a640459 100644
+index 0402044da..c4053987e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -10,17 +10,20 @@ index 2309a77b5..89a640459 100644
  
  #include "ggml.h"
  #include "llama-arch.h"
-@@ -8,6 +11,9 @@
+@@ -8,6 +11,12 @@
  #include "llama-io.h"
  #include "llama-memory.h"
  #include "llama-mmap.h"
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +#include "tsc_timer.h"
 +#endif
- #ifdef STREAM_MOE_ROUTE_B
- #include "stmoe_routeb_lctx_includes.frag"
- #endif
-@@ -19,9 +25,19 @@
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_includes.frag"
++#endif
+ #include "llama-model.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+@@ -16,9 +25,19 @@
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
@@ -40,7 +43,7 @@ index 2309a77b5..89a640459 100644
  
  //
  // llama_context
-@@ -118,7 +134,9 @@ llama_context::llama_context(
+@@ -115,7 +134,9 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
@@ -51,7 +54,7 @@ index 2309a77b5..89a640459 100644
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -142,6 +160,20 @@ llama_context::llama_context(
+@@ -139,6 +160,20 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -72,7 +75,7 @@ index 2309a77b5..89a640459 100644
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -485,6 +517,11 @@ llama_context::~llama_context() {
+@@ -482,6 +517,11 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
@@ -84,14 +87,9 @@ index 2309a77b5..89a640459 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1367,10 +1404,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
-             ret = GGML_STATUS_FAILED;
+@@ -1365,6 +1405,39 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
-+
- #ifdef STREAM_MOE_ROUTE_B
- #include "stmoe_routeb_lctx_process.frag"
- #endif
  
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +        // STREAM_MOE: publish export target pointers BEFORE compute - the eval
@@ -101,12 +99,35 @@ index 2309a77b5..89a640459 100644
 +            export_t_hidden = res->get_h_nextn();
 +            export_t_logits = res->get_logits();
 +        }
++#ifdef STREAM_MOE_ROUTE_B
++        // Whole-layer ownership reuses arena slots inside a layer, so the eval
++        // callback's post-split read of an observed tensor can land on an
++        // overwritten slot. Tell route B to retain every tensor the export reads
++        // (never reuse their slot); an empty list (not exporting) clears the set.
++        std::vector<const ggml_tensor *> export_observed;
++        if (export_active) {
++            export_observed.push_back(export_t_embd);
++            export_observed.push_back(export_t_hidden);
++            export_observed.push_back(export_t_logits);
++            for (int i = 0; i < gf->n_nodes; ++i) {
++                const ggml_tensor * nd = gf->nodes[i];
++                if (nd && nd->op == GGML_OP_MUL_MAT_ID && nd->src[0] && nd->src[2]
++                        && nd->src[0]->name && std::strstr(nd->src[0]->name, "_exps"))
++                    export_observed.push_back(nd->src[2]);
++            }
++        }
++        stream_moe::route_b_set_export_retained(export_observed);
++#endif
++#endif
++
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_process.frag"
 +#endif
 +
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1638,11 +1686,397 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,11 +1705,409 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -121,7 +142,19 @@ index 2309a77b5..89a640459 100644
 +    if (ctx->export_prev_cb_eval) {
 +        if (!ctx->export_prev_cb_eval(t, ask, ctx->export_prev_cb_eval_ud)) return false;
 +    }
-+    if (ask) return true;
++    if (ask) {
++#ifdef STREAM_MOE_TEMP
++        // The per-node byte dump wants every node computed on its own.
++        if (std::getenv("STREAM_MOE_TMP_CB_HASH") || std::getenv("STREAM_MOE_TMP_BIN_DIR")) return true;
++#endif
++        // Only the tensors we actually capture need a separate eval. Returning
++        // true for every node makes the scheduler compute node by node; under
++        // whole-layer ownership that re-runs a layer once per node.
++        if (t == ctx->export_t_embd || t == ctx->export_t_hidden || t == ctx->export_t_logits) return true;
++        if (t && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->src[0]->name
++                && std::strstr(t->src[0]->name, "_exps")) return true;
++        return false;
++    }
 +#ifdef STREAM_MOE_TEMP
 +    // Route-B whole-layer diagnostic (env-gated, permanent): dump every node's
 +    // full bytes right after it is computed. STREAM_MOE_TMP_BIN_DIR enables it;
@@ -504,7 +537,7 @@ index 2309a77b5..89a640459 100644
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -1942,6 +2376,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +2407,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -524,7 +557,7 @@ index 2309a77b5..89a640459 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1969,6 +2416,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2447,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -532,7 +565,37 @@ index 2309a77b5..89a640459 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -3547,6 +3995,9 @@ llama_context_params llama_context_default_params() {
+@@ -2429,6 +2914,9 @@ ggml_cgraph * llama_context::graph_reserve(
+     res->reset();
+ 
+     auto * gf = model.build_graph(gparams);
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_reserve.frag"
++#endif
+ 
+     this->n_outputs = save_n_outputs;
+ 
+@@ -2508,6 +2996,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
+         } else {
+             ggml_set_name(cur, name);
+         }
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_cb.frag"
++#endif
+ 
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+@@ -3416,6 +3907,9 @@ void llama_context::opt_epoch_iter(
+             res->reset();
+ 
+             auto * gf = model.build_graph(gparams);
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_encode.frag"
++#endif
+ 
+             struct ggml_context * ctx_compute_opt;
+             {
+@@ -3532,6 +4026,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -542,7 +605,7 @@ index 2309a77b5..89a640459 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3568,6 +4019,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +4050,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
