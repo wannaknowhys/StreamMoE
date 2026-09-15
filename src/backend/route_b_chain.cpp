@@ -62,6 +62,17 @@ struct region_plan_t {
 };
 static std::map<std::string, region_plan_t> g_plans;
 
+// Cross-device carry relays of the current build (docs/PER_DEVICE_ARENA.md 3).
+// A carry tensor is the producer node's output, so it stays on the producer's
+// device; a consumer on another device gets a local copy (a shell allocated in
+// the consumer's carry region) and its src is rewired to it. The executor runs
+// ggml_backend_tensor_copy(src, dst) at the consumer layer's front.
+static std::vector<route_b_relay_t> g_relays;
+// Shell context for the relay copies (no_alloc; buffer/data set by layout_arena).
+// Recreated every layout_arena - the graph is rebuilt, so shells never outlive
+// the build that references them.
+static ggml_context * g_relay_ctx = nullptr;
+
 #if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
 // Tensors the prefill export reads after compute (route_b_set_export_retained).
 // layout_arena keeps them out of the reuse pool so the export's post-split read
@@ -354,6 +365,51 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (std::find(cN.begin(), cN.end(), t) == cN.end()) cN.push_back(const_cast<ggml_tensor*>(t));
     }
 #endif
+    // ---- cross-device carry relay (docs/PER_DEVICE_ARENA.md 3) -----------
+    // A carry tensor is the producer node's output, so it stays on the
+    // producer's device. If its (max) consumer lives on another device, that
+    // device gets a local copy: a shell reserved in the consumer layer's carry
+    // boundary set, with the consumers' src rewired to it. The executor issues
+    // ggml_backend_tensor_copy(src, dst) at the consumer layer's front. carry1
+    // and carryN relay together at every boundary.
+    g_relays.clear();
+    if (g_relay_ctx) { ggml_free(g_relay_ctx); g_relay_ctx = nullptr; }
+    {
+        ggml_init_params ip = { 2u * 1024u * 1024u, nullptr, /*no_alloc=*/true };
+        g_relay_ctx = ggml_init(ip);
+    }
+    auto relay_split = [&](std::vector<ggml_tensor*> & list) {
+        const size_t n0 = list.size();
+        for (size_t i = 0; i < n0; ++i) {
+            ggml_tensor * nd = list[i];
+            auto cd = consumer_dev.find(nd);
+            auto ml = max_consumer.find(nd);
+            if (cd == consumer_dev.end() || ml == max_consumer.end()) continue;
+            if (cd->second == dev_of[nd]) continue;   // same device: no relay
+            ggml_tensor * dst = g_relay_ctx
+                ? ggml_new_tensor_4d(g_relay_ctx, nd->type, nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3])
+                : nullptr;
+            if (!dst) continue;
+            nlayer[dst] = ml->second;
+            dev_of[dst] = cd->second;
+            list.push_back(dst);   // reserve a slot in the consumer's carry set
+            g_relays.push_back({ nd, dst, ml->second });
+        }
+    };
+    relay_split(c1);
+    relay_split(cN);
+    // Rewire the consumers on the destination device to read the local copy.
+    for (const route_b_relay_t & r : g_relays) {
+        const std::string & cdev = dev_of[r.dst];
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            ggml_tensor * nd = gf->nodes[i];
+            auto dit = dev_of.find(nd);
+            if (dit == dev_of.end() || dit->second != cdev) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s)
+                if (nd->src[s] == r.src) nd->src[s] = r.dst;
+        }
+    }
+
     // ---- per-device plans (docs/PER_DEVICE_ARENA.md 3) --------------------
     // One region_plan_t per device, each with its own grow-only buffer. Regions
     // by liveness: carry (cross-layer pipeline; logically one, physically per
@@ -527,6 +583,19 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             if (mit != plan.scratch_off.end()) { nd->data = base + off_scratch + mit->second; continue; }
         }
     }
+    // Relay copies are shells (not captured nodes): bind them to the consumer's
+    // carry slot so the executor can ggml_backend_tensor_copy into them.
+    for (const route_b_relay_t & r : g_relays) {
+        auto pit = plans.find(dev_of[r.dst]);
+        if (pit == plans.end() || !pit->second.buf) continue;
+        region_plan_t & plan = pit->second;
+        char * rbase = static_cast<char*>(ggml_backend_buffer_get_base(plan.buf));
+        r.dst->buffer = plan.buf;
+        auto c1i = plan.carry1_off.find(r.dst);
+        if (c1i != plan.carry1_off.end()) { r.dst->data = rbase + c1i->second; continue; }
+        auto cNi = plan.carryN_off.find(r.dst);
+        if (cNi != plan.carryN_off.end()) { r.dst->data = rbase + plan.carry1_size + cNi->second; continue; }
+    }
     g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
     // Host plan drives the debug/report paths and the CPU executor.
     region_plan_t & hostp = g_plans[""];
@@ -692,6 +761,8 @@ const char * route_b_closure_device() {
     }
     return one ? one->c_str() : "";
 }
+
+const std::vector<route_b_relay_t> & route_b_relays() { return g_relays; }
 
 bool route_b_in_arena(const void * p) {
     if (!p) return false;

@@ -62,6 +62,20 @@ void route_b_add_expert_pool_device(const char * dev);
 // The device that owns this model's experts ("" = host / several devices).
 const char * route_b_closure_device();
 
+// Cross-device carry relay (docs/PER_DEVICE_ARENA.md 3). A carry tensor is the
+// producer node's output, so it stays on the producer's device. When a consumer
+// lives on another device, layout_arena allocates a local copy (a shell) in the
+// consumer's carry region and rewires the consumers' src to it; the executor
+// copies src -> dst (ggml_backend_tensor_copy) at the front of `layer`, before
+// the head reads it. carry1 and carryN relay together at every boundary.
+struct route_b_relay_t {
+    const ggml_tensor * src = nullptr;   // carry tensor on the producer's device
+    ggml_tensor *       dst = nullptr;   // local copy on the consumer's device
+    int32_t             layer = -1;      // consumer layer (where the copy runs)
+};
+// All relays of the current graph build (empty when single-device / CPU-only).
+const std::vector<route_b_relay_t> & route_b_relays();
+
 // True when the debug whole-layer path is active (STREAM_MOE_TEMP build, not
 // disabled by STREAM_MOE_TMP_NO_WHOLE_LAYER). Used by llama_model::dev_layer to
 // report the layer device as the StreamMoE backend so resolve() keeps fused ops.

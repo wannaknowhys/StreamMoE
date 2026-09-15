@@ -1888,6 +1888,15 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         if (ex) for (auto * nd : ex->compute) fprintf(stderr, "[split]  C %s\n", nd->name ? nd->name : "?");
     }
 #endif
+    // Cross-device carry relay (docs/PER_DEVICE_ARENA.md 3): bring this layer's
+    // incoming carry copies onto the layer's device before the head reads them.
+    // The consumers were already rewired to the local copy by layout_arena.
+    for (const auto & r : route_b_relays()) {
+        if (r.layer != layer || !r.src || !r.dst) continue;
+        // Synchronous (tensor_set/tensor_get or buffer_copy_tensor): the head
+        // reads the copy right after this.
+        ggml_backend_tensor_copy(r.src, r.dst);
+    }
     {
         const enum ggml_status hst = run_dense_subgraph(ctx, cpu, dense_head);
         if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
