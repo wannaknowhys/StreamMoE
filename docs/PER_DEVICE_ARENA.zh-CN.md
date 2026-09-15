@@ -199,6 +199,34 @@ pack 关）仍 PASS。
 `[stage]` 节点值用 `StreamMoE_dump_dbg`
 （+ `STREAM_MOE_TMP_STAGE_DUMP=1 STREAM_MOE_TMP_COMPACT_DEBUG=1`）。
 
+**每设备规划：已落地（2026-09-14，commit `fdd772e`）。** `layout_arena` 现在每设备
+一份 `region_plan_t`，各自一个 grow-only buffer：
+
+- 两个区域按生命周期：`carry`（跨层流水）+ `scratch`（层内：dense head/tail 与 MoE
+  closure 合并）。
+- `carry1` 每设备（parity 双缓冲）、`carryN` 每设备（retained）。`cross_device` 标记
+  消费者在别的设备的 carry 张量；执行器在 consumer 首次读之前搬运
+  （`ggml_backend_tensor_copy`，`M2_DEVICE_EXECUTOR.md` §7.8）。carry1 和 carryN
+  在**每个边界一起搬**（relay：第 L 层时的副本永远在 dev(L)，所以任何设备上的
+  consumer 读到的都是对的那份）。
+- closure 的 `ex.out_off` / `result_bytes` 改为索引合并后的 scratch；
+  `moe_chain_fullalloc_buffer` 改为按设备（专家池设备）查，返回的正是 dense
+  head/tail 用的同一个池。`route_b_in_arena` 检查所有设备 buffer。
+- MoE closure 的设备 = 专家池设备（`route_b_closure_device`，在 `route_b_setup`
+  记录）——closure 在专家所在的设备上跑。专家权重不在普通 buffer 里，所以 `dev_of`
+  无法从权重操作数解析它。
+
+实测（gemma v2，129-token prefill-from，ub 129）：decode build carry1 88 KB /
+scratch 8 MB；prefill build carry1 1.4 MB / scratch 128 MB。（§1 的 ub-512 字节和
+表里 compact 是 2.5 GB；合并+打包后的 scratch 小得多。）
+
+验证（CPU-only 坍缩成 1 个 host plan，数值不变）：pack vs sum `IDENTICAL`
+（embd / hidden / KV + 专家历史）；vk gate 121/129（93.8%）；生产
+`run_baseline`（`StreamMoE_dump`）PASS。
+
+仍待做（设备执行器，phase 3）：真正的跨设备搬运（层前 `ggml_backend_tensor_copy`
++ 把克隆后的 consumer 改指本地副本），以及在 placement 设备上执行 C1/C2。
+
 ## 8. 待定问题
 
 1. `carry1` 两个 buffer 够吗，还是某些层需要更多（边界集合在 head 和 tail 都读，外加同层

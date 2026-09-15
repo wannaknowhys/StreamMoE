@@ -1,7 +1,7 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-09（**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
+> **最近更新**：2026-09-14（**每设备 arena 规划落地**，`fdd772e`：`layout_arena` 改 per-device `region_plan_t`（每设备 grow-only buffer），两区域按生命周期分——`carry`（跨层流水，逻辑一份、物理 per-device、跨边界 relay）+ `scratch`（层内：dense head/tail 与 MoE closure 合并成一个池）；closure 归专家池设备；`moe_chain_fullalloc_buffer`/`route_b_in_arena` 改按设备查。CPU-only 单 host plan：pack vs sum IDENTICAL、vk gate 121/129、`run_baseline` PASS。前情：**prefill 导出捕获修复** `da932e4`/`f42bd1d`（cb_eval 逐节点 → 选择性 need + 保留张量；compact pack 不是数值 bug）；`StreamMoE_latest`/`StreamMoE_dump_dbg` 构建 + AGENTS 15（禁回滚）；**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
 
 ---
 
@@ -12,6 +12,15 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ---
 
 ## 2. 当前状态（✅ 已完成）
+
+### 每设备 arena 规划（2026-09-14，`fdd772e`，docs/PER_DEVICE_ARENA.md）
+
+- **背景**：整层拥有落地后 `layout_arena` 把所有节点预分配进**一个 host arena**，`[carry][compact][closure]`，且 `--dense-placement` 被覆盖。改为 per-device 规划。
+- **`region_plan_t`（每设备一份）**：`{ dev, buf(grow-only), carry1(parity 双缓冲), carryN(retained), scratch(=compact∪closure 合并), 节点→offset, cross_device }`。
+- **两区域按生命周期**：`carry`（跨层流水：逻辑一份，物理 per-device，**跨设备边界 relay**——第 L 层的副本永远在 dev(L)，consumer 读到的一定是对的那份；carry1 和 carryN 每个边界一起搬）；`scratch`（层内临时量：dense head/tail 与 MoE closure **合并成一个池**，执行器 `ex.out_off`/`result_bytes` 改为索引该池，`moe_chain_fullalloc_buffer` 按设备查）。
+- **设备解析**：节点设备 = 权重操作数 buffer 的设备（dense → placement 设备；专家 → 池设备）；无权重继承 producer；host/CPU 坍缩成 host plan。**closure 归专家池设备**（`route_b_closure_device`，`route_b_setup` 记录池设备）——专家权重不在普通 buffer 里，`dev_of` 无法从权重解析。
+- **跨设备搬运**（设备执行器 phase 3，已标 `cross_device`）：层前 `ggml_backend_tensor_copy`（`M2_DEVICE_EXECUTOR.md` §7.8 transport）+ 把克隆后的 consumer 改指本地副本。
+- **验证（CPU-only 单 host plan，数值不变）**：pack vs sum `IDENTICAL`（embd/hidden/KV + 专家历史）；vk gate 121/129（93.8%）；生产 `run_baseline` PASS。实测 gemma ub129：decode carry1 88 KB/scratch 8 MB，prefill carry1 1.4 MB/scratch 128 MB。
 
 ### M4 收编：自研主项目删除（2026-08-31）
 
@@ -138,6 +147,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 **主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线**
 
+0. **每设备 arena 的执行侧（下一步）**：`layout_arena` 的 per-device plan 已落（见 §2）。设备执行器（`M2_DEVICE_EXECUTOR`）接上后：(a) C1/C2 在 placement 设备上跑（`run_dense_subgraph` 现在恒用 CPU backend）；(b) 按 `cross_device` 在层前做 `ggml_backend_tensor_copy` relay + 把克隆后的 consumer 改指本地副本。VRAM 池当前加载即崩（`0xC0000005`，改动前 binary 同样崩 = 独立 bug），多设备验证被挡；先 CPU-only 推进。
 1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
 2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
 3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。

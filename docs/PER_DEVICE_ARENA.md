@@ -235,6 +235,38 @@ produce identical exports. For the `[cpack]` offset plan / `[stage]` node values
 use `StreamMoE_dump_dbg` (+ `STREAM_MOE_TMP_STAGE_DUMP=1
 STREAM_MOE_TMP_COMPACT_DEBUG=1`).
 
+**Per-device plan: LANDED (2026-09-14, commit `fdd772e`).** `layout_arena` now
+builds one `region_plan_t` per device, each with its own grow-only buffer:
+
+- Two regions by liveness: `carry` (cross-layer pipeline) + `scratch`
+  (within-layer: dense head/tail merged with the MoE closure).
+- `carry1` per device (parity double-buffered), `carryN` per device (retained).
+  `cross_device` marks a carry tensor whose consumer is on another device; the
+  executor relays it (`ggml_backend_tensor_copy`, `M2_DEVICE_EXECUTOR.md` §7.8)
+  before the consumer's first read. carry1 and carryN move together at every
+  boundary (relay: the copy current at layer L is always on dev(L), so a
+  consumer on any device reads the right one).
+- The closure's `ex.out_off` / `result_bytes` are rewritten to index the merged
+  scratch; `moe_chain_fullalloc_buffer` is now per-device (the expert pool's
+  device) and returns the same pool the dense head/tail use. `route_b_in_arena`
+  checks every device buffer.
+- The MoE closure device is the expert pool device (`route_b_closure_device`,
+  recorded at `route_b_setup`) - the closure runs where its experts live. The
+  expert weights are not in a normal buffer, so `dev_of` could not resolve them
+  from a weight operand.
+
+Measured (gemma v2, 129-token prefill-from, ub 129): decode build carry1 88 KB /
+scratch 8 MB; prefill build carry1 1.4 MB / scratch 128 MB. (The §1 ub-512
+byte-sum table had 2.5 GB compact; the merged packed scratch is far smaller.)
+
+Verified (CPU-only collapses to one host plan, so numerics are unchanged):
+pack vs sum `IDENTICAL` (embd / hidden / KV + expert history); vk gate 121/129
+(93.8%); production `run_baseline` (`StreamMoE_dump`) PASS.
+
+Still open (device executor, phase 3): the actual cross-device relay
+(`ggml_backend_tensor_copy` at the layer front + rewiring the cloned consumers
+to the local copy), and running C1/C2 on the placement device.
+
 ## 8. Open questions
 
 1. Is 2 buffers enough for `carry1`, or do some layers need more (e.g. a
