@@ -53,42 +53,64 @@
 
 ub512 投影：olmoe 62 MB → ~0.3 MB，gemma 160 MB → ~11 MB，deepseek 2630 MB → ~67 MB。
 
-## 3. 每设备规划
+## 3. 每设备规划（2026-09-14 定稿）
 
-`layout_arena` 改为每设备规划器。每设备一份 `region_plan_t`：
+`layout_arena` 改为每设备规划器。每设备一份 `region_plan_t`。区域按**生命周期**分，
+不按阶段分：
 
 ```
 struct region_plan_t {
-    size_t carry1_bytes;   // 2 × max 边界 pack
-    size_t carryN_bytes;   // 保留
-    size_t compact_bytes;  // max over layers of pack(该层 dense 节点)
-    size_t closure_bytes;  // max over layers of pack(该层 MoE 闭包)
-    std::unordered_map<const ggml_tensor*, size_t> off;   // 节点 -> offset
-    ggml_backend_buffer_t buf;                            // 该设备 arena
+    std::string dev;                     // "" = host
+    ggml_backend_buffer_t buf;           // 每设备一个 grow-only
+    // carry：跨层流水（逻辑一份；物理按设备驻留）
+    size_t carry1_bytes;                 // 2 × max 边界 pack（层奇偶双缓冲）
+    size_t carryN_bytes;                 // 保留的 cross-N
+    // scratch：该设备的全部层内临时量，合并：
+    //   compact（dense head/tail）+ closure（MoE）
+    size_t scratch_bytes;                // max over layers
+    size_t off_carryN, off_scratch;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    std::set<const ggml_tensor*> cross_device;   // carry 被远端设备消费
 };
 ```
 
+**两个区域，按生命周期。**
+
+- **carry**（跨层）：残差流 / 层输出。**逻辑上一份流水**；物理上每个设备各自
+  grow-only 留好位置。当 layer L 的 carry 被 layer L+1（在别的设备）消费时，执行器在
+  L+1 首次读之前**显式搬运**（D2D / transfer-queue；host 边界走 staging）——不隐式、
+  不多份复制。CPU-only = 一个设备 = 零搬运。
+- **scratch**（层内）：`compact`（dense head/tail）**与 `closure`（MoE 计算）合并**。
+  两者都是层内临时量、跨层复用，所以在同一设备上就是一个池。执行器的 closure 偏移
+  （`moe_chain_fullalloc_buffer`）改为索引这个合并池，`closure` 不再是独立区域。
+
+**closure 天然 per-device。** MoE 计算在专家所在的设备上跑，而每个设备都有自己的专家
+池，所以 closure 本来就是 per-device 的——不存在"closure 放哪个设备"的选择。
+
 **节点 → 设备：**
 
-- **C1 dense**（attention / norm / dense MLP / gating）→ `C1:<dev>`
-  （`--dense-placement C1`）；该设备同时拥有该层的 `carry`。
-- **C2 输出头**（`result_norm` / `result_output`，即 logits）→ `C2:<dev>`
-  （`--dense-placement C2`）。
-- **MoE 闭包** → 该层专家池所在设备（`--moe-expert-pools <dev>:<MB>`）。
-- 默认（无 placement）：全部 CPU/RAM。
+- **C1 dense**（attention / norm / dense MLP / gating）→ 它的 `--dense-placement`
+  设备。C1 可以跨设备分拆、可以搬迁（`DENSE_PLACEMENT.md`）。
+- **C2 输出头**（`result_norm` / `result_output`，即 logits）→ `C2:<dev>`，整体
+  （不分割）。
+- **MoE closure** → 该层专家池所在设备。
+- **carry** → 产生层的设备（跨边界按上面显式搬）。
+- 默认（无 placement）：一个 host plan。
 
-**每设备大小**按该设备上有什么算：有 C1（→ carry + compact）、有专家池（→ closure）、
-有 C2（→ C2 激活）。产出的 plan 同时指导 C1/C2 的 arena 和专家闭包布局。
+**设备解析（已落地）。** 被捕获节点的设备 = 拥有它权重操作数的设备（dense 层 → 其
+placement 设备，取权重 buffer 的设备；专家 → 其池设备）；无权重节点从 producer 继承。
+route B 自己的 host backend 和 CPU 设备都坍缩成 host plan。专家池在 `route_b_setup`
+时记录。
 
-**跨设备张量**（消费者在别的设备：`cur` 进远端池、`acc` 回 owner、跨设备 `carry`）在
-plan 里标记，供执行器用 D2D / transfer-queue 搬运（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5），
-绝不 host staging。
+**跨设备**张量（消费者在别的设备）在 plan 里标记，供执行器用 D2D / transfer-queue
+搬运（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5），除 host 边界外绝不 host staging。
 
 ## 4. 复用已有打包
 
 把 `moe_chain_verify_graph` 里现有的 best-fit decreasing 区间打包（闭包结果布局，
-`route_b_chain.cpp`）抽成 `pack(nodes, last_use) -> { offsets, size }`。`compact`、
-`closure`、`carryN`、每个 `carry1` 边界集合都复用它。不写第二个分配器。
+`route_b_chain.cpp`）抽成 `pack(nodes, last_use) -> { offsets, size }`。合并后的
+`scratch`（`compact` ∪ `closure`）、`carryN`、每个 `carry1` 边界集合都复用它。不写
+第二个分配器。
 
 ## 5. C1/C2 放置语义
 

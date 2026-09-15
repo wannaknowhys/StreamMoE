@@ -61,47 +61,74 @@ retained (empty for the current three models, kept for generality).
 Projected at ub 512: olmoe 62 MB -> ~0.3 MB, gemma 160 MB -> ~11 MB,
 deepseek 2630 MB -> ~67 MB.
 
-## 3. Per-device plan
+## 3. Per-device plan (finalized 2026-09-14)
 
-`layout_arena` becomes a per-device planner. One `region_plan_t` per device:
+`layout_arena` becomes a per-device planner. One `region_plan_t` per device.
+Regions are grouped by **liveness**, not by stage:
 
 ```
 struct region_plan_t {
-    size_t carry1_bytes;   // 2 * max boundary pack
-    size_t carryN_bytes;   // retained
-    size_t compact_bytes;  // max over layers of pack(layer dense nodes)
-    size_t closure_bytes;  // max over layers of pack(layer MoE closure)
-    std::unordered_map<const ggml_tensor*, size_t> off;   // node -> offset
-    ggml_backend_buffer_t buf;                            // device arena
+    std::string dev;                     // "" = host
+    ggml_backend_buffer_t buf;           // grow-only, one per device
+    // carry: the cross-layer pipeline (logically one; physically per-device)
+    size_t carry1_bytes;                 // 2 x max boundary pack (layer parity)
+    size_t carryN_bytes;                 // retained cross-N
+    // scratch: every within-layer temporary of this device, MERGED:
+    //   compact (dense head/tail) + closure (MoE)
+    size_t scratch_bytes;                // max over layers
+    size_t off_carryN, off_scratch;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    std::set<const ggml_tensor*> cross_device;   // carry a consumer reads remotely
 };
 ```
 
+**Two regions, by liveness.**
+
+- **carry** (cross-layer): the residual stream / layer outputs. **Logically one
+  pipeline**; physically each device reserves its own grow-only slots. When
+  layer L's carry is consumed by layer L+1 on another device, the executor moves
+  it **explicitly** (D2D / transfer-queue; host boundaries via staging) before
+  L+1 first reads it - not implicit, not duplicated. CPU-only = one device = no
+  move.
+- **scratch** (within-layer): `compact` (dense head/tail) **merged with
+  `closure`** (the MoE computation). Both are per-layer temporaries reused
+  across layers, so on a device they are one pool. The executor's closure
+  offsets (`moe_chain_fullalloc_buffer`) index into this merged pool instead of
+  a separate closure block; `closure` is no longer its own region.
+
+**Closure is per-device by construction.** The MoE computation runs where its
+experts live, and every device has its own expert pool, so the closure is
+naturally per-device - there is no "which device for the closure" choice.
+
 **Node -> device:**
 
-- **C1 dense** (attention / norms / dense MLP / gating) -> `C1:<dev>`
-  (`--dense-placement C1`); this device also owns the layer's `carry`.
-- **C2 output head** (`result_norm` / `result_output`, i.e. the logits) ->
-  `C2:<dev>` (`--dense-placement C2`).
-- **MoE closure** -> the device of that layer's expert pool
-  (`--moe-expert-pools <dev>:<MB>`).
-- Default (no placement): everything on CPU/RAM.
+- **C1 dense** (attention / norms / dense MLP / gating) -> its
+  `--dense-placement` device. C1 may be split across devices and may migrate
+  (`DENSE_PLACEMENT.md`).
+- **C2 output head** (`result_norm` / `result_output`, the logits) ->
+  `C2:<dev>`, whole (never split).
+- **MoE closure** -> the device of that layer's expert pool.
+- **carry** -> the producing layer's device (moved at a boundary, above).
+- Default (no placement): one host plan.
 
-**Per-device size** is computed from what is present on the device: has C1
-(-> carry + compact), has an expert pool (-> closure), has C2 (-> the C2
-activation). The resulting plan guides both the C1/C2 arena and the expert
-closure layout.
+**Device resolution (landed).** A captured node's device is the device that
+owns its weight operand (dense layers -> their placement device, via the weight
+buffer's device; experts -> their pool device); weightless nodes inherit from a
+producer. Route B's own host backend and the CPU device collapse to the host
+plan. The expert pools are recorded at `route_b_setup`.
 
-**Cross-device tensors** (a node whose consumers live on another device: `cur`
-into a remote pool, `acc` back to the owner, cross-device `carry`) are marked
-in the plan so the executor can move them with D2D / the transfer queue
-(`ROUTE_B_LAYER_OWNERSHIP.md` §3.5) - never host staging.
+**Cross-device** tensors (a node whose consumer is on another device) are marked
+in the plan so the executor moves them (D2D / the transfer queue,
+`ROUTE_B_LAYER_OWNERSHIP.md` §3.5) - never host staging except at host
+boundaries.
 
 ## 4. Reuse the existing packing
 
 Extract the best-fit-decreasing interval packing currently in
 `moe_chain_verify_graph` (the closure result layout, `route_b_chain.cpp`) into
-`pack(nodes, last_use) -> { offsets, size }`. Use it for `compact`, `closure`,
-`carryN`, and each `carry1` boundary set. No second allocator.
+`pack(nodes, last_use) -> { offsets, size }`. Use it for the merged `scratch`
+(`compact` ∪ `closure`), `carryN`, and each `carry1` boundary set. No second
+allocator.
 
 ## 5. C1/C2 placement semantics
 
