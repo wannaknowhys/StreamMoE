@@ -575,6 +575,15 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 #endif
         }
 
+        // The host scratch must also hold the closure result layout: with MIXED
+        // pools (RAM + a device) some rounds run on the CPU and bind their twins
+        // through moe_chain_fullalloc_buffer -> the host scratch, even though the
+        // closure nodes themselves were assigned to a device plan.
+        if (D.empty()) {
+            for (auto & kv : g_layer_exec)
+                plan.scratch_size = std::max(plan.scratch_size, kv.second.result_bytes);
+        }
+
         // --- xfer: consumer-side copies of cross-device producers (one shell per
         // producer/device/stage). A shell is live only during the layer whose
         // stage consumes it, so the region is reused across layers -> size = max
@@ -760,11 +769,14 @@ void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
 }
 
 void * moe_chain_fullalloc_buffer(size_t need_bytes) {
-    // Whole-layer: the closure block is the scratch region of the device that
-    // owns the experts (layout_arena merged the dense head/tail and the closure
-    // into that one pool), so the closure twins are pre-allocated there too.
+    // Called only on the CPU path of the bucket engine (a device round binds its
+    // twins to the device arena directly in bind_fresh). With MIXED pools (RAM +
+    // a device) some rounds run on the CPU, so the block MUST be the HOST plan's
+    // scratch - never the closure device's buffer (a CPU round would write to a
+    // device pointer). layout_arena sizes the host scratch to hold the closure
+    // result layout even when the closure nodes themselves live on a device.
     {
-        auto pit = g_plans.find(route_b_closure_device());
+        auto pit = g_plans.find("");
         if (pit != g_plans.end() && pit->second.buf) {
             const region_plan_t & p = pit->second;
             if (need_bytes > p.scratch_size) {

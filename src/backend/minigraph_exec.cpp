@@ -1387,6 +1387,39 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                    + (size_t) n_expert * sizeof(float)     // per-expert scale table
                    + cells * sizeof(int32_t) * 4 + 4096;   // ids + idx leaves
     }
+    // External leaves uploaded to the device staging (bucket_ext_leaf ->
+    // bucket_upload_leaf): every closure-node src whose unwrapped producer is
+    // outside the closure and is not a per-slot gather leaf. Each reference
+    // uploads a fresh copy, and every round re-uploads, so the sum over
+    // references x rounds is an upper bound. (Missed before -> a gating leaf such
+    // as gemma `ffn_moe_gate` overran the staging buffer.) Over-estimation is
+    // safe: the staging buffer is grow-only and persists across layers.
+    {
+        auto in_compute = [&](const ggml_tensor * p) -> bool {
+            for (const auto * cn : ex->compute) if (cn == p) return true;
+            return false;
+        };
+        size_t ext_ref = 0;
+        for (const auto * cn : ex->compute) {
+            if (!cn) continue;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                // src[0] of a routed mm is the expert weight table: it lives in
+                // the pool shell, never uploaded (its graph nbytes is the whole
+                // expert table, which would blow the estimate).
+                if (cn->op == GGML_OP_MUL_MAT_ID && s == 0) continue;
+                const ggml_tensor * t = cn->src[s];
+                if (!t) continue;
+                const ggml_tensor * p = t;
+                while (p && (p->op == GGML_OP_VIEW || p->op == GGML_OP_RESHAPE ||
+                             p->op == GGML_OP_TRANSPOSE || p->op == GGML_OP_PERMUTE ||
+                             p->op == GGML_OP_CONT)) p = p->src[0];
+                if (!p || in_compute(p)) continue;
+                if (p->ne[0] == 1 && p->ne[1] == (int64_t) n_k) continue;   // per-slot: arena gather
+                ext_ref += ggml_nbytes(p) + 4096;
+            }
+        }
+        stage_est += ext_ref * (n_rounds ? n_rounds : 1);
+    }
     // Device arena bump consumers (bind_fresh(..., false)): the fold scratch
     // (pc/s/acc) + the cur gather + one gather per per-(slot,token) routing-
     // weight leaf. The bump is never reset within a layer (all tensors stay valid
