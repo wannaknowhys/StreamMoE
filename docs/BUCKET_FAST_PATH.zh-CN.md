@@ -23,12 +23,12 @@
 > 判据对象是**当前桶（round）**，与它属于哪个 pool 无关；§3 的 peel 按 pool 计算只是为了
 > 说明桶列表怎么来的。
 
-| 省略项 | 条件（每 round / 每 plan） | 挂点 | 理由 |
-| :--- | :--- | :--- | :--- |
-| `GET_ROWS(cur)` | 每 round `r.n_active == n_t` | `bucket_gather_cur` (minigraph_exec.cpp:665) | `active` 按 t 升序构建（mix_split.cpp:113），`build_scatter_plan` 对全 token 产出单位 `order`（scatter_plan.cpp:84）；与 width 无关 |
-| `GET_ROWS(权重)` | 每 round `r.n_active == n_t && r.width == n_k` | `bucket_gather_per_slot` (minigraph_exec.cpp:631) | 必须整个 `(t,k)` 单元都在本 round，目标布局才与源 `[1,n_k,n_t]` 一致 |
-| `ACC` 拷贝化 | `single_target && 只有 1 个 round` | acc 循环 (minigraph_exec.cpp:1300) | 多 round 时 ACC 是真累加；`width==n_k && n_active==n_t` 蕴含单 round |
-| `host layer_fold` | `single_target`（任意 round 数） | `layer_fold` (minigraph_exec.cpp:465) | 单 target 时 host 侧只剩"把该 target 的 acc 落到 moe_out" |
+| 省略项            | 条件（每 round / 每 plan）                     | 挂点                                              | 理由                                                                                                                                |
+| :---------------- | :--------------------------------------------- | :------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------- |
+| `GET_ROWS(cur)`   | 每 round `r.n_active == n_t`                   | `bucket_gather_cur` (minigraph_exec.cpp:665)      | `active` 按 t 升序构建（mix_split.cpp:113），`build_scatter_plan` 对全 token 产出单位 `order`（scatter_plan.cpp:84）；与 width 无关 |
+| `GET_ROWS(权重)`  | 每 round `r.n_active == n_t && r.width == n_k` | `bucket_gather_per_slot` (minigraph_exec.cpp:631) | 必须整个 `(t,k)` 单元都在本 round，目标布局才与源 `[1,n_k,n_t]` 一致                                                                |
+| `ACC` 拷贝化      | `single_target && 只有 1 个 round`             | acc 循环 (minigraph_exec.cpp:1300)                | 多 round 时 ACC 是真累加；`width==n_k && n_active==n_t` 蕴含单 round                                                                |
+| `host layer_fold` | `single_target`（任意 round 数）               | `layer_fold` (minigraph_exec.cpp:465)             | 单 target 时 host 侧只剩"把该 target 的 acc 落到 moe_out"                                                                           |
 
 - `single_target` = `rounds` 里出现的**不同 pool 数 == 1**（不是 `dev_targets.size()<=1`：
   CPU round 与 device round 并存时 target 数是 2）。
@@ -62,10 +62,10 @@
 源 `ffn_moe_weights_norm` 是满的 `[1, n_k, n_t]`（连续，flat 下标 `t*n_k+k`）；桶要
 `[1, width, n_active]`（flat `a*width+s`）。只有覆盖整个网格才恒等。
 
-| 量 | 直接引用（跳过 gather）条件 | gather 形态 |
-| :--- | :--- | :--- |
-| `cur` | `n_active == n_t` | 按 token 取整行（行内连续 d 个 float） |
-| `weights` | `n_active == n_t && width == n_k` | 按 `(t,k)` 取单元素（flat 下标） |
+| 量        | 直接引用（跳过 gather）条件       | gather 形态                            |
+| :-------- | :-------------------------------- | :------------------------------------- |
+| `cur`     | `n_active == n_t`                 | 按 token 取整行（行内连续 d 个 float） |
+| `weights` | `n_active == n_t && width == n_k` | 按 `(t,k)` 取单元素（flat 下标）       |
 
 三种组合：
 
@@ -124,10 +124,10 @@ weighted [d_out, w_b, n_active]
 
 转置张量 = `w_b * d_out * n_active * 4`：
 
-| 场景 | 大小 | 说明 |
-| :--- | ---: | :--- |
+| 场景                        |       大小 | 说明                                               |
+| :-------------------------- | ---------: | :------------------------------------------------- |
 | prefill 3k（w_b=8, d=2048） | ~196 MB/层 | cont 读+写 ~392MB，sum_rows 再读 196MB → ~600MB/层 |
-| decode（n_active=1） | ~64 KB | 可忽略 |
+| decode（n_active=1）        |     ~64 KB | 可忽略                                             |
 
 P1b 实测 2-token 层 `CONT 986us` **不可能是带宽**（数据才几十 KB），只能是固定
 dispatch/图开销或 perf logger 归因——印证 P2"瓶颈是每层 submit+sync"。
@@ -202,13 +202,13 @@ dispatch/图开销或 perf logger 归因——印证 P2"瓶颈是每层 submit+s
 
 ### 9.1 条件发射清单（per bucket）
 
-| 节点 | 不生成条件 | 替代 |
-| :--- | :--- | :--- |
-| `cur` GET_ROWS | `n_active == n_t` | leaf 直接指源 |
-| `weights` GET_ROWS | `cell_full` | leaf 直接指源 |
-| `weights` GET_ROWS | 单 pool（k 集合统一连续） | k-slice 视图 + token gather |
-| `ACC` | `single_target && 单桶` | `sum_rows` 输出直接钉 `moe_out` |
-| host `layer_fold` | `single_target` | acc 直接绑输出 / 单次 D2H |
+| 节点               | 不生成条件                | 替代                            |
+| :----------------- | :------------------------ | :------------------------------ |
+| `cur` GET_ROWS     | `n_active == n_t`         | leaf 直接指源                   |
+| `weights` GET_ROWS | `cell_full`               | leaf 直接指源                   |
+| `weights` GET_ROWS | 单 pool（k 集合统一连续） | k-slice 视图 + token gather     |
+| `ACC`              | `single_target && 单桶`   | `sum_rows` 输出直接钉 `moe_out` |
+| host `layer_fold`  | `single_target`           | acc 直接绑输出 / 单次 D2H       |
 
 单 pool ⇒ 单桶全宽 ⇒ 图退化为"原始闭包 + 一次专家折叠"，几乎无多余节点。
 

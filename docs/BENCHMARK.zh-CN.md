@@ -6,7 +6,7 @@
 > 常驻 VRAM 单独或组合时吞吐提升多少，并与纯粹原版 llama.cpp 对比。
 >
 > 相关：`docs/DENSE_PLACEMENT.md`（`--dense-placement`）、`docs/ROUTE_B_GPU_PHASE.md`
->（专家池 / `--moe-expert-pools`）、`tools/run_export.js`（同一套 spec 模型）、
+> （专家池 / `--moe-expert-pools`）、`tools/run_export.js`（同一套 spec 模型）、
 > `docs/TEST_FLOW.md`。
 
 ## 1. 指标
@@ -49,11 +49,11 @@ node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <sp
 
 三类互斥 spec，跨类重复键直接报错。
 
-| 类别 | 键 |
-| :--- | :--- |
-| model | `model`、`modelPath`、`draft?`、`pool?` |
+| 类别   | 键                                         |
+| :----- | :----------------------------------------- |
+| model  | `model`、`modelPath`、`draft?`、`pool?`    |
 | engine | `engine`、`bin` &#124; `binPath`、`extra?` |
-| task | `input`，加下面的 single/jsonl 字段 |
+| task   | `input`，加下面的 single/jsonl 字段        |
 
 engine = 二进制 + placement 参数：
 
@@ -77,19 +77,19 @@ task 字段：
 
 所有 route-B spec 用 `bin: StreamMoE`；`${pool}` 来自 model spec。
 
-| Spec | `--dense-placement` | `--moe-expert-pools` |
-| :--- | :--- | :--- |
-| `place-cpu.json` | `C1:RAM,C2:RAM` | `RAM:${pool}` |
-| `place-c1.json` | `C1:Vulkan0,C2:RAM` | `RAM:${pool}` |
-| `place-c2.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool}` |
-| `place-exp2.json` | `C1:RAM,C2:RAM` | `RAM:${pool},Vulkan0:2048` |
-| `place-exp5.json` | `C1:RAM,C2:RAM` | `RAM:${pool},Vulkan0:5120` |
-| `place-c1-exp2.json` | `C1:Vulkan0,C2:RAM` | `RAM:${pool},Vulkan0:2048` |
-| `place-c2-exp2.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
-| `place-c1c2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}` |
+| Spec                   | `--dense-placement`     | `--moe-expert-pools`       |
+| :--------------------- | :---------------------- | :------------------------- |
+| `place-cpu.json`       | `C1:RAM,C2:RAM`         | `RAM:${pool}`              |
+| `place-c1.json`        | `C1:Vulkan0,C2:RAM`     | `RAM:${pool}`              |
+| `place-c2.json`        | `C1:RAM,C2:Vulkan0`     | `RAM:${pool}`              |
+| `place-exp2.json`      | `C1:RAM,C2:RAM`         | `RAM:${pool},Vulkan0:2048` |
+| `place-exp5.json`      | `C1:RAM,C2:RAM`         | `RAM:${pool},Vulkan0:5120` |
+| `place-c1-exp2.json`   | `C1:Vulkan0,C2:RAM`     | `RAM:${pool},Vulkan0:2048` |
+| `place-c2-exp2.json`   | `C1:RAM,C2:Vulkan0`     | `RAM:${pool},Vulkan0:2048` |
+| `place-c1c2.json`      | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}`              |
 | `place-c1c2-exp2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
 | `place-c1c2-exp1.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:1024` |
-| `place-c2-exp5.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
+| `place-c2-exp5.json`   | `C1:RAM,C2:Vulkan0`     | `RAM:${pool},Vulkan0:5120` |
 | `place-c1c2-exp5.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
 
 纯粹原版：`stock-cpu.json`（`-ngl 0`）、`stock-vulkan.json`（`-ngl 99`），都走
@@ -112,7 +112,7 @@ Vulkan 构建）、`SM_PREFILL_10K`（`prefill10000` 用的 ~10.4k token 聊天�
 - single：`{kind:"single", cold, warmup[], steady[], median:{prompt_n,prompt_tps,decode_tps}, server_log_tail}`
 - jsonl：每轮一条 `{kind:"turn", turn, prompt_tokens, prompt_tps, decode_tps, gen_n, cache_n}`，
   末尾 `{kind:"summary", turns, total_prompt_tokens, total_gen_tokens,
-  avg_decode_tps, median_decode_tps, avg_prompt_tps, server_log_tail}`
+avg_decode_tps, median_decode_tps, avg_prompt_tps, server_log_tail}`
 
 ## 7. 示例
 
@@ -146,22 +146,22 @@ private\bench.bat --models tools\run_specs\models\gemma.json ^
 
 10 轮平均（tg = decode tok/s，pp = prefill tok/s）：
 
-| engine | tg | pp | 布局 |
-| :--- | ---: | ---: | :--- |
-| stock-cpu | 42.38 | 102.3 | 原版，CPU |
-| stock-vulkan | 41.32 | 221.9 | 原版，全部层 Vulkan0 |
-| place-cpu | 40.00 | 171.5 | route B 基线（dense + 专家全 RAM） |
-| place-c2 | 36.87 / 36.54 | 143.7 / 144.6 | C2 进 Vulkan0（跑了两次） |
-| place-c1 | 19.50 | 188.4 | C1 进 Vulkan0 |
-| place-c1c2 | 20.26 | 195.8 | C1+C2 进 Vulkan0 |
-| place-exp2 | 27.03 | 101.3 | 专家 2G VRAM |
-| place-exp5 | 25.42 | 140.9 | 专家 5G VRAM |
-| place-c2-exp2 | 28.00 | 101.0 | C2 + 2G 专家 |
-| place-c2-exp5 | 26.21 | 145.8 | C2 + 5G 专家 |
-| place-c1-exp2 | 16.69 | 111.4 | C1 + 2G 专家 |
-| place-c1c2-exp1 | 17.77 | 143.5 | C1+C2 + 1G 专家 |
-| place-c1c2-exp2 | 17.12 | 109.1 | C1+C2 + 2G 专家 |
-| place-c1c2-exp5 | 16.39 | 160.5 | C1+C2 + 5G 专家 |
+| engine          |            tg |            pp | 布局                               |
+| :-------------- | ------------: | ------------: | :--------------------------------- |
+| stock-cpu       |         42.38 |         102.3 | 原版，CPU                          |
+| stock-vulkan    |         41.32 |         221.9 | 原版，全部层 Vulkan0               |
+| place-cpu       |         40.00 |         171.5 | route B 基线（dense + 专家全 RAM） |
+| place-c2        | 36.87 / 36.54 | 143.7 / 144.6 | C2 进 Vulkan0（跑了两次）          |
+| place-c1        |         19.50 |         188.4 | C1 进 Vulkan0                      |
+| place-c1c2      |         20.26 |         195.8 | C1+C2 进 Vulkan0                   |
+| place-exp2      |         27.03 |         101.3 | 专家 2G VRAM                       |
+| place-exp5      |         25.42 |         140.9 | 专家 5G VRAM                       |
+| place-c2-exp2   |         28.00 |         101.0 | C2 + 2G 专家                       |
+| place-c2-exp5   |         26.21 |         145.8 | C2 + 5G 专家                       |
+| place-c1-exp2   |         16.69 |         111.4 | C1 + 2G 专家                       |
+| place-c1c2-exp1 |         17.77 |         143.5 | C1+C2 + 1G 专家                    |
+| place-c1c2-exp2 |         17.12 |         109.1 | C1+C2 + 2G 专家                    |
+| place-c1c2-exp5 |         16.39 |         160.5 | C1+C2 + 5G 专家                    |
 
 初步判断（**不是结论**）：
 

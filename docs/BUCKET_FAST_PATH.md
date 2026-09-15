@@ -31,12 +31,12 @@
 > which pool it belongs to; the per-pool peel in §3 only explains how the round
 > list is produced.
 
-| Omitted | Predicate (per round / per plan) | Hook | Reason |
-| :--- | :--- | :--- | :--- |
-| `GET_ROWS(cur)` | per round `r.n_active == n_t` | `bucket_gather_cur` (minigraph_exec.cpp:665) | `active` is built in ascending t (mix_split.cpp:113); `build_scatter_plan` yields an identity `order` for all tokens (scatter_plan.cpp:84); independent of width |
-| `GET_ROWS(weights)` | per round `r.n_active == n_t && r.width == n_k` | `bucket_gather_per_slot` (minigraph_exec.cpp:631) | the whole `(t,k)` cell must be present in this round for the target layout to match the source `[1,n_k,n_t]` |
-| `ACC` as copy | `single_target && exactly 1 round` | acc loop (minigraph_exec.cpp:1300) | with several rounds ACC is a real accumulation; `width==n_k && n_active==n_t` implies a single round |
-| host `layer_fold` | `single_target` (any round count) | `layer_fold` (minigraph_exec.cpp:465) | with one target the host side is only "drop that target's acc into moe_out" |
+| Omitted             | Predicate (per round / per plan)                | Hook                                              | Reason                                                                                                                                                           |
+| :------------------ | :---------------------------------------------- | :------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET_ROWS(cur)`     | per round `r.n_active == n_t`                   | `bucket_gather_cur` (minigraph_exec.cpp:665)      | `active` is built in ascending t (mix_split.cpp:113); `build_scatter_plan` yields an identity `order` for all tokens (scatter_plan.cpp:84); independent of width |
+| `GET_ROWS(weights)` | per round `r.n_active == n_t && r.width == n_k` | `bucket_gather_per_slot` (minigraph_exec.cpp:631) | the whole `(t,k)` cell must be present in this round for the target layout to match the source `[1,n_k,n_t]`                                                     |
+| `ACC` as copy       | `single_target && exactly 1 round`              | acc loop (minigraph_exec.cpp:1300)                | with several rounds ACC is a real accumulation; `width==n_k && n_active==n_t` implies a single round                                                             |
+| host `layer_fold`   | `single_target` (any round count)               | `layer_fold` (minigraph_exec.cpp:465)             | with one target the host side is only "drop that target's acc into moe_out"                                                                                      |
 
 - `single_target` = number of **distinct pools in `rounds` == 1** (not
   `dev_targets.size()<=1`: a CPU round and a device round coexist -> 2 targets).
@@ -80,10 +80,10 @@ question is whether that rectangle is the whole source grid.** The source
 `t*n_k+k`); the bucket needs `[1, width, n_active]` (flat `a*width+s`). Identity
 requires covering the whole grid.
 
-| Quantity | Direct reference (skip gather) | Gather shape |
-| :--- | :--- | :--- |
-| `cur` | `n_active == n_t` | one whole row per token (d contiguous floats) |
-| `weights` | `n_active == n_t && width == n_k` | one element per `(t,k)` (flat index) |
+| Quantity  | Direct reference (skip gather)    | Gather shape                                  |
+| :-------- | :-------------------------------- | :-------------------------------------------- |
+| `cur`     | `n_active == n_t`                 | one whole row per token (d contiguous floats) |
+| `weights` | `n_active == n_t && width == n_k` | one element per `(t,k)` (flat index)          |
 
 Three combinations:
 
@@ -150,10 +150,10 @@ consume -> `ggml_cont` is mandatory, not conservative.
 
 Transposed tensor = `w_b * d_out * n_active * 4`:
 
-| Case | Size | Note |
-| :--- | ---: | :--- |
+| Case                       |          Size | Note                                                               |
+| :------------------------- | ------------: | :----------------------------------------------------------------- |
 | prefill 3k (w_b=8, d=2048) | ~196 MB/layer | cont read+write ~392MB, sum_rows reads 196MB again -> ~600MB/layer |
-| decode (n_active=1) | ~64 KB | negligible |
+| decode (n_active=1)        |        ~64 KB | negligible                                                         |
 
 The P1b measurement of `CONT 986us` for a 2-token layer **cannot be bandwidth**
 (the data is a few tens of KB); it must be fixed dispatch/graph overhead or
@@ -253,13 +253,13 @@ path. The same change eliminates all keep-alive small vectors.
 
 ### 9.1 Conditional emission list (per bucket)
 
-| Node | Do not emit when | Replacement |
-| :--- | :--- | :--- |
-| `cur` GET_ROWS | `n_active == n_t` | leaf referencing the source |
-| `weights` GET_ROWS | `cell_full` | leaf referencing the source |
-| `weights` GET_ROWS | single pool (uniform contiguous k set) | k-slice view + token gather |
-| `ACC` | `single_target && one bucket` | `sum_rows` output pinned to `moe_out` |
-| host `layer_fold` | `single_target` | acc bound to output / one D2H |
+| Node               | Do not emit when                       | Replacement                           |
+| :----------------- | :------------------------------------- | :------------------------------------ |
+| `cur` GET_ROWS     | `n_active == n_t`                      | leaf referencing the source           |
+| `weights` GET_ROWS | `cell_full`                            | leaf referencing the source           |
+| `weights` GET_ROWS | single pool (uniform contiguous k set) | k-slice view + token gather           |
+| `ACC`              | `single_target && one bucket`          | `sum_rows` output pinned to `moe_out` |
+| host `layer_fold`  | `single_target`                        | acc bound to output / one D2H         |
 
 Single pool => one full-width bucket => the graph reduces to "original closure +
 one expert fold", almost no redundant nodes.

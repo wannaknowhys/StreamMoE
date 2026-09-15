@@ -33,6 +33,7 @@ to the device backend).
 ## 2. Background: the three costs
 
 ### 2.1 Seam copies
+
 The MoE backend advertises a host compute buft (`STREAMMOE_HOST`,
 `moe_backend.cpp:264`). The scheduler inserts a copy only when the consuming
 backend does not support the producer's buffer type (`ggml-backend.cpp:1026`,
@@ -42,12 +43,14 @@ executor uploads it again to the device stage (`bucket_upload_leaf`,
 crossings per layer that carry no information.
 
 ### 2.2 Per-layer sync
+
 Dense (llama backend) and MoE (our backend) alternate every layer; the scheduler
 synchronises at every backend boundary. Measured `tail_sync 1.68 ms/layer` on
 decode (`WORK_IN_PROGRESS.md` P2) - the fixed cost that makes the CPU path
 faster than the device path.
 
 ### 2.3 Static C1
+
 `dev_layer` is fixed at load (`llama-model.cpp:1492-1494`). C1 cannot move.
 `DENSE_PLACEMENT.md` §5 Phase 2: dynamic migration requires route B to own the
 C1 weights and execution.
@@ -55,6 +58,7 @@ C1 weights and execution.
 ## 3. Architecture
 
 ### 3.1 Whole-layer closure
+
 Extend the privatised set from the MoE chain to **the whole layer**. Layer
 attribution already exists (`moe_chain_layer_of_node`); the closure becomes all
 layer-L compute nodes (dense, gating, MoE). The verify gate (Check 1) becomes:
@@ -62,6 +66,7 @@ no layer-L intermediate has a consumer outside layer L, except the layer output
 consumed by the next layer / residual.
 
 ### 3.2 One backend, internal placement
+
 The whole graph is owned by our backend, so the scheduler produces **one split**.
 `graph_compute` receives the whole graph and runs it **layer by layer**,
 internally placing each layer's activations on that layer's device. The
@@ -73,6 +78,7 @@ depend on the scheduler's per-backend compute buft. (`supports_buft` accepting
 all device bufts is still useful while layers are only partially owned.)
 
 ### 3.3 Dense delegation
+
 We do not write dense kernels. Every dense node is cloned (fresh tensor, same op
 / op_params) and run on the layer's device backend; dense weights are referenced
 in place (Phase 1) or come from the route-B C1 pool (migration phase). Attention
@@ -80,6 +86,7 @@ references llama's KV tensors in place. The MoE chain runs through the existing
 bucket engine.
 
 ### 3.4 Device-local buffers and the fold
+
 Each layer has a per-device arena (the existing verify interval layout, extended
 from the MoE closure to the whole layer). cur is the layer input; moe_out is the
 layer output and lives on the layer's device. The expert fold writes moe_out on
@@ -87,6 +94,7 @@ the device (the host `layer_fold`, `minigraph_exec.cpp:492`, is replaced by a
 device-side reduction).
 
 ### 3.5 Cross-device transport
+
 Experts are pinned per pool; `build_mix_plan` guarantees a bucket's experts are
 on the bucket's pool. The only cross-device data is:
 
@@ -97,6 +105,7 @@ on the bucket's pool. The only cross-device data is:
 Both are device transfers (D2D or the transfer queue), never host staging.
 
 ### 3.6 ids and the residual host round-trip
+
 The scheduler (pin, `build_mix_plan`) runs on host and needs the current token's
 ids, which are device-computed. This is the one unavoidable per-layer host
 round-trip (the ids tensor is tiny; the cost is the wait). Levers:
@@ -108,12 +117,14 @@ round-trip (the ids tensor is tiny; the cost is the wait). Levers:
   as a device tensor - zero host round-trip for that layer.
 
 ### 3.7 C1 vs C2
+
 C1 is the layer's dense; its device is the layer's device and defines where
 cur/moe_out live. C2 (`token_embd` / `output` / `output_norm`) sits outside the
 layers and does not touch the seam; it stays a placement policy
 (`--dense-placement C2:<dev>`), placed on a device only when it is a net win.
 
 ### 3.8 Dynamic C1 migration
+
 Route B owns the C1 weights in a managed pool (reuse the
 `EXPERT_MOVE_PIPELINE` machinery: move worker, hysteresis, copy-then-release).
 On a migration decision, C1 weights and the layer's KV move together, and the

@@ -494,10 +494,10 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 
 背景：bench olmoe prefill3000（warm 中位数，RX590）：
 
-| 指标 | stock-vulkan | place-c1c2-exp5 | place-cpu |
-| :--- | ---: | ---: | ---: |
-| pp (prefill) | 466.3 | 380.5 (82%) | — |
-| tg (decode) | 38.39 | **17.81 (46%)** | 32.15 (对 stock-cpu 32.99 = 97%) |
+| 指标         | stock-vulkan | place-c1c2-exp5 |                        place-cpu |
+| :----------- | -----------: | --------------: | -------------------------------: |
+| pp (prefill) |        466.3 |     380.5 (82%) |                                — |
+| tg (decode)  |        38.39 | **17.81 (46%)** | 32.15 (对 stock-cpu 32.99 = 97%) |
 
 关键判据：**CPU 路径 decode（32.15）反而比 GPU 设备路径（17.81）快** → decode 差距不是算力，
 是每层设备执行器的固定开销。探针（dbg+TMR，cold 单次 prefill）：`burst` 8.2s = `pin` 2.7s
@@ -510,86 +510,87 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
       **`mix_plan` 并入 scratch**。判据（每桶独立）：cur 省略 `n_active==n_t`；
       weights 省略 `n_active==n_t && width==n_k`；单 target（`cell_full` ⇒ 单 pool ⇒ 单桶）
       时 ACC/fold 直写 `moe_out`。
-      - [x] **P1-a 条件发射**：`bucket_gather_cur`/`bucket_gather_per_slot` 恒等跳过（`tok_full`/
-            `cell_full` + `bucket_direct_leaf`；device 加源紧凑性判断，否则回退 gather）。连续优化待补。
-      - [x] **P1-b 单 target**：ACC 直写 `moe_out`（CPU 绑 `per_token->data` / device 单次 `tensor_get`），
-            跳过 host `layer_fold`；多 target 路径不变。
-      - [x] **P1-c scratch**：`thread_local exec_scratch_t`（grow-only，每层 reset + 按需一次
-            reserve），`i32`（t_round/ids_exp/ids_slot/gather idx）+ `f32`（CPU fold + gather 输出）
-            替换 `mm_ids_pool`/`fold_buf`/`ids_exp`/`ids_slot`/`t_round`/局部 `idx`。**坑**：f32 估算
-            一开始漏了 gather 输出（CPU `bind_fresh(...,false)` 也走 f32）→ `sum_rows` dst 越界崩溃
-            （0xC0000005，lldb 定位 ops.cpp:1487）；补上后三配置 IDENTICAL。
-      - [x] **P1-d `mix_plan` 并入 scratch**：`mix_round_t` 变 `{pool,width,n_active,off}` span，
-            `build_mix_plan` 写调用方 flat `plan_ids/plan_scatter/plan_rounds`；`scatter_plan_t` 同理
-            （`out_order/out_segs`）；`test_mix_plan`/`test_scatter_plan` 同步适配。
-      - [x] **P1-e `twin`/`gather_cache` 换定长数组**（`MAX_TWIN=64`/`MAX_GATHER=16` 线性查，
-            `clear_round()` 每桶清）。
-      - [x] **P1-f 回归**：`build.bat test main` **6/6**（含 mix_plan/scatter_plan 新接口）；
-            纯 CPU / `RAM:8192,Vulkan0:256` / `RAM:8192,Vulkan0:4096` 三配置对 HEAD **IDENTICAL**
-            （embd/hidden/KV + expert_history）。
-      - [x] **P1-g device arena 估算**：把每轮 bump（fold `pc`/`s`/`acc` + cur gather + per-slot
-            gather，`bind_fresh(...,false)` 全部消费者）**之和**并入 `arena_bytes`，删掉固定 32MB slack。
-            验证：129 设备回归（256/4096）**IDENTICAL**；olmoe prefill3000 `place-c1c2-exp5` 跑通。
-            注：fold 中间量在 device 侧是 arena 尾部 bump（CPU 侧是 scratch f32），**不在 result_bytes**
-            ——只有链孪生用 result_bytes/out_off。
-      - 回归/性能（2026-09-09，P1-a/b/g 后）：三配置对 HEAD **IDENTICAL**。bench olmoe prefill3000
-        `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67（记录 380.5 / 17.81）。
-      - 回归/性能（2026-09-09，P1-c/d/e 后）：三配置仍 **IDENTICAL**、单测 6/6；bench 同款
-        **pp 391.9 / tg 18.66**（与 c/d/e 前同量级，符合预期——hygiene 不改算力）。
+  - [x] **P1-a 条件发射**：`bucket_gather_cur`/`bucket_gather_per_slot` 恒等跳过（`tok_full`/
+        `cell_full` + `bucket_direct_leaf`；device 加源紧凑性判断，否则回退 gather）。连续优化待补。
+  - [x] **P1-b 单 target**：ACC 直写 `moe_out`（CPU 绑 `per_token->data` / device 单次 `tensor_get`），
+        跳过 host `layer_fold`；多 target 路径不变。
+  - [x] **P1-c scratch**：`thread_local exec_scratch_t`（grow-only，每层 reset + 按需一次
+        reserve），`i32`（t_round/ids_exp/ids_slot/gather idx）+ `f32`（CPU fold + gather 输出）
+        替换 `mm_ids_pool`/`fold_buf`/`ids_exp`/`ids_slot`/`t_round`/局部 `idx`。**坑**：f32 估算
+        一开始漏了 gather 输出（CPU `bind_fresh(...,false)` 也走 f32）→ `sum_rows` dst 越界崩溃
+        （0xC0000005，lldb 定位 ops.cpp:1487）；补上后三配置 IDENTICAL。
+  - [x] **P1-d `mix_plan` 并入 scratch**：`mix_round_t` 变 `{pool,width,n_active,off}` span，
+        `build_mix_plan` 写调用方 flat `plan_ids/plan_scatter/plan_rounds`；`scatter_plan_t` 同理
+        （`out_order/out_segs`）；`test_mix_plan`/`test_scatter_plan` 同步适配。
+  - [x] **P1-e `twin`/`gather_cache` 换定长数组**（`MAX_TWIN=64`/`MAX_GATHER=16` 线性查，
+        `clear_round()` 每桶清）。
+  - [x] **P1-f 回归**：`build.bat test main` **6/6**（含 mix_plan/scatter_plan 新接口）；
+        纯 CPU / `RAM:8192,Vulkan0:256` / `RAM:8192,Vulkan0:4096` 三配置对 HEAD **IDENTICAL**
+        （embd/hidden/KV + expert_history）。
+  - [x] **P1-g device arena 估算**：把每轮 bump（fold `pc`/`s`/`acc` + cur gather + per-slot
+        gather，`bind_fresh(...,false)` 全部消费者）**之和**并入 `arena_bytes`，删掉固定 32MB slack。
+        验证：129 设备回归（256/4096）**IDENTICAL**；olmoe prefill3000 `place-c1c2-exp5` 跑通。
+        注：fold 中间量在 device 侧是 arena 尾部 bump（CPU 侧是 scratch f32），**不在 result_bytes**
+        ——只有链孪生用 result_bytes/out_off。
+  - 回归/性能（2026-09-09，P1-a/b/g 后）：三配置对 HEAD **IDENTICAL**。bench olmoe prefill3000
+    `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67（记录 380.5 / 17.81）。
+  - 回归/性能（2026-09-09，P1-c/d/e 后）：三配置仍 **IDENTICAL**、单测 6/6；bench 同款
+    **pp 391.9 / tg 18.66**（与 c/d/e 前同量级，符合预期——hygiene 不改算力）。
 - [ ] **P1b fold 路径按桶 token 数二选一（per-k add 链 vs SUM_ROWS）**：
-      - 现状 `append_expert_fold` = `permute → cont(转置) → sum_rows → cont_2d`。**约束**：转置
-        CONT 删不掉而不动 SUM_ROWS——Vulkan `sum_rows` shader 只认连续 ne0（无 nb00；CPU 也
-        assert nb0==4），转置视图喂不进去。要删转置 = 换掉 SUM_ROWS。
-      - 实测（2026-09-09，olmoe 2048-token ubatch，单桶全 VRAM，dbg+perf logger）首图 9 节点：
-        mm 194ms(92%, 1041-1074 GFLOPS) / GLU 6.6ms / MUL 1.8ms / **CONT×2 2.7ms** /
-        **SUM_ROWS 6.5ms（读 134MB → ~20.6 GB/s，带宽极差）**。route-B fold 共 **9.2ms/层 = 4.4%**。
-        转置 CONT 本身不慢（搬 268MB → ~196 GB/s）；慢的是 SUM_ROWS + 小 `cont_2d`（固定开销）。
-      - **方案**：按本桶 `n_active`（或 fold 总字节 `n_active*w_b*d_out`）选路径——
-        大 n_active（prefill）走 **per-k view+add 链**（上游形状：无 CONT/SUM_ROWS，`w_b-1` 个 ADD，
-        带宽效率高、数值顺序=上游）；小 n_active（decode）保留 SUM_ROWS（节点少、固定开销低）。
-      - **实测交叉点（2026-09-09，dbg+perf logger，olmoe 单桶全 VRAM，热图平均）**：fold 耗时
-        （SUM_ROWS+CONT×2 vs 7×ADD）：
+  - 现状 `append_expert_fold` = `permute → cont(转置) → sum_rows → cont_2d`。**约束**：转置
+    CONT 删不掉而不动 SUM_ROWS——Vulkan `sum_rows` shader 只认连续 ne0（无 nb00；CPU 也
+    assert nb0==4），转置视图喂不进去。要删转置 = 换掉 SUM_ROWS。
+  - 实测（2026-09-09，olmoe 2048-token ubatch，单桶全 VRAM，dbg+perf logger）首图 9 节点：
+    mm 194ms(92%, 1041-1074 GFLOPS) / GLU 6.6ms / MUL 1.8ms / **CONT×2 2.7ms** /
+    **SUM_ROWS 6.5ms（读 134MB → ~20.6 GB/s，带宽极差）**。route-B fold 共 **9.2ms/层 = 4.4%**。
+    转置 CONT 本身不慢（搬 268MB → ~196 GB/s）；慢的是 SUM_ROWS + 小 `cont_2d`（固定开销）。
+  - **方案**：按本桶 `n_active`（或 fold 总字节 `n_active*w_b*d_out`）选路径——
+    大 n_active（prefill）走 **per-k view+add 链**（上游形状：无 CONT/SUM_ROWS，`w_b-1` 个 ADD，
+    带宽效率高、数值顺序=上游）；小 n_active（decode）保留 SUM_ROWS（节点少、固定开销低）。
+  - **实测交叉点（2026-09-09，dbg+perf logger，olmoe 单桶全 VRAM，热图平均）**：fold 耗时
+    （SUM_ROWS+CONT×2 vs 7×ADD）：
 
-        | n_t | SUM_ROWS 路径 | ADD 链 | SR/ADD |
-        | ---: | ---: | ---: | ---: |
-        | 1 | 375us | 2265us | 0.17 |
-        | 16 | 486us | 889us | 0.55 |
-        | 64 | 794us | 987us | 0.80 |
-        | 256 | 2273us | 2136us | 1.06 |
-        | 1024 | 6964us | 5062us | 1.38 |
-        | 2048 | 9253us | 6300us | 1.47 |
+    |  n_t | SUM_ROWS 路径 | ADD 链 | SR/ADD |
+    | ---: | ------------: | -----: | -----: |
+    |    1 |         375us | 2265us |   0.17 |
+    |   16 |         486us |  889us |   0.55 |
+    |   64 |         794us |  987us |   0.80 |
+    |  256 |        2273us | 2136us |   1.06 |
+    | 1024 |        6964us | 5062us |   1.38 |
+    | 2048 |        9253us | 6300us |   1.47 |
 
-        **交叉点 n_t ≈ 256**：小桶 SUM_ROWS 赢（n_t=1 快 6×），大桶 ADD 赢（2048 快 1.47×）。
-      - [x] **转正（2026-09-09）**：`append_expert_fold` 按 `fold_bytes = n_active*w_b*d_out*4`
-            选择——`>= 16MB` 走 per-k view+add 链（ping-pong 两缓冲），否则 SUM_ROWS 路径。
-            `STREAM_MOE_TMP_FOLD_ADD`/`_SUM` 保留为 dbg 强制开关。
-      - 验证：L0 隔离（gemma129，dump moe_out，ADD vs SUM）**maxAbs 7.6e-6 ≤ 1e-5 / cos≈1.0**
-            （ADD 本身正确）；端到端 129-token 回归走 SUM 路径 **IDENTICAL**（11.6MB < 16MB）；
-            单测 **6/6**。bench olmoe prefill3000 `place-c1c2-exp5`（ub512→ADD）**pp 385.2 / tg 18.99**
-            vs SUM 版 391.9 / 18.66——净收益 ~1.5%（fold 只占层 ~4%），在 run 噪声内。
-      - 备注：端到端 ADD vs SUM 会出现专家翻转放大（部分 token cos 0.9-0.99），与 route-B vs
-            上游同量级（已知 gate 噪声）；L0 隔离证明是 ULP，非 bug。
-      - 备注：旧 perf logger 2-token 数（ACC 983us/CONT 986us/SUM_ROWS 510us）疑似把算子间停顿
-        归到前一 op，不作判据；ACC 已随 P1-b 单 target 直写去掉。
+    **交叉点 n_t ≈ 256**：小桶 SUM_ROWS 赢（n_t=1 快 6×），大桶 ADD 赢（2048 快 1.47×）。
+
+  - [x] **转正（2026-09-09）**：`append_expert_fold` 按 `fold_bytes = n_active*w_b*d_out*4`
+        选择——`>= 16MB` 走 per-k view+add 链（ping-pong 两缓冲），否则 SUM_ROWS 路径。
+        `STREAM_MOE_TMP_FOLD_ADD`/`_SUM` 保留为 dbg 强制开关。
+  - 验证：L0 隔离（gemma129，dump moe_out，ADD vs SUM）**maxAbs 7.6e-6 ≤ 1e-5 / cos≈1.0**
+    （ADD 本身正确）；端到端 129-token 回归走 SUM 路径 **IDENTICAL**（11.6MB < 16MB）；
+    单测 **6/6**。bench olmoe prefill3000 `place-c1c2-exp5`（ub512→ADD）**pp 385.2 / tg 18.99**
+    vs SUM 版 391.9 / 18.66——净收益 ~1.5%（fold 只占层 ~4%），在 run 噪声内。
+  - 备注：端到端 ADD vs SUM 会出现专家翻转放大（部分 token cos 0.9-0.99），与 route-B vs
+    上游同量级（已知 gate 噪声）；L0 隔离证明是 ULP，非 bug。
+  - 备注：旧 perf logger 2-token 数（ACC 983us/CONT 986us/SUM_ROWS 510us）疑似把算子间停顿
+    归到前一 op，不作判据；ACC 已随 P1-b 单 target 直写去掉。
 - [ ] **接缝（跨 backend）成本——混合放置的真正瓶颈（2026-09-09 实测）**：
-      - 现象：olmoe `place-c1`（C1 dense 在 Vulkan、专家 RAM/CPU）**19.5 t/s** vs `place-cpu` 40.0 /
-        `stock-vulkan` 41.3；`place-cpu ≈ stock-cpu` → **route-B MoE 引擎本身不亏**，慢在混合放置。
-      - `[COPY]` 计时（vendored sched 跨 split 拷贝点，`SM_COPY_TMR` 门控，包住前置 sync）：
-        `cur`（`ffn_norm-N` 8KB）每次 **1.58ms = sync 1.41 + copy 0.17**；全部拷贝每 token
-        **41ms = sync 30 + copy 10.6**。`ffn_moe_out`（8KB 回写）才 **0.003ms**；`topk/weights`（32B）
-        ~0.17ms（同样 sync 主导）。
-      - 结论：**慢的不是拷贝字节，是每层 host 停等 GPU dense 的 `ggml_backend_synchronize`**。
-        上游 dense+MoE 同设备一条命令流（流水）；混合放置逐层 GPU↔host 乒乓、完全串行。
-      - **两个方向（用户 2026-09-09 定，记录待做）**：
-        - **A 消灭 sync**：dense 与 MoE 同设备（都在 GPU 或都在 CPU），消除跨 backend 每层等待；
-          或流水（不等 dense 完成）。放置问题，非拷贝问题。
-        - **B 降低 copy**：170us/8KB（~47MB/s）本身也差；同设备接缝零拷贝可连这 170us 一起省。
-      - **根因定位（2026-09-09，排除法 + `SM_REP100`）**：C1 dense 每图（38 节点）有 **~0.7ms 固定
-        基础 lag**（一次 graph_compute 把真实节点跑 100 遍 → per_rep 0.65-0.93ms；正常 1× ≈1.4ms），
-        16 图/token → ~11ms/token 基础 lag。**已逐一排除**：GGUF（原版文件）、构建（route-B build
-        `-ngl 99` = 89us = 上游）、buft（都 Vulkan0）、显存类型（都 devlocal=1 hostvis=1 rebar）、
-        权重布局/字节（nb 一致、模型字节喂微基准仍慢）、verify tag（`chain=1` 全 `ffn_moe_*`）、shader。
-        → 慢在**整模型大图被切成逐层小图**，每次 `graph_compute` 的固定开销 × 层数。
+  - 现象：olmoe `place-c1`（C1 dense 在 Vulkan、专家 RAM/CPU）**19.5 t/s** vs `place-cpu` 40.0 /
+    `stock-vulkan` 41.3；`place-cpu ≈ stock-cpu` → **route-B MoE 引擎本身不亏**，慢在混合放置。
+  - `[COPY]` 计时（vendored sched 跨 split 拷贝点，`SM_COPY_TMR` 门控，包住前置 sync）：
+    `cur`（`ffn_norm-N` 8KB）每次 **1.58ms = sync 1.41 + copy 0.17**；全部拷贝每 token
+    **41ms = sync 30 + copy 10.6**。`ffn_moe_out`（8KB 回写）才 **0.003ms**；`topk/weights`（32B）
+    ~0.17ms（同样 sync 主导）。
+  - 结论：**慢的不是拷贝字节，是每层 host 停等 GPU dense 的 `ggml_backend_synchronize`**。
+    上游 dense+MoE 同设备一条命令流（流水）；混合放置逐层 GPU↔host 乒乓、完全串行。
+  - **两个方向（用户 2026-09-09 定，记录待做）**：
+    - **A 消灭 sync**：dense 与 MoE 同设备（都在 GPU 或都在 CPU），消除跨 backend 每层等待；
+      或流水（不等 dense 完成）。放置问题，非拷贝问题。
+    - **B 降低 copy**：170us/8KB（~47MB/s）本身也差；同设备接缝零拷贝可连这 170us 一起省。
+  - **根因定位（2026-09-09，排除法 + `SM_REP100`）**：C1 dense 每图（38 节点）有 **~0.7ms 固定
+    基础 lag**（一次 graph_compute 把真实节点跑 100 遍 → per_rep 0.65-0.93ms；正常 1× ≈1.4ms），
+    16 图/token → ~11ms/token 基础 lag。**已逐一排除**：GGUF（原版文件）、构建（route-B build
+    `-ngl 99` = 89us = 上游）、buft（都 Vulkan0）、显存类型（都 devlocal=1 hostvis=1 rebar）、
+    权重布局/字节（nb 一致、模型字节喂微基准仍慢）、verify tag（`chain=1` 全 `ffn_moe_*`）、shader。
+    → 慢在**整模型大图被切成逐层小图**，每次 `graph_compute` 的固定开销 × 层数。
 - [ ] **P2 decode 路径延迟开销细查**：decode ubatch=1，gather 只 1 个 token、开销可忽略——差距
       应来自每层的设备图提交/sync、`acc_d` D2H 回读、host `layer_fold`、`pin_layer` 调用。
       用 `STREAM_MOE_TMR` 口径逐项计时定位，目标 decode 追近 stock-vulkan。
@@ -613,6 +614,7 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
   - 诊断 env：`STREAM_MOE_TMR`、`STREAM_MOE_TMP_PREWARM`、`STREAM_MOE_TMP_SYNC_SPIN`。
   - 待定：这 1.7ms 是"GPU 真在算"还是"驱动提交管线延迟"——需在 vendored vulkan 里加 timestamp
     query（gated + patch 记录）才能区分；见下条。
+
 - 备注：**C（同设备接缝）被 sched 拷贝挡住**——实测 exec 时 `cur` 是 `STREAMMOE_HOST`
   （`[seam] cur 'STREAMMOE#ffn_norm-0 (reshaped)#0' buft=STREAMMOE_HOST`），即 dense cur 已被
   sched 拷到我们的 host backend，不是设备上的生产者；"绑定生产者 buffer" 需把我们的 compute

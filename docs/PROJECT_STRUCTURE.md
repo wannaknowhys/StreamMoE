@@ -26,26 +26,26 @@ StreamMoE/
 
 ## 2. docs/（设计文档集中）
 
-| 文件                                                         | 内容                                                                                         |
-| :----------------------------------------------------------- | :------------------------------------------------------------------------------------------- |
-| `Backend.md`                                                 | DeepSeek4 自定义 backend / expert pool 调度设计（用户原始架构文档）                          |
-| `LLAMA_MOE_NO_MMAP_RESEARCH.md`                              | MoE 去 mmap 可行性研究 + route B 实现要点（含 pin 生命周期 §4.8、shexp §4.9）                |
-| `BUG_TRACKER.md`                                             | bug 追踪清单（P0/P1/P2/P3 + INC 事故记录 + 修复批次）                                        |
-| `TEST_FLOW.md`                                               | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）                                  |
-| `PROJECT_STRUCTURE.md`                                       | 本文件                                                                                       |
-| `MULTI_MODEL_POOL.md` / `MULTI_SUBPOOL.md`                   | 多模型池 / 按专家种类分子池设计                                                              |
-| `UPSTREAM_TOOLS_MIGRATION.md`                                | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入）                             |
-| `VENDORED_MODIFICATIONS.md`                                  | 对 vendored llama.cpp 的改动汇总（route-b-inject patch）                                     |
-| `PREFILL_CROSS_VALIDATION.md` / `EXPERT_TRACE_SIMULATION.md` | prefill/专家历史交叉验证与命中率模拟                                                         |
-| `SAMPLING.md` / `SAMPLING.zh-CN.md`                          | 采样参数推荐                                                                                 |
-| `REVIEW_2026_08_28.md` / `DEBUG_DELEGATION.md`               | 代码审查对照 / delegate 排查记录                                                             |
-| `REPACK_DIVERGENCE_DEBUG.md` / `.zh-CN.md`                   | repack vs 普通内核路径差异的 bit 级排查                                                      |
-| `TODO.md` / `LLAMA_EXE_ROADMAP.md`                           | 待办 / 可执行程序路线图                                                                      |
-| `DENSE_PLACEMENT.md` / `.zh-CN.md`                       | dense 位置管理（C1/C2 驻留、`--dense-placement` 参数、计算/搬迁 lag 判据、静态 vs 动态迁移） |
-| `PER_DEVICE_ARENA.md` / `.zh-CN.md`                      | 每设备 arena 规划（carry cross-1/cross-N 拆分与双缓冲、per-device compact、C1/C2 跟随 placement、复用区间打包） |
-| `ROUTE_B_LAYER_OWNERSHIP.md` / `.zh-CN.md`                   | route B 整层拥有（整层执行、设备本地 buffer、C1 动态搬运、ids join 静态前缀/动态后缀、里程碑 L1-L5） |
+| 文件                                                         | 内容                                                                                                                                     |
+| :----------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
+| `Backend.md`                                                 | DeepSeek4 自定义 backend / expert pool 调度设计（用户原始架构文档）                                                                      |
+| `LLAMA_MOE_NO_MMAP_RESEARCH.md`                              | MoE 去 mmap 可行性研究 + route B 实现要点（含 pin 生命周期 §4.8、shexp §4.9）                                                            |
+| `BUG_TRACKER.md`                                             | bug 追踪清单（P0/P1/P2/P3 + INC 事故记录 + 修复批次）                                                                                    |
+| `TEST_FLOW.md`                                               | 测试流程规范（单 prompt 优先 → .bat 整轮 → 用户手动盯内存）                                                                              |
+| `PROJECT_STRUCTURE.md`                                       | 本文件                                                                                                                                   |
+| `MULTI_MODEL_POOL.md` / `MULTI_SUBPOOL.md`                   | 多模型池 / 按专家种类分子池设计                                                                                                          |
+| `UPSTREAM_TOOLS_MIGRATION.md`                                | 迁移到原版 llama-cli/llama-server 的重构计划（route B 插件注入）                                                                         |
+| `VENDORED_MODIFICATIONS.md`                                  | 对 vendored llama.cpp 的改动汇总（route-b-inject patch）                                                                                 |
+| `PREFILL_CROSS_VALIDATION.md` / `EXPERT_TRACE_SIMULATION.md` | prefill/专家历史交叉验证与命中率模拟                                                                                                     |
+| `SAMPLING.md` / `SAMPLING.zh-CN.md`                          | 采样参数推荐                                                                                                                             |
+| `REVIEW_2026_08_28.md` / `DEBUG_DELEGATION.md`               | 代码审查对照 / delegate 排查记录                                                                                                         |
+| `REPACK_DIVERGENCE_DEBUG.md` / `.zh-CN.md`                   | repack vs 普通内核路径差异的 bit 级排查                                                                                                  |
+| `TODO.md` / `LLAMA_EXE_ROADMAP.md`                           | 待办 / 可执行程序路线图                                                                                                                  |
+| `DENSE_PLACEMENT.md` / `.zh-CN.md`                           | dense 位置管理（C1/C2 驻留、`--dense-placement` 参数、计算/搬迁 lag 判据、静态 vs 动态迁移）                                             |
+| `PER_DEVICE_ARENA.md` / `.zh-CN.md`                          | 每设备 arena 规划（carry cross-1/cross-N 拆分与双缓冲、per-device compact、C1/C2 跟随 placement、复用区间打包）                          |
+| `ROUTE_B_LAYER_OWNERSHIP.md` / `.zh-CN.md`                   | route B 整层拥有（整层执行、设备本地 buffer、C1 动态搬运、ids join 静态前缀/动态后缀、里程碑 L1-L5）                                     |
 | `GRAPH_PARTITION.md` / `.zh-CN.md`                           | 整图分区（`STREAM_MOE_TMP_GRAPH_DUMP` 全图 dump、C1/gating/专家闭包/C2 四区域、接缝 external leaves、buft 标记、同设备接缝与 C1 闭包化） |
-| `BENCHMARK.md` / `.zh-CN.md`                                 | 布局吞吐基准（`tools/run_bench.js`：cold/steady、jsonl 多轮、原版对比、结果结构）             |
+| `BENCHMARK.md` / `.zh-CN.md`                                 | 布局吞吐基准（`tools/run_bench.js`：cold/steady、jsonl 多轮、原版对比、结果结构）                                                        |
 
 **约定**：所有文档 UTF-8；编辑只用 write/edit 工具，**严禁 PowerShell Set-Content 追加中文**（会破坏编码）。
 
@@ -171,11 +171,11 @@ build\<tag>\
 配套 `AGENTS.md` 第 15 条（**新功能遇 bug 严禁回滚，只前进不后退**）。in-progress 功能
 （如 compact 区间打包）在 `STREAM_MOE_LATEST` 下**默认开**，不再默认 gate off。
 
-| tag | 宏 | 新功能 | dbg dump/print | 用途 |
-| :-- | :-- | :-- | :-- | :-- |
-| `StreamMoE_dump` | 无 | 关（opt-in） | 无 | 稳定生产（`run_baseline` 必须绿） |
-| `StreamMoE_latest` | `STREAM_MOE_LATEST` | **默认开** | 无 | 体验/复现 bug 态（干净、无日志噪音） |
-| `StreamMoE_dump_dbg` | `STREAM_MOE_LATEST` + `STREAM_MOE_TEMP` | **默认开** | 有 | 体验 bug 态 + 诊断 dump/print |
+| tag                  | 宏                                      | 新功能       | dbg dump/print | 用途                                 |
+| :------------------- | :-------------------------------------- | :----------- | :------------- | :----------------------------------- |
+| `StreamMoE_dump`     | 无                                      | 关（opt-in） | 无             | 稳定生产（`run_baseline` 必须绿）    |
+| `StreamMoE_latest`   | `STREAM_MOE_LATEST`                     | **默认开**   | 无             | 体验/复现 bug 态（干净、无日志噪音） |
+| `StreamMoE_dump_dbg` | `STREAM_MOE_LATEST` + `STREAM_MOE_TEMP` | **默认开**   | 有             | 体验 bug 态 + 诊断 dump/print        |
 
 - `latest` 与 `dbg` 是同一个"最新功能"构建，**唯一区别**是 `dbg` 带 `STREAM_MOE_TEMP`
   诊断代码（`[stage]`/`[cpack]`/`[one]` 等）。

@@ -15,11 +15,11 @@ After whole-layer ownership became production, `layout_arena` pre-allocates
 **every** compute node into one host arena laid out as `[carry][compact]
 [closure]`. Measured temp space at ubatch 512 (host bufts):
 
-| model | carry | compact | closure | need |
-| :-- | --: | --: | --: | --: |
-| olmoe | 62 MB | 218 MB | 142 MB | 0.4-0.5 GB |
-| gemma | 160 MB | 2498 MB | 198 MB | 2.8 GB |
-| deepseek | 2630 MB | 1300 MB | 248 MB | 4.1 GB |
+| model    |   carry | compact | closure |       need |
+| :------- | ------: | ------: | ------: | ---------: |
+| olmoe    |   62 MB |  218 MB |  142 MB | 0.4-0.5 GB |
+| gemma    |  160 MB | 2498 MB |  198 MB |     2.8 GB |
+| deepseek | 2630 MB | 1300 MB |  248 MB |     4.1 GB |
 
 Three concrete defects:
 
@@ -45,11 +45,11 @@ attribution built in `collect_layer_nodes`).
 
 **Measured (ub=1):** all three models are **100% cross-1, cross-N = 0**:
 
-| model | cross-1 | cross-N |
-| :-- | :-- | :-- |
-| olmoe | 15 nodes / 122880 B (max 8192) | 0 |
-| gemma | 29 nodes / 326656 B (max 11264) | 0 |
-| deepseek | 84 nodes / 5505024 B (max 65536) | 0 |
+| model    | cross-1                          | cross-N |
+| :------- | :------------------------------- | :------ |
+| olmoe    | 15 nodes / 122880 B (max 8192)   | 0       |
+| gemma    | 29 nodes / 326656 B (max 11264)  | 0       |
+| deepseek | 84 nodes / 5505024 B (max 65536) | 0       |
 
 **Layout.** `carry1` is **double-buffered** on the layer-boundary index:
 the set of cross-1 tensors produced by layer L and consumed by L+1 is packed
@@ -175,10 +175,10 @@ defaults it ON (`AGENTS.md` 15), `=0` opts out.
 
 Measured (gemma v2, 129-token prefill-from, 8 GB pool, vs `moe_129_8192_vk`):
 
-| compact layout | exported embd cos (tok 0) | top-4 logits |
-| :-- | --: | :-- |
-| byte sum (default) | 0.98631 | identical |
-| interval pack (`=1`) | 0.01568 | identical |
+| compact layout       | exported embd cos (tok 0) | top-4 logits |
+| :------------------- | ------------------------: | :----------- |
+| byte sum (default)   |                   0.98631 | identical    |
+| interval pack (`=1`) |                   0.01568 | identical    |
 
 The interval-pack "FAIL" is an **export artifact, not an inference bug**:
 
@@ -188,7 +188,7 @@ The interval-pack "FAIL" is an **export artifact, not an inference bug**:
   **bit-identical** pack vs sum (0/129 id mismatches, maxLogitDiff = 0,
   maxLseDiff = 0). The KV caches are identical too (base + swa, 0 diffs).
 - **Only the exported `embd` / `hidden` differ.** `embd` is `t_embd` - the input
-  token embeddings, deterministic from the token ids, so it *cannot* legitimately
+  token embeddings, deterministic from the token ids, so it _cannot_ legitimately
   differ. Under whole-layer ownership it is a layer-0 node in the arena, and
   compact packing reuses its slot for a later L0 node: `embd` and `norm-0` share
   `off=0` / the same `data=` pointer (`[cpack]` / `[stage]`), while byte sum
@@ -210,6 +210,7 @@ layer containing it (`exec_state` is per graph_compute call), so export mode was
 had already reused the slot.
 
 **Fix - LANDED (2026-09-14).**
+
 1. The export callback now returns `true` only for the tensors it actually reads
    (`embd` / `hidden` / `logits` / routed `MUL_MAT_ID` ids), so the scheduler only
    chunks at those points and route B runs a layer about once. Export overhead is

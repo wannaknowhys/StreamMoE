@@ -28,6 +28,7 @@ backend 执行，且该层的激活值放在**我们自己的 buffer**里、落�
 ## 2. 背景：三个代价
 
 ### 2.1 接缝拷贝
+
 MoE backend 声明的是 host compute buft（`STREAMMOE_HOST`，`moe_backend.cpp:264`）。
 sched 只在**目标 backend 不支持源 buft** 时才插拷贝（`ggml-backend.cpp:1026`，拷贝
 条件 `:1325`/`:1399`）。于是 C1 产出的 cur 被拷到 host，执行器再上传到设备 stage
@@ -35,22 +36,26 @@ sched 只在**目标 backend 不支持源 buft** 时才插拷贝（`ggml-backend
 两次不含信息的跨界。
 
 ### 2.2 每层 sync
+
 dense（llama backend）与 MoE（我们的 backend）逐层交替，sched 在每个 backend 边界
 同步。实测 decode `tail_sync 1.68 ms/层`（`WORK_IN_PROGRESS.md` P2）——正是这个固定
 开销让 CPU 路径比设备路径还快。
 
 ### 2.3 静态 C1
+
 `dev_layer` 加载时定死（`llama-model.cpp:1492-1494`），C1 搬不动。
 `DENSE_PLACEMENT.md` §5 Phase 2：动态迁移要求 route B 拥有 C1 权重与执行。
 
 ## 3. 架构
 
 ### 3.1 整层闭包
+
 把私有化集合从"MoE 链"扩到**整层**。层归属已有（`moe_chain_layer_of_node`），闭包
 变成第 L 层的所有计算节点（dense、gating、MoE）。验证门（Check 1）变成：第 L 层的
 任何中间量，除交给下一层/residual 的层输出外，没有层外消费者。
 
 ### 3.2 单 backend、内部放置
+
 整图归我们的 backend，于是 sched 只产生**一个 split**。`graph_compute` 拿到整图，
 **逐层**执行，内部把每层激活值放到该层设备上。sched 的分配退化为模型输入（embd，
 被强制 CPU）与模型输出（logits）；每层激活值都是我们的。
@@ -60,16 +65,19 @@ per-backend compute buft。（在只有部分层归我们的过渡期，`support
 设备 buft 仍有用。）
 
 ### 3.3 dense 委托
+
 我们不写 dense kernel。每个 dense 节点克隆一份（新张量、同 op / op_params），在该层
 设备 backend 上跑；dense 权重先原地引用（Phase 1），迁移阶段改为来自 route-B C1 池。
 attention 原地引用 llama 的 KV 张量。MoE 链走既有桶引擎。
 
 ### 3.4 设备本地 buffer 与 fold
+
 每层一个 per-device arena（既有 verify interval 布局，从 MoE 闭包扩到整层）。cur 是
 层输入；moe_out 是层输出，落在该层设备上。专家 fold 在设备上写 moe_out（现在的 host
 `layer_fold`，`minigraph_exec.cpp:492`，改为设备侧归约）。
 
 ### 3.5 跨设备搬运
+
 专家按 pool pin；`build_mix_plan` 保证一个桶的专家就在该桶的 pool 上。唯一跨设备的是：
 
 - **cur**：owner（层设备）→ 远端 pool。满宽桶 → 整份复制；subset 桶 → index-gather。
@@ -78,6 +86,7 @@ attention 原地引用 llama 的 KV 张量。MoE 链走既有桶引擎。
 都是设备传输（D2D 或 transfer queue），不经 host staging。
 
 ### 3.6 ids 与那一次残余的 host 往返
+
 调度（pin、`build_mix_plan`）在 host，需要当前 token 的 ids，而 ids 是设备算出来的。
 这是唯一不可避免的每层 host 往返（ids 很小，贵的是"等"）。可用的杠杆：
 
@@ -86,11 +95,13 @@ attention 原地引用 llama 的 KV 张量。MoE 链走既有桶引擎。
   `MUL_MAT_ID`（ids 作为设备张量）——该层零 host 往返。
 
 ### 3.7 C1 与 C2
+
 C1 是层内 dense；它的设备就是"层设备"，决定 cur/moe_out 落在哪。C2
 （`token_embd` / `output` / `output_norm`）在层外，不碰接缝；它保持为放置策略
 （`--dense-placement C2:<dev>`），只在净收益为正时放设备。
 
 ### 3.8 C1 动态搬运
+
 Route B 用一个受管池拥有 C1 权重（复用 `EXPERT_MOVE_PIPELINE` 机制：move worker、
 hysteresis、copy-then-release）。迁移决策发生时，C1 权重与该层 KV 一起搬，层图按新
 放置重建。因为我们拥有该层的执行与 buffer，这只是个放置参数，不是 llama 的结构改动。

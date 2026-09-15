@@ -4,6 +4,7 @@
 > 去重后按「潜在 bug / 调试手段 / 架构设计建议」三类整理。纯中文。
 >
 > 来源：
+>
 > - [GPT] `chatgpt_Patch分段测试与漏洞_.md`
 > - [Claude] `claude_Patch分段启用和测试方案.md`
 > - [DeepSeek] `deepseek Patch bug分析.md`
@@ -33,13 +34,13 @@
 
 ### A. 高危：可能直接数值错 / 整层漏跑（静默，不 crash）
 
-| # | 问题 | 来源 | 后果 |
-|---|------|------|------|
-| A1 ★ | `moe_exec_mul_mat_id` 开头 `if (is_alias_op(nodes[0])) return SUCCESS;`。whole-layer 下 split 变大，可能变成 `VIEW/RESHAPE → 真计算`，直接 return 会跳过后面所有计算 | DeepSeek | 整 split 漏执行 |
-| A2 ★ | `first_node = ln->front()` 可能是 VIEW/RESHAPE/TRANSPOSE/PERMUTE。alias 节点在 `moe_chain_assign_backend` 里被跳过、不 `set_tensor_backend`，可能根本不在 split 的 `nodes[]` 里 → `has_first=false` → 整层不 burst | DeepSeek / GPT / Claude | 整层不执行 |
-| A3 ★ | `ffn_moe_out` 找不到时（名字变、不在 lns 中）`down[]` 全 0 → `dense_tail` 为空 → MoE 之后的 residual/post-norm/dense MLP 全被塞进 `dense_head`，在 burst 之前执行 | DeepSeek / GPT | 数值必错，且不报错 |
-| A4 | `dense_head` / `closure` / `dense_tail` 三者互斥且并集 = `lns`，完全靠 `in_closure` + `down[]` 两段逻辑「顺便」保证，无任何显式校验 | Claude | 后续改代码易被静默破坏 |
-| A5 | `last_suffixed` 传播停止条件可能漏掉最后一层「最后一个带 `-<il>` 后缀节点之后」的匿名尾部节点（如 MoE 后匿名 residual/add） | DeepSeek / Claude / GPT | capture 漏节点、tail 不完整 |
+| #    | 问题                                                                                                                                                                                                               | 来源                    | 后果                        |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- | --------------------------- |
+| A1 ★ | `moe_exec_mul_mat_id` 开头 `if (is_alias_op(nodes[0])) return SUCCESS;`。whole-layer 下 split 变大，可能变成 `VIEW/RESHAPE → 真计算`，直接 return 会跳过后面所有计算                                               | DeepSeek                | 整 split 漏执行             |
+| A2 ★ | `first_node = ln->front()` 可能是 VIEW/RESHAPE/TRANSPOSE/PERMUTE。alias 节点在 `moe_chain_assign_backend` 里被跳过、不 `set_tensor_backend`，可能根本不在 split 的 `nodes[]` 里 → `has_first=false` → 整层不 burst | DeepSeek / GPT / Claude | 整层不执行                  |
+| A3 ★ | `ffn_moe_out` 找不到时（名字变、不在 lns 中）`down[]` 全 0 → `dense_tail` 为空 → MoE 之后的 residual/post-norm/dense MLP 全被塞进 `dense_head`，在 burst 之前执行                                                  | DeepSeek / GPT          | 数值必错，且不报错          |
+| A4   | `dense_head` / `closure` / `dense_tail` 三者互斥且并集 = `lns`，完全靠 `in_closure` + `down[]` 两段逻辑「顺便」保证，无任何显式校验                                                                                | Claude                  | 后续改代码易被静默破坏      |
+| A5   | `last_suffixed` 传播停止条件可能漏掉最后一层「最后一个带 `-<il>` 后缀节点之后」的匿名尾部节点（如 MoE 后匿名 residual/add）                                                                                        | DeepSeek / Claude / GPT | capture 漏节点、tail 不完整 |
 
 **对应建议**
 
@@ -51,13 +52,13 @@
 
 ### B. buffer / 执行语义（手工 clone 执行路径）
 
-| # | 问题 | 来源 | 后果 |
-|---|------|------|------|
-| B1 ★ | `run_dense_nodes` 跳过 alias op，但 source clone 直接 `lf->data = src->data`，假设 view 的 data 已 materialize；若 `view->data == nullptr` 就把 NULL 带进去 | GPT / DeepSeek | 读空指针 / 静默错 |
-| B2 | `run_dense_nodes` 没把 clone 之间建成依赖图，只依赖「A 已执行完，B 的 src->data 有结果」——要求 `nodes` 严格 topological order。这是一个很硬但未 assert 的 invariant | GPT / DeepSeek | stale data，诡异错误 |
-| B3 | clone 用 `ggml_new_tensor_4d` 只拷 type/ne/nb/op/op_params，**没拷 `nd->flags`**（如 `GGML_TENSOR_FLAG_OUTPUT`） | Claude | 后续扩展易复发 |
-| B4 | `dense_host` 判定只看 source buffer，不看 `nd->buffer`，隐含假设 scheduler 会给 nd 分配正确 host output buffer | GPT / DeepSeek | 依赖隐式行为，多 backend 下不稳 |
-| B5 ★ | `moe_dev_supports_buft` 在 `STREAM_MOE_TEMP` 下无条件 `return true`，**没跟 `no_whole` 联动** | Claude / DeepSeek | ① 所有 debug build 调度行为被悄悄改变，`NO_WHOLE_LAYER=1` 对照组不干净；② 可能把设备 buffer 的 tensor 分给 CPU 执行 → 崩/读错 |
+| #    | 问题                                                                                                                                                                | 来源              | 后果                                                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| B1 ★ | `run_dense_nodes` 跳过 alias op，但 source clone 直接 `lf->data = src->data`，假设 view 的 data 已 materialize；若 `view->data == nullptr` 就把 NULL 带进去         | GPT / DeepSeek    | 读空指针 / 静默错                                                                                                             |
+| B2   | `run_dense_nodes` 没把 clone 之间建成依赖图，只依赖「A 已执行完，B 的 src->data 有结果」——要求 `nodes` 严格 topological order。这是一个很硬但未 assert 的 invariant | GPT / DeepSeek    | stale data，诡异错误                                                                                                          |
+| B3   | clone 用 `ggml_new_tensor_4d` 只拷 type/ne/nb/op/op_params，**没拷 `nd->flags`**（如 `GGML_TENSOR_FLAG_OUTPUT`）                                                    | Claude            | 后续扩展易复发                                                                                                                |
+| B4   | `dense_host` 判定只看 source buffer，不看 `nd->buffer`，隐含假设 scheduler 会给 nd 分配正确 host output buffer                                                      | GPT / DeepSeek    | 依赖隐式行为，多 backend 下不稳                                                                                               |
+| B5 ★ | `moe_dev_supports_buft` 在 `STREAM_MOE_TEMP` 下无条件 `return true`，**没跟 `no_whole` 联动**                                                                       | Claude / DeepSeek | ① 所有 debug build 调度行为被悄悄改变，`NO_WHOLE_LAYER=1` 对照组不干净；② 可能把设备 buffer 的 tensor 分给 CPU 执行 → 崩/读错 |
 
 **对应建议**
 
@@ -69,12 +70,12 @@
 
 ### C. 调试脚手架 / 生命周期
 
-| # | 问题 | 来源 | 后果 |
-|---|------|------|------|
-| C1 | `g_dbg_pos` 是裸全局静态指针，无生命周期管理，非 thread_local；只在「从未设置过」时赋值一次。跨请求/context 重建后可能悬空，`dbg_canary` 解引用 `g_dbg_pos->data` | Claude | UAF |
-| C2 | `estimate_scratch` 的 per-node 预算是常数 16KB（`need += n_nodes*16*1024`），没按实际 tensor 大小算。multi-token prefill 下单 dense 节点 `n_embd * n_tokens * sizeof(type)` 很容易远超 16KB | Claude / DeepSeek | 大概率静默写坏内存（数值发散候选） |
-| C3 | `g_layer_nodes_all` 在 `moe_chain_assign_backend` 里没 clear；若 `collect_layer_nodes` 内部不清，多次 build graph 会累积旧节点指针 | DeepSeek | 悬垂指针 / 重复执行 / dump 错乱 |
-| C4 | `collect_layer_nodes` 实现未在 diff 中出现（可能链接失败）；且它是否复用修好的 `lay[]` 未知 | Claude / DeepSeek | output head 泄漏进最后一层的问题可能只在「层归属查询」层面修好，在「实际 capture」层面还漏 |
+| #   | 问题                                                                                                                                                                                        | 来源              | 后果                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------ |
+| C1  | `g_dbg_pos` 是裸全局静态指针，无生命周期管理，非 thread_local；只在「从未设置过」时赋值一次。跨请求/context 重建后可能悬空，`dbg_canary` 解引用 `g_dbg_pos->data`                           | Claude            | UAF                                                                                        |
+| C2  | `estimate_scratch` 的 per-node 预算是常数 16KB（`need += n_nodes*16*1024`），没按实际 tensor 大小算。multi-token prefill 下单 dense 节点 `n_embd * n_tokens * sizeof(type)` 很容易远超 16KB | Claude / DeepSeek | 大概率静默写坏内存（数值发散候选）                                                         |
+| C3  | `g_layer_nodes_all` 在 `moe_chain_assign_backend` 里没 clear；若 `collect_layer_nodes` 内部不清，多次 build graph 会累积旧节点指针                                                          | DeepSeek          | 悬垂指针 / 重复执行 / dump 错乱                                                            |
+| C4  | `collect_layer_nodes` 实现未在 diff 中出现（可能链接失败）；且它是否复用修好的 `lay[]` 未知                                                                                                 | Claude / DeepSeek | output head 泄漏进最后一层的问题可能只在「层归属查询」层面修好，在「实际 capture」层面还漏 |
 
 **对应建议**
 
@@ -85,20 +86,20 @@
 
 ### D. 静默跳过 / 错误处理
 
-| # | 问题 | 来源 |
-|---|------|------|
-| D1 | 未捕获 `MUL_MAT_ID` 的报错条件收窄：只有 `src[0]` 名含 `_exps` 才 FAILED，否则静默 `continue` | DeepSeek |
+| #   | 问题                                                                                          | 来源     |
+| --- | --------------------------------------------------------------------------------------------- | -------- |
+| D1  | 未捕获 `MUL_MAT_ID` 的报错条件收窄：只有 `src[0]` 名含 `_exps` 才 FAILED，否则静默 `continue` | DeepSeek |
 
 **建议**：至少对所有「未归属层的 `MUL_MAT_ID`」报错或打 warning，不要静默跳过。
 
 ### E. 归属 heuristic（脆弱点）
 
-| # | 问题 | 来源 |
-|---|------|------|
-| E1 | layer attribution 是 heuristic（name 后缀 `-<il>` + producer propagation）；跨层匿名节点（producers = {L3, L4}）会被默默选一个 | GPT |
-| E2 | `ffn_moe_out` 用 `strstr` substring 匹配，是脆弱 anchor；换模型/上游改名即失效且不报错 | GPT / Claude |
-| E3 | `is_view_op()` 与 `is_alias_op()` 语义重叠（`is_view_op(CONT)==true` 但 `is_alias_op(CONT)==false`），未来误用会把 CONT 当 alias | GPT |
-| E4 | 「每层所有节点会被切进同一连续 split」是 whole-layer 正确性依赖的隐式假设，但 split 由 scheduler 启发式决定，无人保证 | Claude / GPT |
+| #   | 问题                                                                                                                             | 来源         |
+| --- | -------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| E1  | layer attribution 是 heuristic（name 后缀 `-<il>` + producer propagation）；跨层匿名节点（producers = {L3, L4}）会被默默选一个   | GPT          |
+| E2  | `ffn_moe_out` 用 `strstr` substring 匹配，是脆弱 anchor；换模型/上游改名即失效且不报错                                           | GPT / Claude |
+| E3  | `is_view_op()` 与 `is_alias_op()` 语义重叠（`is_view_op(CONT)==true` 但 `is_alias_op(CONT)==false`），未来误用会把 CONT 当 alias | GPT          |
+| E4  | 「每层所有节点会被切进同一连续 split」是 whole-layer 正确性依赖的隐式假设，但 split 由 scheduler 启发式决定，无人保证            | Claude / GPT |
 
 **对应建议**
 
@@ -114,6 +115,7 @@
 ### 2.1 分阶段开关（分段启用）
 
 现有开关：
+
 - 编译期 `STREAM_MOE_TEMP`：不带 = 生产路径（先确认基线没退化）。
 - 运行时 `STREAM_MOE_TMP_NO_WHOLE_LAYER=1`：debug build 但关闭 whole-layer（capture-only）。
 
@@ -234,10 +236,12 @@ L17 residual    DIFFER   ← 直接定位是 residual 被改坏
    - 若不得不手工执行：clone「graph structure」（exec graph 的节点指针指向原 `ggml_tensor`），而不是 `ggml_dup_tensor` + 手工填 `data/buffer/view`——后者极易漏掉 layout/buffer/view invariant。
 
 7. **layer output 作为显式 synchronization boundary**（GPT）
+
    ```
    HEAD → materialize MoE input → pin experts → MOE BURST
         → materialize MoE output → TAIL → LAYER COMPLETE → 下一层
    ```
+
    只有 `LAYER COMPLETE` 后 Layer N+1 才允许读。layer 正是 cache/expert lifetime + compute + activation lifetime 的自然边界（与 StreamMoE 思路吻合）。
 
 8. **LayerExecutionState 保证一次且仅一次执行**（GPT）
@@ -249,10 +253,12 @@ L17 residual    DIFFER   ← 直接定位是 residual 被改坏
 10. **ownership 与 execution 拆成独立 feature flag**（GPT）：见 §2.1。
 
 11. **host-resident 判定升级为 per-layer `LayerCapability`**（GPT）
+
     ```
     Layer 0: dense=HOST, moe=STREAM_MOE, activation=HOST
     Layer 1: dense=GPU,  moe=STREAM_MOE, activation=HOST
     ```
+
     不要散落的 `dense_host` boolean；为后续 P100 + RX590 + CPU 多 backend 准备。
 
 12. **触发时机与 split 解耦**（Claude）：做成图构建阶段就确定的显式回调，而不是「从 MUL_MAT_ID 执行入口顺便判断」的反应式方式。
@@ -274,13 +280,13 @@ STREAM_MOE_TMP_WHOLE_LAYER_MAX=N 只对 layer <= N 启用
 
 ### 5.2 结果
 
-| 配置 | 生成结果 |
-|---|---|
-| baseline（`NO_WHOLE_LAYER=1`） | `Hello! How can I help you today? ...`（正确） |
-| L0–L14 逐个单独接管 | 全部 **SAME** |
-| **L15 单独接管** | **DIFF（乱码）** |
-| `WHOLE_LAYER_MAX=14`（L0–L14 接管，L15 保持 MoE-only） | **正确** |
-| `WHOLE_LAYER_MAX=15`（含最后一层） | 乱码 |
+| 配置                                                   | 生成结果                                       |
+| ------------------------------------------------------ | ---------------------------------------------- |
+| baseline（`NO_WHOLE_LAYER=1`）                         | `Hello! How can I help you today? ...`（正确） |
+| L0–L14 逐个单独接管                                    | 全部 **SAME**                                  |
+| **L15 单独接管**                                       | **DIFF（乱码）**                               |
+| `WHOLE_LAYER_MAX=14`（L0–L14 接管，L15 保持 MoE-only） | **正确**                                       |
+| `WHOLE_LAYER_MAX=15`（含最后一层）                     | 乱码                                           |
 
 **结论：发散 100% 来自接管最后一层。**
 
@@ -315,24 +321,25 @@ ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
 
 ### 6.1 直接就能改（独立、小、风险低）
 
-| id | 问题 | 改法 | 是否动生产路径 |
-|---|---|---|---|
-| A1 | `is_alias_op(nodes[0])` 直接 return | 遍历 split，只跳 alias | 是（`moe_exec_mul_mat_id`） |
-| A2 | `first_node=ln->front()` 可能是 alias | 取首个非 alias 节点 | 是 |
-| A3 | `ffn_moe_out` 找不到静默清空 tail | `if(!out) return FAILED` | 否（dbg 才有 lns） |
-| A4 | head/closure/tail 互斥无校验 | ~~assert 三者并集=lns~~ **评审前提错**：closure 不总是 layer list 的子集（gemma 实测 closure 有节点不在 lns），只保留诊断打印 | 否 |
-| B1 | `lf->data=src->data` 不查空 | assert `src->data` | 否 |
-| B2 | clone 依赖严格拓扑序无 assert | assert src 若属本层须更早 | 否 |
-| B3 | clone 丢 `nd->flags` | 补拷 flags | 否 |
-| B4 | `dense_host` 只看 src buffer | 加 `nd->buffer` 检查 | 否 |
-| B5 | `supports_buft` 无条件 true | 挂到 `NO_WHOLE_LAYER` / 动态判断 | 否（`#ifdef STREAM_MOE_TEMP`） |
-| C1 | `g_dbg_pos` 悬空/UAF | `thread_local` + 每次重置 | 否 |
-| D1 | 未捕获 `MUL_MAT_ID` 静默跳过 | 全部报错/warning | 是 |
-| E1 | 跨层匿名节点默默选一个 | 直接报错 | 否 |
-| E3 | `is_view_op`/`is_alias_op` 语义重叠 | ~~重命名~~ **归 C**（三分类 PURE_ALIAS/MATERIALIZING/COMPUTE 会一并做，不做一次性改名） | - |
-| NEW | DeepSeek 小池 `0xC0000005` 崩溃 | **归 C/D**（是"整图单 buffer"的症状，A 类补不了） | - |
+| id  | 问题                                  | 改法                                                                                                                          | 是否动生产路径                 |
+| --- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| A1  | `is_alias_op(nodes[0])` 直接 return   | 遍历 split，只跳 alias                                                                                                        | 是（`moe_exec_mul_mat_id`）    |
+| A2  | `first_node=ln->front()` 可能是 alias | 取首个非 alias 节点                                                                                                           | 是                             |
+| A3  | `ffn_moe_out` 找不到静默清空 tail     | `if(!out) return FAILED`                                                                                                      | 否（dbg 才有 lns）             |
+| A4  | head/closure/tail 互斥无校验          | ~~assert 三者并集=lns~~ **评审前提错**：closure 不总是 layer list 的子集（gemma 实测 closure 有节点不在 lns），只保留诊断打印 | 否                             |
+| B1  | `lf->data=src->data` 不查空           | assert `src->data`                                                                                                            | 否                             |
+| B2  | clone 依赖严格拓扑序无 assert         | assert src 若属本层须更早                                                                                                     | 否                             |
+| B3  | clone 丢 `nd->flags`                  | 补拷 flags                                                                                                                    | 否                             |
+| B4  | `dense_host` 只看 src buffer          | 加 `nd->buffer` 检查                                                                                                          | 否                             |
+| B5  | `supports_buft` 无条件 true           | 挂到 `NO_WHOLE_LAYER` / 动态判断                                                                                              | 否（`#ifdef STREAM_MOE_TEMP`） |
+| C1  | `g_dbg_pos` 悬空/UAF                  | `thread_local` + 每次重置                                                                                                     | 否                             |
+| D1  | 未捕获 `MUL_MAT_ID` 静默跳过          | 全部报错/warning                                                                                                              | 是                             |
+| E1  | 跨层匿名节点默默选一个                | 直接报错                                                                                                                      | 否                             |
+| E3  | `is_view_op`/`is_alias_op` 语义重叠   | ~~重命名~~ **归 C**（三分类 PURE_ALIAS/MATERIALIZING/COMPUTE 会一并做，不做一次性改名）                                       | -                              |
+| NEW | DeepSeek 小池 `0xC0000005` 崩溃       | **归 C/D**（是"整图单 buffer"的症状，A 类补不了）                                                                             | -                              |
 
 > **落地状态（2026-09-13）**：A 类已完成并推送：
+>
 > - `2efbc98` route_b: per-layer whole-layer bisect switches
 > - `2c2f1b9` minigraph: harden whole-layer dense execution（B1/B2/B3/C1 + A4 诊断）
 > - `f000955` minigraph: whole-layer boundary robustness（A1/A2/A3）
@@ -352,28 +359,28 @@ ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
 
 只要做「**LayerPlan 前置化 + 逐层执行 + 显式边界 + 不 clone dense**」：
 
-| id | 为什么自然消失 |
-|---|---|
-| A5 `last_suffixed` 漏尾部 | 边界显式标注后不需要 suffix/传播启发式 |
-| E2 `ffn_moe_out` 名字匹配 | 边界从 MoE closure 反推，不靠名字 |
-| E4 触发绑定 split | LayerPlan 是执行单位，不需要 `has_first` |
-| A1/A2 | 没有 `first_node`/`has_first` 这套东西 |
-| A3 | 边界显式，不存在「找不到 out」 |
-| B1/B2/B3 | 不再 clone，直接用原 node 的 buffer/view/flags |
-| C1/C2 | tracer 分离；自有 arena 后 scratch 预算问题消失 |
-| **olmoe 根因**（最后一层 `inp_out_ids`） | 逐层 + 显式边界后，最后一层的 output reduction 会被正确处理 |
-| **DeepSeek 根因**（整图单 backend buffer） | 每层自有 arena、不把 43 层塞进一个 compute buffer |
+| id                                         | 为什么自然消失                                              |
+| ------------------------------------------ | ----------------------------------------------------------- |
+| A5 `last_suffixed` 漏尾部                  | 边界显式标注后不需要 suffix/传播启发式                      |
+| E2 `ffn_moe_out` 名字匹配                  | 边界从 MoE closure 反推，不靠名字                           |
+| E4 触发绑定 split                          | LayerPlan 是执行单位，不需要 `has_first`                    |
+| A1/A2                                      | 没有 `first_node`/`has_first` 这套东西                      |
+| A3                                         | 边界显式，不存在「找不到 out」                              |
+| B1/B2/B3                                   | 不再 clone，直接用原 node 的 buffer/view/flags              |
+| C1/C2                                      | tracer 分离；自有 arena 后 scratch 预算问题消失             |
+| **olmoe 根因**（最后一层 `inp_out_ids`）   | 逐层 + 显式边界后，最后一层的 output reduction 会被正确处理 |
+| **DeepSeek 根因**（整图单 backend buffer） | 每层自有 arena、不把 43 层塞进一个 compute buffer           |
 
 ### 6.4 不会消失、且不好改（必须专门设计）
 
-| 问题 | 为什么躲不掉 |
-|---|---|
-| **整图单 backend 的 compute buffer 分配** | 本质是 `ggml_backend_sched` 分配策略；节点都归一个 backend 就可能大。要么不全归我们 backend，要么 `no_alloc`+自有 arena——设计选择，不会自动好 |
-| **最后一层 `inp_out_ids` 语义** | llama.cpp 图结构；route B 无论怎么重构都必须显式理解并处理「最后一层的 output-token reduction」 |
-| **`supports_buft`/`supports_op` 与 scheduler ownership 的耦合** | 用自定义 backend 接管就必须正确声明能力；「怎么声明」是长期设计问题 |
-| **dense 执行顺序 / data 就绪的本质约束** | 即使不 clone，「dense 必须在 burst 前 materialize、严格拓扑序」仍是硬约束 |
-| **debug 脚手架焊在热路径** | `g_dbg_pos`/dump/fprintf 内嵌在 `run_dense_nodes`/`exec_layer_burst`，需主动抽 tracer |
-| **DeepSeek 分配失败的崩溃而非干净报错** | 错误处理问题，需主动补 guard |
+| 问题                                                            | 为什么躲不掉                                                                                                                                  |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **整图单 backend 的 compute buffer 分配**                       | 本质是 `ggml_backend_sched` 分配策略；节点都归一个 backend 就可能大。要么不全归我们 backend，要么 `no_alloc`+自有 arena——设计选择，不会自动好 |
+| **最后一层 `inp_out_ids` 语义**                                 | llama.cpp 图结构；route B 无论怎么重构都必须显式理解并处理「最后一层的 output-token reduction」                                               |
+| **`supports_buft`/`supports_op` 与 scheduler ownership 的耦合** | 用自定义 backend 接管就必须正确声明能力；「怎么声明」是长期设计问题                                                                           |
+| **dense 执行顺序 / data 就绪的本质约束**                        | 即使不 clone，「dense 必须在 burst 前 materialize、严格拓扑序」仍是硬约束                                                                     |
+| **debug 脚手架焊在热路径**                                      | `g_dbg_pos`/dump/fprintf 内嵌在 `run_dense_nodes`/`exec_layer_burst`，需主动抽 tracer                                                         |
+| **DeepSeek 分配失败的崩溃而非干净报错**                         | 错误处理问题，需主动补 guard                                                                                                                  |
 
 ### 6.5 执行顺序建议
 

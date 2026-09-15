@@ -13,6 +13,7 @@
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`.
 
 > **Iron rule - data movement (2026-09-09)**:
+>
 > 1. **ggml tensor bytes**: never dereference or `memcpy` `ggml_tensor::data` on
 >    the host. Use the backend-agnostic `ggml_backend_tensor_get` / `_set`
 >    (`_2d`; `_async` + `ggml_backend_synchronize` mid-graph, backend via
@@ -26,7 +27,7 @@
 >    backend's own engine (device DMA or host memcpy) - legitimate.
 > 4. **Non-tensor memory** (struct init/`memset`, guid/name copies): negligible
 >    and libc is fine, but keep it out of per-token hot paths.
-> See §7.4 for the bug this rule comes from.
+>    See §7.4 for the bug this rule comes from.
 
 ## 1. How the map is produced
 
@@ -56,12 +57,12 @@ The whole graph partitions into four parts. The cut between (2) and (3) is
 **hard** (topology-proven by `moe_chain_verify_graph`: no node outside the
 closure reads a closure intermediate except `ffn_moe_out`).
 
-| # | Region | What | Executor |
-|:-:|:-------|:-----|:---------|
-| 1 | **Dense trunk = C1** | per-layer attention (GQA or MLA+DSA), norms, KV writes, dense MLP (gemma/deepseek), shared expert (deepseek `_shexp`), hyper-connections (deepseek) | llama.cpp native (placement only) |
-| 2 | **Gating** | `ffn_moe_logits/probs/argsort/topk/weights` (+ weight-norm for gemma/deepseek) | llama.cpp native (dense side) |
-| 3 | **Expert closure** | routed `MUL_MAT_ID` + swiglu/geglu + down + weighted + convergence adds + `ffn_moe_out`; weights = `_exps.weight` in the pool | **route B** (privatised) |
-| 4 | **Output head = C2** | final norm + lm_head | llama.cpp native (placement only) |
+|  #  | Region               | What                                                                                                                                                | Executor                          |
+| :-: | :------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------- |
+|  1  | **Dense trunk = C1** | per-layer attention (GQA or MLA+DSA), norms, KV writes, dense MLP (gemma/deepseek), shared expert (deepseek `_shexp`), hyper-connections (deepseek) | llama.cpp native (placement only) |
+|  2  | **Gating**           | `ffn_moe_logits/probs/argsort/topk/weights` (+ weight-norm for gemma/deepseek)                                                                      | llama.cpp native (dense side)     |
+|  3  | **Expert closure**   | routed `MUL_MAT_ID` + swiglu/geglu + down + weighted + convergence adds + `ffn_moe_out`; weights = `_exps.weight` in the pool                       | **route B** (privatised)          |
+|  4  | **Output head = C2** | final norm + lm_head                                                                                                                                | llama.cpp native (placement only) |
 
 Region 3 is exactly the closure: anchor-driven forward BFS from routed
 `MUL_MAT_ID` to `ffn_moe_out` (`collect_chain`). Gating (2) is upstream of the
@@ -73,18 +74,18 @@ producer outputs (they are not compute).
 Measured with the dump above (reserve graph, `-c 2048`; closure bytes are the
 layer's hidden-intermediate block).
 
-| | olmoe-1b-7b | gemma-4-26B-A4B | deepseek-v4-flash |
-|:--|--:|--:|--:|
-| layers | 16 | 30 | 43 |
-| compute nodes | 934 | 2644 | 8521 |
-| leaves | 234 | 729 | 1606 |
-| closure nodes | 320 (20/layer) | 660 (22/layer) | 774 (18/layer) |
-| closure hidden / layer | 344 KB | 578 KB | 608 KB |
-| `MUL_MAT_ID` / layer | 3 (gate/up/down) | 2 (gate_up, down) | 3 (gate/up/down) |
-| C3 expert weights | 48 / 3720 MB | 60 / 13688 MB | 129 / 140352 MB |
-| C1 per-layer dense | 144 / 160.8 MB | 565 / 1711.2 MB | 1193 / 11993.5 MB |
-| C2 embedding (`token_embd`) | 1 / 55.3 MB | 2 / 1496 MB | 1 / 1010 MB |
-| C4 scale | - | 30 / 15 KB | - |
+|                             |      olmoe-1b-7b |   gemma-4-26B-A4B | deepseek-v4-flash |
+| :-------------------------- | ---------------: | ----------------: | ----------------: |
+| layers                      |               16 |                30 |                43 |
+| compute nodes               |              934 |              2644 |              8521 |
+| leaves                      |              234 |               729 |              1606 |
+| closure nodes               |   320 (20/layer) |    660 (22/layer) |    774 (18/layer) |
+| closure hidden / layer      |           344 KB |            578 KB |            608 KB |
+| `MUL_MAT_ID` / layer        | 3 (gate/up/down) | 2 (gate_up, down) |  3 (gate/up/down) |
+| C3 expert weights           |     48 / 3720 MB |     60 / 13688 MB |   129 / 140352 MB |
+| C1 per-layer dense          |   144 / 160.8 MB |   565 / 1711.2 MB | 1193 / 11993.5 MB |
+| C2 embedding (`token_embd`) |      1 / 55.3 MB |       2 / 1496 MB |       1 / 1010 MB |
+| C4 scale                    |                - |        30 / 15 KB |                 - |
 
 Model-specific notes:
 
@@ -99,26 +100,26 @@ Model-specific notes:
 `STREAM_MOE_CAP_DUMP=1` prints each layer's external leaves - the tensors the
 closure consumes from the dense side, and the one it hands back:
 
-| role | tensor | producer | consumer |
-|:-----|:-------|:---------|:---------|
-| `w` | `blk.L.ffn_*_exps.weight` | expert pool (scheduler pin) | the closure's `MUL_MAT_ID` |
-| `cur` | `ffn_norm-L` (normed hidden) | C1 norm | first `MUL_MAT_ID` |
-| `ids` | `ffn_moe_argsort-L` | gating | `MUL_MAT_ID` src[2] |
-| `scale` | `ffn_moe_weights-L` (routing weights) | gating | `ffn_moe_weighted` |
-| `scale` | `blk.L.ffn_down_exps.scale` (gemma only, C4) | C4 resident | down weightless op |
-| **out** | `ffn_moe_out-L` | closure | dense residual add |
+| role    | tensor                                       | producer                    | consumer                   |
+| :------ | :------------------------------------------- | :-------------------------- | :------------------------- |
+| `w`     | `blk.L.ffn_*_exps.weight`                    | expert pool (scheduler pin) | the closure's `MUL_MAT_ID` |
+| `cur`   | `ffn_norm-L` (normed hidden)                 | C1 norm                     | first `MUL_MAT_ID`         |
+| `ids`   | `ffn_moe_argsort-L`                          | gating                      | `MUL_MAT_ID` src[2]        |
+| `scale` | `ffn_moe_weights-L` (routing weights)        | gating                      | `ffn_moe_weighted`         |
+| `scale` | `blk.L.ffn_down_exps.scale` (gemma only, C4) | C4 resident                 | down weightless op         |
+| **out** | `ffn_moe_out-L`                              | closure                     | dense residual add         |
 
 So the entire dense<->closure interface is: **`cur` in, `ids` in, routing-weight
 `scale` in, expert weights in, `ffn_moe_out` out**. Nothing else crosses.
 
 ## 5. Buffer-type marks
 
-| buft name | meaning | where |
-|:----------|:--------|:------|
-| `STREAMMOE_EXPERT` | expert-pool buft; every routed `_exps.weight` | C3, the closure's weight leaves |
-| `STREAMMOE_HOST` | host-mapped buft for C4-replicated small leaves | gemma `_exps.scale` |
-| `STREAMMOE_DENSE` | v2-chunk dense strip buft (`topo.incomplete` only) | not present for these complete GGUFs |
-| `STREAMMOE` (backend) | the device that receives the privatised closure splits | `graph_compute` of region 3 |
+| buft name             | meaning                                                | where                                |
+| :-------------------- | :----------------------------------------------------- | :----------------------------------- |
+| `STREAMMOE_EXPERT`    | expert-pool buft; every routed `_exps.weight`          | C3, the closure's weight leaves      |
+| `STREAMMOE_HOST`      | host-mapped buft for C4-replicated small leaves        | gemma `_exps.scale`                  |
+| `STREAMMOE_DENSE`     | v2-chunk dense strip buft (`topo.incomplete` only)     | not present for these complete GGUFs |
+| `STREAMMOE` (backend) | the device that receives the privatised closure splits | `graph_compute` of region 3          |
 
 `--dense-placement C1/C2` is **orthogonal** to these marks: it moves dense
 weights to a device buft (e.g. `Vulkan0`), which is not a STREAMMOE name.
@@ -178,7 +179,7 @@ seam disappears by construction.
 - Mechanical refactor when it lands: generalise `collect_chain` to
   `collect_closure(gf, seed_pred, stop_pred, ...)`; expert closure =
   `(is_routed_mm, is_output_name)`, whole-layer closure = `(is_layer_node,
-  layer_output)`. Verify becomes "no external consumer of any layer-L
+layer_output)`. Verify becomes "no external consumer of any layer-L
   intermediate except the layer output".
 - Sequencing: 7.1 captures most of the win for **static all-resident C1** (one
   device, no round-trip) without the takeover. 7.2 is the end-state for
@@ -249,49 +250,49 @@ Ordered by dependency; each step is independently verifiable.
 ### A. Data-movement hygiene (do first, small)
 
 - [x] B39: `stream_moe_backend_replicate_leaf` reads its source via
-  `ggml_backend_tensor_get` (§7.4).
+      `ggml_backend_tensor_get` (§7.4).
 - [x] `minigraph_exec.cpp:564` staging upload -> `tensor_write_host`
-  (`ggml_backend_tensor_set`); the fake base pointer makes the stage buffer's
-  `set_tensor` resolve the offset.
+      (`ggml_backend_tensor_set`); the fake base pointer makes the stage buffer's
+      `set_tensor` resolve the offset.
 - [x] `minigraph_exec.cpp:1256` DEVDBG arena read - kept gated (reads a host
-  mapping of our own arena; diagnostic only).
+      mapping of our own arena; diagnostic only).
 - [x] One helper `src/backend/tensor_io.h` (`tensor_read_host` /
-  `tensor_write_host`); used by B39, the staging upload, and the ids read.
+      `tensor_write_host`); used by B39, the staging upload, and the ids read.
 - [x] Grep guard: `scripts/check_tensor_data.js` (Node, zero-dep) scans `src/` +
-  `patches/` for `memcpy/memmove/memset(...->data...)`; wired into `build.bat test`
-  and runnable standalone. Exempt a line (or the next line) with the marker
-  `iron-rule-exempt` (backend iface). Current: 0 violations.
+      `patches/` for `memcpy/memmove/memset(...->data...)`; wired into `build.bat test`
+      and runnable standalone. Exempt a line (or the next line) with the marker
+      `iron-rule-exempt` (backend iface). Current: 0 violations.
 
 ### B. `ids` host copy (unblocks device-resident routing)
 
 - [x] `exec_layer_burst_chain_buckets` and `exec_layer_burst` pin keys: read
-  ids through `host_image()` + `moe_id_at()` (host copy only when the ids buffer
-  is not host-resident; compact-ids build and round planning stay host-side).
+      ids through `host_image()` + `moe_id_at()` (host copy only when the ids buffer
+      is not host-resident; compact-ids build and round planning stay host-side).
 - [x] Device smoke: gemma `C1:Vulkan0` + Vulkan pool runs clean (exit 0). Note
-  the ids-copy branch is defensive: the current sched copies ids into our host
-  backend, so it is not yet hit in production; it fires once the closure runs
-  as a device graph with ids device-resident.
+      the ids-copy branch is defensive: the current sched copies ids into our host
+      backend, so it is not yet hit in production; it fires once the closure runs
+      as a device graph with ids device-resident.
 
 ### C. Same-device seam: `cur` / `ffn_moe_out` no round-trip
 
 - [ ] Device-identity map: `ggml_backend_get_device` / `ggml_backend_dev_name`;
-  expose dense `dev_layer[il].dev` and the pool device.
+      expose dense `dev_layer[il].dev` and the pool device.
 - [ ] `cur`: if the producing norm device == pool device, bind the closure's cur
-  leaf to the producer buffer (no staging); else stage.
+      leaf to the producer buffer (no staging); else stage.
 - [ ] `ffn_moe_out`: keep `acc_d` on device, do the fold + residual add
-  on-device; read back only the final layer output (or keep it resident when the
-  consumer shares the device).
+      on-device; read back only the final layer output (or keep it resident when the
+      consumer shares the device).
 - [ ] Verify: same-device path vs staged path byte-IDENTICAL.
 
 ### D. Multi-outlet whole-layer package (end-state)
 
 - [ ] Generalise `collect_chain` -> `collect_closure(gf, seed_pred, stop_pred,
-  ...)`; expert = `(is_routed_mm, is_output_name)`, whole-layer =
-  `(is_layer_node, layer_output)`.
+...)`; expert = `(is_routed_mm, is_output_name)`, whole-layer =
+      `(is_layer_node, layer_output)`.
 - [ ] Package shape: C1 prefix (1 device) -> fan-out `cur` to per-device expert
-  closures -> fan-in `ffn_moe_out` (§7.3).
+      closures -> fan-in `ffn_moe_out` (§7.3).
 - [ ] Reuse the M2-2 per-device graph + `EXPERT_MOVE_PIPELINE` move machinery;
-  C1 execution takeover (attention/KV/dense MLP) is the large piece - gate it on
-  dynamic/split C1 only.
+      C1 execution takeover (attention/KV/dense MLP) is the large piece - gate it on
+      dynamic/split C1 only.
 - [ ] Verify: per-device graph correctness + no external consumer of any layer-L
-  intermediate except the layer output.
+      intermediate except the layer output.

@@ -178,11 +178,11 @@ if (il == n_layer - 1 && inp_out_ids) {
 当前整层路径把 `FLASH_ATTN_EXT` 变成手动 `kq / softmax / kqv`，落地 `O(B^2)` 的
 score 矩阵。每层估算（f32，`h` 个头）：
 
-| 模型 | B | head（linear + attn） | closure | tail |
-|---|---|---|---|---|
-| gemma | 2048 | **900 MB (132 + 768)** | 77 MB | 60 MB |
-| olmoe | 2048 | **864 MB (96 + 768)** | 48 MB | 40 MB |
-| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB | 80 MB |
+| 模型     | B    | head（linear + attn）    | closure | tail  |
+| -------- | ---- | ------------------------ | ------- | ----- |
+| gemma    | 2048 | **900 MB (132 + 768)**   | 77 MB   | 60 MB |
+| olmoe    | 2048 | **864 MB (96 + 768)**    | 48 MB   | 40 MB |
+| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB   | 80 MB |
 
 attention 项占大头且随 `B^2` 增长。route B 拥有层但**委托**它不实现的操作；
 `FLASH_ATTN_EXT` 必须委托给设备/CPU backend，让 score 矩阵永不落地。这是硬要求
@@ -199,16 +199,16 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 
 ## 5. D 类问题（必须专门设计，不会自动消失）
 
-| D 问题 | 本设计如何应对 |
-|---|---|
-| 整图单 backend compute buffer | 一块 worst-case 一层 arena、跨层复用（3、4.2） |
-| 最后一层 `inp_out_ids` 语义 | 显式收窄支持（4.7） |
-| flash attention 必须保留 | 委托 `FLASH_ATTN_EXT`（4.9） |
-| C2 缝拷贝 | C2 接管（4.10） |
-| `supports_buft` / `supports_op` 与 ownership | route B 声明 arena buft + expert buft |
-| dense 执行顺序 / data 就绪 | 内部控制顺序 + `LayerExecutionState` + assert |
-| debug 脚手架焊在热路径 | tracer 分离（4.8） |
-| 分配失败崩溃 | 干净错误路径（4.8） |
+| D 问题                                       | 本设计如何应对                                 |
+| -------------------------------------------- | ---------------------------------------------- |
+| 整图单 backend compute buffer                | 一块 worst-case 一层 arena、跨层复用（3、4.2） |
+| 最后一层 `inp_out_ids` 语义                  | 显式收窄支持（4.7）                            |
+| flash attention 必须保留                     | 委托 `FLASH_ATTN_EXT`（4.9）                   |
+| C2 缝拷贝                                    | C2 接管（4.10）                                |
+| `supports_buft` / `supports_op` 与 ownership | route B 声明 arena buft + expert buft          |
+| dense 执行顺序 / data 就绪                   | 内部控制顺序 + `LayerExecutionState` + assert  |
+| debug 脚手架焊在热路径                       | tracer 分离（4.8）                             |
+| 分配失败崩溃                                 | 干净错误路径（4.8）                            |
 
 ## 6. 里程碑
 
@@ -223,6 +223,7 @@ route-B 层 -> C2 那道缝，同 device 也可能拷。
 每个里程碑都保持生产（MoE-only）路径数值 **IDENTICAL**。
 
 **已落地（2026-09-13）：**
+
 - **R1** 官方层号 channel + 构建期 LayerPlan + consumer gate：`6c1c99b`、`011948b`。
 - **R2** 不 clone 的 dense 执行 + `LayerExecutionState`。dense head/tail 用**原主图节点**
   手工拼一个 `ggml_cgraph` 执行（不再 `ggml_dup` clone）；节点列表不必在主图里连续
@@ -257,11 +258,11 @@ capture/arena/plan 调用无条件执行。调试 dump 仍留在 `#ifdef STREAM_
 **临时激活空间（arena `need`，host buft）。** 用生产构建（`STREAM_MOE_TMP_DENSE_DEBUG=1`）、
 按给定 ubatch 的 prompt prefill（`-ub N`）实测：
 
-| ubatch | olmoe | gemma | deepseek |
-| ---: | ---: | ---: | ---: |
-| 1 | ~1.0 MB | ~5.6 MB | ~9.8 MB |
-| 512 | ~0.5 GB | ~2.8 GB | ~4.1 GB |
-| 2048 | ~2.0 GB | - | - |
+| ubatch |   olmoe |   gemma | deepseek |
+| -----: | ------: | ------: | -------: |
+|      1 | ~1.0 MB | ~5.6 MB |  ~9.8 MB |
+|    512 | ~0.5 GB | ~2.8 GB |  ~4.1 GB |
+|   2048 | ~2.0 GB |       - |        - |
 
 ubatch 512 分解（carry / compact / closure）：olmoe 62/218/142 MB，
 gemma 160/2498/198 MB，deepseek 2630/1300/248 MB。arena 装下每层全部激活：

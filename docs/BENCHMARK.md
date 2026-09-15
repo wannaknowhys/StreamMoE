@@ -54,11 +54,11 @@ node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <sp
 
 Three disjoint spec categories; any duplicate key across them aborts.
 
-| Category | Keys |
-| :------- | :--- |
-| model | `model`, `modelPath`, `draft?`, `pool?` |
-| engine | `engine`, `bin` &#124; `binPath`, `extra?` |
-| task  | `input`, plus single/jsonl fields below |
+| Category | Keys                                       |
+| :------- | :----------------------------------------- |
+| model    | `model`, `modelPath`, `draft?`, `pool?`    |
+| engine   | `engine`, `bin` &#124; `binPath`, `extra?` |
+| task     | `input`, plus single/jsonl fields below    |
 
 Engine = binary + placement args:
 
@@ -83,19 +83,19 @@ Task fields:
 
 All route-B specs use `bin: StreamMoE`; `${pool}` comes from the model spec.
 
-| Spec | `--dense-placement` | `--moe-expert-pools` |
-| :--- | :--- | :--- |
-| `place-cpu.json` | `C1:RAM,C2:RAM` | `RAM:${pool}` |
-| `place-c1.json` | `C1:Vulkan0,C2:RAM` | `RAM:${pool}` |
-| `place-c2.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool}` |
-| `place-exp2.json` | `C1:RAM,C2:RAM` | `RAM:${pool},Vulkan0:2048` |
-| `place-exp5.json` | `C1:RAM,C2:RAM` | `RAM:${pool},Vulkan0:5120` |
-| `place-c1-exp2.json` | `C1:Vulkan0,C2:RAM` | `RAM:${pool},Vulkan0:2048` |
-| `place-c2-exp2.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
-| `place-c1c2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}` |
+| Spec                   | `--dense-placement`     | `--moe-expert-pools`       |
+| :--------------------- | :---------------------- | :------------------------- |
+| `place-cpu.json`       | `C1:RAM,C2:RAM`         | `RAM:${pool}`              |
+| `place-c1.json`        | `C1:Vulkan0,C2:RAM`     | `RAM:${pool}`              |
+| `place-c2.json`        | `C1:RAM,C2:Vulkan0`     | `RAM:${pool}`              |
+| `place-exp2.json`      | `C1:RAM,C2:RAM`         | `RAM:${pool},Vulkan0:2048` |
+| `place-exp5.json`      | `C1:RAM,C2:RAM`         | `RAM:${pool},Vulkan0:5120` |
+| `place-c1-exp2.json`   | `C1:Vulkan0,C2:RAM`     | `RAM:${pool},Vulkan0:2048` |
+| `place-c2-exp2.json`   | `C1:RAM,C2:Vulkan0`     | `RAM:${pool},Vulkan0:2048` |
+| `place-c1c2.json`      | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool}`              |
 | `place-c1c2-exp2.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:2048` |
 | `place-c1c2-exp1.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:1024` |
-| `place-c2-exp5.json` | `C1:RAM,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
+| `place-c2-exp5.json`   | `C1:RAM,C2:Vulkan0`     | `RAM:${pool},Vulkan0:5120` |
 | `place-c1c2-exp5.json` | `C1:Vulkan0,C2:Vulkan0` | `RAM:${pool},Vulkan0:5120` |
 
 Stock upstream: `stock-cpu.json` (`-ngl 0`), `stock-vulkan.json` (`-ngl 99`),
@@ -118,7 +118,7 @@ calls the runner. The committed template is `scripts/sm_env.example.bat`.
 - single: `{kind:"single", cold, warmup[], steady[], median:{prompt_n,prompt_tps,decode_tps}, server_log_tail}`
 - jsonl: one `{kind:"turn", turn, prompt_tokens, prompt_tps, decode_tps, gen_n, cache_n}`
   per turn, then `{kind:"summary", turns, total_prompt_tokens, total_gen_tokens,
-  avg_decode_tps, median_decode_tps, avg_prompt_tps, server_log_tail}`
+avg_decode_tps, median_decode_tps, avg_prompt_tps, server_log_tail}`
 
 ## 7. Examples
 
@@ -152,22 +152,22 @@ private\bench.bat --models tools\run_specs\models\gemma.json ^
 
 Average over 10 turns (tg = decode tok/s, pp = prefill tok/s):
 
-| engine | tg | pp | placement |
-| :--- | ---: | ---: | :--- |
-| stock-cpu | 42.38 | 102.3 | upstream, CPU |
-| stock-vulkan | 41.32 | 221.9 | upstream, all layers Vulkan0 |
-| place-cpu | 40.00 | 171.5 | route B baseline (dense + experts RAM) |
-| place-c2 | 36.87 / 36.54 | 143.7 / 144.6 | C2 on Vulkan0 (run twice) |
-| place-c1 | 19.50 | 188.4 | C1 on Vulkan0 |
-| place-c1c2 | 20.26 | 195.8 | C1+C2 on Vulkan0 |
-| place-exp2 | 27.03 | 101.3 | experts 2G VRAM |
-| place-exp5 | 25.42 | 140.9 | experts 5G VRAM |
-| place-c2-exp2 | 28.00 | 101.0 | C2 + 2G experts |
-| place-c2-exp5 | 26.21 | 145.8 | C2 + 5G experts |
-| place-c1-exp2 | 16.69 | 111.4 | C1 + 2G experts |
-| place-c1c2-exp1 | 17.77 | 143.5 | C1+C2 + 1G experts |
-| place-c1c2-exp2 | 17.12 | 109.1 | C1+C2 + 2G experts |
-| place-c1c2-exp5 | 16.39 | 160.5 | C1+C2 + 5G experts |
+| engine          |            tg |            pp | placement                              |
+| :-------------- | ------------: | ------------: | :------------------------------------- |
+| stock-cpu       |         42.38 |         102.3 | upstream, CPU                          |
+| stock-vulkan    |         41.32 |         221.9 | upstream, all layers Vulkan0           |
+| place-cpu       |         40.00 |         171.5 | route B baseline (dense + experts RAM) |
+| place-c2        | 36.87 / 36.54 | 143.7 / 144.6 | C2 on Vulkan0 (run twice)              |
+| place-c1        |         19.50 |         188.4 | C1 on Vulkan0                          |
+| place-c1c2      |         20.26 |         195.8 | C1+C2 on Vulkan0                       |
+| place-exp2      |         27.03 |         101.3 | experts 2G VRAM                        |
+| place-exp5      |         25.42 |         140.9 | experts 5G VRAM                        |
+| place-c2-exp2   |         28.00 |         101.0 | C2 + 2G experts                        |
+| place-c2-exp5   |         26.21 |         145.8 | C2 + 5G experts                        |
+| place-c1-exp2   |         16.69 |         111.4 | C1 + 2G experts                        |
+| place-c1c2-exp1 |         17.77 |         143.5 | C1+C2 + 1G experts                     |
+| place-c1c2-exp2 |         17.12 |         109.1 | C1+C2 + 2G experts                     |
+| place-c1c2-exp5 |         16.39 |         160.5 | C1+C2 + 5G experts                     |
 
 Tentative reading (NOT a conclusion):
 

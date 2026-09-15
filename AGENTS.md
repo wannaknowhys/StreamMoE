@@ -100,6 +100,13 @@
 | :------------------------------------------------ | :------------------------------------------------------------------------------------------------------- |
 | 调度/池（dir 二维、异步装载、全局线程、驱逐打分） | `docs/EXPERT_SCHEDULER_DESIGN.md`                                                                        |
 | GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）      | `docs/ROUTE_B_GPU_PHASE.md`                                                                              |
+| dense 放置与驻留管理（C1/C2 策略、迁移判据）      | `docs/DENSE_PLACEMENT.md`                                                                                |
+| 每设备 arena 规划（区间打包、carry 管线）         | `docs/PER_DEVICE_ARENA.md`                                                                               |
+| 整图分区（四区域、接缝 leaves、buft 标记）        | `docs/GRAPH_PARTITION.md`                                                                                |
+| route B 整层拥有（整层执行、跨设备搬运）          | `docs/ROUTE_B_LAYER_OWNERSHIP.md`                                                                        |
+| 紧凑多桶快速路径 / 算子融合                       | `docs/BUCKET_FAST_PATH.md`                                                                               |
+| token 子集 scatter-add 规划                       | `docs/SCATTER_PLAN.md`                                                                                   |
+| 吞吐基准评测（单次/多轮、参数矩阵）               | `docs/BENCHMARK.md`                                                                                      |
 | 多模型池 / 异构子池                               | `docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md`                                                      |
 | GGUF 格式 v1/v2 / RAID0 分片                      | `docs/STREAMMOE_GGUF_FORMAT.md`                                                                          |
 | prefill 交叉验证 / 专家历史模拟 / repack 排查     | `docs/PREFILL_CROSS_VALIDATION.md`、`docs/EXPERT_TRACE_SIMULATION.md`、`docs/REPACK_DIVERGENCE_DEBUG.md` |

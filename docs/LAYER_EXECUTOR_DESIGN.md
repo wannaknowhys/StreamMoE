@@ -40,7 +40,7 @@ backend); changing C1/C2 placement semantics.
   `LayerPlan`.
 - Per layer: `dense head -> MoE burst -> dense tail`, then the layer is complete.
 - **One arena buffer per device, sized to the worst-case (largest) layer, reused
-  across layers.** "Per-layer" below refers to the *layout analysis* (offsets),
+  across layers.** "Per-layer" below refers to the _layout analysis_ (offsets),
   not to separate backing allocations.
 - Dataflow: the KV cache is resident (llama-owned, not in our arena); our arena
   holds only the transient per-layer activations; only the hidden state `X` and
@@ -210,11 +210,11 @@ The current whole-layer path turns `FLASH_ATTN_EXT` into manual `kq / softmax /
 kqv`, which materializes the `O(B^2)` score matrix. Per-layer estimates (f32,
 `h` heads):
 
-| model | B | head (linear + attn) | closure | tail |
-|---|---|---|---|---|
-| gemma | 2048 | **900 MB (132 + 768)** | 77 MB | 60 MB |
-| olmoe | 2048 | **864 MB (96 + 768)** | 48 MB | 40 MB |
-| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB | 80 MB |
+| model    | B    | head (linear + attn)     | closure | tail  |
+| -------- | ---- | ------------------------ | ------- | ----- |
+| gemma    | 2048 | **900 MB (132 + 768)**   | 77 MB   | 60 MB |
+| olmoe    | 2048 | **864 MB (96 + 768)**    | 48 MB   | 40 MB |
+| deepseek | 2048 | **3264 MB (192 + 3072)** | 96 MB   | 80 MB |
 
 The attention term dominates and scales as `B^2`. Route B owns the layer but
 **delegates** ops it does not implement; `FLASH_ATTN_EXT` must be delegated to
@@ -234,16 +234,16 @@ liveness analysis merges C1/C2 (they do not overlap in time).
 
 ## 5. D problems (must be designed, not automatic)
 
-| D problem | How this design addresses it |
-|---|---|
-| Whole-graph single-backend compute buffer | One worst-case-layer arena, reused (3, 4.2) |
-| Last-layer `inp_out_ids` semantics | Explicit narrowing support (4.7) |
-| Flash attention must stay on | Delegate `FLASH_ATTN_EXT` (4.9) |
-| C2 seam copies | C2 takeover (4.10) |
-| `supports_buft` / `supports_op` vs ownership | route B declares the arena buft + expert bufts |
-| dense execution order / data readiness | internal order + `LayerExecutionState` + asserts |
-| debug scaffold on the hot path | tracer separation (4.8) |
-| allocation failure crash | clean error path (4.8) |
+| D problem                                    | How this design addresses it                     |
+| -------------------------------------------- | ------------------------------------------------ |
+| Whole-graph single-backend compute buffer    | One worst-case-layer arena, reused (3, 4.2)      |
+| Last-layer `inp_out_ids` semantics           | Explicit narrowing support (4.7)                 |
+| Flash attention must stay on                 | Delegate `FLASH_ATTN_EXT` (4.9)                  |
+| C2 seam copies                               | C2 takeover (4.10)                               |
+| `supports_buft` / `supports_op` vs ownership | route B declares the arena buft + expert bufts   |
+| dense execution order / data readiness       | internal order + `LayerExecutionState` + asserts |
+| debug scaffold on the hot path               | tracer separation (4.8)                          |
+| allocation failure crash                     | clean error path (4.8)                           |
 
 ## 6. Milestones
 
@@ -259,6 +259,7 @@ liveness analysis merges C1/C2 (they do not overlap in time).
 Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 
 **Landed (2026-09-13):**
+
 - **R1** official layer channel + build-time LayerPlan + consumer gate:
   `6c1c99b`, `011948b`.
 - **R2** no-clone dense execution + `LayerExecutionState`. The dense head/tail
@@ -309,11 +310,11 @@ whole-layer executor.
 production build (`STREAM_MOE_TMP_DENSE_DEBUG=1`), prompt-driven prefill at a
 given ubatch (`-ub N`):
 
-| ubatch | olmoe | gemma | deepseek |
-| ---: | ---: | ---: | ---: |
-| 1 | ~1.0 MB | ~5.6 MB | ~9.8 MB |
-| 512 | ~0.5 GB | ~2.8 GB | ~4.1 GB |
-| 2048 | ~2.0 GB | - | - |
+| ubatch |   olmoe |   gemma | deepseek |
+| -----: | ------: | ------: | -------: |
+|      1 | ~1.0 MB | ~5.6 MB |  ~9.8 MB |
+|    512 | ~0.5 GB | ~2.8 GB |  ~4.1 GB |
+|   2048 | ~2.0 GB |       - |        - |
 
 Breakdown at ubatch 512 (carry / compact / closure): olmoe 62/218/142 MB,
 gemma 160/2498/198 MB, deepseek 2630/1300/248 MB. The arena holds every layer

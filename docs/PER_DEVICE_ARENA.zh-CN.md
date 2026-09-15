@@ -13,11 +13,11 @@
 整层所有权转正后，`layout_arena` 把**每个** compute 节点预分配进单个 host arena，
 布局为 `[carry][compact][closure]`。ubatch 512 实测（host buft）：
 
-| model | carry | compact | closure | need |
-| :-- | --: | --: | --: | --: |
-| olmoe | 62 MB | 218 MB | 142 MB | 0.4–0.5 GB |
-| gemma | 160 MB | 2498 MB | 198 MB | 2.8 GB |
-| deepseek | 2630 MB | 1300 MB | 248 MB | 4.1 GB |
+| model    |   carry | compact | closure |       need |
+| :------- | ------: | ------: | ------: | ---------: |
+| olmoe    |   62 MB |  218 MB |  142 MB | 0.4–0.5 GB |
+| gemma    |  160 MB | 2498 MB |  198 MB |     2.8 GB |
+| deepseek | 2630 MB | 1300 MB |  248 MB |     4.1 GB |
 
 三个具体缺陷：
 
@@ -40,11 +40,11 @@
 
 **实测（ub=1）：三模型全是 100% cross-1，cross-N = 0：**
 
-| model | cross-1 | cross-N |
-| :-- | :-- | :-- |
-| olmoe | 15 节点 / 122880 B（max 8192） | 0 |
-| gemma | 29 节点 / 326656 B（max 11264） | 0 |
-| deepseek | 84 节点 / 5505024 B（max 65536） | 0 |
+| model    | cross-1                          | cross-N |
+| :------- | :------------------------------- | :------ |
+| olmoe    | 15 节点 / 122880 B（max 8192）   | 0       |
+| gemma    | 29 节点 / 326656 B（max 11264）  | 0       |
+| deepseek | 84 节点 / 5505024 B（max 65536） | 0       |
 
 **布局。** `carry1` 按**层边界索引双缓冲**：第 L 层产出、被 L+1 消费的那组 cross-1 张量
 打包进 buffer `L % 2`（两个 buffer，使 L+1 的 tail 处 `O_L` 与 `O_{L+1}` 共存——那里既读
@@ -150,10 +150,10 @@ gemma 160 MB → ~11 MB。闭包块也降（olmoe ub1 278528 → 131072 B）。�
 
 实测（gemma v2、129-token prefill-from、8 GB 池，对 `moe_129_8192_vk`）：
 
-| compact 布局 | 导出的 embd cos（token 0） | top-4 logits |
-| :-- | --: | :-- |
-| 字节求和（默认） | 0.98631 | 完全一致 |
-| 区间打包（`=1`） | 0.01568 | 完全一致 |
+| compact 布局     | 导出的 embd cos（token 0） | top-4 logits |
+| :--------------- | -------------------------: | :----------- |
+| 字节求和（默认） |                    0.98631 | 完全一致     |
+| 区间打包（`=1`） |                    0.01568 | 完全一致     |
 
 区间打包的 "FAIL" 是**导出假象，不是推理 bug**：
 
@@ -179,6 +179,7 @@ graph_compute call 的），所以导出模式慢 ~8x（实测 prompt 4.2 → 0.
 整层已复用槽之后。
 
 **修复 —— 已落地（2026-09-14）。**
+
 1. 导出回调只对它真正读取的张量（`embd` / `hidden` / `logits` / 路由 `MUL_MAT_ID` 的
    ids）返回 `true`，于是 sched 只在那些点切块、route B 基本每层跑一次。导出开销回到
    ~1.4x（prompt 4.3 → 3.3 t/s；剩余来自每层的 MoE 切点）。

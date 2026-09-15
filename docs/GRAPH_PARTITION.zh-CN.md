@@ -8,10 +8,11 @@
 >
 > 相关：`docs/ROUTE_B_GPU_PHASE.md`（闭包/私有化）、`docs/DENSE_PLACEMENT.md`
 > §2/§7（C1/C2 分类、闭包分析）、`docs/STREAMMOE_GGUF_FORMAT.md` §3
->（C1/C2/C3/C4）、`docs/M2_DEVICE_EXECUTOR.md`（每设备执行器）、
+> （C1/C2/C3/C4）、`docs/M2_DEVICE_EXECUTOR.md`（每设备执行器）、
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`。
 
 > **铁律 - 数据搬运（2026-09-09）**：
+>
 > 1. **ggml 张量字节**：永远不要在 host 上解引用或 `memcpy` `ggml_tensor::data`。
 >    一律用后端无关拷贝 `ggml_backend_tensor_get` / `_set`（`_2d`；mid-graph 用
 >    `_async` + `ggml_backend_synchronize`，后端用
@@ -24,7 +25,7 @@
 >    （设备 DMA 或 host memcpy），合法。
 > 4. **非张量内存**（结构体 init/`memset`、guid/名字拷贝）：可忽略，libc 即可，但别放进
 >    每 token 的热路径。
-> 来源见 §7.4。
+>    来源见 §7.4。
 
 ## 1. 地图怎么来的
 
@@ -53,12 +54,12 @@ node temp/analyze_gdump.js dump.txt
 整图分成四块。第 (2) 与第 (3) 之间的切面是**硬切**（`moe_chain_verify_graph`
 用纯拓扑证明：闭包外的节点绝不消费闭包中间量，只有 `ffn_moe_out` 例外）。
 
-| # | 区域 | 内容 | 执行者 |
-|:-:|:-----|:-----|:-------|
-| 1 | **Dense trunk = C1** | 逐层 attention（GQA 或 MLA+DSA）、norm、KV 写入、dense MLP（gemma/deepseek）、共享专家（deepseek `_shexp`）、hyper-connection（deepseek） | llama.cpp 原生（只做放置） |
-| 2 | **Gating** | `ffn_moe_logits/probs/argsort/topk/weights`（gemma/deepseek 另有权重归一化） | llama.cpp 原生（dense 侧） |
-| 3 | **专家闭包** | routed `MUL_MAT_ID` + swiglu/geglu + down + weighted + 收敛 ADD + `ffn_moe_out`；权重 = 池里的 `_exps.weight` | **route B**（私有化） |
-| 4 | **Output head = C2** | final norm + lm_head | llama.cpp 原生（只做放置） |
+|  #  | 区域                 | 内容                                                                                                                                      | 执行者                     |
+| :-: | :------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :------------------------- |
+|  1  | **Dense trunk = C1** | 逐层 attention（GQA 或 MLA+DSA）、norm、KV 写入、dense MLP（gemma/deepseek）、共享专家（deepseek `_shexp`）、hyper-connection（deepseek） | llama.cpp 原生（只做放置） |
+|  2  | **Gating**           | `ffn_moe_logits/probs/argsort/topk/weights`（gemma/deepseek 另有权重归一化）                                                              | llama.cpp 原生（dense 侧） |
+|  3  | **专家闭包**         | routed `MUL_MAT_ID` + swiglu/geglu + down + weighted + 收敛 ADD + `ffn_moe_out`；权重 = 池里的 `_exps.weight`                             | **route B**（私有化）      |
+|  4  | **Output head = C2** | final norm + lm_head                                                                                                                      | llama.cpp 原生（只做放置） |
 
 区域 3 就是闭包：从 routed `MUL_MAT_ID` 锚点前向 BFS 到 `ffn_moe_out`
 （`collect_chain`）。Gating（2）在锚点上游，留在 dense 侧。闭包包含其生产者输出
@@ -68,18 +69,18 @@ node temp/analyze_gdump.js dump.txt
 
 用上面的 dump 实测（reserve 图，`-c 2048`；闭包字节是该层 hidden 中间块）。
 
-| | olmoe-1b-7b | gemma-4-26B-A4B | deepseek-v4-flash |
-|:--|--:|--:|--:|
-| 层数 | 16 | 30 | 43 |
-| compute 节点 | 934 | 2644 | 8521 |
-| leaf | 234 | 729 | 1606 |
-| 闭包节点 | 320（20/层） | 660（22/层） | 774（18/层） |
-| 闭包 hidden / 层 | 344 KB | 578 KB | 608 KB |
-| `MUL_MAT_ID` / 层 | 3（gate/up/down） | 2（gate_up, down） | 3（gate/up/down） |
-| C3 专家权重 | 48 / 3720 MB | 60 / 13688 MB | 129 / 140352 MB |
-| C1 逐层 dense | 144 / 160.8 MB | 565 / 1711.2 MB | 1193 / 11993.5 MB |
-| C2 embedding（`token_embd`） | 1 / 55.3 MB | 2 / 1496 MB | 1 / 1010 MB |
-| C4 scale | - | 30 / 15 KB | - |
+|                              |       olmoe-1b-7b |    gemma-4-26B-A4B | deepseek-v4-flash |
+| :--------------------------- | ----------------: | -----------------: | ----------------: |
+| 层数                         |                16 |                 30 |                43 |
+| compute 节点                 |               934 |               2644 |              8521 |
+| leaf                         |               234 |                729 |              1606 |
+| 闭包节点                     |      320（20/层） |       660（22/层） |      774（18/层） |
+| 闭包 hidden / 层             |            344 KB |             578 KB |            608 KB |
+| `MUL_MAT_ID` / 层            | 3（gate/up/down） | 2（gate_up, down） | 3（gate/up/down） |
+| C3 专家权重                  |      48 / 3720 MB |      60 / 13688 MB |   129 / 140352 MB |
+| C1 逐层 dense                |    144 / 160.8 MB |    565 / 1711.2 MB | 1193 / 11993.5 MB |
+| C2 embedding（`token_embd`） |       1 / 55.3 MB |        2 / 1496 MB |       1 / 1010 MB |
+| C4 scale                     |                 - |         30 / 15 KB |                 - |
 
 模型差异：
 
@@ -94,26 +95,26 @@ node temp/analyze_gdump.js dump.txt
 `STREAM_MOE_CAP_DUMP=1` 打印每层的外部叶子——闭包从 dense 侧取的东西，以及它交回
 的唯一产物：
 
-| role | 张量 | 生产者 | 消费者 |
-|:-----|:-----|:-------|:-------|
-| `w` | `blk.L.ffn_*_exps.weight` | 专家池（scheduler pin） | 闭包的 `MUL_MAT_ID` |
-| `cur` | `ffn_norm-L`（norm 后 hidden） | C1 norm | 第一个 `MUL_MAT_ID` |
-| `ids` | `ffn_moe_argsort-L` | gating | `MUL_MAT_ID` src[2] |
-| `scale` | `ffn_moe_weights-L`（路由权重） | gating | `ffn_moe_weighted` |
-| `scale` | `blk.L.ffn_down_exps.scale`（仅 gemma，C4） | C4 常驻 | down 的无权重 op |
-| **out** | `ffn_moe_out-L` | 闭包 | dense 残差 ADD |
+| role    | 张量                                        | 生产者                  | 消费者              |
+| :------ | :------------------------------------------ | :---------------------- | :------------------ |
+| `w`     | `blk.L.ffn_*_exps.weight`                   | 专家池（scheduler pin） | 闭包的 `MUL_MAT_ID` |
+| `cur`   | `ffn_norm-L`（norm 后 hidden）              | C1 norm                 | 第一个 `MUL_MAT_ID` |
+| `ids`   | `ffn_moe_argsort-L`                         | gating                  | `MUL_MAT_ID` src[2] |
+| `scale` | `ffn_moe_weights-L`（路由权重）             | gating                  | `ffn_moe_weighted`  |
+| `scale` | `blk.L.ffn_down_exps.scale`（仅 gemma，C4） | C4 常驻                 | down 的无权重 op    |
+| **out** | `ffn_moe_out-L`                             | 闭包                    | dense 残差 ADD      |
 
 所以 dense<->闭包 的全部接口就是：**`cur` 进、`ids` 进、路由权重 `scale` 进、专家
 权重进、`ffn_moe_out` 出**。别的都不跨。
 
 ## 5. buffer 类型标记
 
-| buft 名 | 含义 | 出现位置 |
-|:--------|:-----|:---------|
-| `STREAMMOE_EXPERT` | 专家池 buft；所有 routed `_exps.weight` | C3，闭包的权重叶子 |
-| `STREAMMOE_HOST` | C4 复制小叶子的 host-mapped buft | gemma `_exps.scale` |
-| `STREAMMOE_DENSE` | v2-chunk dense 条带 buft（仅 `topo.incomplete`） | 这三个完整 GGUF 没出现 |
-| `STREAMMOE`（backend） | 接收私有化闭包 split 的设备 | 区域 3 的 `graph_compute` |
+| buft 名                | 含义                                             | 出现位置                  |
+| :--------------------- | :----------------------------------------------- | :------------------------ |
+| `STREAMMOE_EXPERT`     | 专家池 buft；所有 routed `_exps.weight`          | C3，闭包的权重叶子        |
+| `STREAMMOE_HOST`       | C4 复制小叶子的 host-mapped buft                 | gemma `_exps.scale`       |
+| `STREAMMOE_DENSE`      | v2-chunk dense 条带 buft（仅 `topo.incomplete`） | 这三个完整 GGUF 没出现    |
+| `STREAMMOE`（backend） | 接收私有化闭包 split 的设备                      | 区域 3 的 `graph_compute` |
 
 `--dense-placement C1/C2` 与这些标记**正交**：它把 dense 权重放到设备 buft
 （如 `Vulkan0`），名字不是 STREAMMOE。
@@ -226,42 +227,42 @@ leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——�
 ### A. 数据搬运卫生（先做，小）
 
 - [x] B39：`stream_moe_backend_replicate_leaf` 用 `ggml_backend_tensor_get` 读源
-  （§7.4）。
+      （§7.4）。
 - [x] `minigraph_exec.cpp:564` staging 上传 -> `tensor_write_host`
-  （`ggml_backend_tensor_set`）；假基址让 stage buffer 的 `set_tensor` 解析出偏移。
+      （`ggml_backend_tensor_set`）；假基址让 stage buffer 的 `set_tensor` 解析出偏移。
 - [x] `minigraph_exec.cpp:1256` DEVDBG arena 读——保持门控（读的是我们自己 arena 的
-  host 映射；仅诊断）。
+      host 映射；仅诊断）。
 - [x] 一个 helper `src/backend/tensor_io.h`（`tensor_read_host` /
-  `tensor_write_host`）；B39、staging 上传、ids 读取都用它。
+      `tensor_write_host`）；B39、staging 上传、ids 读取都用它。
 - [x] grep 守卫：`scripts/check_tensor_data.js`（Node，零依赖）扫 `src/` + `patches/`
-  里的 `memcpy/memmove/memset(...->data...)`；已挂到 `build.bat test`，也可独立运行。
-  合法行（或其后一行）加 `iron-rule-exempt` 标记豁免（后端 iface）。当前 0 命中。
+      里的 `memcpy/memmove/memset(...->data...)`；已挂到 `build.bat test`，也可独立运行。
+      合法行（或其后一行）加 `iron-rule-exempt` 标记豁免（后端 iface）。当前 0 命中。
 
 ### B. `ids` host 拷贝（解锁 device-resident 路由）
 
 - [x] `exec_layer_burst_chain_buckets` 与 `exec_layer_burst` 的 pin keys：用
-  `host_image()` + `moe_id_at()` 读 ids（仅当 ids buffer 非 host-resident 时才拷贝；
-  compact-ids 构建与 round 规划仍留 host）。
+      `host_image()` + `moe_id_at()` 读 ids（仅当 ids buffer 非 host-resident 时才拷贝；
+      compact-ids 构建与 round 规划仍留 host）。
 - [x] 设备冒烟：gemma `C1:Vulkan0` + Vulkan 池干净跑通（exit 0）。注意 ids 拷贝分支是
-  防御性的：当前 sched 会把 ids 拷进我们的 host backend，所以生产路径还没触发；等闭包
-  以设备图跑、ids 设备常驻时才生效。
+      防御性的：当前 sched 会把 ids 拷进我们的 host backend，所以生产路径还没触发；等闭包
+      以设备图跑、ids 设备常驻时才生效。
 
 ### C. 同设备接缝：`cur` / `ffn_moe_out` 不出设备
 
 - [ ] 设备身份映射：`ggml_backend_get_device` / `ggml_backend_dev_name`；暴露 dense
-  `dev_layer[il].dev` 与池设备。
+      `dev_layer[il].dev` 与池设备。
 - [ ] `cur`：产生它的 norm 设备 == 池设备时，把闭包的 cur 叶子绑到生产者 buffer
-  （不 staging）；否则 staging。
+      （不 staging）；否则 staging。
 - [ ] `ffn_moe_out`：`acc_d` 留在设备上，fold + 残差 ADD 在设备侧；只回读最终层输出
-  （消费者同设备则也常驻）。
+      （消费者同设备则也常驻）。
 - [ ] 验证：同设备路径 vs staging 路径逐字节一致。
 
 ### D. 多出口整层包（终态）
 
 - [ ] 把 `collect_chain` 泛化成 `collect_closure(gf, seed_pred, stop_pred, ...)`；
-  专家 = `(is_routed_mm, is_output_name)`，整层 = `(is_layer_node, layer_output)`。
+      专家 = `(is_routed_mm, is_output_name)`，整层 = `(is_layer_node, layer_output)`。
 - [ ] 包形状：C1 前段（1 设备）-> `cur` 扇出到 per-device 专家闭包 -> `ffn_moe_out`
-  扇入（§7.3）。
+      扇入（§7.3）。
 - [ ] 复用 M2-2 每设备图 + `EXPERT_MOVE_PIPELINE` 搬迁机制；C1 执行接管
-  （attention/KV/dense MLP）是最大块——只在动态/拆分 C1 时启用。
+      （attention/KV/dense MLP）是最大块——只在动态/拆分 C1 时启用。
 - [ ] 验证：每设备图正确性 + 除层输出外没有外部消费者读任何第 L 层中间量。
