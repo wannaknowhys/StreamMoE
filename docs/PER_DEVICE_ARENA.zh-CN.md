@@ -68,13 +68,16 @@ struct region_plan_t {
     // scratch：该设备的全部层内临时量，合并：
     //   compact（dense head/tail）+ closure（MoE）
     size_t scratch_bytes;                // max over layers
-    size_t off_carryN, off_scratch;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    // xfer：跨设备生产者的消费者侧副本，每个 (生产者, 设备, stage) 一个 shell；
+    //   跨层复用（取各层 max）
+    size_t xfer_bytes;
+    size_t off_carryN, off_scratch, off_xfer;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off, xfer_off;
     std::set<const ggml_tensor*> cross_device;   // carry 被远端设备消费
 };
 ```
 
-**两个区域，按生命周期。**
+**三个区域，按生命周期。**
 
 - **carry**（跨层）：残差流 / 层输出。**逻辑上一份流水**；物理上每个设备各自
   grow-only 留好位置。当 layer L 的 carry 被 layer L+1（在别的设备）消费时，执行器在
@@ -102,12 +105,16 @@ placement 设备，取权重 buffer 的设备；专家 → 其池设备）；无
 route B 自己的 host backend 和 CPU 设备都坍缩成 host plan。专家池在 `route_b_setup`
 时记录。
 
-**跨设备**张量（消费者在别的设备）在 plan 里标记，供执行器用 D2D / transfer-queue
-搬运（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5），除 host 边界外绝不 host staging。除
-**carry**（C1 → C2 / 下一层）外，标记集还含 **`cur`**（C1 dense head → 远端专家池）、
-**`moe_out`**（远端专家池 → C1/fold 设备）以及路由 **`ids`**（无条件搬到 CPU：compact-ids
-构建与 round 规划都在 host）。当前只标记了 carry（`region_plan_t::cross_device`），其余
-随设备执行器落地。
+**跨设备搬运（通用机制，2026-09-15 落地）。** 每条生产者/消费者设备不同的已捕获边，都在
+**消费者设备的 `xfer` 区**分配一个**消费者侧副本**（shell），并把消费者的 `src` 改指它。
+执行器按 **stage** 各跑一次 `ggml_backend_tensor_copy(src, dst)`：
+`ROUTE_B_XFER_LAYER_FRONT`（跨层 carry，消费者层 head 之前）、`ROUTE_B_XFER_CLOSURE`
+（如 `cur`，MoE 闭包之前）、`ROUTE_B_XFER_TAIL`（如 `moe_out`，dense tail 之前）。每个
+`(生产者, 消费者设备, stage)` 只一个 shell，所以生产者在一层内被写多次也只**搬一次**，
+不是每次写都跨设备。这是 D2D / transfer-queue，除 host 边界外绝不 host staging
+（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5）。carry、`cur`（C1 head → 专家池）、`moe_out`
+（专家池 → C1 tail）统一走它。路由 **`ids`** 无条件读到 host（compact-ids 构建与 round
+规划都在 host），不需要 shell。
 
 ## 4. 复用已有打包
 
@@ -239,9 +246,16 @@ carry1 和 carryN 在每个边界一起搬。
 单设备 / CPU-only：没有跨设备 carry → 没有 relay → 验证 `IDENTICAL`（pack vs sum +
 专家历史）。
 
-仍待做（设备执行器，phase 3）：在 placement 设备上执行 C1/C2（`run_dense_subgraph`
-仍用 CPU backend）。注意：改指 `src` 发生在 scheduler 的 tensor-backend pass 之后——
-route B 整层拥有时是安全的，但所有权模型若变必须重新检查。
+**phase 3（设备执行器）：已落地（2026-09-15）。** `route_b_setup` 记录
+`设备名 → ggml_backend_t` 表；`layout_arena` 暴露 `节点 → 设备`；`exec_layer_burst`
+把 dense head/tail 按 placement 设备分组、各在自己的 backend 上跑
+（`run_dense_subgraph`，host → CPU）。`cur` 上传与 `moe_out` 回写都改为 backend 无关，
+设备驻留的激活值绝不在 host 上解引用。carry 专用的 relay 已被上面的通用 stage 搬运
+取代：carry、`cur`、`moe_out` 统一走 `xfer` 区。
+
+仍待做：C1 **跨设备拆分**（同层 head → head 的边需要比 `LAYER_FRONT` 更细的 stage）；
+设备侧验证（C1/C2 上 Vulkan）。注意：改指 `src` 发生在 scheduler 的 tensor-backend
+pass 之后——route B 整层拥有时是安全的，但所有权模型若变必须重新检查。
 
 ## 8. 已定结论（2026-09-15）
 
@@ -250,8 +264,8 @@ route B 整层拥有时是安全的，但所有权模型若变必须重新检查
 2. **`carry1` 边界集合：每个 parity 一个共享集合，按该 parity 各层的最大边界定容**
    （即当前布局）。不需要逐边界打包——总量很小（deepseek ub 512 约 67 MB）。
 3. **C1/C2 放置严格尊重参数。** C1 与 C2 不同设备时，末层输出 → C2 必然搬运；不要求
-   C2 == C1。plan 标记所有跨设备张量（见 §3）：carry、`cur`、`moe_out`，以及路由 `ids`
-   （无条件搬到 CPU）。
+   C2 == C1。每条跨设备边都插一个带 stage 的搬运（见 §3）：carry、`cur`、`moe_out`；
+   路由 `ids` 读到 host（无 shell）。
 4. **每设备一份 plan，按该设备实际拥有的节点定容。** 设备只为它有的节点（C1 / MoE closure /
    C2）预留区域；plan 由节点存在性导出，不是固定模板。
 5. **每层设备 backend 注册表（phase 3）。** `route_b_setup` 记录一张

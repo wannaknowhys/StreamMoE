@@ -76,13 +76,16 @@ struct region_plan_t {
     // scratch: every within-layer temporary of this device, MERGED:
     //   compact (dense head/tail) + closure (MoE)
     size_t scratch_bytes;                // max over layers
-    size_t off_carryN, off_scratch;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    // xfer: consumer-side copies of cross-device producers, one shell per
+    //   (producer, device, stage); reused across layers (max over layers)
+    size_t xfer_bytes;
+    size_t off_carryN, off_scratch, off_xfer;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off, xfer_off;
     std::set<const ggml_tensor*> cross_device;   // carry a consumer reads remotely
 };
 ```
 
-**Two regions, by liveness.**
+**Three regions, by liveness.**
 
 - **carry** (cross-layer): the residual stream / layer outputs. **Logically one
   pipeline**; physically each device reserves its own grow-only slots. When
@@ -117,14 +120,19 @@ buffer's device; experts -> their pool device); weightless nodes inherit from a
 producer. Route B's own host backend and the CPU device collapse to the host
 plan. The expert pools are recorded at `route_b_setup`.
 
-**Cross-device** tensors (a node whose consumer is on another device) are marked
-in the plan so the executor moves them (D2D / the transfer queue,
-`ROUTE_B_LAYER_OWNERSHIP.md` §3.5) - never host staging except at host
-boundaries. Besides **carry** (C1 -> C2 / next layer), the marked set includes
-**`cur`** (C1 dense head -> a remote expert pool), **`moe_out`** (remote expert
-pool -> the C1/fold device) and the routing **`ids`** (unconditionally to the
-CPU: compact-ids build and round planning are host-side). Today only carry is
-marked (`region_plan_t::cross_device`); the rest lands with the device executor.
+**Cross-device transfers (generic, landed 2026-09-15).** Every captured edge
+whose producer and consumer devices differ gets a **consumer-side copy** (a
+shell) in the consumer device's `xfer` region, and the consumer's `src` is
+rewired to it. The executor runs one `ggml_backend_tensor_copy(src, dst)` per
+**stage** - `ROUTE_B_XFER_LAYER_FRONT` (cross-layer carry, before the consumer
+layer's head), `ROUTE_B_XFER_CLOSURE` (e.g. `cur`, before the MoE closure) and
+`ROUTE_B_XFER_TAIL` (e.g. `moe_out`, before the dense tail). One shell per
+`(producer, consumer device, stage)`, so a producer written many times inside a
+layer copies **once**, not per write. This is D2D / transfer-queue, never host
+staging except at host boundaries (`ROUTE_B_LAYER_OWNERSHIP.md` §3.5). It covers
+carry, `cur` (C1 head -> expert pool) and `moe_out` (expert pool -> C1 tail)
+uniformly. The routing **`ids`** are read to the host unconditionally (compact-ids
+build and round planning are host-side), so they need no shell.
 
 ## 4. Reuse the existing packing
 
@@ -282,10 +290,20 @@ every boundary.
 Single-device / CPU-only: no cross-device carry, so no relays - verified
 `IDENTICAL` (pack vs sum + expert history).
 
-Still open (device executor, phase 3): running C1/C2 on the placement device
-(`run_dense_subgraph` still uses the CPU backend). Caveat: the rewire mutates
-the captured graph's `src` after the scheduler's tensor-backend pass - safe
-while route B owns the whole layer, but must be re-checked if that changes.
+**Phase 3 (device executor): LANDED (2026-09-15).** `route_b_setup` records a
+`device name -> ggml_backend_t` table; `layout_arena` exposes `node -> device`;
+`exec_layer_burst` groups the dense head/tail by placement device and runs each
+group on that backend (`run_dense_subgraph`, host -> CPU). `cur` upload and
+`moe_out` fold/writeback are backend-agnostic, so a device-resident activation is
+never dereferenced on the host. The carry-specific relay is superseded by the
+generic stage-tagged transfer insertion above: carry, `cur` and `moe_out` all
+move through the `xfer` region.
+
+Still open: C1 **split** across devices (a within-layer head -> head edge would
+need a finer stage than `LAYER_FRONT`); device-side validation (C1/C2 on Vulkan).
+Caveat: the rewire mutates the captured graph's `src` after the scheduler's
+tensor-backend pass - safe while route B owns the whole layer, but must be
+re-checked if that changes.
 
 ## 8. Resolved decisions (2026-09-15)
 
@@ -298,8 +316,8 @@ while route B owns the whole layer, but must be re-checked if that changes.
    needed - the totals are tiny (deepseek ~67 MB at ub 512).
 3. **C1/C2 placement is respected verbatim.** C1 and C2 on different devices
    necessarily transfer the last layer's output -> C2; C2 == C1 is not required.
-   The plan marks every cross-device tensor (see §3): carry, `cur`, `moe_out`,
-   and the routing `ids` (unconditionally to the CPU).
+   Every cross-device edge gets a stage-tagged transfer (see §3): carry, `cur`,
+   `moe_out`; the routing `ids` are read to the host (no shell).
 4. **One plan per device, sized to what the device actually owns.** A device
    reserves a region only for the nodes it has (C1 / MoE closure / C2); the plan
    is derived from node presence, not a fixed template.
