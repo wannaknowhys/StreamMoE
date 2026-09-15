@@ -54,10 +54,10 @@ struct region_plan_t {
     std::string dev;
     ggml_backend_buffer_t buf = nullptr;
     size_t cap = 0;
-    size_t off_carryN = 0, off_scratch = 0;
-    size_t carry1_size = 0, carryN_size = 0, scratch_size = 0;
+    size_t off_carryN = 0, off_scratch = 0, off_xfer = 0;
+    size_t carry1_size = 0, carryN_size = 0, scratch_size = 0, xfer_size = 0;
     size_t need = 0;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off, xfer_off;
     std::set<const ggml_tensor*> cross_device;   // carry a remote consumer reads
 };
 static std::map<std::string, region_plan_t> g_plans;
@@ -372,48 +372,67 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (std::find(cN.begin(), cN.end(), t) == cN.end()) cN.push_back(const_cast<ggml_tensor*>(t));
     }
 #endif
-    // ---- cross-device carry relay (docs/PER_DEVICE_ARENA.md 3) -----------
-    // A carry tensor is the producer node's output, so it stays on the
-    // producer's device. If its (max) consumer lives on another device, that
-    // device gets a local copy: a shell reserved in the consumer layer's carry
-    // boundary set, with the consumers' src rewired to it. The executor issues
-    // ggml_backend_tensor_copy(src, dst) at the consumer layer's front. carry1
-    // and carryN relay together at every boundary.
+    // ---- generic cross-device transfers (docs/PER_DEVICE_ARENA.md 3/SS8.3) ----
+    // Every captured edge whose producer and consumer devices differ gets a
+    // consumer-side copy (shell) in the consumer device's `xfer` region, and the
+    // consumer's src is rewired to it. The executor copies src -> dst once at the
+    // tagged stage, so a producer written many times inside a layer copies once,
+    // not per write. CPU-only has no cross-device edge -> nothing is rewired
+    // (numerics unchanged). Covers cross-layer carry, `cur` (before the closure)
+    // and `moe_out` (before the tail) uniformly.
     g_relays.clear();
     if (g_relay_ctx) { ggml_free(g_relay_ctx); g_relay_ctx = nullptr; }
     {
         ggml_init_params ip = { 2u * 1024u * 1024u, nullptr, /*no_alloc=*/true };
         g_relay_ctx = ggml_init(ip);
     }
-    auto relay_split = [&](std::vector<ggml_tensor*> & list) {
-        const size_t n0 = list.size();
-        for (size_t i = 0; i < n0; ++i) {
-            ggml_tensor * nd = list[i];
-            auto cd = consumer_dev.find(nd);
-            auto ml = max_consumer.find(nd);
-            if (cd == consumer_dev.end() || ml == max_consumer.end()) continue;
-            if (cd->second == dev_of[nd]) continue;   // same device: no relay
-            ggml_tensor * dst = g_relay_ctx
-                ? ggml_new_tensor_4d(g_relay_ctx, nd->type, nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3])
-                : nullptr;
-            if (!dst) continue;
-            nlayer[dst] = ml->second;
-            dev_of[dst] = cd->second;
-            list.push_back(dst);   // reserve a slot in the consumer's carry set
-            g_relays.push_back({ nd, dst, ml->second });
-        }
+    struct shell_key_t { const ggml_tensor * p; std::string dev; int stage; };
+    std::vector<shell_key_t> shell_keys;
+    std::vector<ggml_tensor*> shell_dsts;
+    std::vector<int>          shell_layers;
+    auto shell_for = [&](const ggml_tensor * p, const std::string & dev, int stage,
+                         int layer) -> ggml_tensor * {
+        for (size_t i = 0; i < shell_keys.size(); ++i)
+            if (shell_keys[i].p == p && shell_keys[i].dev == dev && shell_keys[i].stage == stage)
+                return shell_dsts[i];
+        ggml_tensor * dst = g_relay_ctx
+            ? ggml_new_tensor_4d(g_relay_ctx, p->type, p->ne[0], p->ne[1], p->ne[2], p->ne[3])
+            : nullptr;
+        if (!dst) return nullptr;
+        shell_keys.push_back({ p, dev, stage });
+        shell_dsts.push_back(dst);
+        shell_layers.push_back(layer);
+        nlayer[dst] = layer;
+        dev_of[dst] = dev;
+        return dst;
     };
-    relay_split(c1);
-    relay_split(cN);
-    // Rewire the consumers on the destination device to read the local copy.
-    for (const route_b_relay_t & r : g_relays) {
-        const std::string & cdev = dev_of[r.dst];
-        for (int i = 0; i < gf->n_nodes; ++i) {
-            ggml_tensor * nd = gf->nodes[i];
-            auto dit = dev_of.find(nd);
-            if (dit == dev_of.end() || dit->second != cdev) continue;
-            for (int s = 0; s < GGML_MAX_SRC; ++s)
-                if (nd->src[s] == r.src) nd->src[s] = r.dst;
+    auto consumer_stage = [&](int L, const ggml_tensor * c) -> int {
+        if (const moe_layer_exec_t * ex = moe_chain_layer_exec(L))
+            for (const auto * cn : ex->compute) if (cn == c) return ROUTE_B_XFER_CLOSURE;
+        if (const moe_layer_plan_t * lp = moe_chain_layer_plan(L))
+            for (const auto * t : lp->tail) if (t == c) return ROUTE_B_XFER_TAIL;
+        return ROUTE_B_XFER_LAYER_FRONT;
+    };
+    for (auto & kv : g_layer_nodes) {
+        const int L = kv.first;
+        for (ggml_tensor * c : kv.second) {
+            if (!c) continue;
+            auto cit = dev_of.find(c);
+            const std::string cdev = cit != dev_of.end() ? cit->second : std::string();
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                ggml_tensor * p = c->src[s];
+                if (!p || p->view_src) continue;          // views follow their root
+                auto pit = dev_of.find(p);
+                if (pit == dev_of.end()) continue;        // external leaf / weight
+                if (pit->second == cdev) continue;        // same device: no copy
+                int stage = ROUTE_B_XFER_LAYER_FRONT;
+                auto pl = nlayer.find(p);
+                if (pl != nlayer.end() && pl->second == L) stage = consumer_stage(L, c);
+                ggml_tensor * dst = shell_for(p, cdev, stage, L);
+                if (!dst) continue;
+                c->src[s] = dst;
+                g_relays.push_back({ p, dst, L, stage });
+            }
         }
     }
 
@@ -556,8 +575,35 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 #endif
         }
 
+        // --- xfer: consumer-side copies of cross-device producers (one shell per
+        // producer/device/stage). A shell is live only during the layer whose
+        // stage consumes it, so the region is reused across layers -> size = max
+        // over layers of that layer's shells on D.
+        {
+            std::map<int, size_t> layer_bytes;
+            for (size_t i = 0; i < shell_keys.size(); ++i) {
+                if (shell_keys[i].dev != D) continue;
+                layer_bytes[shell_layers[i]] += ggml_nbytes(shell_dsts[i]);
+            }
+            size_t m = 0;
+            for (auto & kv : layer_bytes) m = std::max(m, kv.second);
+            m = (m + 63) & ~size_t(63);
+            plan.xfer_size = m;
+            std::map<int, size_t> cur;
+            for (size_t i = 0; i < shell_keys.size(); ++i) {
+                if (shell_keys[i].dev != D) continue;
+                size_t & off = cur[shell_layers[i]];
+                off = (off + 63) & ~size_t(63);
+                plan.xfer_off[shell_dsts[i]] = off;
+                off += ggml_nbytes(shell_dsts[i]);
+            }
+        }
+
         // --- grow-only device buffer (host buft when D == "")
-        plan.need = plan.carry1_size + plan.carryN_size + plan.scratch_size + 4096;
+        plan.off_carryN = plan.carry1_size;
+        plan.off_scratch = plan.carry1_size + plan.carryN_size;
+        plan.off_xfer = plan.carry1_size + plan.carryN_size + plan.scratch_size;
+        plan.need = plan.off_xfer + plan.xfer_size + 4096;
         if (plan.need > plan.cap) {
             if (plan.buf) ggml_backend_buffer_free(plan.buf);
             ggml_backend_buffer_type_t buft = nullptr;
@@ -568,32 +614,6 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             }
             plan.buf = buft ? ggml_backend_buft_alloc_buffer(buft, plan.need) : nullptr;
             plan.cap = plan.buf ? plan.need : 0;
-        }
-    }
-
-    // Within-layer cross-device tensors (docs/PER_DEVICE_ARENA.md SS8.3): `cur`
-    // (C1 dense head -> the expert-pool closure) and `moe_out` (closure -> the C1
-    // dense tail) must move when their producer/consumer devices differ. The
-    // executor resolves the devices at run time (route_b_node_device); this marks
-    // them in the plan for the dump / the future transfer queue. The routing ids
-    // are read to the host unconditionally (the bucket engine plans on host), so
-    // they are never marked.
-    for (auto & kv : g_layer_exec) {
-        for (const ggml_tensor * cn : kv.second.compute) {
-            if (!cn || cn->op != GGML_OP_MUL_MAT_ID || !cn->src[1]) continue;
-            auto it = dev_of.find(cn->src[1]);
-            if (it == dev_of.end() || it->second == closure_dev) continue;
-            auto pit = plans.find(it->second);
-            if (pit != plans.end()) pit->second.cross_device.insert(cn->src[1]);
-        }
-        const moe_layer_plan_t * lp = moe_chain_layer_plan(kv.first);
-        if (lp && lp->moe_out && !lp->tail.empty()) {
-            auto cit = dev_of.find(lp->tail[0]);
-            const std::string tdev = cit != dev_of.end() ? cit->second : std::string();
-            if (tdev != closure_dev) {
-                auto pit = plans.find(closure_dev);
-                if (pit != plans.end()) pit->second.cross_device.insert(lp->moe_out);
-            }
         }
     }
 
@@ -616,18 +636,17 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             if (mit != plan.scratch_off.end()) { nd->data = base + off_scratch + mit->second; continue; }
         }
     }
-    // Relay copies are shells (not captured nodes): bind them to the consumer's
-    // carry slot so the executor can ggml_backend_tensor_copy into them.
+    // Transfer copies are shells (not captured nodes): bind them to the
+    // consumer device's xfer slot so the executor can ggml_backend_tensor_copy
+    // into them.
     for (const route_b_relay_t & r : g_relays) {
         auto pit = plans.find(dev_of[r.dst]);
         if (pit == plans.end() || !pit->second.buf) continue;
         region_plan_t & plan = pit->second;
         char * rbase = static_cast<char*>(ggml_backend_buffer_get_base(plan.buf));
         r.dst->buffer = plan.buf;
-        auto c1i = plan.carry1_off.find(r.dst);
-        if (c1i != plan.carry1_off.end()) { r.dst->data = rbase + c1i->second; continue; }
-        auto cNi = plan.carryN_off.find(r.dst);
-        if (cNi != plan.carryN_off.end()) { r.dst->data = rbase + plan.carry1_size + cNi->second; continue; }
+        auto xi = plan.xfer_off.find(r.dst);
+        if (xi != plan.xfer_off.end()) r.dst->data = rbase + plan.off_xfer + xi->second;
     }
     g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
     g_node_dev = dev_of;   // expose node -> device to the executor (phase 3)

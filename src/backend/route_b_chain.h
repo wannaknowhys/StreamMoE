@@ -73,18 +73,25 @@ ggml_backend_t route_b_device_backend(const char * dev);   // nullptr when unkno
 // refreshed by layout_arena on every build. "" for an unknown node.
 const char * route_b_node_device(const struct ggml_tensor * node);
 
-// Cross-device carry relay (docs/PER_DEVICE_ARENA.md 3). A carry tensor is the
-// producer node's output, so it stays on the producer's device. When a consumer
-// lives on another device, layout_arena allocates a local copy (a shell) in the
-// consumer's carry region and rewires the consumers' src to it; the executor
-// copies src -> dst (ggml_backend_tensor_copy) at the front of `layer`, before
-// the head reads it. carry1 and carryN relay together at every boundary.
-struct route_b_relay_t {
-    const ggml_tensor * src = nullptr;   // carry tensor on the producer's device
-    ggml_tensor *       dst = nullptr;   // local copy on the consumer's device
-    int32_t             layer = -1;      // consumer layer (where the copy runs)
+// Generic cross-device transfer (docs/PER_DEVICE_ARENA.md 3/SS8.3). Every captured
+// edge whose producer and consumer devices differ gets a consumer-side copy (a
+// shell) in the consumer device's `xfer` region, and the consumer's src is
+// rewired to it. The executor runs ggml_backend_tensor_copy(src, dst) once at
+// `stage` (below) - so a producer written many times inside a layer copies once,
+// not per write. One shell per (producer, consumer device, stage). A tensor is
+// the producer node's output, so it stays on the producer's device.
+enum route_b_xfer_stage {
+    ROUTE_B_XFER_LAYER_FRONT = 0,   // cross-layer carry: before the consumer layer's head
+    ROUTE_B_XFER_CLOSURE     = 1,   // within-layer: before the MoE closure (e.g. cur)
+    ROUTE_B_XFER_TAIL        = 2,   // within-layer: before the dense tail (e.g. moe_out)
 };
-// All relays of the current graph build (empty when single-device / CPU-only).
+struct route_b_relay_t {
+    const ggml_tensor * src = nullptr;   // producer tensor on the producer's device
+    ggml_tensor *       dst = nullptr;   // local copy on the consumer's device
+    int32_t             layer = -1;      // layer whose stage runs the copy
+    int                 stage = ROUTE_B_XFER_LAYER_FRONT;
+};
+// All transfers of the current graph build (empty when single-device / CPU-only).
 const std::vector<route_b_relay_t> & route_b_relays();
 
 // True when the debug whole-layer path is active (STREAM_MOE_TEMP build, not

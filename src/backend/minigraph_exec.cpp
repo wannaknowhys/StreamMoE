@@ -1838,6 +1838,16 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     return GGML_STATUS_SUCCESS;
 }
 
+// Run this layer's cross-device transfers for one stage (docs/PER_DEVICE_ARENA.md
+// SS8.3): ggml_backend_tensor_copy(src, dst) refreshes the consumer-side copy
+// before the stage reads it. Synchronous - the consumer reads right after.
+static void run_layer_xfers(int32_t layer, int stage) {
+    for (const auto & r : route_b_relays()) {
+        if (r.layer != layer || r.stage != stage || !r.src || !r.dst) continue;
+        ggml_backend_tensor_copy(r.src, r.dst);
+    }
+}
+
 // Burst one whole layer from its captured sequence.
 static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
                                          ggml_backend_t cpu, expert_scheduler& sched,
@@ -1949,15 +1959,10 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         if (ex) for (auto * nd : ex->compute) fprintf(stderr, "[split]  C %s\n", nd->name ? nd->name : "?");
     }
 #endif
-    // Cross-device carry relay (docs/PER_DEVICE_ARENA.md 3): bring this layer's
+    // Cross-device transfers (docs/PER_DEVICE_ARENA.md SS8.3): bring this layer's
     // incoming carry copies onto the layer's device before the head reads them.
     // The consumers were already rewired to the local copy by layout_arena.
-    for (const auto & r : route_b_relays()) {
-        if (r.layer != layer || !r.src || !r.dst) continue;
-        // Synchronous (tensor_set/tensor_get or buffer_copy_tensor): the head
-        // reads the copy right after this.
-        ggml_backend_tensor_copy(r.src, r.dst);
-    }
+    run_layer_xfers(layer, ROUTE_B_XFER_LAYER_FRONT);
     {
         const enum ggml_status hst = run_dense_by_device(ctx, cpu, dense_head);
         if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
@@ -2064,6 +2069,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
 
     // The compact-chain bucket engine is the only executor: a full-width single
     // bucket by default (no env), or an env-selected multi-bucket cut.
+    run_layer_xfers(layer, ROUTE_B_XFER_CLOSURE);   // cur on the closure's device
     const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
 #ifdef STREAM_MOE_TEMP
     dump_node_hash(layer, "moe", dense_head);   // head nodes still live at the tail?
@@ -2071,6 +2077,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // L2 whole-layer ownership: run the dense tail (residual / post-norm / dense
     // MLP) after moe_out is materialised.
     if (st == GGML_STATUS_SUCCESS && !dense_tail.empty()) {
+        run_layer_xfers(layer, ROUTE_B_XFER_TAIL);   // moe_out on the tail's device
         const enum ggml_status tst = run_dense_by_device(ctx, cpu, dense_tail);
         if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
     }
