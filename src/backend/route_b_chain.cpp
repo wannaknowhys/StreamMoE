@@ -255,6 +255,15 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
         dev_of[nd] = d;   // "" = host
     }
+    // The MoE closure runs where its experts live, not where the gating came
+    // from: the expert weights are not in a normal buffer, so dev_of could not
+    // resolve them from a weight operand. Place every closure node on the pool's
+    // device (host when there is no single pool device). Done before the carry
+    // analysis so a closure consumer reports the pool device.
+    const std::string closure_dev = route_b_closure_device();
+    for (auto & kv : g_layer_exec)
+        for (const ggml_tensor * cn : kv.second.compute)
+            dev_of[const_cast<ggml_tensor*>(cn)] = closure_dev;
 
     // carry: captured node consumed in a different layer
     std::set<const ggml_tensor*> carry;
@@ -272,8 +281,11 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 
     // Carry distance analysis: for each cross-layer tensor, the max consumer
     // layer minus its own layer. distance 1 = pipeline (reusable across layers);
-    // distance > 1 = must be retained (cross-N). DEBUG: report the split.
+    // distance > 1 = must be retained (cross-N). Also record the max consumer's
+    // DEVICE: a carry tensor read by a consumer on another device must be relayed
+    // (docs/PER_DEVICE_ARENA.md 3). DEBUG: report the split.
     std::unordered_map<const ggml_tensor*, int> max_consumer;
+    std::unordered_map<const ggml_tensor*, std::string> consumer_dev;
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * nd = gf->nodes[i];
         auto it = nlayer.find(nd);
@@ -284,7 +296,11 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             auto sit = nlayer.find(src);
             if (sit == nlayer.end() || sit->second == it->second) continue;
             auto & m = max_consumer[src];
-            if (m < it->second) m = it->second;
+            if (m < it->second) {
+                m = it->second;
+                auto dit = dev_of.find(nd);
+                consumer_dev[src] = dit != dev_of.end() ? dit->second : std::string();
+            }
         }
     }
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
@@ -338,182 +354,201 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (std::find(cN.begin(), cN.end(), t) == cN.end()) cN.push_back(const_cast<ggml_tensor*>(t));
     }
 #endif
-    std::map<int, size_t> c1_layer_bytes;
-    for (ggml_tensor * nd : c1) c1_layer_bytes[nlayer[nd]] += ggml_nbytes(nd);
-    size_t c1_buf = 0;
-    for (auto & kv : c1_layer_bytes) c1_buf = std::max(c1_buf, kv.second);
-    c1_buf = (c1_buf + 63) & ~size_t(63);
-    const size_t carry1_size = 2 * c1_buf;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off;
-    {
-        std::map<int, size_t> cur;
-        for (ggml_tensor * nd : c1) {
-            const int L = nlayer[nd];
-            size_t & off = cur[L];
-            off = (off + 63) & ~size_t(63);
-            carry1_off[nd] = (L % 2 ? c1_buf : 0) + off;
-            off += ggml_nbytes(nd);
-        }
-    }
-    // cross-N: retained (packed; empty for the current three models).
-    size_t carryN_size = 0;
-    std::unordered_map<const ggml_tensor*, size_t> carryN_off;
-    if (!cN.empty()) {
-        std::vector<int> s(cN.size()), e(cN.size());
-        for (size_t i = 0; i < cN.size(); ++i) { s[i] = (int) i; e[i] = (int) cN.size(); }
-        std::vector<int64_t> o;
-        carryN_size = pack_interval(cN, s, e, o);
-        for (size_t i = 0; i < cN.size(); ++i) carryN_off[cN[i]] = (size_t) o[i];
-    }
+    // ---- per-device plans (docs/PER_DEVICE_ARENA.md 3) --------------------
+    // One region_plan_t per device, each with its own grow-only buffer. Regions
+    // by liveness: carry (cross-layer pipeline; logically one, physically per
+    // device, relayed at a device boundary) + scratch (within-layer temporaries:
+    // dense head/tail MERGED with the MoE closure, one pool per device).
+    std::map<std::string, region_plan_t> plans;
+    for (auto & kv : dev_of) plans[kv.second];   // one plan per device with a node
 
-    // closure node -> offset inside the closure block (the packed result layout)
-    std::unordered_map<const ggml_tensor*, size_t> closure_off;
-    for (auto & kv : g_layer_exec) {
-        const moe_layer_exec_t & ex = kv.second;
-        for (size_t i = 0; i < ex.compute.size(); ++i)
-            if (ex.layout_ok && i < ex.out_off.size() && ex.out_off[i] >= 0)
-                closure_off[ex.compute[i]] = (size_t) ex.out_off[i];
-    }
+    for (auto & pkv : plans) {
+        const std::string & D = pkv.first;
+        region_plan_t & plan = pkv.second;
+        plan.dev = D;
 
-    // The MoE closure runs where its experts live, not where the gating came
-    // from, so place every closure node on the expert pool's device (host when
-    // there is no single pool device). The expert weights are not in a normal
-    // buffer, so dev_of could not resolve them above.
-    const std::string closure_dev = route_b_closure_device();
-    for (auto & kv : closure_off) dev_of[kv.first] = closure_dev;
-
-    // ---- compact: per-layer interval packing of the layer's dense head/tail
-    // (non-carry, non-closure, non-view). Time axis = EXECUTION order (head,
-    // closure barrier, tail), NOT graph order: the closure runs after the whole
-    // head, so a head node consumed by the closure is live until the barrier.
-    // Size = max over layers.
-    size_t compact_size = 0;
-    std::unordered_map<const ggml_tensor*, size_t> compact_off;
-    for (auto & kv : g_layer_nodes) {
-        const moe_layer_plan_t * plan = moe_chain_layer_plan(kv.first);
-        const moe_layer_exec_t * ex = moe_chain_layer_exec(kv.first);
-        std::unordered_map<const ggml_tensor*, int> etime;
-        int H = 0;
-        if (plan) for (ggml_tensor * h : plan->head) etime[h] = H++;
-        if (ex)   for (ggml_tensor * c : ex->compute) etime[c] = H;   // closure barrier
-        int T = H + 1;
-        if (plan) for (ggml_tensor * t : plan->tail) etime[t] = T++;
-        std::unordered_map<const ggml_tensor*, int> last_etime;
-        for (auto & ep : etime) {
-            const ggml_tensor * node = ep.first;
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                const ggml_tensor * src = node->src[s];
-                if (!src) continue;
-                // unwrap view/layout chains: a consumer may read a VIEW of a
-                // compact producer, and the producer must stay live until then.
-                while (src && is_view_op(src)) src = src->src[0];
-                if (!src) continue;
-                auto it = last_etime.find(src);
-                if (it == last_etime.end()) last_etime[src] = ep.second;
-                else if (it->second < ep.second) it->second = ep.second;
+        // --- carry1: cross-1 boundary tensors produced on D, parity
+        // double-buffered (O_L and O_{L+1} coexist at L+1's tail).
+        {
+            std::map<int, size_t> layer_bytes;
+            for (ggml_tensor * nd : c1)
+                if (dev_of[nd] == D) layer_bytes[nlayer[nd]] += ggml_nbytes(nd);
+            size_t buf = 0;
+            for (auto & kv : layer_bytes) buf = std::max(buf, kv.second);
+            buf = (buf + 63) & ~size_t(63);
+            plan.carry1_size = 2 * buf;
+            std::map<int, size_t> cur;
+            for (ggml_tensor * nd : c1) {
+                if (dev_of[nd] != D) continue;
+                const int L = nlayer[nd];
+                size_t & off = cur[L];
+                off = (off + 63) & ~size_t(63);
+                plan.carry1_off[nd] = (L % 2 ? buf : 0) + off;
+                off += ggml_nbytes(nd);
             }
         }
-        std::vector<ggml_tensor*> cns;
-        std::vector<int> cstart;
-        for (ggml_tensor * nd : kv.second) {
-            if (nd->view_src || carry.count(nd) || closure_off.count(nd)) continue;
-            auto et = etime.find(nd);
-            if (et == etime.end()) continue;
-            cns.push_back(nd);
-            cstart.push_back(et->second);
+
+        // --- carryN: retained (live across the span; relayed at boundaries)
+        {
+            std::vector<ggml_tensor*> cn;
+            for (ggml_tensor * nd : cN) if (dev_of[nd] == D) cn.push_back(nd);
+            if (!cn.empty()) {
+                std::vector<int> s(cn.size()), e(cn.size());
+                for (size_t i = 0; i < cn.size(); ++i) { s[i] = (int) i; e[i] = (int) cn.size(); }
+                std::vector<int64_t> o;
+                plan.carryN_size = pack_interval(cn, s, e, o);
+                for (size_t i = 0; i < cn.size(); ++i) plan.carryN_off[cn[i]] = (size_t) o[i];
+            }
         }
-        if (cns.empty()) continue;
-        std::vector<int> cend(cns.size());
-        for (size_t k = 0; k < cns.size(); ++k) {
-            auto it = last_etime.find(cns[k]);
-            cend[k] = it != last_etime.end() ? std::max(it->second, cstart[k]) : T;
+
+        // --- cross_device: a carry tensor produced on D but read by a consumer
+        // on another device. The executor relays it (ggml_backend_tensor_copy,
+        // M2_DEVICE_EXECUTOR SS7.8 transport) before the consumer's first read;
+        // carry1 and carryN move together at every boundary (docs/PER_DEVICE_ARENA.md 3).
+        for (const ggml_tensor * nd : carry) {
+            if (dev_of[nd] != D) continue;
+            auto cd = consumer_dev.find(nd);
+            if (cd != consumer_dev.end() && cd->second != D) plan.cross_device.insert(nd);
         }
-        std::vector<int64_t> o;
-        size_t lb;
-        // Interval packing of the compact region is still not correct for every
-        // model (gemma diverges), so in production it stays opt-in (byte sum).
-        // The latest-features build (STREAM_MOE_LATEST) defaults it ON so the bug
-        // stays reproducible (AGENTS.md 15: never roll a feature back); env
-        // STREAM_MOE_TMP_COMPACT_PACK=0 opts out there.
-#ifdef STREAM_MOE_LATEST
-        const char * cp = std::getenv("STREAM_MOE_TMP_COMPACT_PACK");
-        const bool pack_compact = !(cp && cp[0] == '0');
-#else
-        const bool pack_compact = std::getenv("STREAM_MOE_TMP_COMPACT_PACK") != nullptr;
-#endif
-        if (pack_compact) {
-            lb = pack_interval(cns, cstart, cend, o);
-        } else {
-            size_t off = 0;
-            o.resize(cns.size());
-            for (size_t k = 0; k < cns.size(); ++k) { off = (off + 63) & ~size_t(63); o[k] = (int64_t) off; off += ggml_nbytes(cns[k]); }
-            lb = off;
-        }
-        compact_size = std::max(compact_size, lb);
-        for (size_t k = 0; k < cns.size(); ++k) compact_off[cns[k]] = (size_t) o[k];
+
+        // --- scratch: dense head/tail + MoE closure, one pool per device.
+        // Time axis = global exec order (head, closure, tail); last_use = the
+        // latest consumer (possibly on another device). Size = max over layers.
+        for (auto & kv : g_layer_nodes) {
+            const moe_layer_plan_t * lp = moe_chain_layer_plan(kv.first);
+            const moe_layer_exec_t * ex = moe_chain_layer_exec(kv.first);
+            std::unordered_map<const ggml_tensor*, int> etime;
+            int H = 0;
+            if (lp) for (ggml_tensor * h : lp->head) etime[h] = H++;
+            const int CB = H;   // closure base
+            if (ex) for (size_t i = 0; i < ex->compute.size(); ++i) etime[ex->compute[i]] = CB + (int) i;
+            int T = CB + (ex ? (int) ex->compute.size() : 0);
+            if (lp) for (ggml_tensor * t : lp->tail) { auto e = etime.find(t); if (e == etime.end()) etime[t] = T++; }
+            std::unordered_map<const ggml_tensor*, int> last_etime;
+            for (auto & ep : etime) {
+                const ggml_tensor * node = ep.first;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = node->src[s];
+                    if (!src) continue;
+                    // unwrap view/layout chains: a consumer may read a VIEW of a
+                    // producer, and the producer must stay live until then.
+                    while (src && is_view_op(src)) src = src->src[0];
+                    if (!src) continue;
+                    auto it = last_etime.find(src);
+                    if (it == last_etime.end()) last_etime[src] = ep.second;
+                    else if (it->second < ep.second) it->second = ep.second;
+                }
+            }
+            std::vector<ggml_tensor*> cns;
+            std::vector<int> cstart;
+            for (ggml_tensor * nd : kv.second) {
+                if (nd->view_src || carry.count(nd)) continue;
+                if (dev_of[nd] != D) continue;
+                auto et = etime.find(nd);
+                if (et == etime.end()) continue;
+                cns.push_back(nd);
+                cstart.push_back(et->second);
+            }
+            if (cns.empty()) continue;
+            std::vector<int> cend(cns.size());
+            for (size_t k = 0; k < cns.size(); ++k) {
+                auto it = last_etime.find(cns[k]);
+                cend[k] = it != last_etime.end() ? std::max(it->second, cstart[k]) : T;
+            }
+            std::vector<int64_t> o;
+            size_t lb;
+            // Scratch packing is the production layout now (the earlier gemma
+            // "divergence" was the prefill-export capture reading a reused slot,
+            // fixed). STREAM_MOE_TMP_COMPACT_PACK=0 forces the byte-sum layout
+            // for A/B debugging only.
+            const char * cp = std::getenv("STREAM_MOE_TMP_COMPACT_PACK");
+            if (!(cp && cp[0] == '0')) {
+                lb = pack_interval(cns, cstart, cend, o);
+            } else {
+                size_t off = 0;
+                o.resize(cns.size());
+                for (size_t k = 0; k < cns.size(); ++k) { off = (off + 63) & ~size_t(63); o[k] = (int64_t) off; off += ggml_nbytes(cns[k]); }
+                lb = off;
+            }
+            plan.scratch_size = std::max(plan.scratch_size, lb);
+            for (size_t k = 0; k < cns.size(); ++k) plan.scratch_off[cns[k]] = (size_t) o[k];
+            // The closure's own layout now indexes the merged scratch, so the
+            // executor (moe_chain_fullalloc_buffer base + out_off) lands in the
+            // same pool as the dense head/tail.
+            if (ex && !ex->compute.empty()) {
+                moe_layer_exec_t * mut = const_cast<moe_layer_exec_t*>(ex);
+                for (size_t i = 0; i < ex->compute.size(); ++i) {
+                    auto oit = plan.scratch_off.find(ex->compute[i]);
+                    if (oit != plan.scratch_off.end()) mut->out_off[i] = (int64_t) oit->second;
+                }
+                mut->result_bytes = lb;
+                mut->layout_ok = true;
+            }
 #ifdef STREAM_MOE_TEMP
-        if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && kv.first == 0) {
-            for (size_t k = 0; k < cns.size(); ++k)
-                fprintf(stderr, "[cpack] b%d L0 %-24s start=%d end=%d off=%lld sz=%zu ptr=%p\n",
-                        g_build_id, cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]), (const void *) cns[k]);
-        }
+            if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && kv.first == 0) {
+                for (size_t k = 0; k < cns.size(); ++k)
+                    fprintf(stderr, "[cpack] b%d L0 %-24s start=%d end=%d off=%lld sz=%zu ptr=%p\n",
+                            g_build_id, cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]), (const void *) cns[k]);
+            }
 #endif
-    }
-
-    // closure block: max over layers of the executor's need (result_bytes when
-    // the layout is valid, else the full per-node sum, mirroring exec_layer_burst)
-    size_t closure_size = 0;
-    for (auto & kv : g_layer_exec) {
-        const moe_layer_exec_t & ex = kv.second;
-        size_t need = ex.result_bytes;
-        if (!ex.layout_ok) {
-            need = 0;
-            for (const auto * cn : ex.compute)
-                if (!(cn->name && strstr(cn->name, "ffn_moe_out"))) need += ggml_nbytes(cn);
         }
-        closure_size = std::max(closure_size, need);
+
+        // --- grow-only device buffer (host buft when D == "")
+        plan.need = plan.carry1_size + plan.carryN_size + plan.scratch_size + 4096;
+        if (plan.need > plan.cap) {
+            if (plan.buf) ggml_backend_buffer_free(plan.buf);
+            ggml_backend_buffer_type_t buft = nullptr;
+            if (D.empty()) {
+                buft = ggml_backend_get_default_buffer_type(our_backend);
+            } else if (ggml_backend_dev_t d = ggml_backend_dev_by_name(D.c_str())) {
+                buft = ggml_backend_dev_buffer_type(d);
+            }
+            plan.buf = buft ? ggml_backend_buft_alloc_buffer(buft, plan.need) : nullptr;
+            plan.cap = plan.buf ? plan.need : 0;
+        }
     }
 
-    const size_t need = carry1_size + carryN_size + compact_size + closure_size + 4096;
-    if (need > g_arena_cap) {
-        if (g_arena) ggml_backend_buffer_free(g_arena);
-        g_arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(our_backend), need);
-        g_arena_cap = g_arena ? need : 0;
-    }
-    if (!g_arena) return;
-    char * base = static_cast<char*>(ggml_backend_buffer_get_base(g_arena));
-    const size_t off_carryN  = carry1_size;
-    const size_t off_compact = carry1_size + carryN_size;
-    g_arena_closure_off  = off_compact + compact_size;
-    g_arena_closure_size = closure_size;
-
+    // Assign every captured node to its device's buffer/region.
     for (auto & kv : g_layer_nodes) {
         for (auto * nd : kv.second) {
             if (nd->view_src) continue;   // view/in-place: data follows view_src
-            nd->buffer = g_arena;
-            auto c1i = carry1_off.find(nd);
-            if (c1i != carry1_off.end()) { nd->data = base + c1i->second; continue; }
-            auto cNi = carryN_off.find(nd);
-            if (cNi != carryN_off.end()) { nd->data = base + off_carryN + cNi->second; continue; }
-            auto mit = compact_off.find(nd);
-            if (mit != compact_off.end()) { nd->data = base + off_compact + mit->second; continue; }
-            auto clo = closure_off.find(nd);
-            if (clo != closure_off.end()) { nd->data = base + g_arena_closure_off + clo->second; continue; }
+            auto pit = plans.find(dev_of[nd]);
+            if (pit == plans.end() || !pit->second.buf) continue;
+            region_plan_t & plan = pit->second;
+            char * base = static_cast<char*>(ggml_backend_buffer_get_base(plan.buf));
+            const size_t off_carryN  = plan.carry1_size;
+            const size_t off_scratch = plan.carry1_size + plan.carryN_size;
+            nd->buffer = plan.buf;
+            auto c1i = plan.carry1_off.find(nd);
+            if (c1i != plan.carry1_off.end()) { nd->data = base + c1i->second; continue; }
+            auto cNi = plan.carryN_off.find(nd);
+            if (cNi != plan.carryN_off.end()) { nd->data = base + off_carryN + cNi->second; continue; }
+            auto mit = plan.scratch_off.find(nd);
+            if (mit != plan.scratch_off.end()) { nd->data = base + off_scratch + mit->second; continue; }
         }
     }
+    g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
+    // Host plan drives the debug/report paths and the CPU executor.
+    region_plan_t & hostp = g_plans[""];
+    g_arena = hostp.buf;
+    g_arena_cap = hostp.cap;
+    g_arena_closure_off  = hostp.carry1_size + hostp.carryN_size;
+    g_arena_closure_size = hostp.scratch_size;
+    if (!g_arena) return;
+    char * base = static_cast<char*>(ggml_backend_buffer_get_base(g_arena));
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
         for (auto & kv : g_layer_nodes)
             for (auto * nd : kv.second) {
                 if (nd->view_src) continue;
-                if (!carry1_off.count(nd) && !carryN_off.count(nd) && !compact_off.count(nd) && !closure_off.count(nd))
-                    fprintf(stderr, "[route_b_cap] UNASSIGNED '%s' op=%s\n",
-                            nd->name ? nd->name : "?", ggml_op_name(nd->op));
-                if (!nd->data) continue;
+                if (!hostp.carry1_off.count(nd) && !hostp.carryN_off.count(nd) && !hostp.scratch_off.count(nd))
+                    fprintf(stderr, "[route_b_cap] UNASSIGNED '%s' op=%s dev=%s\n",
+                            nd->name ? nd->name : "?", ggml_op_name(nd->op), dev_of[nd].c_str());
+                if (nd->buffer != g_arena || !nd->data) continue;
                 const char * p = (const char*) nd->data;
-                if (p < base || p + ggml_nbytes(nd) > base + need)
+                if (p < base || p + ggml_nbytes(nd) > base + hostp.cap)
                     fprintf(stderr, "[route_b_cap] OOB '%s' off=%zu sz=%zu need=%zu\n",
-                            nd->name ? nd->name : "?", (size_t)(p - base), ggml_nbytes(nd), need);
+                            nd->name ? nd->name : "?", (size_t)(p - base), ggml_nbytes(nd), hostp.cap);
             }
     }
 #endif
@@ -534,32 +569,28 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
     }
     if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
-        fprintf(stderr, "==== arena plan: carry1=%zu carryN=%zu compact=%zu closure=%zu total=%zu ====\n",
-                carry1_size, carryN_size, compact_size, closure_size, g_arena_cap);
-        fprintf(stderr, "---- cross-1 (carry1) %zu nodes ----\n", carry1_off.size());
-        for (auto & kv : carry1_off)
+        fprintf(stderr, "==== arena plan (host): carry1=%zu carryN=%zu scratch=%zu total=%zu ====\n",
+                hostp.carry1_size, hostp.carryN_size, hostp.scratch_size, g_arena_cap);
+        fprintf(stderr, "---- cross-1 (carry1) %zu nodes ----\n", hostp.carry1_off.size());
+        for (auto & kv : hostp.carry1_off)
             fprintf(stderr, "  %-30s L%-3d off=%zu sz=%zu\n", kv.first->name ? kv.first->name : "(anon)",
                     route_b_official_layer(kv.first), kv.second, ggml_nbytes(kv.first));
-        fprintf(stderr, "---- cross-N (carryN) %zu nodes ----\n", carryN_off.size());
-        for (auto & kv : carryN_off)
+        fprintf(stderr, "---- cross-N (carryN) %zu nodes ----\n", hostp.carryN_off.size());
+        for (auto & kv : hostp.carryN_off)
             fprintf(stderr, "  %-30s L%-3d off=%zu sz=%zu\n", kv.first->name ? kv.first->name : "(anon)",
                     route_b_official_layer(kv.first), kv.second, ggml_nbytes(kv.first));
         fprintf(stderr, "---- compute graph (%d nodes) ----\n", gf->n_nodes);
         for (int i = 0; i < gf->n_nodes; ++i) {
             const ggml_tensor * nd = gf->nodes[i];
             const char * region = "-"; size_t off = 0;
-            auto a = carry1_off.find(nd);
-            if (a != carry1_off.end()) { region = "carry1"; off = a->second; }
+            auto a = hostp.carry1_off.find(nd);
+            if (a != hostp.carry1_off.end()) { region = "carry1"; off = a->second; }
             else {
-                auto b = carryN_off.find(nd);
-                if (b != carryN_off.end()) { region = "carryN"; off = off_carryN + b->second; }
+                auto b = hostp.carryN_off.find(nd);
+                if (b != hostp.carryN_off.end()) { region = "carryN"; off = hostp.carry1_size + b->second; }
                 else {
-                    auto m = compact_off.find(nd);
-                    if (m != compact_off.end()) { region = "compact"; off = off_compact + m->second; }
-                    else {
-                        auto l = closure_off.find(nd);
-                        if (l != closure_off.end()) { region = "closure"; off = g_arena_closure_off + l->second; }
-                    }
+                    auto m = hostp.scratch_off.find(nd);
+                    if (m != hostp.scratch_off.end()) { region = "scratch"; off = hostp.carry1_size + hostp.carryN_size + m->second; }
                 }
             }
             fprintf(stderr, "  [%4d] %-30s %-14s L%-3d %-8s off=%zu\n", i,
@@ -580,32 +611,19 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         fflush(stderr);
     }
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
-        fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry1=%zu carryN=%zu compact=%zu closure=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
-                (long long) n_tok, carry1_size, carryN_size, compact_size, closure_size,
-                carry1_size + carryN_size + compact_size + closure_size + 4096, g_arena_cap, carry.size());
+        fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry1=%zu carryN=%zu scratch=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
+                (long long) n_tok, hostp.carry1_size, hostp.carryN_size, hostp.scratch_size,
+                hostp.need, g_arena_cap, carry.size());
 
-    // Per-device plan report (node -> device, and the raw bytes the device would
-    // hold per region). The packing is still global today, so this is a split
-    // preview, not the final per-device packed size (that lands with the
-    // per-device buffers). One line per device; CPU-only = one line.
+    // Per-device plan: one line per device with its own buffer + region sizes.
     if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
-        struct acc_t { size_t n=0, carry1=0, carryN=0, compact=0, closure=0; };
-        std::map<std::string, acc_t> acc;
-        for (auto & kv : dev_of) {
-            const ggml_tensor * nd = kv.first;
-            acc_t & a = acc[kv.second];
-            ++a.n;
-            if (carry1_off.count(nd))       a.carry1  += ggml_nbytes(nd);
-            else if (carryN_off.count(nd))  a.carryN  += ggml_nbytes(nd);
-            else if (compact_off.count(nd)) a.compact += ggml_nbytes(nd);
-            else if (closure_off.count(nd)) a.closure += ggml_nbytes(nd);
-        }
-        fprintf(stderr, "==== per-device plan (%zu device(s)) ====\n", acc.size());
-        for (auto & kv : acc) {
-            const acc_t & a = kv.second;
-            fprintf(stderr, "  dev=%-12s nodes=%-5zu carry1=%-9zu carryN=%-9zu compact=%-9zu closure=%-9zu\n",
+        fprintf(stderr, "==== per-device plan (%zu device(s)) ====\n", g_plans.size());
+        for (auto & kv : g_plans) {
+            const region_plan_t & p = kv.second;
+            fprintf(stderr, "  dev=%-12s nodes=%-5zu carry1=%-9zu carryN=%-9zu scratch=%-9zu cross_dev=%-4zu cap=%zu\n",
                     kv.first.empty() ? "CPU(host)" : kv.first.c_str(),
-                    a.n, a.carry1, a.carryN, a.compact, a.closure);
+                    p.carry1_off.size() + p.carryN_off.size() + p.scratch_off.size(),
+                    p.carry1_size, p.carryN_size, p.scratch_size, p.cross_device.size(), p.cap);
         }
     }
 }
@@ -620,15 +638,20 @@ void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
 }
 
 void * moe_chain_fullalloc_buffer(size_t need_bytes) {
-    // Whole-layer: the closure block lives inside the arena at a fixed offset
-    // (layout_arena set it), so the closure twins are pre-allocated there too.
-    if (g_arena) {
-        if (need_bytes > g_arena_closure_size) {
-            fprintf(stderr, "[route_b_cap] ERROR: closure block overflow need=%zu cap=%zu\n",
-                    need_bytes, g_arena_closure_size);
-            return nullptr;
+    // Whole-layer: the closure block is the scratch region of the device that
+    // owns the experts (layout_arena merged the dense head/tail and the closure
+    // into that one pool), so the closure twins are pre-allocated there too.
+    {
+        auto pit = g_plans.find(route_b_closure_device());
+        if (pit != g_plans.end() && pit->second.buf) {
+            const region_plan_t & p = pit->second;
+            if (need_bytes > p.scratch_size) {
+                fprintf(stderr, "[route_b_cap] ERROR: closure block overflow need=%zu cap=%zu\n",
+                        need_bytes, p.scratch_size);
+                return nullptr;
+            }
+            return static_cast<char*>(ggml_backend_buffer_get_base(p.buf)) + p.carry1_size + p.carryN_size;
         }
-        return static_cast<char*>(ggml_backend_buffer_get_base(g_arena)) + g_arena_closure_off;
     }
     if (!g_fullalloc_buf) return nullptr;   // set_full_alloc(layer_sum) must run first
     if (need_bytes > g_fullalloc_cap) {
@@ -671,10 +694,15 @@ const char * route_b_closure_device() {
 }
 
 bool route_b_in_arena(const void * p) {
-    if (!g_arena || !p) return false;
-    const char * base = static_cast<const char*>(ggml_backend_buffer_get_base(g_arena));
+    if (!p) return false;
     const char * q = static_cast<const char*>(p);
-    return q >= base && q < base + g_arena_cap;
+    for (auto & kv : g_plans) {
+        const region_plan_t & plan = kv.second;
+        if (!plan.buf) continue;
+        const char * base = static_cast<const char*>(ggml_backend_buffer_get_base(plan.buf));
+        if (q >= base && q < base + plan.cap) return true;
+    }
+    return false;
 }
 
 bool route_b_whole_layer_active() {
