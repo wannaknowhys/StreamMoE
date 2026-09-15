@@ -41,6 +41,27 @@ size_t g_arena_closure_off = 0;   // byte offset of the closure block inside g_a
 size_t g_arena_closure_size = 0;
 int    g_dump_ubatch = -1;        // bin-dump ubatch subdirectory index
 int    g_build_id = 0;            // layout_arena call counter (per-build seed)
+
+// Per-device arena plan (docs/PER_DEVICE_ARENA.md 3). One plan per device, each
+// with its own grow-only buffer. Two regions by liveness:
+//   carry  - cross-layer pipeline (logically one, physically per device; moved
+//            explicitly at a device boundary)
+//   scratch- within-layer temporaries (compact merged with closure), reused
+//            across layers
+// Key = device name ("" = host). Filled by layout_arena (per-device grouping
+// lands incrementally; today the host plan carries everything).
+struct region_plan_t {
+    std::string dev;
+    ggml_backend_buffer_t buf = nullptr;
+    size_t cap = 0;
+    size_t off_carryN = 0, off_scratch = 0;
+    size_t carry1_size = 0, carryN_size = 0, scratch_size = 0;
+    size_t need = 0;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off;
+    std::set<const ggml_tensor*> cross_device;   // carry a remote consumer reads
+};
+static std::map<std::string, region_plan_t> g_plans;
+
 #if defined(STREAM_MOE_ROUTE_B) && defined(STREAM_MOE_PREFILL_EXPORT)
 // Tensors the prefill export reads after compute (route_b_set_export_retained).
 // layout_arena keeps them out of the reuse pool so the export's post-split read
