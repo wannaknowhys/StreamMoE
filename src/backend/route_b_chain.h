@@ -57,6 +57,11 @@ int  route_b_official_layer(const ggml_tensor * node);   // -1 when unknown
 // that the scheduler did not overwrite pre-allocated node data.
 bool route_b_in_arena(const void * p);
 
+// Expert pool devices recorded by route_b_setup (per-device arena plan).
+void route_b_add_expert_pool_device(const char * dev);
+// The device that owns this model's experts ("" = host / several devices).
+const char * route_b_closure_device();
+
 // True when the debug whole-layer path is active (STREAM_MOE_TEMP build, not
 // disabled by STREAM_MOE_TMP_NO_WHOLE_LAYER). Used by llama_model::dev_layer to
 // report the layer device as the StreamMoE backend so resolve() keeps fused ops.

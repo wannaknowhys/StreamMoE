@@ -2,6 +2,7 @@
 #include "../../third_party/llama.cpp/src/tsc_timer.h"
 
 #include "backend/moe_backend.h"
+#include "backend/route_b_chain.h"
 #include "backend/scheduler.h"
 #include "common/types.h"
 #include "io/async_dio.h"
@@ -257,6 +258,7 @@ llama_model_tensor_buft_override* route_b_setup(
             std::fprintf(stderr, "route B: device pool '%s' got %zu/%zu MB (planned %zu MB)%s\n",
                          vs.dev.c_str(), got_bytes / (1024 * 1024), vs.mb,
                          plan_bytes / (1024 * 1024), ginfo.empty() ? "" : (" groups:" + ginfo).c_str());
+            route_b_add_expert_pool_device(vs.dev.c_str());
         }
 
         // Hand the host-mapped device regions to the scheduler so its slot space

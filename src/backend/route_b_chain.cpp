@@ -375,6 +375,13 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
                 closure_off[ex.compute[i]] = (size_t) ex.out_off[i];
     }
 
+    // The MoE closure runs where its experts live, not where the gating came
+    // from, so place every closure node on the expert pool's device (host when
+    // there is no single pool device). The expert weights are not in a normal
+    // buffer, so dev_of could not resolve them above.
+    const std::string closure_dev = route_b_closure_device();
+    for (auto & kv : closure_off) dev_of[kv.first] = closure_dev;
+
     // ---- compact: per-layer interval packing of the layer's dense head/tail
     // (non-carry, non-closure, non-view). Time axis = EXECUTION order (head,
     // closure barrier, tail), NOT graph order: the closure runs after the whole
@@ -641,6 +648,26 @@ int route_b_official_layer(const ggml_tensor * node) {
     if (!node) return -1;
     auto it = g_official_layer.find(node);
     return it == g_official_layer.end() ? -1 : it->second;
+}
+
+// Expert pool devices, in creation order (empty = host/RAM). Recorded by
+// route_b_setup. The MoE closure runs where the experts live, so these place it
+// (docs/PER_DEVICE_ARENA.md 3): a single non-host device -> the closure goes
+// there; none or several -> the host plan.
+static std::vector<std::string> g_expert_pool_devs;
+
+void route_b_add_expert_pool_device(const char * dev) {
+    g_expert_pool_devs.push_back(dev ? dev : "");
+}
+
+const char * route_b_closure_device() {
+    const std::string * one = nullptr;
+    for (const std::string & d : g_expert_pool_devs) {
+        if (d.empty()) continue;
+        if (one && *one != d) return "";   // pools span devices -> host plan
+        one = &d;
+    }
+    return one ? one->c_str() : "";
 }
 
 bool route_b_in_arena(const void * p) {
