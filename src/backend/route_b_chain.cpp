@@ -257,18 +257,24 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * nd = gf->nodes[i];
         if (nlayer.find(nd) == nlayer.end()) continue;
+        // Prefer a REAL device operand: a node with one host and one device
+        // operand must run on the device (the host operand gets a transfer via
+        // the generic xfer below), otherwise a CPU node would touch device
+        // memory (e.g. a SET_ROWS writing the device KV cache).
         std::string d; bool found = false;
-        for (int s = 0; s < GGML_MAX_SRC && !found; ++s) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * src = nd->src[s];
             if (!src || !src->buffer || !src->buffer->buft) continue;
             ggml_backend_dev_t wd = ggml_backend_buft_get_device(src->buffer->buft);
             if (!wd) continue;
-            d = dev_key(wd); found = true;
+            std::string k = dev_key(wd);
+            if (k.empty()) continue;            // host: keep looking for a device
+            d = k; found = true; break;
         }
         if (!found) {
-            for (int s = 0; s < GGML_MAX_SRC && !found; ++s) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 auto it = dev_of.find(nd->src[s]);
-                if (it != dev_of.end()) { d = it->second; found = true; }
+                if (it != dev_of.end() && !it->second.empty()) { d = it->second; found = true; break; }
             }
         }
         dev_of[nd] = d;   // "" = host
@@ -417,14 +423,32 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         const int L = kv.first;
         for (ggml_tensor * c : kv.second) {
             if (!c) continue;
+            // The MoE closure is executed by the bucket engine, which stages its
+            // own leaves (cur / ids / routing weights) and writes moe_out itself -
+            // do NOT insert xfer shells for closure nodes. (moe_out's cross-device
+            // move is still handled: it is the tail node's src, and the tail is a
+            // dense node processed here.)
+            if (const moe_layer_exec_t * cex = moe_chain_layer_exec(L)) {
+                bool in_closure = false;
+                for (const auto * cn : cex->compute) if (cn == c) { in_closure = true; break; }
+                if (in_closure) continue;
+            }
             auto cit = dev_of.find(c);
             const std::string cdev = cit != dev_of.end() ? cit->second : std::string();
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 ggml_tensor * p = c->src[s];
                 if (!p || p->view_src) continue;          // views follow their root
+                // src[0] of a routed mm is the expert weight table: it lives in
+                // the pool shell, never transferred.
+                if (c->op == GGML_OP_MUL_MAT_ID && s == 0) continue;
+                std::string pdev;
                 auto pit = dev_of.find(p);
-                if (pit == dev_of.end()) continue;        // external leaf / weight
-                if (pit->second == cdev) continue;        // same device: no copy
+                if (pit != dev_of.end()) pdev = pit->second;            // captured node
+                else if (p->buffer && p->buffer->buft) {
+                    ggml_backend_dev_t d = ggml_backend_buft_get_device(p->buffer->buft);
+                    if (d) pdev = dev_key(d);                           // leaf with a buffer
+                }                                                       // else: bufferless -> host
+                if (pdev == cdev) continue;                             // same device: no copy
                 int stage = ROUTE_B_XFER_LAYER_FRONT;
                 auto pl = nlayer.find(p);
                 if (pl != nlayer.end() && pl->second == L) stage = consumer_stage(L, c);
@@ -575,15 +599,6 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 #endif
         }
 
-        // The host scratch must also hold the closure result layout: with MIXED
-        // pools (RAM + a device) some rounds run on the CPU and bind their twins
-        // through moe_chain_fullalloc_buffer -> the host scratch, even though the
-        // closure nodes themselves were assigned to a device plan.
-        if (D.empty()) {
-            for (auto & kv : g_layer_exec)
-                plan.scratch_size = std::max(plan.scratch_size, kv.second.result_bytes);
-        }
-
         // --- xfer: consumer-side copies of cross-device producers (one shell per
         // producer/device/stage). A shell is live only during the layer whose
         // stage consumes it, so the region is reused across layers -> size = max
@@ -657,6 +672,75 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         auto xi = plan.xfer_off.find(r.dst);
         if (xi != plan.xfer_off.end()) r.dst->data = rbase + plan.off_xfer + xi->second;
     }
+    // ---- strict cross-device audit (docs/PER_DEVICE_ARENA.md SS8.3) ----------
+    // Every captured node must run on a device where ALL its operands live, or
+    // have a transfer for the ones that don't. The generic xfer above covers
+    // captured-node edges (it rewires the consumer src to a local copy); a
+    // NON-captured leaf operand (weight / KV cache / input) on a different device
+    // has no transfer, which would make a device graph read/write foreign memory.
+    // Print the whole graph + the offending nodes, then abort (fail-fast).
+    {
+        struct prob_t { const ggml_tensor * node; std::string msg; };
+        std::vector<prob_t> problems;
+        auto tensor_dev = [&](const ggml_tensor * t) -> const std::string * {
+            auto it = dev_of.find(t);
+            if (it != dev_of.end()) return &it->second;
+            return nullptr;
+        };
+        for (auto & kv : g_layer_nodes) {
+            for (const ggml_tensor * nd : kv.second) {
+                if (!nd) continue;
+                const std::string * nde = tensor_dev(nd);
+                const std::string node_dev = nde ? *nde : std::string();
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = nd->src[s];
+                    if (!src) continue;
+                    // expert weight operand (pool shell, not a normal buffer)
+                    if (nd->op == GGML_OP_MUL_MAT_ID && s == 0) continue;
+                    std::string sdev;
+                    if (const std::string * sd = tensor_dev(src)) sdev = *sd;
+                    else if (src->buffer && src->buffer->buft) {
+                        ggml_backend_dev_t d = ggml_backend_buft_get_device(src->buffer->buft);
+                        if (d) sdev = dev_key(d);
+                    }
+                    // bufferless / unresolvable buft -> host memory (device "").
+                    if (sdev != node_dev) {
+                        char m[256];
+                        std::snprintf(m, sizeof(m), "src[%d] '%s' on %s != node dev %s", s,
+                                      src->name ? src->name : "?", sdev.empty() ? "CPU(host)" : sdev.c_str(),
+                                      node_dev.empty() ? "CPU(host)" : node_dev.c_str());
+                        problems.push_back({ nd, m });
+                    }
+                }
+            }
+        }
+        if (!problems.empty()) {
+            std::fprintf(stderr, "[route_b_audit] %zu cross-device operand(s) with no transfer:\n", problems.size());
+            for (const auto & p : problems)
+                std::fprintf(stderr, "  node '%s' op=%s: %s\n",
+                             p.node->name ? p.node->name : "?", ggml_op_name(p.node->op), p.msg.c_str());
+            std::fprintf(stderr, "[route_b_audit] ---- full graph (%d nodes) ----\n", gf->n_nodes);
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const ggml_tensor * nd = gf->nodes[i];
+                const std::string * d = tensor_dev(nd);
+                std::fprintf(stderr, "  [%4d] %-34s %-14s dev=%s\n", i,
+                             nd->name ? nd->name : "?", ggml_op_name(nd->op),
+                             d ? (d->empty() ? "CPU(host)" : d->c_str()) : "-");
+            }
+            std::fflush(stderr);
+#ifdef STREAM_MOE_TEMP
+            // Dev build: STREAM_MOE_TMP_AUDIT_CONTINUE downgrades to print+continue
+            // so several problems can be surveyed in one run. Production exits.
+            if (std::getenv("STREAM_MOE_TMP_AUDIT_CONTINUE")) {
+                std::fprintf(stderr, "[route_b_audit] (continuing: STREAM_MOE_TMP_AUDIT_CONTINUE)\n");
+            } else
+#endif
+            {
+                std::exit(1);
+            }
+        }
+    }
+
     g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
     g_node_dev = dev_of;   // expose node -> device to the executor (phase 3)
     // Host plan drives the debug/report paths and the CPU executor.
@@ -697,6 +781,9 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
                 t = t->view_src;
             }
             if (t && t->data) nd->data = static_cast<char*>(t->data) + off;
+            // A device backend resolves the memory via the owning buffer, so a
+            // view must carry its root's buffer too (CPU reads data directly).
+            if (t && t->buffer) nd->buffer = t->buffer;
         }
     }
     if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
@@ -770,23 +857,11 @@ void moe_chain_set_full_alloc(size_t layer_sum_bytes) {
 
 void * moe_chain_fullalloc_buffer(size_t need_bytes) {
     // Called only on the CPU path of the bucket engine (a device round binds its
-    // twins to the device arena directly in bind_fresh). With MIXED pools (RAM +
-    // a device) some rounds run on the CPU, so the block MUST be the HOST plan's
-    // scratch - never the closure device's buffer (a CPU round would write to a
-    // device pointer). layout_arena sizes the host scratch to hold the closure
-    // result layout even when the closure nodes themselves live on a device.
-    {
-        auto pit = g_plans.find("");
-        if (pit != g_plans.end() && pit->second.buf) {
-            const region_plan_t & p = pit->second;
-            if (need_bytes > p.scratch_size) {
-                fprintf(stderr, "[route_b_cap] ERROR: closure block overflow need=%zu cap=%zu\n",
-                        need_bytes, p.scratch_size);
-                return nullptr;
-            }
-            return static_cast<char*>(ggml_backend_buffer_get_base(p.buf)) + p.carry1_size + p.carryN_size;
-        }
-    }
+    // twins to the device arena directly in bind_fresh). A CPU round must land in
+    // HOST memory, so use the dedicated host full-alloc block - never a per-device
+    // plan buffer (which may be a device buffer under mixed RAM+device pools). It
+    // is sized by moe_chain_set_full_alloc(ex->result_bytes), which layout_arena
+    // leaves at the (final, per-device) closure layout, so the twins' out_off fits.
     if (!g_fullalloc_buf) return nullptr;   // set_full_alloc(layer_sum) must run first
     if (need_bytes > g_fullalloc_cap) {
         fprintf(stderr, "[route_b_cap] ERROR: full-alloc overflow need=%zu cap=%zu\n", need_bytes, g_fullalloc_cap);
@@ -1065,32 +1140,16 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
     // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md): capture every
     // compute node of each layer (dense + MoE + anonymous) and assign it to our
     // backend, so the whole graph is ONE split and all activations stay under our
-    // control (the executor runs the dense head/tail around the MoE burst).
-    // Only layers whose dense weights are host-resident are taken over: with a
-    // device compute buft the executor would need the device path (later
-    // milestone); device-dense layers keep the MoE-only split.
+    // control. The executor runs the dense head/tail around the MoE burst, each
+    // on the node's placement device (docs/PER_DEVICE_ARENA.md SS8.5) - device
+    // dense is captured too (phase 3); cross-device edges move through the
+    // stage-tagged xfer mechanism.
     collect_layer_nodes(gf, g_layer_nodes_all);
     verify_layer_consumers(gf);
     {
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
         for (auto & kv : all) {
-            bool dense_host = true;
-            for (auto * nd : kv.second) {
-                // Check the node's own output buffer too, not just its sources.
-                ggml_backend_buffer_t nbuf = nd->view_src ? nd->view_src->buffer : nd->buffer;
-                if (nbuf && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(nbuf)))
-                    dense_host = false;
-                for (int s = 0; s < GGML_MAX_SRC && dense_host; ++s) {
-                    const ggml_tensor * src = nd->src[s];
-                    if (!src) continue;
-                    ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
-                    if (buf && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buf)))
-                        dense_host = false;
-                }
-                if (!dense_host) break;
-            }
-            if (!dense_host) continue;
             g_layer_nodes[kv.first] = kv.second;
             for (auto * nd : kv.second) {
                 if (is_alias_op(nd)) continue;

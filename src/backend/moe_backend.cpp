@@ -270,16 +270,26 @@ ggml_backend_buffer_type_t moe_dev_get_buffer_type(ggml_backend_dev_t dev) {
     return static_cast<moe_dev_ctx*>(dev->context)->host_buft;
 }
 
+// Device-exec resources (defined below). Declared here so supports_buft can
+// masquerade the device bufts we run on.
+std::vector<device_exec_ctx_t> g_dev_execs;   // index = pool - 1 (pool 1 = first device)
+
 bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     // Whole-layer ownership (docs/ROUTE_B_LAYER_OWNERSHIP.md): accept host bufts
-    // so the scheduler keeps the layer's dense nodes on our backend (we run
-    // dense on CPU). Device bufts are NOT accepted (device path is a later
-    // milestone; device-dense layers keep the MoE-only split).
+    // so the scheduler keeps the layer's dense nodes on our backend.
     if (ggml_backend_buft_is_host(buft)) return true;
     auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
     if (buft == ctx->host_buft) return true;
     for (const auto& eb : ctx->expert_bufts) {
         if (buft == eb) return true;
+    }
+    // Phase 3 (device dense, docs/PER_DEVICE_ARENA.md SS8.5): masquerade the
+    // device bufts we execute on. Without this the scheduler dup's a layer's
+    // device weight onto our host buft (`%s#%s#%d`, ggml-backend.cpp) and the
+    // device subgraph then receives a host operand - an invalid Vulkan
+    // subbuffer. The weight stays on the device; the executor runs it there.
+    for (const auto& e : g_dev_execs) {
+        if (e.be && (buft == e.arena_buft || buft == e.stage_buft)) return true;
     }
     return false;
 }
@@ -430,7 +440,7 @@ void stream_moe_backend_set_threads(int threads) { g_threads = threads > 0 ? thr
 // ---- M2 device-exec resources -------------------------------------------------
 
 namespace {
-std::vector<device_exec_ctx_t> g_dev_execs;   // index = pool - 1 (pool 1 = first device)
+// g_dev_execs is declared near moe_dev_supports_buft (index = pool - 1).
 
 device_exec_ctx_t* exec_ctx(uint32_t pool) {
     if (pool == 0) return nullptr;

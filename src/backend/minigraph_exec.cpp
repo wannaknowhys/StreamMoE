@@ -249,14 +249,19 @@ struct exec_scratch_t {
     std::vector<mix_round_t>   plan_rounds;  // mix_plan rounds (spans)
     std::vector<uint32_t>      sp_order;     // scatter_plan tight order
     std::vector<scatter_seg_t> sp_segs;      // scatter_plan acc runs
-    size_t i32_used = 0, f32_used = 0;
+    // Grow-only host copies of device-source leaves read on a CPU round
+    // (bucket_source_leaf). Independent of f32/i32 so the fragile shared bump
+    // sizing cannot be overrun by a leaf read (docs/DEVICE_DENSE_CLOSURE.md 3.8).
+    std::vector<uint8_t>       leaf_host;
+    size_t i32_used = 0, f32_used = 0, leaf_used = 0;
     void reset() {
-        i32_used = 0; f32_used = 0;
+        i32_used = 0; f32_used = 0; leaf_used = 0;
         plan_ids.clear(); plan_scatter.clear(); plan_rounds.clear();
         sp_order.clear(); sp_segs.clear();
     }
     int32_t * a32(size_t n) { int32_t * p = i32.data() + i32_used; i32_used += n; return p; }
     float   * af32(size_t n) { float * p = f32.data() + f32_used; f32_used += n; return p; }
+    uint8_t * abytes(size_t n) { uint8_t * p = leaf_host.data() + leaf_used; leaf_used += n; return p; }
 };
 static thread_local exec_scratch_t g_scratch;
 #ifdef STREAM_MOE_TEMP
@@ -611,6 +616,11 @@ struct chain_ctx_t {
     // CPU accumulator [d_out, n_t]: process-lifetime grow-only, zeroed per layer.
     // Device targets keep their own acc_d in the device arena.
     std::vector<float>      acc_d;
+    // (b) Per-round temporaries (fold pc/s/acc, gathers, cur gather) each get
+    // their OWN backend buffer instead of a shared bump with a guessed size
+    // (docs/DEVICE_DENSE_CLOSURE.md 3.8). Freed at the layer end.
+    std::vector<ggml_backend_buffer_t> owned;
+    ggml_backend_buffer_type_t         cpu_buft = nullptr;
 };
 
 // Fold / exit helpers live after bucket_build_t (they need bind_fresh).
@@ -723,29 +733,39 @@ struct bucket_build_t {
         void * base = moe_chain_fullalloc_buffer(need);
         return base ? static_cast<char*>(base) + ex->out_off[(size_t) seq] : nullptr;
     }
-    // Bind a fresh output tensor to the current target. Device: the target
-    // arena at out_off[seq] (twins) or a bump region (scratch). CPU: fullalloc +
-    // out_off (twins) or the fold_buf heap (scratch) - unchanged behaviour.
+    // (b) Each per-round temporary gets its own backend buffer on the current
+    // target's buft - no shared bump, nothing to size (the class of bug that
+    // overran the f32 scratch). Freed at the layer end.
+    void bind_owned(ggml_tensor * t, size_t nbytes) {
+        chain_ctx_t & cc = *c;
+        ggml_backend_buffer_type_t bt = cc.dev
+            ? ggml_backend_buffer_get_type(cc.dev->arena) : cc.cpu_buft;
+        ggml_backend_buffer_t b = bt ? ggml_backend_buft_alloc_buffer(bt, nbytes) : nullptr;
+        if (!b) { t->data = nullptr; return; }
+        cc.owned.push_back(b);
+        t->buffer = b;
+        t->data = cc.dev ? stmoe_vk_buffer_host_offset(b, 0)
+                         : ggml_backend_buffer_get_base(b);
+    }
+    // Bind a fresh output tensor to the current target. Layout tensors (twins)
+    // use the verify plan slot (device arena at out_off / host full-alloc);
+    // everything else (per-round temporaries) gets its own buffer.
     void bind_fresh(ggml_tensor * t, size_t nbytes, bool use_layout) {
         chain_ctx_t & cc = *c;
-        if (cc.dev) {
-            size_t off;
-            if (use_layout && ex && ex->layout_ok && seq >= 0 &&
-                seq < (int64_t) ex->out_off.size() && ex->out_off[(size_t) seq] >= 0) {
-                off = (size_t) ex->out_off[(size_t) seq];
-            } else {
-                off = (cc.dev->arena_used + 63u) & ~size_t(63u);
-                cc.dev->arena_used = off + nbytes;
-            }
-            t->buffer = cc.dev->arena;
-            t->data   = stmoe_vk_buffer_host_offset(cc.dev->arena, off);
-            return;
-        }
         if (use_layout) {
-            void * p = twin_out(nbytes);
-            if (p) { t->data = p; return; }
+            if (cc.dev) {
+                if (ex && ex->layout_ok && seq >= 0 &&
+                    seq < (int64_t) ex->out_off.size() && ex->out_off[(size_t) seq] >= 0) {
+                    t->buffer = cc.dev->arena;
+                    t->data   = stmoe_vk_buffer_host_offset(cc.dev->arena, (size_t) ex->out_off[(size_t) seq]);
+                    return;
+                }
+            } else {
+                void * p = twin_out(nbytes);
+                if (p) { t->data = p; return; }
+            }
         }
-        t->data = buf((nbytes + 3) / 4);
+        bind_owned(t, nbytes);
     }
 };
 
@@ -784,24 +804,37 @@ static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
     return l;
 }
 
-// Leaf over an EXISTING tensor source that may live on any backend (the C1
-// activation `cur` after a `--dense-placement` on a device). Device targets copy
-// it into staging via a backend-agnostic read - never dereference src->data on
-// the host (iron rule). CPU references the source in place. The source geometry
-// (ne) is a contiguous view of `src`, so a flat nbytes read is valid.
-static ggml_tensor * bucket_upload_tensor(chain_ctx_t & c, const ggml_tensor * src,
-                                          const int64_t ne[4], const size_t nb[4]) {
+// Leaf over an EXISTING tensor source that may live on ANY backend (C1
+// activations / routing weights after a `--dense-placement` on a device):
+//   - device target: backend-agnostic read into the staging buffer;
+//   - CPU target, host source: reference the source in place;
+//   - CPU target, device source: backend-agnostic read into host scratch.
+// Never dereference src->data on the host (iron rule, docs/GRAPH_PARTITION.md).
+// The source geometry (ne) is a contiguous view of `src`, so a flat nbytes read
+// is valid. This is the single entry point for "a leaf whose source device is
+// not known statically" - do not reintroduce host `m->data` uploads.
+static ggml_tensor * bucket_source_leaf(chain_ctx_t & c, const ggml_tensor * src,
+                                        const int64_t ne[4], const size_t nb[4]) {
     ggml_tensor * l = ggml_new_tensor_4d(c.ctx, src->type, ne[0], ne[1], ne[2], ne[3]);
     for (int i = 0; i < 4; ++i) l->nb[i] = nb[i];
-    if (!c.dev) { l->data = const_cast<void *>(src->data); return l; }
+    const bool src_host = !src->buffer ||
+        ggml_backend_buft_is_host(ggml_backend_buffer_get_type(src->buffer));
     const size_t bytes = ggml_nbytes(l);
-    const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
-    c.dev->stage_used = off + bytes;
-    l->buffer = c.dev->stage;
-    l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
-    std::vector<uint8_t> tmp(bytes);
-    tensor_read_host(src, tmp.data(), 0, bytes);
-    tensor_write_host(l, tmp.data(), 0, bytes);
+    if (c.dev) {
+        const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
+        c.dev->stage_used = off + bytes;
+        l->buffer = c.dev->stage;
+        l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+        std::vector<uint8_t> tmp(bytes);
+        tensor_read_host(src, tmp.data(), 0, bytes);
+        tensor_write_host(l, tmp.data(), 0, bytes);
+    } else if (src_host) {
+        l->data = const_cast<void *>(src->data);
+    } else {
+        uint8_t * buf = c.scratch->abytes(bytes);
+        l->data = buf;
+        tensor_read_host(src, buf, 0, bytes);
+    }
     return l;
 }
 
@@ -869,8 +902,7 @@ static ggml_tensor * bucket_direct_leaf(bucket_build_t & b, const ggml_tensor * 
     // CPU references it in place; a device needs a compact (contiguous) source
     // for the one-shot upload - callers fall back to the gather otherwise.
     chain_ctx_t & c = *b.c;
-    if (c.dev) return bucket_upload_tensor(c, m, ne, nb);
-    return bucket_ref_leaf(c, m->type, ne, nb, const_cast<void *>(m->data));
+    return bucket_source_leaf(c, m, ne, nb);
 }
 
 static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tensor * m) {
@@ -894,7 +926,7 @@ static ggml_tensor * bucket_gather_per_slot(bucket_build_t & b, const ggml_tenso
                          stride_k * (size_t)(m->ne[1] ? m->ne[1] - 1 : 0)) / esz + 1;
     int64_t sne[4] = { 1, (int64_t) span, 1, 1 };
     size_t  snb[4] = { esz, esz, span * esz, span * esz };
-    ggml_tensor * flat = bucket_upload_leaf(c, m->type, sne, snb, m->data);
+    ggml_tensor * flat = bucket_source_leaf(c, m, sne, snb);
     const int64_t n = (int64_t) b.w_b * b.n_active;
     int32_t * idx = c.scratch->a32((size_t) n);
     for (int64_t i = 0; i < b.n_active; ++i) {
@@ -930,7 +962,7 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     int64_t sne[4] = { d, n_t, 1, 1 };
     size_t  snb[4] = { m->nb[0], m->nb[2], m->nb[2] * (size_t) n_t,
                        m->nb[2] * (size_t) n_t };
-    ggml_tensor * src2d = bucket_upload_tensor(c, m, sne, snb);
+    ggml_tensor * src2d = bucket_source_leaf(c, m, sne, snb);
     int32_t * idx = c.scratch->a32((size_t) b.n_active);
     for (int64_t i = 0; i < b.n_active; ++i) {
         idx[(size_t) i] = (int32_t) b.t_round[b.order[(size_t) i]];
@@ -981,7 +1013,7 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
     }
     int64_t ne[4]; size_t nb[4];
     for (int i = 0; i < 4; ++i) { ne[i] = m->ne[i]; nb[i] = m->nb[i]; }
-    return bucket_upload_leaf(c, m->type, ne, nb, m->data);
+    return bucket_source_leaf(c, m, ne, nb);
 }
 
 // Leaf twin of a chain producer `p` (already built) narrowed to the bucket.
@@ -1347,6 +1379,15 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     c.scratch = &sc;
     c.fold_repl = true;
     c.w_b = n_k; c.n_t = n_t; c.d_out = d_out;
+    c.cpu_buft = ggml_backend_get_default_buffer_type(cpu);
+    // Free the per-round temporary buffers once the layer's graphs have run.
+    struct owned_guard_t {
+        chain_ctx_t & cc;
+        ~owned_guard_t() {
+            for (ggml_backend_buffer_t b : cc.owned) ggml_backend_buffer_free(b);
+            cc.owned.clear();
+        }
+    } _owned_guard{ c };
 
     bucket_build_t b;
     b.c = &c; b.ex = ex; b.ids = ids; b.ids_data = ids;
@@ -1394,12 +1435,12 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     // references x rounds is an upper bound. (Missed before -> a gating leaf such
     // as gemma `ffn_moe_gate` overran the staging buffer.) Over-estimation is
     // safe: the staging buffer is grow-only and persists across layers.
+    size_t ext_ref = 0;
     {
         auto in_compute = [&](const ggml_tensor * p) -> bool {
             for (const auto * cn : ex->compute) if (cn == p) return true;
             return false;
         };
-        size_t ext_ref = 0;
         for (const auto * cn : ex->compute) {
             if (!cn) continue;
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -1466,6 +1507,9 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
         sc.i32.resize(i32_need + 64);
         sc.f32.resize(f32_need + 64);
+        // Device-source leaves read on a CPU round get their own grow-only host
+        // block: one copy per reference per round (an upper bound on ext_ref).
+        sc.leaf_host.resize(ext_ref * (n_rounds ? n_rounds : 1) + 64);
     }
     auto align64 = [](size_t x) { return (x + 63u) & ~size_t(63u); };
     std::unordered_map<uint32_t, size_t> pool_bump;
@@ -1877,7 +1921,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 static void run_layer_xfers(int32_t layer, int stage) {
     for (const auto & r : route_b_relays()) {
         if (r.layer != layer || r.stage != stage || !r.src || !r.dst) continue;
-        ggml_backend_tensor_copy(r.src, r.dst);
+        if (r.src->buffer) {
+            ggml_backend_tensor_copy(r.src, r.dst);
+        } else if (r.src->data) {
+            // bufferless host leaf (positions / freq factors / mask): upload the
+            // host bytes into the device shell.
+            ggml_backend_tensor_set(r.dst, r.src->data, 0, ggml_nbytes(r.src));
+        }
     }
 }
 
@@ -1964,9 +2014,13 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     for (const auto * lt : ex->input_layouts) {
         if (!lt || !lt->src[0] || !lt->src[0]->data) continue;
         ggml_tensor * mut = const_cast<ggml_tensor*>(lt);
+        const ggml_tensor * src = lt->src[0];
         mut->data = lt->op == GGML_OP_VIEW
-                    ? static_cast<char*>(lt->src[0]->data) + lt->view_offs
-                    : lt->src[0]->data;
+                    ? static_cast<char*>(src->data) + lt->view_offs
+                    : src->data;
+        // A device backend resolves the memory via the owning buffer, so the
+        // layout tensor must carry its source's buffer (CPU reads data directly).
+        if (src->buffer) mut->buffer = src->buffer;
     }
 
     // L2 whole-layer ownership: run the dense head (layer nodes not in the MoE
