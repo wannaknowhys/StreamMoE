@@ -263,9 +263,23 @@ Verified (CPU-only collapses to one host plan, so numerics are unchanged):
 pack vs sum `IDENTICAL` (embd / hidden / KV + expert history); vk gate 121/129
 (93.8%); production `run_baseline` (`StreamMoE_dump`) PASS.
 
-Still open (device executor, phase 3): the actual cross-device relay
-(`ggml_backend_tensor_copy` at the layer front + rewiring the cloned consumers
-to the local copy), and running C1/C2 on the placement device.
+**Cross-device carry relay: LANDED (2026-09-14, commit `0ef71df`).** A carry
+tensor is the producer node's output, so it stays on the producer's device. When
+its (max) consumer is on another device, `layout_arena` allocates a local copy -
+a shell tensor reserved in the consumer layer's carry1/carryN boundary set (so
+it shares the carry's packing and lifetime) - and rewires the consumers' `src`
+to it. `exec_layer_burst` runs `ggml_backend_tensor_copy(src, dst)`
+(synchronous; the `M2_DEVICE_EXECUTOR.md` §7.8 transport) at the front of the
+consumer layer, before the head reads it. carry1 and carryN relay together at
+every boundary.
+
+Single-device / CPU-only: no cross-device carry, so no relays - verified
+`IDENTICAL` (pack vs sum + expert history).
+
+Still open (device executor, phase 3): running C1/C2 on the placement device
+(`run_dense_subgraph` still uses the CPU backend). Caveat: the rewire mutates
+the captured graph's `src` after the scheduler's tensor-backend pass - safe
+while route B owns the whole layer, but must be re-checked if that changes.
 
 ## 8. Open questions
 

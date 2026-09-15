@@ -19,7 +19,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **`region_plan_t`（每设备一份）**：`{ dev, buf(grow-only), carry1(parity 双缓冲), carryN(retained), scratch(=compact∪closure 合并), 节点→offset, cross_device }`。
 - **两区域按生命周期**：`carry`（跨层流水：逻辑一份，物理 per-device，**跨设备边界 relay**——第 L 层的副本永远在 dev(L)，consumer 读到的一定是对的那份；carry1 和 carryN 每个边界一起搬）；`scratch`（层内临时量：dense head/tail 与 MoE closure **合并成一个池**，执行器 `ex.out_off`/`result_bytes` 改为索引该池，`moe_chain_fullalloc_buffer` 按设备查）。
 - **设备解析**：节点设备 = 权重操作数 buffer 的设备（dense → placement 设备；专家 → 池设备）；无权重继承 producer；host/CPU 坍缩成 host plan。**closure 归专家池设备**（`route_b_closure_device`，`route_b_setup` 记录池设备）——专家权重不在普通 buffer 里，`dev_of` 无法从权重解析。
-- **跨设备搬运**（设备执行器 phase 3，已标 `cross_device`）：层前 `ggml_backend_tensor_copy`（`M2_DEVICE_EXECUTOR.md` §7.8 transport）+ 把克隆后的 consumer 改指本地副本。
+- **跨设备 carry relay（2026-09-14，`0ef71df`）**：carry 张量是 producer 节点输出 → 留在 producer 设备；consumer 在别的设备时 `layout_arena` 在 consumer 层的 carry 边界集合里预留一个 shell 本地副本（共用打包/生命周期），把 consumer 的 `src` 改指它；`exec_layer_burst` 层前同步 `ggml_backend_tensor_copy`。CPU-only 无跨设备 → relay 空 → IDENTICAL。
+- **仍待做（phase 3）**：C1/C2 在 placement 设备上执行（`run_dense_subgraph` 仍恒用 CPU backend）。
 - **验证（CPU-only 单 host plan，数值不变）**：pack vs sum `IDENTICAL`（embd/hidden/KV + 专家历史）；vk gate 121/129（93.8%）；生产 `run_baseline` PASS。实测 gemma ub129：decode carry1 88 KB/scratch 8 MB，prefill carry1 1.4 MB/scratch 128 MB。
 
 ### M4 收编：自研主项目删除（2026-08-31）
@@ -147,7 +148,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 **主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线**
 
-0. **每设备 arena 的执行侧（下一步）**：`layout_arena` 的 per-device plan 已落（见 §2）。设备执行器（`M2_DEVICE_EXECUTOR`）接上后：(a) C1/C2 在 placement 设备上跑（`run_dense_subgraph` 现在恒用 CPU backend）；(b) 按 `cross_device` 在层前做 `ggml_backend_tensor_copy` relay + 把克隆后的 consumer 改指本地副本。VRAM 池当前加载即崩（`0xC0000005`，改动前 binary 同样崩 = 独立 bug），多设备验证被挡；先 CPU-only 推进。
+0. **每设备 arena 的执行侧（下一步）**：per-device plan（§2）与跨设备 carry relay（`0ef71df`）已落。剩：(a) C1/C2 在 placement 设备上跑（`run_dense_subgraph` 现在恒用 CPU backend，需 device 名→backend 映射 + 按设备拆 head/tail 子图）。VRAM 池当前加载即崩（`0xC0000005`，改动前 binary 同样崩 = 独立 bug），多设备验证被挡；先 CPU-only 推进。
 1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
 2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
 3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。

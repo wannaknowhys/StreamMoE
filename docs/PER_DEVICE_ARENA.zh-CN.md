@@ -224,8 +224,20 @@ scratch 8 MB；prefill build carry1 1.4 MB / scratch 128 MB。（§1 的 ub-512 
 （embd / hidden / KV + 专家历史）；vk gate 121/129（93.8%）；生产
 `run_baseline`（`StreamMoE_dump`）PASS。
 
-仍待做（设备执行器，phase 3）：真正的跨设备搬运（层前 `ggml_backend_tensor_copy`
-+ 把克隆后的 consumer 改指本地副本），以及在 placement 设备上执行 C1/C2。
+**跨设备 carry relay：已落地（2026-09-14，commit `0ef71df`）。** carry 张量是
+producer 节点的输出，所以留在 producer 设备上。当它的（最大）consumer 在别的设备
+时，`layout_arena` 分配一份本地副本——在 consumer 层的 carry1/carryN 边界集合里预留
+一个 shell 张量（与 carry 共用打包和生命周期）——并把 consumer 的 `src` 改指它。
+`exec_layer_burst` 在 consumer 层最前面、head 读之前执行
+`ggml_backend_tensor_copy(src, dst)`（同步；`M2_DEVICE_EXECUTOR.md` §7.8 的 transport）。
+carry1 和 carryN 在每个边界一起搬。
+
+单设备 / CPU-only：没有跨设备 carry → 没有 relay → 验证 `IDENTICAL`（pack vs sum +
+专家历史）。
+
+仍待做（设备执行器，phase 3）：在 placement 设备上执行 C1/C2（`run_dense_subgraph`
+仍用 CPU backend）。注意：改指 `src` 发生在 scheduler 的 tensor-backend pass 之后——
+route B 整层拥有时是安全的，但所有权模型若变必须重新检查。
 
 ## 8. 待定问题
 
