@@ -62,6 +62,13 @@ struct region_plan_t {
 };
 static std::map<std::string, region_plan_t> g_plans;
 
+// Device name -> backend (docs/PER_DEVICE_ARENA.md SS8.5). Recorded by
+// route_b_setup; the executor uses it to run a layer's dense head/tail on the
+// placement device. Host plan nodes resolve to the CPU backend (no entry).
+static std::map<std::string, ggml_backend_t> g_dev_backends;
+// Node -> device ("" = host), refreshed by layout_arena each build.
+static std::unordered_map<const ggml_tensor*, std::string> g_node_dev;
+
 // Cross-device carry relays of the current build (docs/PER_DEVICE_ARENA.md 3).
 // A carry tensor is the producer node's output, so it stays on the producer's
 // device; a consumer on another device gets a local copy (a shell allocated in
@@ -564,6 +571,32 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
     }
 
+    // Within-layer cross-device tensors (docs/PER_DEVICE_ARENA.md SS8.3): `cur`
+    // (C1 dense head -> the expert-pool closure) and `moe_out` (closure -> the C1
+    // dense tail) must move when their producer/consumer devices differ. The
+    // executor resolves the devices at run time (route_b_node_device); this marks
+    // them in the plan for the dump / the future transfer queue. The routing ids
+    // are read to the host unconditionally (the bucket engine plans on host), so
+    // they are never marked.
+    for (auto & kv : g_layer_exec) {
+        for (const ggml_tensor * cn : kv.second.compute) {
+            if (!cn || cn->op != GGML_OP_MUL_MAT_ID || !cn->src[1]) continue;
+            auto it = dev_of.find(cn->src[1]);
+            if (it == dev_of.end() || it->second == closure_dev) continue;
+            auto pit = plans.find(it->second);
+            if (pit != plans.end()) pit->second.cross_device.insert(cn->src[1]);
+        }
+        const moe_layer_plan_t * lp = moe_chain_layer_plan(kv.first);
+        if (lp && lp->moe_out && !lp->tail.empty()) {
+            auto cit = dev_of.find(lp->tail[0]);
+            const std::string tdev = cit != dev_of.end() ? cit->second : std::string();
+            if (tdev != closure_dev) {
+                auto pit = plans.find(closure_dev);
+                if (pit != plans.end()) pit->second.cross_device.insert(lp->moe_out);
+            }
+        }
+    }
+
     // Assign every captured node to its device's buffer/region.
     for (auto & kv : g_layer_nodes) {
         for (auto * nd : kv.second) {
@@ -597,6 +630,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (cNi != plan.carryN_off.end()) { r.dst->data = rbase + plan.carry1_size + cNi->second; continue; }
     }
     g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
+    g_node_dev = dev_of;   // expose node -> device to the executor (phase 3)
     // Host plan drives the debug/report paths and the CPU executor.
     region_plan_t & hostp = g_plans[""];
     g_arena = hostp.buf;
@@ -760,6 +794,23 @@ const char * route_b_closure_device() {
         one = &d;
     }
     return one ? one->c_str() : "";
+}
+
+void route_b_add_device_backend(const char * dev, ggml_backend_t be) {
+    if (!dev || !*dev || !be) return;
+    g_dev_backends[dev] = be;
+}
+
+ggml_backend_t route_b_device_backend(const char * dev) {
+    if (!dev || !*dev) return nullptr;
+    auto it = g_dev_backends.find(dev);
+    return it == g_dev_backends.end() ? nullptr : it->second;
+}
+
+const char * route_b_node_device(const ggml_tensor * node) {
+    if (!node) return "";
+    auto it = g_node_dev.find(node);
+    return it == g_node_dev.end() ? "" : it->second.c_str();
 }
 
 const std::vector<route_b_relay_t> & route_b_relays() { return g_relays; }

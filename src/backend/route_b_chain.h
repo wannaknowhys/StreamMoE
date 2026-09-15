@@ -62,6 +62,17 @@ void route_b_add_expert_pool_device(const char * dev);
 // The device that owns this model's experts ("" = host / several devices).
 const char * route_b_closure_device();
 
+// Device name -> backend registry (docs/PER_DEVICE_ARENA.md SS8.5, phase 3).
+// route_b_setup records every device pool's backend here; the executor resolves
+// a layer's dense head/tail backend from the node's placement device. The host
+// plan resolves to the CPU backend the executor already holds (no registry hit).
+void route_b_add_device_backend(const char * dev, ggml_backend_t be);
+ggml_backend_t route_b_device_backend(const char * dev);   // nullptr when unknown
+
+// Device that owns a captured node ("" = host). Valid after the graph build;
+// refreshed by layout_arena on every build. "" for an unknown node.
+const char * route_b_node_device(const struct ggml_tensor * node);
+
 // Cross-device carry relay (docs/PER_DEVICE_ARENA.md 3). A carry tensor is the
 // producer node's output, so it stays on the producer's device. When a consumer
 // lives on another device, layout_arena allocates a local copy (a shell) in the

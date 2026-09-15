@@ -174,6 +174,37 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
     return ggml_backend_graph_compute(backend, g);
 }
 
+// Whole-layer dense head/tail per placement device (docs/PER_DEVICE_ARENA.md
+// SS8.5, phase 3): group the nodes by their captured device and run each group
+// on that device's backend. A whole C1 (--dense-placement) is one device, so the
+// common case is a single group; grouping keeps the structure correct if C1 is
+// later split across devices. Host nodes use `cpu`; an unknown device falls back
+// to `cpu` (never expected - route_b_setup registered every pool device).
+static enum ggml_status run_dense_by_device(ggml_context * ctx, ggml_backend_t cpu,
+                                            const std::vector<ggml_tensor*> & list) {
+    if (list.empty()) return GGML_STATUS_SUCCESS;
+    std::vector<std::string> keys;
+    std::vector<std::vector<ggml_tensor*>> groups;
+    for (ggml_tensor * nd : list) {
+        const char * d = route_b_node_device(nd);
+        const std::string key = d ? d : "";
+        size_t gi = 0;
+        for (; gi < keys.size(); ++gi) if (keys[gi] == key) break;
+        if (gi == keys.size()) { keys.push_back(key); groups.push_back({}); }
+        groups[gi].push_back(nd);
+    }
+    for (size_t gi = 0; gi < keys.size(); ++gi) {
+        ggml_backend_t be = keys[gi].empty() ? cpu : route_b_device_backend(keys[gi].c_str());
+        if (!be) be = cpu;   // unknown device: fall back (never expected)
+        const enum ggml_status st = run_dense_subgraph(ctx, be, groups[gi]);
+        if (st != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("stream_moe: dense subgraph failed on device '" << keys[gi] << "'");
+            return st;
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 #ifdef STREAM_MOE_TEMP
 // Mid-layer node dump (STREAM_MOE_TMP_STAGE_DUMP=1): FNV hash of each node's
 // current bytes, tagged with the execution stage, so a live node that gets
@@ -595,14 +626,17 @@ static bool layer_fold(const moe_layer_exec_t * ex, int64_t d_out, int64_t n_t,
     }
     if (!moe_out || !moe_out->data) return true;
     const size_t slot = (size_t)(d_out * n_t);
-    float * out = (float *) moe_out->data;
+    // moe_out may live on a device (C1 placement / per-device plan): fold on the
+    // host, then write back backend-agnostically (iron rule, docs/GRAPH_PARTITION.md).
+    // Sum order is unchanged, so a host moe_out is byte-identical to before.
+    std::vector<float> out(slot, 0.0f);
     bool first = true;
     for (const float * a : accs) {
         if (!a) continue;
         for (size_t i = 0; i < slot; ++i) out[i] = first ? a[i] : out[i] + a[i];
         first = false;
     }
-    if (first) std::fill(out, out + slot, 0.0f);
+    tensor_write_host(moe_out, out.data(), 0, slot * sizeof(float));
     return true;
 }
 
@@ -750,6 +784,27 @@ static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
     return l;
 }
 
+// Leaf over an EXISTING tensor source that may live on any backend (the C1
+// activation `cur` after a `--dense-placement` on a device). Device targets copy
+// it into staging via a backend-agnostic read - never dereference src->data on
+// the host (iron rule). CPU references the source in place. The source geometry
+// (ne) is a contiguous view of `src`, so a flat nbytes read is valid.
+static ggml_tensor * bucket_upload_tensor(chain_ctx_t & c, const ggml_tensor * src,
+                                          const int64_t ne[4], const size_t nb[4]) {
+    ggml_tensor * l = ggml_new_tensor_4d(c.ctx, src->type, ne[0], ne[1], ne[2], ne[3]);
+    for (int i = 0; i < 4; ++i) l->nb[i] = nb[i];
+    if (!c.dev) { l->data = const_cast<void *>(src->data); return l; }
+    const size_t bytes = ggml_nbytes(l);
+    const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
+    c.dev->stage_used = off + bytes;
+    l->buffer = c.dev->stage;
+    l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+    std::vector<uint8_t> tmp(bytes);
+    tensor_read_host(src, tmp.data(), 0, bytes);
+    tensor_write_host(l, tmp.data(), 0, bytes);
+    return l;
+}
+
 // Fold the round's experts: sum over the per-token expert axis (w_b) so the
 // weighted output [d_out, w_b, n_active] becomes a per-token column
 // [d_out, n_active]. Every intermediate/output is bound to the current target
@@ -814,7 +869,7 @@ static ggml_tensor * bucket_direct_leaf(bucket_build_t & b, const ggml_tensor * 
     // CPU references it in place; a device needs a compact (contiguous) source
     // for the one-shot upload - callers fall back to the gather otherwise.
     chain_ctx_t & c = *b.c;
-    if (c.dev) return bucket_upload_leaf(c, m->type, ne, nb, m->data);
+    if (c.dev) return bucket_upload_tensor(c, m, ne, nb);
     return bucket_ref_leaf(c, m->type, ne, nb, const_cast<void *>(m->data));
 }
 
@@ -875,7 +930,7 @@ static ggml_tensor * bucket_gather_cur(bucket_build_t & b, const ggml_tensor * m
     int64_t sne[4] = { d, n_t, 1, 1 };
     size_t  snb[4] = { m->nb[0], m->nb[2], m->nb[2] * (size_t) n_t,
                        m->nb[2] * (size_t) n_t };
-    ggml_tensor * src2d = bucket_upload_leaf(c, m->type, sne, snb, m->data);
+    ggml_tensor * src2d = bucket_upload_tensor(c, m, sne, snb);
     int32_t * idx = c.scratch->a32((size_t) b.n_active);
     for (int64_t i = 0; i < b.n_active; ++i) {
         idx[(size_t) i] = (int32_t) b.t_round[b.order[(size_t) i]];
@@ -1680,7 +1735,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #endif
         if (direct_out) {
             // single target: the device result IS the layer output -> one D2H
-            if (t.result) ggml_backend_tensor_get(t.result, moe_out->data, 0, acc_bytes);
+            // readback, then a backend-agnostic write into moe_out (which may be
+            // device-resident under a C1 placement).
+            if (t.result) {
+                std::vector<uint8_t> tmp(acc_bytes);
+                ggml_backend_tensor_get(t.result, tmp.data(), 0, acc_bytes);
+                tensor_write_host(moe_out, tmp.data(), 0, acc_bytes);
+            }
         } else {
             dev_accs[di].assign(acc_sz, 0.0f);
 #ifdef STREAM_MOE_TEMP
@@ -1898,7 +1959,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         ggml_backend_tensor_copy(r.src, r.dst);
     }
     {
-        const enum ggml_status hst = run_dense_subgraph(ctx, cpu, dense_head);
+        const enum ggml_status hst = run_dense_by_device(ctx, cpu, dense_head);
         if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
     }
 #ifdef STREAM_MOE_TEMP
@@ -2010,7 +2071,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // L2 whole-layer ownership: run the dense tail (residual / post-norm / dense
     // MLP) after moe_out is materialised.
     if (st == GGML_STATUS_SUCCESS && !dense_tail.empty()) {
-        const enum ggml_status tst = run_dense_subgraph(ctx, cpu, dense_tail);
+        const enum ggml_status tst = run_dense_by_device(ctx, cpu, dense_tail);
         if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
     }
 #ifdef STREAM_MOE_TEMP

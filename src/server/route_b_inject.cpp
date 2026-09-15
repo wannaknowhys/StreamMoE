@@ -233,6 +233,9 @@ llama_model_tensor_buft_override* route_b_setup(
                 continue;
             }
             pool->vram_backends.push_back(vbe);
+            // Device name -> backend registry (docs/PER_DEVICE_ARENA.md SS8.5):
+            // the executor runs a layer's dense head/tail on the placement device.
+            route_b_add_device_backend(vs.dev.c_str(), vbe);
             ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(vbe);
             // M2 device-exec resources: arena + staging both use the default
             // (DEVICE_LOCAL|HOST_VISIBLE) buft - the dedicated Vulkan_Host buft
