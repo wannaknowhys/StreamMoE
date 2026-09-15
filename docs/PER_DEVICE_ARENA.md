@@ -120,7 +120,11 @@ plan. The expert pools are recorded at `route_b_setup`.
 **Cross-device** tensors (a node whose consumer is on another device) are marked
 in the plan so the executor moves them (D2D / the transfer queue,
 `ROUTE_B_LAYER_OWNERSHIP.md` §3.5) - never host staging except at host
-boundaries.
+boundaries. Besides **carry** (C1 -> C2 / next layer), the marked set includes
+**`cur`** (C1 dense head -> a remote expert pool), **`moe_out`** (remote expert
+pool -> the C1/fold device) and the routing **`ids`** (unconditionally to the
+CPU: compact-ids build and round planning are host-side). Today only carry is
+marked (`region_plan_t::cross_device`); the rest lands with the device executor.
 
 ## 4. Reuse the existing packing
 
@@ -169,9 +173,10 @@ olmoe 62 MB -> ~0.25 MB, gemma 160 MB -> ~11 MB. The closure block also drops
 olmoe / gemma / deepseek whole-layer OK.
 
 **Compact pack: NOT a math bug - it breaks the `--prefill-from` export capture.**
-Production `StreamMoE_dump` keeps it opt-in (`STREAM_MOE_TMP_COMPACT_PACK`,
-default off = byte sum); the latest build `StreamMoE_latest` / `StreamMoE_dump_dbg`
-defaults it ON (`AGENTS.md` 15), `=0` opts out.
+Once the export-capture fix below landed, packed scratch became the **production
+layout in every build** (the earlier "opt-in in `StreamMoE_dump`" plan was
+superseded, `AGENTS.md` 15); `STREAM_MOE_TMP_COMPACT_PACK=0` forces the byte-sum
+layout for A/B debugging only.
 
 Measured (gemma v2, 129-token prefill-from, 8 GB pool, vs `moe_129_8192_vk`):
 
@@ -225,10 +230,10 @@ Gated on `STREAM_MOE_PREFILL_EXPORT` (the callback) and on
 `STREAM_MOE_ROUTE_B && STREAM_MOE_PREFILL_EXPORT` (the retain API), so no code is
 compiled where it cannot be used.
 
-Verified (gemma v2, 129-token prefill-from, `StreamMoE_latest`, pack default ON):
-exported `embd` / `hidden` / KV and the expert history are **IDENTICAL** pack vs
-sum; top-4 logits stay bit-identical; pack matches the `moe_129_8192_vk` gate;
-production `run_baseline` (`StreamMoE_dump`, pack off) still PASS.
+Verified (gemma v2, 129-token prefill-from, pack default ON): exported `embd` /
+`hidden` / KV and the expert history are **IDENTICAL** pack vs sum; top-4 logits
+stay bit-identical; pack matches the `moe_129_8192_vk` gate; production
+`run_baseline` (`StreamMoE_dump`, pack default ON) still PASS.
 
 **Repro.** Build `build.bat llamalibs StreamMoE_latest`, then the 129-token
 prefill-from with no env takes the packed path and `=0` takes byte sum; both now
@@ -282,16 +287,24 @@ Still open (device executor, phase 3): running C1/C2 on the placement device
 the captured graph's `src` after the scheduler's tensor-backend pass - safe
 while route B owns the whole layer, but must be re-checked if that changes.
 
-## 8. Open questions
+## 8. Resolved decisions (2026-09-15)
 
-1. Is 2 buffers enough for `carry1`, or do some layers need more (e.g. a
-   boundary set read at both head and tail plus a same-layer second boundary)?
-2. `carry1` boundary set: pack per boundary, or one shared set sized to the max
-   across boundaries (simpler, slightly larger)?
-3. C2 on a device other than C1: the last layer's output -> C2 needs a
-   cross-device move; keep it a plan-marked transfer, or require C2 == C1's
-   device for zero-copy (design §4.10 C2 takeover)?
-4. Do we keep a single grow-only buffer per device, or one buffer per region?
-5. When C1 is on a device, `run_dense_subgraph` must call that device's backend;
-   `moe_exec_mul_mat_id` already receives `cpu_backend` - how is the per-layer
-   device backend threaded through?
+1. **`carry1` stays at two buffers.** A boundary set that does not fit in the two
+   parity buffers is not really cross-1 and must be classified as **cross-N**
+   (`carryN`) instead. The cross-1/cross-N split is the guarantee - no third
+   buffer.
+2. **`carry1` boundary set: one shared set per parity, sized to the max boundary**
+   of that parity's layers (the current layout). Per-boundary packing is not
+   needed - the totals are tiny (deepseek ~67 MB at ub 512).
+3. **C1/C2 placement is respected verbatim.** C1 and C2 on different devices
+   necessarily transfer the last layer's output -> C2; C2 == C1 is not required.
+   The plan marks every cross-device tensor (see §3): carry, `cur`, `moe_out`,
+   and the routing `ids` (unconditionally to the CPU).
+4. **One plan per device, sized to what the device actually owns.** A device
+   reserves a region only for the nodes it has (C1 / MoE closure / C2); the plan
+   is derived from node presence, not a fixed template.
+5. **Per-layer device backend registry (phase 3).** `route_b_setup` records a
+   `device name -> ggml_backend_t` table (next to the expert-pool device record);
+   the executor resolves each head/tail/closure backend from the plan's device.
+   `run_dense_subgraph` and `moe_exec_mul_mat_id` take the resolved backend
+   instead of the fixed CPU one.

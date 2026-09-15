@@ -103,7 +103,11 @@ route B 自己的 host backend 和 CPU 设备都坍缩成 host plan。专家池�
 时记录。
 
 **跨设备**张量（消费者在别的设备）在 plan 里标记，供执行器用 D2D / transfer-queue
-搬运（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5），除 host 边界外绝不 host staging。
+搬运（`ROUTE_B_LAYER_OWNERSHIP.md` §3.5），除 host 边界外绝不 host staging。除
+**carry**（C1 → C2 / 下一层）外，标记集还含 **`cur`**（C1 dense head → 远端专家池）、
+**`moe_out`**（远端专家池 → C1/fold 设备）以及路由 **`ids`**（无条件搬到 CPU：compact-ids
+构建与 round 规划都在 host）。当前只标记了 carry（`region_plan_t::cross_device`），其余
+随设备执行器落地。
 
 ## 4. 复用已有打包
 
@@ -143,10 +147,10 @@ ubatch 512 实测（生产构建）：deepseek carry 2630 MB → ~67 MB，olmoe 
 gemma 160 MB → ~11 MB。闭包块也降（olmoe ub1 278528 → 131072 B）。验证：生产
 `run_baseline` PASS；olmoe / gemma / deepseek 整层 OK。
 
-**compact 打包：不是数学 bug —— 它破坏的是 `--prefill-from` 的导出捕获。** 生产
-`StreamMoE_dump` 保持 opt-in（`STREAM_MOE_TMP_COMPACT_PACK`，默认关 = 字节求和）；
-最新功能构建 `StreamMoE_latest` / `StreamMoE_dump_dbg` 默认**开**（`AGENTS.md` 15），
-`=0` 可关。
+**compact 打包：不是数学 bug —— 它破坏的是 `--prefill-from` 的导出捕获。** 下面的
+导出捕获修复落地后，打包后的 scratch 已成为**所有构建的生产布局**（原先"生产
+`StreamMoE_dump` opt-in"的计划被取代，`AGENTS.md` 15）：`STREAM_MOE_TMP_COMPACT_PACK=0`
+强制字节求和布局，仅用于 A/B 调试。
 
 实测（gemma v2、129-token prefill-from、8 GB 池，对 `moe_129_8192_vk`）：
 
@@ -190,10 +194,9 @@ graph_compute call 的），所以导出模式慢 ~8x（实测 prompt 4.2 → 0.
 门控：回调挂 `STREAM_MOE_PREFILL_EXPORT`，保留 API 挂
 `STREAM_MOE_ROUTE_B && STREAM_MOE_PREFILL_EXPORT`，用不到的地方不编译。
 
-验证（gemma v2、129-token prefill-from、`StreamMoE_latest`、pack 默认开）：导出的
-`embd` / `hidden` / KV 与 expert history 在 pack vs sum 下 **IDENTICAL**；top-4 logits
-仍逐位相同；pack 对 `moe_129_8192_vk` gate 通过；生产 `run_baseline`（`StreamMoE_dump`，
-pack 关）仍 PASS。
+验证（gemma v2、129-token prefill-from、pack 默认开）：导出的 `embd` / `hidden` / KV
+与 expert history 在 pack vs sum 下 **IDENTICAL**；top-4 logits 仍逐位相同；pack 对
+`moe_129_8192_vk` gate 通过；生产 `run_baseline`（`StreamMoE_dump`，pack 默认开）仍 PASS。
 
 **复现。** `build.bat llamalibs StreamMoE_latest` 后跑 129-token prefill-from：不带 env
 走打包路径、`=0` 走字节求和；两者现在产物完全一致。要看 `[cpack]` offset 计划 /
@@ -240,13 +243,18 @@ carry1 和 carryN 在每个边界一起搬。
 仍用 CPU backend）。注意：改指 `src` 发生在 scheduler 的 tensor-backend pass 之后——
 route B 整层拥有时是安全的，但所有权模型若变必须重新检查。
 
-## 8. 待定问题
+## 8. 已定结论（2026-09-15）
 
-1. `carry1` 两个 buffer 够吗，还是某些层需要更多（边界集合在 head 和 tail 都读，外加同层
-   第二个边界）？
-2. `carry1` 边界集合：逐边界打包，还是用一个共享集合按全局 max 定大小（更简单、略大）？
-3. C2 与 C1 不同设备时：末层输出 → C2 需要跨设备搬运；保持为 plan 标记的搬运，还是要求
-   C2 == C1 的设备以零拷贝（设计 §4.10 C2 接管）？
-4. 每设备一个 grow-only buffer，还是每区域一个 buffer？
-5. C1 在设备上时，`run_dense_subgraph` 要调该设备的 backend；`moe_exec_mul_mat_id` 现在
-   收 `cpu_backend` —— 每层设备 backend 怎么穿进来？
+1. **`carry1` 保持两个 buffer。** 放不进两个 parity buffer 的边界集合本就不是 cross-1，
+   必须划归 **cross-N**（`carryN`）。cross-1/cross-N 的划分就是保证——不加第三个 buffer。
+2. **`carry1` 边界集合：每个 parity 一个共享集合，按该 parity 各层的最大边界定容**
+   （即当前布局）。不需要逐边界打包——总量很小（deepseek ub 512 约 67 MB）。
+3. **C1/C2 放置严格尊重参数。** C1 与 C2 不同设备时，末层输出 → C2 必然搬运；不要求
+   C2 == C1。plan 标记所有跨设备张量（见 §3）：carry、`cur`、`moe_out`，以及路由 `ids`
+   （无条件搬到 CPU）。
+4. **每设备一份 plan，按该设备实际拥有的节点定容。** 设备只为它有的节点（C1 / MoE closure /
+   C2）预留区域；plan 由节点存在性导出，不是固定模板。
+5. **每层设备 backend 注册表（phase 3）。** `route_b_setup` 记录一张
+   `设备名 → ggml_backend_t` 表（与专家池设备记录放在一起）；执行器按 plan 的设备解析
+   每个 head/tail/closure 的 backend。`run_dense_subgraph` 与 `moe_exec_mul_mat_id` 收
+   解析出的 backend，而不是固定 CPU。

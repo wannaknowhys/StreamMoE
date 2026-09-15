@@ -148,7 +148,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 **主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线**
 
-0. **每设备 arena 的执行侧（下一步）**：per-device plan（§2）与跨设备 carry relay（`0ef71df`）已落。剩：(a) C1/C2 在 placement 设备上跑（`run_dense_subgraph` 现在恒用 CPU backend，需 device 名→backend 映射 + 按设备拆 head/tail 子图）。VRAM 池当前加载即崩（`0xC0000005`，改动前 binary 同样崩 = 独立 bug），多设备验证被挡；先 CPU-only 推进。
+0. **每设备 arena 的执行侧（下一步）**：per-device plan（§2）与跨设备 carry relay（`0ef71df`）已落。剩：(a) C1/C2 在 placement 设备上跑（`run_dense_subgraph` 现在恒用 CPU backend，需 device 名→backend 映射 + 按设备拆 head/tail 子图）。VRAM 池当前加载即崩（`0xC0000005`，改动前 binary 同样崩 = 独立 bug），多设备验证被挡；先 CPU-only 推进。**phase 3 方案已定（2026-09-15，`PER_DEVICE_ARENA.md` §8）**：`route_b_setup` 建 `设备名→ggml_backend_t` 注册表；C1/C2 放置严格尊重参数（不同设备则搬运，不要求 C2==C1）；跨设备标记除 carry 外还需含 `cur`/`moe_out` 与 `ids`（ids 无条件搬 CPU）；每设备 plan 按其实际拥有的 C1/MoE/C2 定容。
 1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
 2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
 3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。

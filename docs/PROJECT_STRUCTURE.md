@@ -168,8 +168,12 @@ build\<tag>\
 
 ### 最新功能构建：latest vs dbg（2026-09-14）
 
-配套 `AGENTS.md` 第 15 条（**新功能遇 bug 严禁回滚，只前进不后退**）。in-progress 功能
-（如 compact 区间打包）在 `STREAM_MOE_LATEST` 下**默认开**，不再默认 gate off。
+配套 `AGENTS.md` 第 15 条（**新功能遇 bug 严禁回滚，只前进不后退**）。尚未转正的
+in-progress 功能可在 `STREAM_MOE_LATEST` 下**默认开**，不再默认 gate off。
+
+> 注：`STREAM_MOE_LATEST` 目前尚无源码引用（仅 `build.bat` 传入）。已转正的
+> compact 区间打包在所有构建**默认开**（`STREAM_MOE_TMP_COMPACT_PACK=0` 才关，见
+> `docs/PER_DEVICE_ARENA.md` §7），因此不再适合作为该宏的示例。
 
 | tag                  | 宏                                      | 新功能       | dbg dump/print | 用途                                 |
 | :------------------- | :-------------------------------------- | :----------- | :------------- | :----------------------------------- |
