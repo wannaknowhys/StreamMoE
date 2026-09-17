@@ -68,6 +68,7 @@ static std::map<std::string, region_plan_t> g_plans;
 static std::map<std::string, ggml_backend_t> g_dev_backends;
 // Node -> device ("" = host), refreshed by layout_arena each build.
 static std::unordered_map<const ggml_tensor*, std::string> g_node_dev;
+static std::unordered_map<const ggml_tensor*, ggml_backend_dev_t> g_node_physical;
 
 // Cross-device carry relays of the current build (docs/PER_DEVICE_ARENA.md 3).
 // A carry tensor is the producer node's output, so it stays on the producer's
@@ -257,27 +258,11 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * nd = gf->nodes[i];
         if (nlayer.find(nd) == nlayer.end()) continue;
-        // Prefer a REAL device operand: a node with one host and one device
-        // operand must run on the device (the host operand gets a transfer via
-        // the generic xfer below), otherwise a CPU node would touch device
-        // memory (e.g. a SET_ROWS writing the device KV cache).
-        std::string d; bool found = false;
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            const ggml_tensor * src = nd->src[s];
-            if (!src || !src->buffer || !src->buffer->buft) continue;
-            ggml_backend_dev_t wd = ggml_backend_buft_get_device(src->buffer->buft);
-            if (!wd) continue;
-            std::string k = dev_key(wd);
-            if (k.empty()) continue;            // host: keep looking for a device
-            d = k; found = true; break;
+        auto * physical = route_b_op_physical(nd);
+        if (!physical || physical == our_dev) {
+            GGML_ABORT("RouteB: unknown physical placement for '%s'", nd->name);
         }
-        if (!found) {
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                auto it = dev_of.find(nd->src[s]);
-                if (it != dev_of.end() && !it->second.empty()) { d = it->second; found = true; break; }
-            }
-        }
-        dev_of[nd] = d;   // "" = host
+        dev_of[nd] = dev_key(physical);
     }
     // The MoE closure runs where its experts live, not where the gating came
     // from: the expert weights are not in a normal buffer, so dev_of could not
@@ -399,7 +384,8 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
     auto shell_for = [&](const ggml_tensor * p, const std::string & dev, int stage,
                          int layer) -> ggml_tensor * {
         for (size_t i = 0; i < shell_keys.size(); ++i)
-            if (shell_keys[i].p == p && shell_keys[i].dev == dev && shell_keys[i].stage == stage)
+            if (shell_keys[i].p == p && shell_keys[i].dev == dev && shell_keys[i].stage == stage &&
+                shell_layers[i] == layer)
                 return shell_dsts[i];
         ggml_tensor * dst = g_relay_ctx
             ? ggml_new_tensor_4d(g_relay_ctx, p->type, p->ne[0], p->ne[1], p->ne[2], p->ne[3])
@@ -688,8 +674,17 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             return nullptr;
         };
         for (auto & kv : g_layer_nodes) {
+            const moe_layer_exec_t * cex = moe_chain_layer_exec(kv.first);
             for (const ggml_tensor * nd : kv.second) {
                 if (!nd) continue;
+                // The MoE closure is executed by the bucket engine, which stages
+                // its own operands (cur / ids / routing weights) itself - they are
+                // not plan transfers, so do not audit them here.
+                if (cex) {
+                    bool in_closure = false;
+                    for (const auto * cn : cex->compute) if (cn == nd) { in_closure = true; break; }
+                    if (in_closure) continue;
+                }
                 const std::string * nde = tensor_dev(nd);
                 const std::string node_dev = nde ? *nde : std::string();
                 for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -811,9 +806,11 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
                     if (m != hostp.scratch_off.end()) { region = "scratch"; off = hostp.carry1_size + hostp.carryN_size + m->second; }
                 }
             }
-            fprintf(stderr, "  [%4d] %-30s %-14s L%-3d %-8s off=%zu\n", i,
+            auto dit = dev_of.find(nd);
+            const char * dstr = dit != dev_of.end() ? (dit->second.empty() ? "CPU(host)" : dit->second.c_str()) : "?";
+            fprintf(stderr, "  [%4d] %-30s %-14s L%-3d %-8s off=%-8zu dev=%s\n", i,
                     nd->name ? nd->name : "(anon)", ggml_op_name(nd->op),
-                    route_b_official_layer(nd), region, off);
+                    route_b_official_layer(nd), region, off, dstr);
         }
         fprintf(stderr, "---- MoE plan ----\n");
         for (auto & kv : g_layer_exec) {
@@ -870,16 +867,27 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes) {
     return g_fullalloc_buf;
 }
 
-// Official layer attribution, fed by llama's graph-build callback (see the
-// phase-1 anchor in llama-context.cpp::graph_get_cb).
-void route_b_on_node(const ggml_tensor * node, int il) {
-    if (node) g_official_layer[node] = il;
+void route_b_begin_graph() {
+    g_official_layer.clear();
+    g_node_physical.clear();
+}
+
+void route_b_on_node(const ggml_tensor * node, int il, ggml_backend_dev_t physical) {
+    if (!node) return;
+    g_official_layer[node] = il;
+    if (physical && std::strcmp(ggml_backend_dev_name(physical), "STREAMMOE") != 0) {
+        g_node_physical[node] = physical;
+    }
 }
 
 int route_b_official_layer(const ggml_tensor * node) {
-    if (!node) return -1;
     auto it = g_official_layer.find(node);
     return it == g_official_layer.end() ? -1 : it->second;
+}
+
+ggml_backend_dev_t route_b_op_physical(const ggml_tensor * node) {
+    auto it = g_node_physical.find(node);
+    return it == g_node_physical.end() ? nullptr : it->second;
 }
 
 // Expert pool devices, in creation order (empty = host/RAM). Recorded by
@@ -914,9 +922,9 @@ ggml_backend_t route_b_device_backend(const char * dev) {
 }
 
 const char * route_b_node_device(const ggml_tensor * node) {
-    if (!node) return "";
+    if (!node) return nullptr;
     auto it = g_node_dev.find(node);
-    return it == g_node_dev.end() ? "" : it->second.c_str();
+    return it == g_node_dev.end() ? nullptr : it->second.c_str();
 }
 
 const std::vector<route_b_relay_t> & route_b_relays() { return g_relays; }
@@ -931,12 +939,6 @@ bool route_b_in_arena(const void * p) {
         if (q >= base && q < base + plan.cap) return true;
     }
     return false;
-}
-
-bool route_b_whole_layer_active() {
-    // Whole-layer ownership is the production path: route B owns every compute
-    // node, the scheduler sees one split, and all activations live in our arena.
-    return true;
 }
 
 int route_b_build_id() { return g_build_id; }
@@ -1042,7 +1044,8 @@ static size_t pack_interval(const std::vector<ggml_tensor*> & nodes,
     return (size_t) arena;
 }
 
-bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend) {
+bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_t our_backend,
+                              const std::vector<ggml_backend_dev_t> & physical_layers, bool probe) {
     if (!gf || !sched || !our_backend) return false;
     // Privatise the WHOLE chain closure (BFS from routed mm anchors, shared
     // with verify): routed mm + named hidden intermediates + output end + the
@@ -1145,21 +1148,47 @@ bool moe_chain_assign_backend(ggml_cgraph * gf, ggml_backend_sched_t sched, ggml
     // dense is captured too (phase 3); cross-device edges move through the
     // stage-tagged xfer mechanism.
     collect_layer_nodes(gf, g_layer_nodes_all);
+    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+        const auto * nd = gf->nodes[i];
+        auto * physical = route_b_op_physical(nd);
+        if (!physical) continue;
+        for (const auto * src : nd->src) {
+            if (src && pos.count(src) && !route_b_op_physical(src)) {
+                g_node_physical[src] = physical;
+            }
+        }
+    }
     verify_layer_consumers(gf);
     {
         std::map<int, std::vector<ggml_tensor*>> & all = g_layer_nodes_all;
         g_layer_nodes.clear();
         for (auto & kv : all) {
-            g_layer_nodes[kv.first] = kv.second;
             for (auto * nd : kv.second) {
-                if (is_alias_op(nd)) continue;
-                // Fused ops (FLASH_ATTN_EXT / LIGHTNING_INDEXER / DSV4_HC_*) are
-                // claimed too: together with llama_model::dev_layer reporting the
-                // StreamMoE device, resolve() sees device_fused == dev_layer and
-                // keeps the fused path (moe_dev_supports_op also accepts them).
-                ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
+                auto * physical = route_b_op_physical(nd);
+                if (!physical && kv.first >= 0 && size_t(kv.first) < physical_layers.size()) {
+                    physical = physical_layers[kv.first];
+                    g_node_physical[nd] = physical;
+                }
+                bool closure = false;
+                auto ex = g_layer_exec.find(kv.first);
+                if (ex != g_layer_exec.end()) {
+                    closure = std::find(ex->second.compute.begin(), ex->second.compute.end(), nd) != ex->second.compute.end();
+                }
+                if (!closure && !is_alias_op(nd) && nd->op != GGML_OP_NONE) {
+                    if (!physical || physical == ggml_backend_get_device(our_backend)) {
+                        GGML_ABORT("RouteB: unknown physical device for '%s' (%s)", nd->name, ggml_op_name(nd->op));
+                    }
+                    if (!ggml_backend_dev_supports_op(physical, nd)) {
+                        if (probe) continue;
+                        GGML_ABORT("RouteB: device %s does not support '%s' (%s); no CPU fallback",
+                                   ggml_backend_dev_name(physical), nd->name, ggml_op_name(nd->op));
+                    }
+                }
+                if (!is_alias_op(nd)) ggml_backend_sched_set_tensor_backend(sched, nd, our_backend);
+                g_layer_nodes[kv.first].push_back(nd);
             }
         }
+        if (probe) return true;
     }
     // Build the per-layer plans (head/tail/moe) from the capture.
     build_layer_plans();

@@ -33,7 +33,8 @@ bool moe_chain_node_is_privatizable(const ggml_tensor * node);
 // user assignments) so the whole chain lands as one split in our graph_compute.
 // View/layout nodes are skipped - pass4 follows view_src automatically.
 bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sched,
-                              ggml_backend_t our_backend);
+                              ggml_backend_t our_backend,
+                              const std::vector<ggml_backend_dev_t> & physical_layers, bool probe = false);
 
 // Full-allocation mode for the layer hidden intermediates (the compact
 // bucket engine allocates every twin output inside this): ONE fixed buffer
@@ -44,14 +45,10 @@ bool moe_chain_assign_backend(struct ggml_cgraph * gf, ggml_backend_sched_t sche
 void   moe_chain_set_full_alloc(size_t layer_sum_bytes);
 void * moe_chain_fullalloc_buffer(size_t need_bytes);
 
-// Official layer attribution (docs/LAYER_EXECUTOR_DESIGN.md 4.5): llama's graph
-// build calls cb(tensor, name, il) for every named node; the phase-1 anchor in
-// llama-context.cpp::graph_get_cb forwards (tensor, il) here. Populated during
-// model.build_graph(); consumed (and cleared) by moe_chain_assign_backend.
-// The official layer index is the primary source; the "-<il>" name suffix is the
-// fallback (kept for robustness / future name-format changes).
-void route_b_on_node(const ggml_tensor * node, int il);
-int  route_b_official_layer(const ggml_tensor * node);   // -1 when unknown
+void route_b_begin_graph();
+void route_b_on_node(const ggml_tensor * node, int il, ggml_backend_dev_t physical);
+int route_b_official_layer(const ggml_tensor * node);
+ggml_backend_dev_t route_b_op_physical(const ggml_tensor * node);
 
 // Debug: true when `p` lies inside the whole-layer arena (R3). Used to check
 // that the scheduler did not overwrite pre-allocated node data.
@@ -94,16 +91,8 @@ struct route_b_relay_t {
 // All transfers of the current graph build (empty when single-device / CPU-only).
 const std::vector<route_b_relay_t> & route_b_relays();
 
-// True when the debug whole-layer path is active (STREAM_MOE_TEMP build, not
-// disabled by STREAM_MOE_TMP_NO_WHOLE_LAYER). Used by llama_model::dev_layer to
-// report the layer device as the StreamMoE backend so resolve() keeps fused ops.
-bool route_b_whole_layer_active();
-
 // True for llama's fused ops (FLASH_ATTN_EXT / LIGHTNING_INDEXER / DSV4_HC_*)
 // whose fusion llama_context::resolve probes against the layer's device.
-// Whole-layer ownership claims these so resolve() sees device_fused ==
-// dev_layer (both StreamMoE) and keeps the fused path instead of decomposing
-// to primitive ops.
 bool route_b_is_fused_op(enum ggml_op op);
 
 // Debug: write a node's full bytes to <STREAM_MOE_TMP_BIN_DIR>/ub<N>/<name>.bin
