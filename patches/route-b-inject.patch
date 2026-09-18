@@ -31,8 +31,60 @@ index 36f1e0cd5..807600820 100644
 +else()
 +    target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_posix.cpp)
 +endif()
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 66dd9dd3e..502411596 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -783,6 +783,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+         std::string value;
+         if (opt.get_value_from_env(value)) {
+             try {
++#ifdef STREAM_MOE_ROUTE_B
++                params.route_b_track_option(opt.args, opt.env);
++#endif
+                 if (opt.handler_void && is_truthy(value)) {
+                     opt.handler_void(params);
+                 }
+@@ -837,6 +840,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+             }
+             try {
++#ifdef STREAM_MOE_ROUTE_B
++                params.route_b_track_option(opt.args, arg);
++#endif
+                 if (opt.handler_void) {
+                     opt.handler_void(params);
+                     continue;
+@@ -888,6 +894,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+     // parse all CLI args now, so that -hf is available below for remote preset resolution
+     parse_cli_args();
+ 
++#ifdef STREAM_MOE_ROUTE_B
++    const auto placement_error = params.route_b_placement_error();
++    if (!placement_error.empty()) {
++        throw std::invalid_argument(placement_error);
++    }
++#endif
++
+     postprocess_cpu_params(params.cpuparams,       nullptr);
+     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+ 
+diff --git a/common/preset.cpp b/common/preset.cpp
+index 4c61e93ee..e587ff71c 100644
+--- a/common/preset.cpp
++++ b/common/preset.cpp
+@@ -147,6 +147,9 @@ void common_preset::apply_to_params(common_params & params, const std::set<std::
+             }
+         }
+         // apply each option to params
++#ifdef STREAM_MOE_ROUTE_B
++        params.route_b_track_option(opt.args, std::string("preset:") + (opt.env ? opt.env : opt.args.front()));
++#endif
+         if (opt.handler_string) {
+             opt.handler_string(params, val);
+         } else if (opt.handler_int) {
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4eef2212e..f910c7e0e 100644
+index 4eef2212e..8e076fdb2 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -12,6 +12,8 @@
@@ -120,7 +172,7 @@ index 4eef2212e..f910c7e0e 100644
 +        // same _exps pattern must not route the draft's experts to the main
 +        // pool). ram_pool_mb==0 -> full residency (no eviction).
 +        if (params.expert_backend) {
-+            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), {}, params.moe_draft_expert_pools, params.cpuparams.n_threads, true);
++            auto * ovr = stream_moe::route_b_setup(model_path.c_str(), {}, params.moe_draft_expert_pools, params.cpuparams.n_threads, true, "");
 +            if (ovr) {
 +                mparams.tensor_buft_overrides = ovr; // draft pool's own (terminated) array
 +            }
@@ -157,8 +209,76 @@ index 12ae31b7d..009538c9a 100644
  // comma separated list the provided types
  std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
  
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 2309a77b5..7e550dce0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2511,6 +2511,9 @@ ggml_status llama_context::graph_compute(
+ }
+ 
+ llm_graph_cb llama_context::graph_get_cb() const {
++#ifdef STREAM_MOE_ROUTE_B
++    stream_moe::route_b_begin_graph();
++#endif
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+             ggml_format_name(cur, "%s-%d", name, il);
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 948d08146..7c170e4d7 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -947,8 +947,12 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
++        if (!offload && model.route_b_enabled() &&
++                ggml_backend_dev_type(model.dev_layer_physical(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            throw std::runtime_error("RouteB: --no-kv-offload conflicts with GPU C1 compressor state at layer " + std::to_string(il));
++        }
+         if (offload) {
+-            auto * dev = model.dev_layer(il);
++            auto * dev = model.dev_layer_physical(il);
+             buft = ggml_backend_dev_buffer_type(dev);
+ 
+             dev_name = ggml_backend_dev_name(dev);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ec0f5a753..1d7907447 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -211,8 +211,12 @@ llama_kv_cache::llama_kv_cache(
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
++        if (!offload && model.route_b_enabled() &&
++                ggml_backend_dev_type(model.dev_layer_physical(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            throw std::runtime_error("RouteB: --no-kv-offload conflicts with GPU C1 placement at layer " + std::to_string(il));
++        }
+         if (offload) {
+-            auto * dev = model.dev_layer(il);
++            auto * dev = model.dev_layer_physical(il);
+             buft = ggml_backend_dev_buffer_type(dev);
+ 
+             dev_name = ggml_backend_dev_name(dev);
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index e2990972e..904230938 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -82,8 +82,12 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
++        if (!offload && model.route_b_enabled() &&
++                ggml_backend_dev_type(model.dev_layer_physical(i)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            throw std::runtime_error("RouteB: --no-kv-offload conflicts with GPU C1 recurrent state at layer " + std::to_string(i));
++        }
+         if (offload) {
+-            auto * dev = model.dev_layer(i);
++            auto * dev = model.dev_layer_physical(i);
+             buft = ggml_backend_dev_buffer_type(dev);
+ 
+             dev_name = ggml_backend_dev_name(dev);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 9b22cb05f..d5973d044 100644
+index 9b22cb05f..1cc71b8c6 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -5,6 +5,11 @@
@@ -168,7 +288,7 @@ index 9b22cb05f..d5973d044 100644
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "tsc_timer.h"
 +// v2-chunk dense takeover: route_b fills dense tensors from their strip segments.
-+namespace stream_moe { bool route_b_fill_dense(const char*, void*); }
++namespace stream_moe { bool route_b_fill_dense(const char*, struct ggml_tensor*); }
 +#endif
  
  #include <algorithm>
@@ -215,10 +335,11 @@ index 9b22cb05f..d5973d044 100644
      if (files.empty()) {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              set_tensor_data(t, set_tensor_data_ud);
-@@ -1585,13 +1611,36 @@ bool llama_model_loader::load_all_data(
+@@ -1584,14 +1610,33 @@ bool llama_model_loader::load_all_data(
+         } else {
              const auto & file = files.at(weight->idx);
  
-             if (ggml_backend_buffer_is_host(cur->buffer)) {
+-            if (ggml_backend_buffer_is_host(cur->buffer)) {
 -                file->seek(weight->offs, SEEK_SET);
 -                file->read_raw(cur->data, n_size);
 -                if (check_tensors) {
@@ -226,20 +347,25 @@ index 9b22cb05f..d5973d044 100644
 -                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
 -                    }));
 +#ifdef STREAM_MOE_ROUTE_B
-+                // StreamMoE: expert tensors on the pool buft carry a dummy data
-+                // pointer - they are loaded on demand by the scheduler. Skip the
-+                // plain read here (would hit an invalid address).
-+                bool skip_pooled = false;
-+                if (tensor_buft_overrides) {
-+                    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
-+                        if (o->buft && cur->buffer && ggml_backend_buffer_get_type(cur->buffer) == o->buft) {
-+                            skip_pooled = true;
-+                            break;
-+                        }
++            // Route B owns loading: any tensor routed to a route-B buft (expert
++            // pool, C1/C2 dense, v2-chunk dense) is read by route B itself via the
++            // shared DIO engine and uploaded to its backend (host or device).
++            // Skip llama's read entirely (the pooled expert tensors even carry a
++            // dummy data pointer).
++            bool route_b_owns = false;
++            if (tensor_buft_overrides) {
++                for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
++                    if (o->buft && cur->buffer && ggml_backend_buffer_get_type(cur->buffer) == o->buft) {
++                        route_b_owns = true;
++                        break;
 +                    }
-+                }
-+                if (!skip_pooled) {
+                 }
++            }
++            if (route_b_owns) {
++                stream_moe::route_b_fill_dense(cur->name, cur);
++            } else
 +#endif
++            if (ggml_backend_buffer_is_host(cur->buffer)) {
 +                    file->seek(weight->offs, SEEK_SET);
 +                    file->read_raw(cur->data, n_size);
 +                    if (check_tensors) {
@@ -247,14 +373,6 @@ index 9b22cb05f..d5973d044 100644
 +                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
 +                        }));
 +                    }
-+#ifdef STREAM_MOE_ROUTE_B
-+                } else {
-+                    // v2-chunk dense tensors (dense buft override) are filled by
-+                    // route_b from their strip segments; expert tensors are loaded
-+                    // on demand by the scheduler. Both skip the tensor_info read.
-+                    stream_moe::route_b_fill_dense(cur->name, cur->data);
-                 }
-+#endif
              } else {
                  // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                  if (upload_backend) {
@@ -281,7 +399,7 @@ index e9fe3592d..1149ae5af 100644
      };
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c34700ff5..d7a7de255 100644
+index c34700ff5..a9fe5cc9e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -5,6 +5,10 @@
@@ -290,12 +408,37 @@ index c34700ff5..d7a7de255 100644
  #include "llama-mmap.h"
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "tsc_timer.h"
-+namespace stream_moe { const char * route_b_dense_device(const char * spec, int il, int n_layer_all); bool route_b_whole_layer_active(); }
++namespace stream_moe { const char * route_b_dense_device(const char * spec, int il, int n_layer_all); }
 +#endif
  #include "llama-cparams.h"
  #include "llama-model-loader.h"
  
-@@ -1370,6 +1374,9 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+@@ -1150,6 +1154,7 @@ struct llama_model::impl {
+     std::vector<layer_dev> dev_layer;
+ 
+     bool has_tensor_overrides;
++    bool route_b_enabled = false;
+ 
+     std::vector<float> tensor_split_owned;
+ };
+@@ -1162,6 +1167,16 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+         this->params.tensor_split = pimpl->tensor_split_owned.data();
+     }
+     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
++#ifdef STREAM_MOE_ROUTE_B
++    if (params.tensor_buft_overrides) {
++        for (auto * p = params.tensor_buft_overrides; p->pattern; ++p) {
++            if (p->buft && std::strncmp(ggml_backend_buft_name(p->buft), "STREAMMOE_EXPERT", 15) == 0) {
++                pimpl->route_b_enabled = true;
++                break;
++            }
++        }
++    }
++#endif
+ }
+ 
+ llama_model::~llama_model() {
+@@ -1370,6 +1385,9 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
  }
  
  bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -305,7 +448,7 @@ index c34700ff5..d7a7de255 100644
      const auto & split_mode   = params.split_mode;
      const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
      const auto & tensor_split = params.tensor_split;
-@@ -1450,6 +1457,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1450,6 +1468,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
      auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
          const bool is_swa = il < n_layer_all && hparams.is_swa(il);
@@ -321,7 +464,7 @@ index c34700ff5..d7a7de255 100644
 +                        return {d.dev, &pimpl->gpu_buft_list.at(d.dev)};
 +                    }
 +                }
-+                LLAMA_LOG_WARN("load_tensors: dense placement device '%s' not in model devices; layer %d on CPU\n", dn, il);
++                throw std::runtime_error(format("RouteB: dense placement device '%s' not in model devices for layer %d", dn, il));
 +            }
 +            return {cpu_dev, &pimpl->cpu_buft_list};
 +        }
@@ -329,22 +472,64 @@ index c34700ff5..d7a7de255 100644
          if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
              LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
              return {cpu_dev, &pimpl->cpu_buft_list};
-@@ -2089,6 +2113,14 @@ void llama_model::print_info() const {
+@@ -1460,10 +1495,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+-
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
+     for (int il = 0; il < n_layer_all; ++il) {
+@@ -1473,6 +1504,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // assign the output layer
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+ 
++    // assign the input layer
++    // Usually the input layer stays on the CPU (little benefit to offload it).
++    // With route-B dense placement the token embedding is a global dense tensor
++    // (C2) and must follow C2, else the layer-0 prologue and the attention end up
++    // on different devices and the whole head is split.
++#ifdef STREAM_MOE_ROUTE_B
++    if (params.dense_placement) {
++        pimpl->dev_input = pimpl->dev_output;
++    } else
++#endif
++    {
++        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    }
++
+     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
+ 
+     // create tensors for the weights
+@@ -2088,10 +2133,23 @@ void llama_model::print_info() const {
+     vocab.print_info();
  }
  
- ggml_backend_dev_t llama_model::dev_layer(int il) const {
-+#ifdef STREAM_MOE_ROUTE_B
-+    // Whole-layer (debug): report the StreamMoE backend as the layer device so
-+    // llama_context::resolve sees a consistent device and keeps fused ops.
-+    if (stream_moe::route_b_whole_layer_active()) {
-+        ggml_backend_dev_t d = ggml_backend_dev_by_name("STREAMMOE");
-+        if (d) return d;
-+    }
-+#endif
+-ggml_backend_dev_t llama_model::dev_layer(int il) const {
++bool llama_model::route_b_enabled() const {
++    return pimpl->route_b_enabled;
++}
++
++ggml_backend_dev_t llama_model::dev_layer_physical(int il) const {
      return pimpl->dev_layer.at(il).dev;
  }
  
-@@ -2633,6 +2665,9 @@ llama_model_params llama_model_default_params() {
++ggml_backend_dev_t llama_model::dev_layer(int il) const {
++    if (route_b_enabled()) {
++        auto * dev = ggml_backend_dev_by_name("STREAMMOE");
++        if (!dev) throw std::runtime_error("RouteB model has no STREAMMOE device");
++        return dev;
++    }
++    return dev_layer_physical(il);
++}
++
+ ggml_backend_dev_t llama_model::dev_output() const {
+     return pimpl->dev_output.dev;
+ }
+@@ -2633,6 +2691,9 @@ llama_model_params llama_model_default_params() {
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,
@@ -354,6 +539,19 @@ index c34700ff5..d7a7de255 100644
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 44bd96757..aa6070c50 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -705,6 +705,8 @@ struct llama_model {
+     void print_info() const;
+ 
+     ggml_backend_dev_t dev_layer(int il) const;
++    ggml_backend_dev_t dev_layer_physical(int il) const;
++    bool route_b_enabled() const;
+     ggml_backend_dev_t dev_output() const;
+ 
+     ggml_backend_buffer_type_t select_buft(int il) const;
 diff --git a/src/llama.cpp b/src/llama.cpp
 index 1609fec88..f5d3d826f 100644
 --- a/src/llama.cpp

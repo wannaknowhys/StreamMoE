@@ -24,10 +24,6 @@
             // GPU re-enables op_offload in common.cpp (weightless dense ops
             // must follow their weights).
             params.no_op_offload = true;
-            // Dense placement is owned by route B: -ngl is rejected at load
-            // time and --dense-placement decides per category. Do NOT set
-            // n_gpu_layers here - the default (-1) is the "user did not pass
-            // -ngl" sentinel the validator checks (docs/DENSE_PLACEMENT.md).
         }
     ));
     add_opt(common_arg(
@@ -86,7 +82,7 @@
         {"--kv-placement"}, "<RAM,VRAM0,...>",
         "StreamMoE: KV cache placement as a collection (comma-separated). "
         "Multi-replica mirrors are a future feature - today only the first "
-        "element is honored, extra elements warn.",
+        "element is honored, extra elements warn. Not supported with --expert-backend; KV cache placement follows C1.",
         [](common_params & params, const std::string & value) {
             params.kv_placement.clear();
             size_t start = 0;
@@ -104,7 +100,8 @@
         {"--dense-placement"}, "<C1:dev,C2:dev>",
         "StreamMoE: dense placement (docs/DENSE_PLACEMENT.md). C1 = per-layer dense "
         "(all layers), C2 = global dense (output layer; alias GLOBAL). dev = RAM | CPU | "
-        "Vulkan0 | ... Empty = all dense on CPU. -ngl is rejected under --expert-backend.",
+        "Vulkan0 | ... Empty = all dense on CPU. Standard llama.cpp-style placement options are rejected "
+        "under --expert-backend; use --dense-placement and --moe-expert-pools. KV cache placement follows C1.",
         [](common_params & params, const std::string & value) {
             params.dense_placement = value;
         }

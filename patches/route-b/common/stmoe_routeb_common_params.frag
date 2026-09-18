@@ -18,3 +18,56 @@
     // Dense placement (docs/DENSE_PLACEMENT.md, Phase 1a): "C1:<dev>,C2:<dev>"
     // (GLOBAL = C2 alias; RAM/CPU = host). Empty = all dense on CPU.
     std::string dense_placement;
+
+    std::vector<std::string> route_b_placement_options;
+    std::string route_b_fit_source;
+
+    void route_b_track_option(const std::vector<const char *> & names, const std::string & source) {
+        for (const char * name : names) {
+            const std::string option(name);
+            if (option == "--fit") {
+                route_b_fit_source = source;
+                return;
+            }
+            if (option != "--gpu-layers" && option != "--device" &&
+                option != "--main-gpu" && option != "--split-mode" &&
+                option != "--tensor-split" && option != "--cpu-moe" &&
+                option != "--n-cpu-moe" && option != "--override-tensor" &&
+                option != "--kv-offload" && option != "--op-offload" &&
+                option != "--no-host" && option != "--kv-placement") {
+                continue;
+            }
+            const std::string entry = option + " (" + source + ")";
+            for (const auto & recorded : route_b_placement_options) {
+                if (recorded == entry) {
+                    return;
+                }
+            }
+            route_b_placement_options.push_back(entry);
+            return;
+        }
+    }
+
+    std::string route_b_placement_error() const {
+        if (!expert_backend) {
+            return {};
+        }
+        std::string options;
+        for (const auto & option : route_b_placement_options) {
+            if (!options.empty()) {
+                options += ", ";
+            }
+            options += option;
+        }
+        if (!route_b_fit_source.empty() && fit_params) {
+            if (!options.empty()) {
+                options += ", ";
+            }
+            options += "--fit on (" + route_b_fit_source + ")";
+        }
+        if (options.empty()) {
+            return {};
+        }
+        return "Route B does not support standard llama.cpp-style placement options with --expert-backend: " +
+               options + ". Use --dense-placement and --moe-expert-pools; KV cache placement follows C1.";
+    }
