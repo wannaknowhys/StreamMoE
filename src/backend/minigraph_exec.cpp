@@ -19,6 +19,19 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef STREAM_MOE_TEMP
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <tuple>
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #else
@@ -115,8 +128,184 @@ static bool is_alias_op(const ggml_tensor * n) {
 // nodes/n_nodes when planning (ggml_graph_plan), so a hand-assembled cgraph over
 // the original tensors is valid; their data/buffer/view are the arena ones set
 // by layout_arena. Views are skipped (their data follows the producer).
+#ifdef STREAM_MOE_TEMP
+static int32_t live_dump_layer() {
+    const char * value = std::getenv("STREAM_MOE_TMP_LIVE_DUMP_LAYER");
+    if (!value) return -1;
+    if (!*value) throw std::runtime_error("STREAM_MOE_TMP_LIVE_DUMP_LAYER must be a nonnegative int32");
+    int32_t layer = 0;
+    for (const char * p = value; *p; ++p) {
+        if (*p < '0' || *p > '9' || layer > (std::numeric_limits<int32_t>::max() - (*p - '0')) / 10) {
+            throw std::runtime_error("STREAM_MOE_TMP_LIVE_DUMP_LAYER must be a nonnegative int32");
+        }
+        layer = layer * 10 + (*p - '0');
+    }
+    return layer;
+}
+
+static bool live_dump_once_take(int32_t layer, const char * stage, ggml_backend_t backend) {
+    const char * once = std::getenv("STREAM_MOE_TMP_LIVE_DUMP_ONCE");
+    if (!once || std::strcmp(once, "1") != 0) return true;
+    static std::mutex mutex;
+    static std::set<std::tuple<int32_t, std::string, uintptr_t>> seen;
+    const std::lock_guard<std::mutex> lock(mutex);
+    return seen.emplace(layer, stage, reinterpret_cast<uintptr_t>(backend)).second;
+}
+
+static std::filesystem::path live_dump_call_dir(const std::filesystem::path & root, uint64_t & call) {
+    static std::mutex mutex;
+    static std::filesystem::path session_root, session;
+    static uint64_t next_call = 0;
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (session.empty()) {
+        std::filesystem::create_directories(root);
+        const std::string prefix = "live_session_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        for (uint64_t attempt = 0;; ++attempt) {
+            const auto candidate = root / (prefix + "_" + std::to_string(attempt));
+            if (std::filesystem::create_directory(candidate)) {
+                session_root = root;
+                session = candidate;
+                break;
+            }
+            if (attempt == std::numeric_limits<uint64_t>::max()) throw std::runtime_error("LIVE_DUMP session id exhausted");
+        }
+    } else if (session_root != root) {
+        throw std::runtime_error("STREAM_MOE_TMP_BIN_DIR changed during LIVE_DUMP session");
+    }
+    if (next_call == std::numeric_limits<uint64_t>::max()) throw std::runtime_error("LIVE_DUMP call id exhausted");
+    call = ++next_call;
+    const auto dir = session / ("call_" + std::to_string(call));
+    if (!std::filesystem::create_directory(dir)) throw std::runtime_error("LIVE_DUMP call directory already exists");
+    return dir;
+}
+
+static void live_dump_one(const std::filesystem::path & dir, uint64_t call, size_t index, int slot,
+                          int32_t layer, const char * stage, int build, ggml_backend_t backend,
+                          const ggml_tensor * node, const ggml_tensor * t, std::vector<char> & chunk,
+                          std::string & active_path) {
+    const std::string stem = "node_" + std::to_string(index) + (slot < 0 ? "_out" : "_src_" + std::to_string(slot));
+    const auto bin_path = dir / (stem + ".bin");
+    active_path = bin_path.u8string();
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] < 0) throw std::runtime_error("LIVE_DUMP negative tensor dimension");
+    }
+    const size_t bytes = ggml_nbytes(t);
+    const auto buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    if (bytes && (!t->data || !buffer || !buffer->iface.get_tensor)) {
+        throw std::runtime_error("LIVE_DUMP nonempty tensor has no readable data/buffer");
+    }
+    std::ofstream bin;
+    bin.exceptions(std::ios::failbit | std::ios::badbit);
+    bin.open(bin_path, std::ios::binary | std::ios::out | std::ios::trunc);
+    for (size_t offset = 0; offset < bytes;) {
+        const size_t count = std::min(chunk.size(), bytes - offset);
+        tensor_read_host(t, chunk.data(), offset, count);
+        bin.write(chunk.data(), static_cast<std::streamsize>(count));
+        offset += count;
+    }
+    bin.close();
+    const auto meta_path = dir / (stem + ".meta");
+    active_path = meta_path.u8string();
+    std::ofstream meta;
+    meta.exceptions(std::ios::failbit | std::ios::badbit);
+    meta.imbue(std::locale::classic());
+    meta.open(meta_path, std::ios::binary | std::ios::out | std::ios::trunc);
+    meta << "call " << call << "\nindex " << index << "\nslot " << slot
+         << "\nphase " << std::quoted(slot < 0 ? "after" : "before")
+         << "\nlayer " << layer << "\nstage " << std::quoted(stage) << "\nbuild " << build
+         << "\nbackend " << std::quoted(ggml_backend_name(backend))
+         << "\nnode_address " << static_cast<const void *>(node) << "\nnode_name " << std::quoted(node->name)
+         << "\nname " << std::quoted(t->name) << "\ntype " << static_cast<int>(t->type)
+         << ' ' << std::quoted(ggml_type_name(t->type)) << "\nop " << static_cast<int>(t->op)
+         << ' ' << std::quoted(ggml_op_name(t->op)) << "\nne";
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) meta << ' ' << t->ne[d];
+    meta << "\nnb";
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) meta << ' ' << t->nb[d];
+    meta << "\nop_params";
+    for (int32_t param : t->op_params) meta << ' ' << param;
+    meta << "\nnbytes " << bytes << "\ntensor_address " << static_cast<const void *>(t)
+         << "\nbuffer_address " << static_cast<const void *>(t->buffer)
+         << "\nread_buffer_address " << static_cast<const void *>(buffer)
+         << "\nbuffer_name " << std::quoted(buffer ? ggml_backend_buffer_name(buffer) : "none")
+         << "\ndata " << t->data << "\nview_src " << static_cast<const void *>(t->view_src)
+         << "\nview_offs " << t->view_offs << '\n';
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const auto * src = t->src[s];
+        meta << "src " << s << ' ' << static_cast<const void *>(src) << ' '
+             << std::quoted(src ? src->name : "") << '\n';
+    }
+    meta.close();
+}
+#endif
+
 static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t backend,
-                                           const std::vector<ggml_tensor*> & list) {
+                                           const std::vector<ggml_tensor*> & list,
+                                           [[maybe_unused]] int32_t layer, [[maybe_unused]] const char * stage) {
+    if (!backend) return GGML_STATUS_FAILED;
+    for (const auto * nd : list) {
+        if (!nd || is_alias_op(nd) || nd->op == GGML_OP_NONE) continue;
+        if (!ggml_backend_supports_op(backend, nd)) {
+            LOG_ERROR("stream_moe: device " << ggml_backend_name(backend) << " does not support "
+                      << nd->name << " (" << ggml_op_name(nd->op) << "); no CPU fallback");
+            return GGML_STATUS_FAILED;
+        }
+    }
+#ifdef STREAM_MOE_TEMP
+    if (std::getenv("STREAM_MOE_TMP_LIVE_DUMP") || std::getenv("STREAM_MOE_TMP_SUBGRAPH_ONE")) {
+        uint64_t call = 0;
+        size_t index = 0;
+        int slot = -1;
+        std::string active_path;
+        try {
+            const char * env_dir = std::getenv("STREAM_MOE_TMP_BIN_DIR");
+            if (!env_dir || !*env_dir) throw std::runtime_error("LIVE_DUMP/SUBGRAPH_ONE requires STREAM_MOE_TMP_BIN_DIR");
+            const int32_t selected_layer = live_dump_layer();
+            const auto root = std::filesystem::absolute(std::filesystem::u8path(env_dir)).lexically_normal();
+            active_path = root.u8string();
+            if ((selected_layer < 0 || layer == selected_layer) && live_dump_once_take(layer, stage, backend)) {
+                const auto dir = live_dump_call_dir(root, call);
+                active_path = dir.u8string();
+                std::vector<char> chunk(1024 * 1024);
+                ggml_cgraph * one = ggml_new_graph_custom(ctx, 4, false);
+                if (!one) throw std::runtime_error("LIVE_DUMP single-node graph allocation failed");
+                const int build = route_b_build_id();
+                for (; index < list.size(); ++index) {
+                    ggml_tensor * nd = list[index];
+                    if (!nd || is_alias_op(nd)) continue;
+                    slot = -1;
+                    ggml_backend_synchronize(backend);
+                    for (slot = 0; slot < GGML_MAX_SRC; ++slot) {
+                        if (nd->src[slot]) live_dump_one(dir, call, index, slot, layer, stage, build, backend,
+                                                        nd, nd->src[slot], chunk, active_path);
+                    }
+                    slot = -1;
+                    active_path = (dir / ("node_" + std::to_string(index) + "_out.bin")).u8string();
+                    const auto output_buffer = nd->view_src ? nd->view_src->buffer : nd->buffer;
+                    if (ggml_nbytes(nd) && (!nd->data || !output_buffer || !output_buffer->iface.get_tensor)) {
+                        throw std::runtime_error("LIVE_DUMP nonempty output has no readable data/buffer");
+                    }
+                    ggml_graph_clear(one);
+                    one->nodes[one->n_nodes++] = nd;
+                    const auto status = ggml_backend_graph_compute(backend, one);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        throw std::runtime_error("LIVE_DUMP node compute failed, status=" + std::to_string(static_cast<int>(status)));
+                    }
+                    ggml_backend_synchronize(backend);
+                    live_dump_one(dir, call, index, slot, layer, stage, build, backend, nd, nd, chunk, active_path);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[live-dump] FAILED layer=%d stage=%s call=%llu index=%zu slot=%d path=%s: %s\n",
+                    layer, stage, (unsigned long long) call, index, slot, active_path.c_str(), e.what());
+            return GGML_STATUS_FAILED;
+        } catch (...) {
+            fprintf(stderr, "[live-dump] FAILED layer=%d stage=%s call=%llu index=%zu slot=%d path=%s: unknown exception\n",
+                    layer, stage, (unsigned long long) call, index, slot, active_path.c_str());
+            return GGML_STATUS_FAILED;
+        }
+    }
+#endif
     if (list.empty()) return GGML_STATUS_SUCCESS;
     std::vector<ggml_tensor*> nodes;
     nodes.reserve(list.size());
@@ -147,24 +336,6 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
         }
     }
 #endif
-#ifdef STREAM_MOE_TEMP
-    if (std::getenv("STREAM_MOE_TMP_SUBGRAPH_ONE")) {
-        for (ggml_tensor * nd : nodes) {
-            ggml_cgraph * g1 = ggml_new_graph_custom(ctx, 4, false);
-            if (!g1) return GGML_STATUS_ALLOC_FAILED;
-            g1->nodes[g1->n_nodes++] = nd;
-            const enum ggml_status s1 = ggml_backend_graph_compute(backend, g1);
-            if (s1 != GGML_STATUS_SUCCESS) return s1;
-            const size_t nb = ggml_nbytes(nd);
-            const uint8_t * bp = (const uint8_t *) nd->data;
-            uint64_t h = 1469598103934665603ull;
-            for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
-            fprintf(stderr, "[one] b%d %-26s %-12s %016llx\n", route_b_build_id(),
-                    nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h);
-        }
-        return GGML_STATUS_SUCCESS;
-    }
-#endif
     ggml_cgraph * g = ggml_new_graph_custom(ctx, nodes.size() + 8, false);
     if (!g) {
         LOG_ERROR("stream_moe: dense subgraph build failed");
@@ -178,16 +349,19 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
 // SS8.5, phase 3): group the nodes by their captured device and run each group
 // on that device's backend. A whole C1 (--dense-placement) is one device, so the
 // common case is a single group; grouping keeps the structure correct if C1 is
-// later split across devices. Host nodes use `cpu`; an unknown device falls back
-// to `cpu` (never expected - route_b_setup registered every pool device).
 static enum ggml_status run_dense_by_device(ggml_context * ctx, ggml_backend_t cpu,
-                                            const std::vector<ggml_tensor*> & list) {
+                                            const std::vector<ggml_tensor*> & list,
+                                            int32_t layer, const char * stage) {
     if (list.empty()) return GGML_STATUS_SUCCESS;
     std::vector<std::string> keys;
     std::vector<std::vector<ggml_tensor*>> groups;
     for (ggml_tensor * nd : list) {
         const char * d = route_b_node_device(nd);
-        const std::string key = d ? d : "";
+        if (!d) {
+            LOG_ERROR("stream_moe: unknown physical device for '" << nd->name << "'");
+            return GGML_STATUS_FAILED;
+        }
+        const std::string key = d;
         size_t gi = 0;
         for (; gi < keys.size(); ++gi) if (keys[gi] == key) break;
         if (gi == keys.size()) { keys.push_back(key); groups.push_back({}); }
@@ -195,8 +369,11 @@ static enum ggml_status run_dense_by_device(ggml_context * ctx, ggml_backend_t c
     }
     for (size_t gi = 0; gi < keys.size(); ++gi) {
         ggml_backend_t be = keys[gi].empty() ? cpu : route_b_device_backend(keys[gi].c_str());
-        if (!be) be = cpu;   // unknown device: fall back (never expected)
-        const enum ggml_status st = run_dense_subgraph(ctx, be, groups[gi]);
+        if (!be || std::strcmp(ggml_backend_name(be), "STREAMMOE") == 0) {
+            LOG_ERROR("stream_moe: no physical backend for device '" << keys[gi] << "'");
+            return GGML_STATUS_FAILED;
+        }
+        const enum ggml_status st = run_dense_subgraph(ctx, be, groups[gi], layer, stage);
         if (st != GGML_STATUS_SUCCESS) {
             LOG_ERROR("stream_moe: dense subgraph failed on device '" << keys[gi] << "'");
             return st;
@@ -2051,7 +2228,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // The consumers were already rewired to the local copy by layout_arena.
     run_layer_xfers(layer, ROUTE_B_XFER_LAYER_FRONT);
     {
-        const enum ggml_status hst = run_dense_by_device(ctx, cpu, dense_head);
+        const enum ggml_status hst = run_dense_by_device(ctx, cpu, dense_head, layer, "head");
         if (hst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense head failed L" << layer); return hst; }
     }
 #ifdef STREAM_MOE_TEMP
@@ -2059,24 +2236,33 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
 #endif
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer == 0 && ex) {
+        // Backend-agnostic value read (a device tensor's data is a fake offset).
+        auto read3f = [](const ggml_tensor * t, float v[3]) {
+            v[0] = v[1] = v[2] = 0.0f;
+            if (!t || !t->data) return;
+            float buf[4] = { 0, 0, 0, 0 };
+            const size_t n = std::min<size_t>(3, (size_t) ggml_nelements(t));
+            tensor_read_host(t, buf, 0, n * sizeof(float));
+            v[0] = buf[0]; v[1] = buf[1]; v[2] = buf[2];
+        };
         for (const auto * cn : ex->compute) {
             if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[1] && cn->src[1]->data) {
-                const float * p = (const float *) cn->src[1]->data;
+                float v[3]; read3f(cn->src[1], v);
                 const ggml_tensor * vs = cn->src[1]->view_src;
                 fprintf(stderr, "[cur] %s data=%p off=%zu view_src=%s(%p) v=%.6f %.6f %.6f\n",
                         cn->src[1]->name ? cn->src[1]->name : "?", cn->src[1]->data,
                         cn->src[1]->view_offs,
                         vs ? (vs->name ? vs->name : "?") : "-", vs ? vs->data : nullptr,
-                        p[0], p[1], p[2]);
+                        v[0], v[1], v[2]);
                 break;
             }
         }
         for (auto * nd : dense_head) {
             if (nd->name && strncmp(nd->name, "norm-0", 6) == 0 && nd->op == GGML_OP_RMS_NORM &&
                 nd->src[0] && nd->src[0]->data) {
-                const float * q = (const float *) nd->src[0]->data;
+                float v[3]; read3f(nd->src[0], v);
                 fprintf(stderr, "[embd] %s %.6f %.6f %.6f\n",
-                        nd->src[0]->name ? nd->src[0]->name : "?", q[0], q[1], q[2]);
+                        nd->src[0]->name ? nd->src[0]->name : "?", v[0], v[1], v[2]);
                 break;
             }
         }
@@ -2084,13 +2270,14 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
             const ggml_tensor * t = el.tensor;
             if (!t || !t->data) continue;
             if (t->type == GGML_TYPE_F32) {
-                const float * p = (const float *) t->data;
+                float v[3]; read3f(t, v);
                 fprintf(stderr, "[ext] %-6s %-26s f32 %.6f %.6f %.6f\n",
-                        el.role ? el.role : "?", t->name ? t->name : "?", p[0], p[1], p[2]);
+                        el.role ? el.role : "?", t->name ? t->name : "?", v[0], v[1], v[2]);
             } else if (t->type == GGML_TYPE_I32) {
-                const int32_t * p = (const int32_t *) t->data;
+                int32_t buf[4] = { 0, 0, 0, 0 };
+                tensor_read_host(t, buf, 0, std::min<size_t>(3, (size_t) ggml_nelements(t)) * sizeof(int32_t));
                 fprintf(stderr, "[ext] %-6s %-26s i32 %d %d %d\n",
-                        el.role ? el.role : "?", t->name ? t->name : "?", p[0], p[1], p[2]);
+                        el.role ? el.role : "?", t->name ? t->name : "?", buf[0], buf[1], buf[2]);
             }
         }
     }
@@ -2165,7 +2352,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // MLP) after moe_out is materialised.
     if (st == GGML_STATUS_SUCCESS && !dense_tail.empty()) {
         run_layer_xfers(layer, ROUTE_B_XFER_TAIL);   // moe_out on the tail's device
-        const enum ggml_status tst = run_dense_by_device(ctx, cpu, dense_tail);
+        const enum ggml_status tst = run_dense_by_device(ctx, cpu, dense_tail, layer, "tail");
         if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
     }
 #ifdef STREAM_MOE_TEMP
@@ -2175,19 +2362,41 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer >= 0) {
         const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);
         if (all) {
-            for (auto * nd : *all) {
-                if (!nd || is_alias_op(nd) || !nd->data) continue;
-                route_b_dump_node_bin(layer, nd->name, ggml_op_name(nd->op), (int) nd->type,
-                                      nd->ne[0], nd->ne[1], nd->data, ggml_nbytes(nd));
-                const size_t nb = ggml_nbytes(nd);
-                const uint8_t * bp = (const uint8_t *) nd->data;
+            std::unordered_map<const ggml_tensor*, char> nodeset;
+            for (auto * t : *all) if (t) nodeset[t] = 1;
+            // Dump a tensor (backend-agnostic: a device tensor's data is a fake
+            // offset pointer, never dereference it on the host). Name carries the
+            // layer + node index (+ src slot) so dumps are unique and ordered.
+            auto dump_one = [&](const ggml_tensor * t, const char * tag) {
+                if (!t || !t->data) return;
+                const size_t nb = ggml_nbytes(t);
+                std::vector<uint8_t> host(nb);
+                tensor_read_host(t, host.data(), 0, nb);
+                char nm[160];
+                std::snprintf(nm, sizeof(nm), "L%d_%s_%s", layer, tag, t->name ? t->name : "?");
+                route_b_dump_node_bin(layer, nm, ggml_op_name(t->op), (int) t->type,
+                                      t->ne[0], t->ne[1], host.data(), nb);
                 uint64_t h = 1469598103934665603ull;
-                for (size_t bi = 0; bi < nb; ++bi) { h ^= bp[bi]; h *= 1099511628211ull; }
+                for (size_t bi = 0; bi < nb; ++bi) { h ^= host[bi]; h *= 1099511628211ull; }
                 double v0 = 0.0;
-                if (nd->type == GGML_TYPE_F32) v0 = *(const float *) nd->data;
-                else if (nd->type == GGML_TYPE_I32) v0 = (double) *(const int32_t *) nd->data;
-                fprintf(stderr, "[node] L%d %-26s %-12s %016llx v0=%.6g\n", layer,
-                        nd->name ? nd->name : "?", ggml_op_name(nd->op), (unsigned long long) h, v0);
+                if (t->type == GGML_TYPE_F32) v0 = *(const float *) host.data();
+                else if (t->type == GGML_TYPE_I32) v0 = (double) *(const int32_t *) host.data();
+                fprintf(stderr, "[node] L%d %-40s %-12s %016llx v0=%.6g\n", layer,
+                        nm, ggml_op_name(t->op), (unsigned long long) h, v0);
+            };
+            for (size_t ni = 0; ni < all->size(); ++ni) {
+                auto * nd = (*all)[ni];
+                if (!nd || is_alias_op(nd) || !nd->data) continue;
+                char tag[32]; std::snprintf(tag, sizeof(tag), "%03zu", ni);
+                dump_one(nd, tag);
+                // Inputs that are not layer nodes (weights / leaves): dump them too
+                // so a node's operands can be compared offline.
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = nd->src[s];
+                    if (!src || !src->data || nodeset.count(src)) continue;
+                    char stag[40]; std::snprintf(stag, sizeof(stag), "%03zu_src%d", ni, s);
+                    dump_one(src, stag);
+                }
             }
         }
     }

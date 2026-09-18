@@ -41,7 +41,7 @@ struct model_pool_t {
     ggml_backend_buffer_type_t            buft = nullptr;       // expert pool buft
     ggml_backend_buffer_type_t            dense_buft = nullptr; // v2-chunk dense buft
     std::unordered_map<std::string, std::vector<src_seg_t>> dense_srcs; // name -> strip segments (v2 chunk)
-    llama_model_tensor_buft_override      overrides[3] = {};    // expert + dense + terminator
+    llama_model_tensor_buft_override      overrides[5] = {};    // expert + C1 + C2 + dense + terminator
     // Device pools beyond the CPU-RAM scheduler (M1+): allocated up front in
     // route_b_setup, same point as the RAM scheduler. Every block is a whole
     // group of slot-aligned expert runs (an expert weight is never split); a
@@ -140,7 +140,8 @@ llama_model_tensor_buft_override* route_b_setup(
     const char* model_path,
     const std::vector<std::string>& extra_files,
     const std::vector<std::string>& pools,
-    int threads, bool pool_full_when_zero) {
+    int threads, bool pool_full_when_zero,
+    const char* dense_placement) {
     sm_tmr::timer _t("route_b_setup");
     for (const auto& p : g_pools) {
         if (p->model_path == model_path) {
@@ -171,10 +172,11 @@ llama_model_tensor_buft_override* route_b_setup(
             std::fprintf(stderr, "route B: dense model - expert backend is a no-op\n");
             return nullptr;
         }
-        if (pool->topo->incomplete) {
-            // v2-chunk: remember every dense tensor's strip segments for fill
-            for (const auto& d : m.dense) pool->dense_srcs[d.name] = d.srcs;
-        }
+        // Remember every dense tensor's source segments so route B reads them
+        // itself through the shared DIO engine (all models, not just v2-chunk
+        // strips). The loader skips these tensors (docs/DEVICE_DENSE_CLOSURE.md
+        // SS3.5 "route B owns loading"); we fill them via route_b_fill_dense.
+        for (const auto& d : m.dense) pool->dense_srcs[d.name] = d.srcs;
         if (!g_shared_dio) {
             g_shared_dio = async_dio_engine::create(1024);
         }
@@ -314,6 +316,7 @@ llama_model_tensor_buft_override* route_b_setup(
         stream_moe_backend_set_threads(threads);
 
         pool->overrides[0] = { ".*_exps\\.weight", pool->buft };
+        int oi = 1;
         if (pool->topo->incomplete) {
             // v2-chunk: dense tensors are strip-scattered - route them to a real
             // dense buft so llama.cpp skips its tensor_info read and route_b
@@ -323,7 +326,20 @@ llama_model_tensor_buft_override* route_b_setup(
                 std::fprintf(stderr, "route B: dense buft unavailable\n");
                 return nullptr;
             }
-            pool->overrides[1] = { "^(?!.*_exps\\.weight)", pool->dense_buft };
+            pool->overrides[oi++] = { "^(?!.*_exps\\.weight)", pool->dense_buft };
+        } else if (dense_placement && *dense_placement) {
+            // Take over ALL dense tensors (docs/DEVICE_DENSE_CLOSURE.md SS3.5):
+            // C1 ("blk.*") and C2 (everything else) go to their --dense-placement
+            // device's buft, so every weight is exactly where the plan says.
+            auto dev_buft = [](const char * dn) -> ggml_backend_buffer_type_t {
+                if (!dn || !*dn || std::strcmp(dn, "CPU") == 0) return nullptr;
+                ggml_backend_dev_t d = ggml_backend_dev_by_name(dn);
+                return d ? ggml_backend_dev_buffer_type(d) : nullptr;
+            };
+            ggml_backend_buffer_type_t c1 = dev_buft(route_b_dense_device(dense_placement, 0, 1));
+            ggml_backend_buffer_type_t c2 = dev_buft(route_b_dense_device(dense_placement, 1, 1));
+            if (c1) pool->overrides[oi++] = { "^blk\\.", c1 };
+            if (c2) pool->overrides[oi++] = { "^(?!blk\\.)", c2 };
         }
 
         std::fprintf(stderr, "route B: expert pool active (model '%s'), %.1f GB cap, %u slots%s\n",
@@ -338,11 +354,11 @@ llama_model_tensor_buft_override* route_b_setup(
     }
 }
 
-bool route_b_fill_dense(const char* tensor_name, void* data) {
-    if (!tensor_name || !data) return false;
+bool route_b_fill_dense(const char* tensor_name, ggml_tensor* t) {
+    if (!tensor_name || !t) return false;
     const std::string name(tensor_name);
     for (auto& p : g_pools) {
-        if (!p->topo || !p->topo->incomplete) continue; // only v2-chunk pools take over dense
+        if (!p->topo) continue;
         auto it = p->dense_srcs.find(name);
         if (it == p->dense_srcs.end()) continue; // expert / unknown: scheduler or default path
         std::vector<sub_tensor_req_t> reqs;
@@ -364,11 +380,18 @@ bool route_b_fill_dense(const char* tensor_name, void* data) {
             staging = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(ssz));
             if (!staging) return false;
         }
+        // Read into a host buffer, then upload to the tensor's backend: a device
+        // tensor's data is a fake offset pointer, never write it on the host.
+        std::vector<uint8_t> host(ggml_nbytes(t));
         uint8_t dummy = 0;
         const bool ok = read_expert_sync(p->dio.get(), p->shards, plan,
-                                         staging ? staging : &dummy, static_cast<uint8_t*>(data));
+                                         staging ? staging : &dummy, host.data());
         if (staging) async_dio_engine::free_aligned(staging);
-        return ok;
+        if (std::getenv("STREAM_MOE_DBG"))
+            std::fprintf(stderr, "[fill_dense] %-40s nbytes=%zu ok=%d\n", name.c_str(), host.size(), (int) ok);
+        if (!ok) return false;
+        ggml_backend_tensor_set(t, host.data(), 0, host.size());
+        return true;
     }
     return false;
 }

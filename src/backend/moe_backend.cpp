@@ -291,33 +291,18 @@ bool moe_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t bu
     for (const auto& e : g_dev_execs) {
         if (e.be && (buft == e.arena_buft || buft == e.stage_buft)) return true;
     }
-    return false;
+    auto * physical = ggml_backend_buft_get_device(buft);
+    auto * backend = physical ? route_b_device_backend(ggml_backend_dev_name(physical)) : nullptr;
+    return physical != dev && backend && ggml_backend_supports_buft(backend, buft);
 }
 
 bool moe_dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor* op) {
-    // Take ownership ONLY of routed-expert MUL_MAT_ID (`*_exps`). Everything
-    // else (dense, shared `*_shexp`, embeddings, ...) must stay on llama.cpp
-    // defaults - otherwise the loader would select our ACCEL buft for them.
-    if (!op || !op->src[0] || !op->src[0]->name) return false;
-    const char* n = op->src[0]->name;
-    if (!n[0]) return false;
-    // Whole-layer ownership: claim llama's fused ops so llama_context::resolve
-    // sees device_fused == dev_layer (both StreamMoE) and keeps the fused path
-    // instead of decomposing to primitive ops (deepseek4 LIGHTNING_INDEXER /
-    // DSV4_HC_*, flash attention).
-    if (stream_moe::route_b_whole_layer_active() && stream_moe::route_b_is_fused_op(op->op))
+    if (!op) return false;
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[0] && std::strstr(op->src[0]->name, "_exps")) {
         return true;
-    if (op->op == GGML_OP_MUL_MAT_ID) {
-        return std::strstr(n, "_exps") != nullptr;
     }
-    // View / layout ops whose source lives on our host compute buffer (e.g.
-    // gemma4 slices the fused gate_up MUL_MAT_ID output). These are pure views
-    // (no weight read) - the delegate executes them on the real buffer.
-    if (op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE ||
-        op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_PERMUTE ||
-        op->op == GGML_OP_CONT) {
-        auto* ctx = static_cast<moe_dev_ctx*>(dev->context);
-        return op->src[0]->buffer && op->src[0]->buffer->buft == ctx->host_buft;
+    if (auto * physical = route_b_op_physical(op)) {
+        return physical != dev && ggml_backend_dev_supports_op(physical, op);
     }
     return false;
 }

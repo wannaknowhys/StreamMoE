@@ -23,16 +23,23 @@ namespace stream_moe {
 // expert byte size (full residency, no eviction) instead of 75% free RAM.
 // Returns a per-pool tensor_buft_overrides array (terminated by {nullptr,nullptr})
 // or nullptr on failure.
+// `dense_placement`: "--dense-placement C1:<dev>,C2:<dev>" spec (may be empty).
+// When set, route B also takes over ALL dense model tensors: `^blk\.` (C1) and
+// `^(?!blk\.)` (C2) go to their placement device's buft, so every weight is
+// exactly where the plan says (no reliance on llama's get_layer_buft_list).
 llama_model_tensor_buft_override* route_b_setup(
     const char* model_path,
     const std::vector<std::string>& extra_files,
     const std::vector<std::string>& pools,
-    int threads, bool pool_full_when_zero);
+    int threads, bool pool_full_when_zero,
+    const char* dense_placement);
 
-// v2-chunk: fill a dense tensor from its strip-file segments (called by the
-// llama.cpp loader where it would otherwise skip the override read). Expert
-// tensors / unknown names are a no-op. Returns true if the tensor was filled.
-bool route_b_fill_dense(const char* tensor_name, void* data);
+// Fill a dense tensor from its GGUF source segments via the shared DIO engine
+// (route B owns loading, all models). Called by the llama.cpp loader for every
+// tensor routed to a route-B buft. The upload is backend-agnostic (device
+// tensors are uploaded with ggml_backend_tensor_set). Expert tensors / unknown
+// names are a no-op. Returns true if the tensor was filled.
+bool route_b_fill_dense(const char* tensor_name, struct ggml_tensor* t);
 
 // Dense placement (docs/DENSE_PLACEMENT.md, Phase 1a). `spec` is
 // "C1:<dev>,C2:<dev>" (GLOBAL = C2 alias; RAM/CPU = host). Called from the
