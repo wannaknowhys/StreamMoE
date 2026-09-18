@@ -36,7 +36,7 @@ The same methodology drives route B and the stock upstream binary.
 `tools/run_bench.js` reuses the `run_specs` model/engine/task cartesian product
 and `${VAR}` env expansion from `run_export.js`.
 
-```
+```bash
 node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]>
                         [--port N] [--health-timeout S] [--out FILE] [--dry-run]
 ```

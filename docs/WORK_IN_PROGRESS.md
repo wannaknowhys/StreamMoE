@@ -118,7 +118,7 @@
 > gate_up Q4_K 2230272=4096×544.5（非 4K）/ down Q5_1 1486848（4K）/ 末层 Q8_0 2106368（非 4K）；
 > deepseek+dspark Q8_0 4456448 全 4K。
 
-**定案（用户 2026-09，两步 + 装载分流）**
+### 定案（用户 2026-09，两步 + 装载分流）
 
 - **文件侧（B，保留 expert-blocks 架构）**：v2 块内**每个张量切片独立 4K 对齐**（gate_up 段、
   down 段各自起点 4K；原紧凑拼接 down 起点因 gate_up 2230272 半块错开非 4K）。块内 offset 计算
@@ -133,7 +133,7 @@
   - perExpert 非 4K → DIO 读 4K 窗口 → **staging move**（gemma gate_up 2230272、末层 down）
   - 异步 ring buffer / pending 聚合 / staging 基础设施已有（async_load_t reqs[pending]）
 
-**任务**
+### 任务
 
 - [x] K1 转换器：v2 write 侧块内分支 offset 每分支 align_up 4K（computeV2Layout 块内布局 + fill pad）；read 侧 buildLayerBranches 对称（branchOff 对齐）。产出合法 v2（tensor_info 占位不变）——57a2838
 - [x] K2 跑转换 gemma original→新 v2（v2align，branch_align=1），验证：块内每张量切片 offset%4096==0、llama/convertd 可读、与旧 v2 数值等价（16/16 切片采样逐字节一致）——N:\AI_LLM\gemma-4-26B-A4B-it-UD-Q4_K_M-v2align.gguf
@@ -332,7 +332,7 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 **收敛计划（2026-09-07 冻结，未执行——先做 out_off buffer 改造）**：
 
 - 目标：唯一执行引擎 = 紧凑链 buckets 引擎；删 A 全族（exec_split_legacy_impl / exec_mixed_mm /
-  exec_one_burst / hide_output / hide_burst / refresh_aliases / tmp_split_* 自测 / exec_round_cpu|vk /
+  exec_one_burst / hide_output / hide_burst / refresh_aliases / `tmp_split_*` 自测 / exec_round_cpu|vk /
   build_cur_sub / scatter_sub_dst）；B（`exec_layer_burst_chain_buckets` + append_*_bucket 全族 +
   append_expert_fold + chain_exit）移出 `#ifdef STREAM_MOE_TEMP` 无条件编译；exec_layer_burst 只留
   ex 闭包 + input_layouts 指针修复 + pin 段，之后无条件调 buckets（默认单全宽桶 = cut=one 语义，env
@@ -445,7 +445,7 @@ handle.pool` 直接从 pin 返回的 handle 取（`pin_layer` 本就 per-expert 
 - 结论：设备侧非权重开销 MB 级；scale 每设备存全量可忽略；cur 挑 token 已实现
   （`bucket_gather_cur`）。
 
-**已确认的硬点（无阻塞）**
+### 已确认的硬点（无阻塞）
 
 - 设备 tensor 绑定范式（删 A 前 `exec_round_vk`）：`t->buffer=设备 buffer;
 t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
@@ -453,7 +453,7 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 - vulkan 支持 ACC（op_params 的 nb1/2/3/offset，含 delta 等差）/GET_ROWS/SUM_ROWS/CLAMP。
 - 回读走 `ggml_backend_tensor_get`（transfer-queue DMA），不用 rebar host 读 0.02GB/s。
 
-**任务**
+### L 任务
 
 - [x] chain_ctx 加 target（pool/backend/arena+stage buffer/host map/bump）+ bind_pool /
       bind_arena / bind_stage 助手；CPU 路径行为不变（`device_target_t` + `chain_ctx.dev`；
@@ -468,7 +468,7 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 - [x] 回归：纯 RAM 默认 vs HEAD 干净构建 **IDENTICAL**；RAM8G+VRAM256M 跑通、VRAM round 真的
       走设备（`dev=1`）、对同分区 force-cpu **cos 0.982**（与已知 0.986 同量级，backend gate）
 
-**踩坑记录**
+### 踩坑记录
 
 - **vulkan ACC 的 nb2/nb3 不能为 0**：`acc.comp` 用 `src1_i / p.nb03 / p.nb02` 分解索引（CPU 核
   忽略 2D src1 的 nb2/nb3）。传 0 → 除零 → acc 全零。改成传 `d_out*n_t*4` 后 acc 正常。

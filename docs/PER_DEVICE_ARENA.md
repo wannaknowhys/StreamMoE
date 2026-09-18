@@ -66,7 +66,7 @@ deepseek 2630 MB -> ~67 MB.
 `layout_arena` becomes a per-device planner. One `region_plan_t` per device.
 Regions are grouped by **liveness**, not by stage:
 
-```
+```cpp
 struct region_plan_t {
     std::string dev;                     // "" = host
     ggml_backend_buffer_t buf;           // grow-only, one per device

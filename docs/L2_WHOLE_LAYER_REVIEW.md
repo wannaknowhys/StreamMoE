@@ -42,7 +42,7 @@
 | A4   | `dense_head` / `closure` / `dense_tail` 三者互斥且并集 = `lns`，完全靠 `in_closure` + `down[]` 两段逻辑「顺便」保证，无任何显式校验                                                                                | Claude                  | 后续改代码易被静默破坏      |
 | A5   | `last_suffixed` 传播停止条件可能漏掉最后一层「最后一个带 `-<il>` 后缀节点之后」的匿名尾部节点（如 MoE 后匿名 residual/add）                                                                                        | DeepSeek / Claude / GPT | capture 漏节点、tail 不完整 |
 
-**对应建议**
+#### A 对应建议
 
 - A1：不要只看 `nodes[0]`，应遍历 split，只跳过 alias，继续处理非 alias 节点。
 - A2：`first_node` 取该层第一个**非 alias** 节点；debug 打印 `first_node / has_first`，当「layer 出现在 nodes 中但 `!has_first`」时报警。
@@ -60,7 +60,7 @@
 | B4   | `dense_host` 判定只看 source buffer，不看 `nd->buffer`，隐含假设 scheduler 会给 nd 分配正确 host output buffer                                                      | GPT / DeepSeek    | 依赖隐式行为，多 backend 下不稳                                                                                               |
 | B5 ★ | `moe_dev_supports_buft` 在 `STREAM_MOE_TEMP` 下无条件 `return true`，**没跟 `no_whole` 联动**                                                                       | Claude / DeepSeek | ① 所有 debug build 调度行为被悄悄改变，`NO_WHOLE_LAYER=1` 对照组不干净；② 可能把设备 buffer 的 tensor 分给 CPU 执行 → 崩/读错 |
 
-**对应建议**
+#### B 对应建议
 
 - B1：dump 检查 VIEW 的 `data` 何时被设置；加 `assert(src->data)`；否则 `lf->data = src->data` 会把 NULL 带进去（GPT 认为这是**最值得实际 dump 检查的 bug candidate**）。
 - B2：加 assert：若某 src 属于 `dense_nodes`，则它必须出现在更早位置。
@@ -77,7 +77,7 @@
 | C3  | `g_layer_nodes_all` 在 `moe_chain_assign_backend` 里没 clear；若 `collect_layer_nodes` 内部不清，多次 build graph 会累积旧节点指针                                                          | DeepSeek          | 悬垂指针 / 重复执行 / dump 错乱                                                            |
 | C4  | `collect_layer_nodes` 实现未在 diff 中出现（可能链接失败）；且它是否复用修好的 `lay[]` 未知                                                                                                 | Claude / DeepSeek | output head 泄漏进最后一层的问题可能只在「层归属查询」层面修好，在「实际 capture」层面还漏 |
 
-**对应建议**
+#### C 对应建议
 
 - C1：每次新 decode/graph 开始时重置为 `nullptr`；改 `thread_local`。
 - C2：先确认 ctx 是否 `no_alloc`；若会落地数据，按 `ggml_nbytes` 精确算预算。
@@ -101,7 +101,7 @@
 | E3  | `is_view_op()` 与 `is_alias_op()` 语义重叠（`is_view_op(CONT)==true` 但 `is_alias_op(CONT)==false`），未来误用会把 CONT 当 alias | GPT          |
 | E4  | 「每层所有节点会被切进同一连续 split」是 whole-layer 正确性依赖的隐式假设，但 split 由 scheduler 启发式决定，无人保证            | Claude / GPT |
 
-**对应建议**
+#### E 对应建议
 
 - E1：归属做成「验证式」——跨层匿名节点直接报错，不 silent recovery。
 - E2：从已有 MoE closure（`moe_layer_exec_t` 的 compute 集合）反推 boundary，而不是从 tensor name 猜。
@@ -121,7 +121,7 @@
 
 建议新增（GPT #10 / Claude #4）：
 
-```
+```text
 STREAM_MOE_L2_CAPTURE=1        // 只 capture
 STREAM_MOE_L2_OWNERSHIP=1      // 只改 ownership，不执行 dense
 STREAM_MOE_L2_EXECUTION=1      // 真正执行
@@ -133,7 +133,7 @@ STREAM_MOE_TMP_WHOLE_LAYER=<L>     // 只开单层 L，其余走 baseline
 
 ### 2.2 推荐测试顺序
 
-```
+```text
                     ┌─ NO_WHOLE_LAYER=1 ── baseline
 graph build ─ capture ┤
                     └─ whole layer
@@ -157,7 +157,7 @@ graph build ─ capture ┤
 - 用同一 tiny fixture，`NO_WHOLE_LAYER=1` vs whole-layer 两次跑，对比每层每节点数值；重点看 `norm / cur / ffn_moe_in / ffn_moe_out / residual / post_norm`。**不需要先看最终 logits**。
 - 正式化成 **whole-layer A/B verifier**：对每节点输出做 hash/compare，直接输出：
 
-```
+```text
 L17 norm        SAME
 L17 Qcur        SAME
 L17 attn        SAME
@@ -237,7 +237,7 @@ L17 residual    DIFFER   ← 直接定位是 residual 被改坏
 
 7. **layer output 作为显式 synchronization boundary**（GPT）
 
-   ```
+   ```text
    HEAD → materialize MoE input → pin experts → MOE BURST
         → materialize MoE output → TAIL → LAYER COMPLETE → 下一层
    ```
@@ -254,7 +254,7 @@ L17 residual    DIFFER   ← 直接定位是 residual 被改坏
 
 11. **host-resident 判定升级为 per-layer `LayerCapability`**（GPT）
 
-    ```
+    ```text
     Layer 0: dense=HOST, moe=STREAM_MOE, activation=HOST
     Layer 1: dense=GPU,  moe=STREAM_MOE, activation=HOST
     ```
@@ -271,7 +271,7 @@ L17 residual    DIFFER   ← 直接定位是 residual 被改坏
 
 加逐层开关（`src/backend/route_b_chain.cpp`，`STREAM_MOE_TEMP` 门控）：
 
-```
+```text
 STREAM_MOE_TMP_WHOLE_LAYER=L     只对第 L 层启用 whole-layer
 STREAM_MOE_TMP_WHOLE_LAYER_MAX=N 只对 layer <= N 启用
 ```

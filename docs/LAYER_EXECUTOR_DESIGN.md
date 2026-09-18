@@ -103,7 +103,7 @@ still allocates. The device path already sets `buffer` (`:724`).
 One arena buffer per device, sized once (never re-grown - a grow would
 invalidate already-set `data` pointers), split into three fixed sub-regions:
 
-```
+```text
 [ carry region (fixed base) ][ compact region ][ closure block ]
 ```
 

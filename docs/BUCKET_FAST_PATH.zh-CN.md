@@ -101,7 +101,7 @@ peel 机制（mix_split.cpp:21-35, 108-135）：每 pool 按 hit_count 分桶，
 
 `append_expert_fold`（minigraph_exec.cpp:608-624）：
 
-```
+```text
 weighted [d_out, w_b, n_active]
   -> permute(1,0,2,3)            // 视图 [w_b, d_out, n_active]，新 nb0 = d_out*4
   -> ggml_cont                   // :615 真正搬数据（转置）

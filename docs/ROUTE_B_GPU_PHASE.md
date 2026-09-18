@@ -186,7 +186,7 @@ Current single-pool code already keeps a pool dimension in the directory
 (entries is (L,E) x pool, `scan` iterates pools) - keep that. What changes is
 physical slot addressing (today one base carved into layer groups):
 
-```
+```text
 device_pool[] = {
   ggml_backend handle,
   physical base (VRAM or RAM), slot stride, capacity,
@@ -198,7 +198,7 @@ device_pool[] = {
 **Fixed arena per device**: one preallocated block sized for the worst-case
 layer the device will process:
 
-```
+```text
 arena = [ staging(cur copy) | exec region (chain intermediates overwrite in
           place) | result (expert contributions) ]
 ```

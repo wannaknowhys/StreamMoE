@@ -1,7 +1,9 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-15（**phase 3 设备执行落地**，`102c2eb`/`b525e29`：`设备名→ggml_backend_t` 注册表 + `node→device`，dense head/tail 按 placement 设备跑；通用 stage 化 `xfer` 跨设备搬运（一次拷贝，覆盖 carry/cur/moe_out）；`cur`/`moe_out` backend 无关。run_baseline PASS。前情：2026-09-14（**每设备 arena 规划落地**，`fdd772e`：`layout_arena` 改 per-device `region_plan_t`（每设备 grow-only buffer），两区域按生命周期分——`carry`（跨层流水，逻辑一份、物理 per-device、跨边界 relay）+ `scratch`（层内：dense head/tail 与 MoE closure 合并成一个池）；closure 归专家池设备；`moe_chain_fullalloc_buffer`/`route_b_in_arena` 改按设备查。CPU-only 单 host plan：pack vs sum IDENTICAL、vk gate 121/129、`run_baseline` PASS。前情：**prefill 导出捕获修复** `da932e4`/`f42bd1d`（cb_eval 逐节点 → 选择性 need + 保留张量；compact pack 不是数值 bug）；`StreamMoE_latest`/`StreamMoE_dump_dbg` 构建 + AGENTS 15（禁回滚）；**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
+> **最近更新**：2026-09-17（**xfer shell 按层修复 + KV/物理设备解耦 + 参数拒绝**）：xfer shell 复用键纳入 consumer layer，避免跨层复用同一 shell；`dev_layer()` 表示 STREAMMOE 调度设备，`dev_layer_physical()` 表示 C1 物理设备，KV/DSV4 compressor/recurrent state 跟随后者；CLI/env/preset 显式冲突放置参数拒绝。既有 129-token 证据：`temp/embedding_probe_2026-09-17T19-07-02-705Z/manifest.json`（label=`xfer_layer_fixed_129`，ref/dev 均 exit 0）；同目录 `gate_ref_vs_dev.log`：123/129=95.3% PASS，`gate_frozen_vs_ref.log`：121/129=93.8% PASS（embd cos>=0.99 的 token 比例至少 90%，非 bit 一致）。本次仅重生成 route-b patch 与同步本检查点：独立 clone 从 `f280b2698` 按 macros → tsc_timer → route-b-inject → prefill-export-llama 重放，3494 文件仅规范化 CRLF 后逐字节一致；证据 `temp/patch_replay_20260917.log`、`temp/patch_verify_result_20260917.json`。未改源码/frag、未重跑数值测试、未 commit/push，现有未提交 prefill patch 保持原字节。
+>
+> **前次更新**：2026-09-15（**phase 3 设备执行落地**，`102c2eb`/`b525e29`：`设备名→ggml_backend_t` 注册表 + `node→device`，dense head/tail 按 placement 设备跑；通用 stage 化 `xfer` 跨设备搬运（一次拷贝，覆盖 carry/cur/moe_out）；`cur`/`moe_out` backend 无关。run_baseline PASS。前情：2026-09-14（**每设备 arena 规划落地**，`fdd772e`：`layout_arena` 改 per-device `region_plan_t`（每设备 grow-only buffer），两区域按生命周期分——`carry`（跨层流水，逻辑一份、物理 per-device、跨边界 relay）+ `scratch`（层内：dense head/tail 与 MoE closure 合并成一个池）；closure 归专家池设备；`moe_chain_fullalloc_buffer`/`route_b_in_arena` 改按设备查。CPU-only 单 host plan：pack vs sum IDENTICAL、vk gate 121/129、`run_baseline` PASS。前情：**prefill 导出捕获修复** `da932e4`/`f42bd1d`（cb_eval 逐节点 → 选择性 need + 保留张量；compact pack 不是数值 bug）；`StreamMoE_latest`/`StreamMoE_dump_dbg` 构建 + AGENTS 15（禁回滚）；**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
 
 ---
 
@@ -20,7 +22,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - **两区域按生命周期**：`carry`（跨层流水：逻辑一份，物理 per-device，**跨设备边界 relay**——第 L 层的副本永远在 dev(L)，consumer 读到的一定是对的那份；carry1 和 carryN 每个边界一起搬）；`scratch`（层内临时量：dense head/tail 与 MoE closure **合并成一个池**，执行器 `ex.out_off`/`result_bytes` 改为索引该池，`moe_chain_fullalloc_buffer` 按设备查）。
 - **设备解析**：节点设备 = 权重操作数 buffer 的设备（dense → placement 设备；专家 → 池设备）；无权重继承 producer；host/CPU 坍缩成 host plan。**closure 归专家池设备**（`route_b_closure_device`，`route_b_setup` 记录池设备）——专家权重不在普通 buffer 里，`dev_of` 无法从权重解析。
 - **跨设备 carry relay（2026-09-14，`0ef71df`）**：carry 张量是 producer 节点输出 → 留在 producer 设备；consumer 在别的设备时 `layout_arena` 在 consumer 层的 carry 边界集合里预留一个 shell 本地副本（共用打包/生命周期），把 consumer 的 `src` 改指它；`exec_layer_burst` 层前同步 `ggml_backend_tensor_copy`。CPU-only 无跨设备 → relay 空 → IDENTICAL。
-- **仍待做（phase 3）**：C1/C2 在 placement 设备上执行（`run_dense_subgraph` 仍恒用 CPU backend）。
+- **phase 3 已落地（2026-09-15/17）**：C1/C2 dense head/tail 按 placement 设备执行；跨设备边在 consumer 的 `xfer` 区分配本地 shell，按 `LAYER_FRONT`/`CLOSURE`/`TAIL` 搬运。**xfer shell 按层修复**：复用判据为 producer/device/stage/consumer layer，避免共享 producer（如全局输入）跨层复用同一 shell 而漏掉后续层传输；`xfer` 空间仍按层复用。129-token RAM ref 对 Vulkan C1/C2 + mixed expert pools 的既有 gate 为 123/129 PASS（证据见顶部最近更新）。
 - **验证（CPU-only 单 host plan，数值不变）**：pack vs sum `IDENTICAL`（embd/hidden/KV + 专家历史）；vk gate 121/129（93.8%）；生产 `run_baseline` PASS。实测 gemma ub129：decode carry1 88 KB/scratch 8 MB，prefill carry1 1.4 MB/scratch 128 MB。
 
 ### M4 收编：自研主项目删除（2026-08-31）
@@ -31,14 +33,14 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ### vendored patch 体系（2026-09-03 重构：frag 全主仓库 + features 宏机制）
 
-- **vendored HEAD = 纯上游 `f280b2698`**，工作区干净（5 patch 全部 apply 为工作态）。
+- **vendored HEAD = 纯上游 `f280b2698`**，工作区是 4 patch 叠加的未提交修改态（不是 clean）；2026-09-17 已从实际工作区重生成 route-b 差量并验证重放。
 - **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b / prefill_export / route_b,prefill_export）→ vendored 根 `CMakeLists.txt` features 块全局 `add_compile_definitions` + `include_directories`（主仓库 frag 目录）。**宏不拼 CXX_FLAGS**。宏对当次构建全部 target 生效（防静默丢弃）。
 - **frag 全在主仓库**（随主仓库 commit）：`patches/route-b/common/`、`patches/prefill-export/common/`、`patches/prefill-export/include/`——vendored `include/` 已清空。
 - **4 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
   - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（根 CMakeLists features 块 + 共享文件 include 锚点：arg/common.cpp/h/llama.h/server-context 3 锚点）+ `tsc_timer.patch`（[TMR] `sm_tmr`，`STREAM_MOE_TMR` env 门控）
-  - **Phase 2a（可选）**：`route-b-inject.patch`（route-b 专属：common/CMakeLists STREAM_MOE_SRC + speculative + llama-model-loader.cpp/h + llama-model.cpp + llama.cpp）——**无 frag new-file、无 server-context 段**
+  - **Phase 2a（可选）**：`route-b-inject.patch`（2026-09-17 重生成，14 文件，273 行新增/15 行删除）：保留 common/CMakeLists STREAM_MOE_SRC、speculative.cpp/h、llama-model-loader.cpp/h、llama.cpp；更新 llama-model.cpp/h 的逻辑/物理设备分离；新增 common/arg.cpp、common/preset.cpp 参数追踪、llama-context.cpp 的 `route_b_begin_graph()`、llama-kv-cache.cpp / llama-kv-cache-dsv4.cpp / llama-memory-recurrent.cpp 的物理设备选择与冲突拒绝。**无 frag new-file，不重复 phase1 的根 features、llama.h、common/common、Vulkan hostmap/dma、server-context 锚点；不重复 prefill 导出段。**
   - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 专属：llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）——**无 frag new-file**
-- **应用顺序**：macros → tsc_timer → route-b-inject → prefill-export-llama（临时 worktree 逐字节一致验证过）。
+- **应用顺序与本次验证（2026-09-17）**：macros → tsc_timer → route-b-inject → prefill-export-llama；独立 clone `temp/patch_replay_20260917`，`core.autocrlf=false`，各 patch `--check` 后顺序 apply。3494 文件中 61 文件原字节相同、3433 文件仅 CRLF 不同；仅将 CRLF 规范化为 LF 后零差异。prefill 仅有预期的 context +3 / KV +4 行定位偏移，未修改其 patch。日志 `temp/patch_replay_20260917.log`，校验结果 `temp/patch_verify_result_20260917.json`；真实 vendored 与主仓库源码/frag 的 SHA-256 未变。
 - **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`StreamMoE`→route_b（无导出代码的旗舰对话 build，见下）；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`StreamMoE` + `upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；`--expert-backend` **隐含 no-op-offload**，见下）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖。
 - **op_offload 与数值形态**：llama 默认 `op_offload=true`（把 host 计算自动 offload 到 device，-ngl 0 也占 Vulkan0 compute buffer ~1.3G）。`--expert-backend` 在 frag 里隐含 `--no-op-offload`（route B 拥有专家放置权，3932d33）——Vulkan0 splits=0 实测。但 **GGML_VULKAN=ON 编译本身改变数值**（CPU buft 换 Vulkan0 host buft 等 host 内存形态，gate 边界 expert-flip 级噪声）——回归按构建形态选基线：CPU-only 编对 `baseline_regression\baseline\moe_129_8192`，默认 vulkan 编对 `moe_129_8192_vk`（run_baseline.bat 首参，见该 README）。
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
@@ -71,8 +73,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ### dense 位置管理 Phase 1a（2026-09-08，docs/DENSE_PLACEMENT.md）
 
-- `--dense-placement C1:<dev>,C2:<dev>`：整体 C1 / 整体 C2 选设备（RAM/CPU/Vulkan0/...）。经 `llama_model_params.dense_placement` → `get_layer_buft_list` route-b 钩子（`stream_moe::route_b_dense_device`）设置 `dev_layer`，KV 自动跟随（`offload_kqv`）。
-- `--expert-backend` 下 `-ngl` 报错退出；设备名非法报错退出；不传 placement 默认 dense 全 CPU。
+- `--dense-placement C1:<dev>,C2:<dev>`：整体 C1 / 整体 C2 选设备（RAM/CPU/Vulkan0/...）。经 `llama_model_params.dense_placement` → `get_layer_buft_list` route-b 钩子设置物理放置。**2026-09-17 解耦**：每模型从 expert buffer override 识别 `route_b_enabled()`；route-b 的 `dev_layer()` 返回 STREAMMOE 调度设备，`dev_layer_physical()` 返回真实 C1 设备。KV、DSV4 compressor、recurrent state 用后者分配，非 route-b 模型保持原物理设备语义。
+- **参数拒绝（2026-09-17）**：CLI/env/preset 跟踪显式标准放置选项；`--expert-backend` 下拒绝 gpu-layers/device/main-gpu/split-mode/tensor-split/cpu-moe/n-cpu-moe/override-tensor/kv-offload/op-offload/no-host/kv-placement，以及显式 `--fit on`；使用 `--dense-placement`、`--moe-expert-pools`，KV 跟随 C1，`--fit off` 可用。物理 C1 在 GPU 且 `--no-kv-offload` 时，KV/DSV4/recurrent 构造直接报错；放置设备不在 model devices 中直接报错，不再静默回退 CPU。不传 placement 默认 dense 全 CPU。
 - 实测 gemma-4-26B 129-token prefill-from：默认 / `C1:RAM,C2:RAM` 逐字节 IDENTICAL；`C1:Vulkan0,C2:Vulkan0` 30 C1 + 输出层上 Vulkan0，hidden cos ~0.986（已知后端噪声量级）；`C1:RAM,C2:Vulkan0` / `C1:Vulkan0,C2:RAM` ~0.9999。DeepSeek C1 放不进 RX590 8G（dense 11.66 GB），目标 P100 16G。
 - patch 重生成 + 临时 worktree apply 逐字节复现（20 文件）。
 
@@ -146,9 +148,9 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 ## 4. 下一步（TODO）
 
-**主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线**
+### 主线：GPU 执行已落地（M2-2 全并行骨架），剩余收尾 + 长线
 
-0. **每设备 arena 执行侧：phase 3 已落地（2026-09-15，`102c2eb`/`b525e29`）**。`route_b_setup` 建 `设备名→ggml_backend_t` 注册表；`layout_arena` 暴露 `node→device`；`exec_layer_burst` 把 dense head/tail 按 placement 设备分组、各在自己 backend 上跑（`run_dense_subgraph`，host→CPU）。**通用跨设备搬运**：每条生产者/消费者设备不同的边，在消费者设备新增的 `xfer` 区分配 shell + 改指 consumer `src`，执行器按 stage（`LAYER_FRONT`/`CLOSURE`/`TAIL`）各跑一次 `ggml_backend_tensor_copy`（生产者被写多次也只搬一次），统一覆盖 carry/`cur`/`moe_out`；`cur` 上传与 `moe_out` 回写改 backend 无关。run_baseline PASS（vk gate 121/129=93.8%，upstream IDENTICAL）。**仍待**：C1 跨设备拆分（同层 head→head 边需更细 stage）；设备侧验证（C1/C2 上 Vulkan，先前记录的 VRAM 池 `0xC0000005` 需复核是否已被 B39 修复覆盖）。
+0. **每设备 arena 执行侧：phase 3 已落地（2026-09-15，`102c2eb`/`b525e29`）**。`route_b_setup` 建 `设备名→ggml_backend_t` 注册表；`layout_arena` 暴露 `node→device`；`exec_layer_burst` 把 dense head/tail 按 placement 设备分组、各在自己 backend 上跑（`run_dense_subgraph`，host→CPU）。**通用跨设备搬运**：每条生产者/消费者设备不同的边，在消费者设备新增的 `xfer` 区分配 shell + 改指 consumer `src`，执行器按 stage（`LAYER_FRONT`/`CLOSURE`/`TAIL`）各跑一次 `ggml_backend_tensor_copy`（生产者被写多次也只搬一次），统一覆盖 carry/`cur`/`moe_out`；`cur` 上传与 `moe_out` 回写改 backend 无关。run_baseline PASS（vk gate 121/129=93.8%，upstream IDENTICAL）。**2026-09-17 更新**：xfer shell 按 consumer layer 区分，KV/dev_layer 物理设备解耦与参数拒绝已进入当前 patch 栈；已有 C1/C2 Vulkan + RAM:71680,Vulkan0:128 的 129-token 设备侧验证（ref/dev exit 0、123/129 PASS；frozen/ref 121/129 PASS），证据见顶部 `embedding_probe_2026-09-17T19-07-02-705Z`。这证明该配置跑通，不扩大为所有 VRAM 崩溃路径均已覆盖。**仍待**：C1 跨设备拆分（同层 head→head 边需更细 stage）。
 1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
 2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
 3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。
@@ -156,11 +158,11 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 5. **H 长线**：消灭 phase2a/2b patch（vendored 改动全经 phase1 打桩 + 主仓库内容）。
 6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
 
-**顺手**
+### 顺手
 
 7. `llama-tokenize` 一次性编译（`ninja llama-tokenize`）；3 个 direct_fill task spec；OpenSSL（`OPENSSL_ROOT_DIR`）。
 
-**明确不做**（用户决策）
+### 明确不做（用户决策）
 
 - deepseek prefill 追 bit 级（A1）；prefill 全 token 层状态验证（B5）；v1 张量级分片（C6）。
 - 设备混跑 vs CPU 的 cos 0.982 差距（2026-09-08，与已知 0.986 冻结基线同量级，不追）。

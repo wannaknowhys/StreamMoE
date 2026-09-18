@@ -35,7 +35,7 @@ bit 63........32 | 31........3 | 2 1 0
 
 - **generation (32 bit)**: 每次 slot 被重新装填不同专家时自增，用于防 ABA。
 
-#### 监听与唤醒路径 (低 32 位):
+#### 监听与唤醒路径 (低 32 位)
 
 - **Windows 路径**: `WaitOnAddress` 支持 1/2/4/8 字节，直接对整个 64 位字做 `WaitOnAddress(addr, &expected_snapshot, 8, ...)`，拿完整的 64 位快照做比较，不用拆字，最简单。
 
@@ -69,7 +69,7 @@ READY  --CAS-->  EVICTING  ----->  清空 expert_directory  ----->  等 refcount
 
 - `expert_directory_version[n_expert]`: 32 位/64 位原子自增版本号，每专家一个。用于解决二维 directory 下的等待问题。
 
-#### 计算线程侧查找流程：
+#### 计算线程侧查找流程
 
 1. 读 `expert_directory[e]` 遍历各池子。
 
@@ -77,7 +77,7 @@ READY  --CAS-->  EVICTING  ----->  清空 expert_directory  ----->  等 refcount
 
 3. **未命中** (所有池均为 `UNASSIGNED`) → 先记下当前 `snapshot = expert_directory_version[e]`，走 MPSC 队列向调度线程发起分配请求，然后 wait 在 `expert_directory_version[e]` 这个地址上。被唤醒后重读 directory 并进入 `slot_meta` 的 pin/等待流程。
 
-#### 通信信道明确分三条：
+#### 通信信道明确分三条
 
 1. **分配请求**: 计算线程 → 调度线程，有界 MPSC 队列，满时生产者阻塞等 (`wait-on-address` 等有空位)，不丢弃请求。
 

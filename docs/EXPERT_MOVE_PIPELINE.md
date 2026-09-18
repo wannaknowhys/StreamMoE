@@ -57,7 +57,7 @@ target count), batch_ready ptr, needed[8]=512-bit bitmap}`.
 
 ### 3.1 Today (3 parallel arrays, all indexed by (L,E))
 
-```
+```text
 entries_  [(L,E)*n_pools + pool]  -> slot            (expert -> per-pool slot)
 versions_ [(L,E)]                 -> u32             (wait/wake version)
 last_used_[(L,E)]                 -> u64             (recency, cross-pool)
@@ -97,7 +97,7 @@ layout is a few hundred KB. Negligible.
 
 States (per (L,E) x pool; an expert may hold RAM + VRAM copies simultaneously):
 
-```
+```text
 ABSENT       no slot    not in this pool
 LOADING      slot Y     reserved, DIO in flight (slot IO_INFLIGHT), NOT ready
 READY        slot Y     pin-able (current behaviour)
@@ -135,7 +135,7 @@ every transition stays - any half-way state change wakes waiters to rescan.
 
 When the scheduler decides to load (L,E) into pool p slot s:
 
-```
+```text
 dir(L,E,p) = LOADING(slot=s)   // publish intent FIRST (seq-cst store = visibility point)
 owner side: (removed, see §4)
 slots_[s].begin_reload()       // physical slot -> IO_INFLIGHT
@@ -149,7 +149,7 @@ duplicate-load window.
 scan that sees `dir = READY` MUST be able to pin the physical slot. So the
 completion tail is:
 
-```
+```text
 slots_[s].mark_ready()            // physical slot -> READY (releases readers)
 memory fence (seq-cst)
 dir(L,E,p) : LOADING -> READY     // only now may a compute scan observe READY
@@ -165,7 +165,7 @@ Exec is deliberately **stateless about residency**: it never reads state
 transitions, never distinguishes ABSENT / LOADING / MOVING_IN. It only tries to
 pin and re-asks for whatever failed:
 
-```
+```text
 exec pin_layer(bitmap):
   loop:
     for each needed (L,E):
@@ -282,7 +282,7 @@ A ring of move tasks, mirroring the async-load ring buffer pattern.
 
 ### 5.5 State dance for one v2r move
 
-```
+```text
 scheduler (device region full, needs slot for new expert X):
   pick victim V by (L,E) eviction (§6)
   begin_evict(src slot)                // READY -> EVICTING (blocks new try_pin)
@@ -326,7 +326,7 @@ are chosen from layers nearest to L (the just-finished layer is most likely
 stale within a decode), then further layers, with the score threshold relaxed
 by distance:
 
-```
+```text
 for delta = 1, 2, ...:
   for each (L-delta, e) resident in this pool:
      if slot READY && refcount==0 && score(e) <= threshold(delta): candidate
@@ -377,7 +377,7 @@ waiter lists needed.
 
 ### 7.1 The active-slot discipline
 
-```
+```text
 scheduler loop (global worker polls each per-model scheduler; models don't block
 each other - each has its own active slot):
   per model:
@@ -486,7 +486,7 @@ before waking exec. Exec never sees a partially-pinned B.
 
 1. **Settle before register (lost-event window).** An expert may settle to
    READY _between_ exec's scan (B includes it as LOADING) and the scheduler
-   registering active_ (the drain turn ran first, when no active_ existed).
+   registering `active_` (the drain turn ran first, when no active_ existed).
    The drain event for it is then gone forever. Fix: the registration step
    MUST re-scan the current state of every B item in the same turn (READY ->
    pin now; ABSENT -> load now; LOADING -> wait for drain). Not an implied
@@ -494,13 +494,13 @@ before waking exec. Exec never sees a partially-pinned B.
    registration" must still get pinned.
 2. **ABSENT in B needs an explicit load.** Putting an ABSENT item into
    active_.still_need does not make it LOADING by itself - someone must
-   explicitly alloc + submit it. Without this step active_ waits forever on an
+   explicitly alloc + submit it. Without this step `active_` waits forever on an
    expert nobody is loading (livelock). Write it into the register step
    (accept_requests ABSENT branch above), not left implicit.
 
 **Exec side - single-pass pin_layer (replaces §3.5 loop / §7.3 rounds):**
 
-```
+```text
 exec pin_layer(layer, needed, await, out):
   A = {}; B = {}
   for each needed (L,E):
@@ -566,7 +566,7 @@ failure signal". The ledger lives in active_, not in hack bumps.
    **[done for the LOADING-before + state-aware accept side - M2, dbaff8f;
    single-active-slot NOT done - it is part of M5]**
 3. Eviction: (L,E)-keyed layer-distance selection inside alloc_or_evict; delete
-   owner_ (8 uses, all in alloc_or_evict, already enumerated). **[done - M3, 45b14de]**
+   `owner_` (8 uses, all in alloc_or_evict, already enumerated). **[done - M3, 45b14de]**
 4. Move pipeline: move_task ring + 1 worker (v2r + r2v) + completion drain;
    wire v2r into eviction of a device victim; r2v available for placement
    policy later. **[done - M4, fdf4982; v2r now DMA per §5.2 revision - 717bac8]**

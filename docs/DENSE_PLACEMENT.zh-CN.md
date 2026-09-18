@@ -75,7 +75,7 @@ C1 每 token、每层必用，**层内零复用**、严格顺序访问。LRU/驱
 对一层 C1，设参数 `Np`、每参数字节 `b`、CPU/GPU 有效算力 `P_cpu`/`P_gpu`、
 链路带宽 `BW`、决策窗口 token 数 `T`：
 
-```
+```text
 省下的计算  = T * 2 * Np * (1/P_cpu - 1/P_gpu)
 搬迁代价    = (Np*b + KV_bytes) / BW
 迁移  <=>  T > (b + KV_bytes/Np) / (2 * BW * (1/P_cpu - 1/P_gpu))
@@ -108,7 +108,7 @@ route B 报警并退出。检测方式：`--expert-backend` 的 handler **不要
 
 **Phase 1a（第一里程碑）：整体选设备。**
 
-```
+```text
 --dense-placement <spec>
   spec  := item[,item...]
   item  := C1:<dev>            # 全部 C1 层（整体）
@@ -132,7 +132,7 @@ DeepSeek 的 C1 放不进 RX590 8G（dense 11.66 GB > 8 GB）——目标是 P10
 
 **Phase 1b（后续）：逐层表。**
 
-```
+```text
   item  := ... | L<a>[-<b>]:<dev> | LAYER:<dev> | OUTPUT:<dev>
 ```
 

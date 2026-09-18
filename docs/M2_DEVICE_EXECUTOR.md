@@ -302,7 +302,7 @@ arena, no device-side whole chain.
 Gap to the final design (per-device expert-column mini graphs, §1-§7). Items
 below, roughly in dependency order:
 
-**Analysis layer (verify/assign) - mostly landed, needs device-ization**
+### Analysis layer (verify/assign) - mostly landed, needs device-ization
 
 - [x] closure collection + internal dependency/last-use + layout
       (best-fit out_off / result_bytes) - done (e6995dd, 488930f).
@@ -314,7 +314,7 @@ below, roughly in dependency order:
       of its inputs it must have). Every device runs the FULL node chain over
       ITS OWN columns (whole chain to the contribution), not just the mm.
 
-**Per-device arena (user decision 2026-09-05): NO per-device shrinking**
+### Per-device arena (user decision 2026-09-05): NO per-device shrinking
 
 - [ ] each device that participates in a layer allocates a FULL whole-layer
       result block (result_bytes from the existing best-fit layout) - NOT a
@@ -326,7 +326,7 @@ below, roughly in dependency order:
 - [ ] bucket execution: within its block, a device computes only its own
       buckets (columns), leaving other slices untouched (see executor items).
 
-**Executor resources**
+### Executor resources
 
 - [ ] per-device ping-pong / event tracking (async GPU must not let the next
       layer overwrite in-flight results - §3 sync discipline).
@@ -336,7 +336,7 @@ below, roughly in dependency order:
       compute node in the layer (same node chain, restricted to its columns),
       so the device reaches its contribution without host round-trips.
 
-**Async execution skeleton**
+### Async execution skeleton
 
 - [ ] `exec_round_vk` -> async submit (`graph_compute_async`) + completion
       tracking instead of per-round sync + read back.
@@ -347,7 +347,7 @@ below, roughly in dependency order:
 - [ ] each participating device holds its OWN full whole-layer result block
       (same §4.1 geometry, one block per device, not column-sliced).
 
-**Verification gates**
+### Verification gates
 
 - [ ] pure-device numeric gate once device execution lands (K6 shape; note GPU
       has no absolute fidelity vs CPU - validate structural equivalence, not
@@ -355,7 +355,7 @@ below, roughly in dependency order:
 - [ ] M8 UTs (layout self-check, device plan, merge) - test link fix is the
       blocker (stmoe_vk_* symbols need ggml-vulkan at link, B33).
 
-**Profile (deferred, §6)**
+### Profile (deferred, §6)
 
 - [ ] profile ring + per-device completion timestamps; slot_request_t already
       carries total_tokens / start_rdtsc fields.
@@ -677,14 +677,14 @@ transport itself is GPU-phase work only.
 The anonymous per-token cross-expert fold is the per-token reduction over its
 routed experts (llama-graph.cpp 2274-2304):
 
-```
+```text
 moe_out[t] = sum_{k in topk(t)} contrib(k, t)        // reduction domain = experts
 ```
 
 Multi-device re-partitions the SAME reduction by associativity (only float
 summation order changes - relaxed gate, SS7.3):
 
-```
+```text
 moe_out[t] = sum_{d in devices}  acc_d[t]
 acc_d[t]   = sum_{k in topk(t) ∩ device_d}  contrib(k, t)   // expert axis contracted
 ```

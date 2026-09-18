@@ -67,7 +67,7 @@ DMA 读导出为**一个全 void 参数的普通函数**，由 `ggml-vulkan.cpp`
 include 的 frag 定义（锚点处内部 vulkan 类型与 TU-static `ggml_vk_buffer_read`
 可见）。scheduler 以 `extern` 声明并直接调用；任何 vulkan/ggml 类型都不跨界。
 
-```
+```text
 ggml-vulkan.cpp（vendored，已 patch）
    + route-B 锚点 include stmoe_routeb_vk_dma.frag
       导出: stmoe_vk_dma_read(void*, size_t, void*, size_t)

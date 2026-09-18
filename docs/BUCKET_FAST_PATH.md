@@ -126,7 +126,7 @@ Consequences: `width==n_k` does not imply `n_active==n_t` (Case B);
 
 `append_expert_fold` (minigraph_exec.cpp:608-624):
 
-```
+```text
 weighted [d_out, w_b, n_active]
   -> permute(1,0,2,3)            // view [w_b, d_out, n_active], new nb0 = d_out*4
   -> ggml_cont                   // :615 real data movement (transpose)

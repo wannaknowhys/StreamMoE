@@ -84,7 +84,7 @@ intermediate compute nodes keep using the verify-built plan (`ex->out_off` /
 
 The closure already folds/accumulates within itself. Each device folds its own
 buckets into **its own `moe_out` partial**. The **anonymous add** that consumes
-`ffn_moe_out` is *outside* the closure (`collect_chain` stops at `moe_out`'s
+`ffn_moe_out` is _outside_ the closure (`collect_chain` stops at `moe_out`'s
 consumers, `route_b_chain.cpp:1746`) and is a **tail** node, so it runs on C1's
 device. It gets **one extra `src` per device partial** and sums them
 (single device => one input, no extra work). This replaces the host-side

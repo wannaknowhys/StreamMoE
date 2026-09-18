@@ -25,7 +25,8 @@
 - **多轮对话与 Prompt Cache (KV Cache Management)**：
   - 支持 `/clear`（重置会话）、`/reset`（清空热度统计）、`/stats`（查看当前 Cache 命中率与状态机模式）。
   - 显示详细的内存画像：
-    ```
+
+    ```text
     [Model Metadata]
       Architecture:    deepseek4 (43 layers, 256 experts/layer)
       Context Window:  4096 tokens (Max: 1048576)

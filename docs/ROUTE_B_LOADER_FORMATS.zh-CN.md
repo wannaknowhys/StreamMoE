@@ -3,7 +3,7 @@
 [English](ROUTE_B_LOADER_FORMATS.md) | [简体中文](ROUTE_B_LOADER_FORMATS.zh-CN.md)
 
 > 本文档的事实来源：`src/loader/model_builder.cpp` / `src/loader/model.h`（读写共用的 `model_t`）+ `src/convert/writer.cpp`（写入方向）。转换器已纯 C++ 化，与加载器共用 `model_t`。
-
+>
 > **2026-09 修订（v1 已删除）**：
 > ggml-vulkan 将每专家的 stride 硬编码为单张量紧凑大小（`ne0*ne1`），因此 route B 正迁移至 **结构体数组池（SoA，每个张量一列）** 以及 v2/v3 块结构（**每个分支张量切片在块内部 4K 对齐**，参见 `STREAMMOE_GGUF_FORMAT.md` §2.6/§3）。对加载器的影响：
 > 加载为 **每个 (expert, tensor-slice) 执行一次 DIO**，而非对整个块执行单次 DIO：若切片的 perExpert 为 4K 整数倍，则直接加载至对应的张量列（对齐源 + 对齐槽位）；否则 DIO 读取 4K 窗口至中转区后拷入对应列。列布局由 `src/loader` + `src/backend/scheduler` (SoA) 决定，独立于文件格式。
@@ -48,7 +48,7 @@
 
 统一规划器 + 规范异步 DIO：
 
-```
+```text
 输入路径
   -> 格式检测（布局 KV + incomplete 标志，均位于文件头部）
   -> 按格式规划器 -> 统一读取计划：

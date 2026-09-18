@@ -10,7 +10,7 @@
 > §2/§7（C1/C2 分类、闭包分析）、`docs/STREAMMOE_GGUF_FORMAT.md` §3
 > （C1/C2/C3/C4）、`docs/M2_DEVICE_EXECUTOR.md`（每设备执行器）、
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`。
-
+>
 > **铁律 - 数据搬运（2026-09-09）**：
 >
 > 1. **ggml 张量字节**：永远不要在 host 上解引用或 `memcpy` `ggml_tensor::data`。
@@ -42,7 +42,7 @@ scheduler 切分之前的完整 `ggml_cgraph`。`STREAM_MOE_TEMP` 门控的 dump
 `ggml_backend_buffer_get_type` 解析（权重有；compute 节点要到 sched 切分后才有）。
 复现：
 
-```
+```cmd
 STREAM_MOE_TMP_GRAPH_DUMP=1 build\StreamMoE_dump_dbg\llama-build\bin\llama-cli.exe ^
   -m <model> -p hi -n 1 -c 2048 -t 16 --expert-backend --fit off ^
   --moe-expert-pools RAM:<N> --dense-placement C1:RAM,C2:RAM --no-warmup < nul > dump.txt 2>&1
@@ -175,7 +175,7 @@ C1 本身**不是**锚点驱动的闭包：它的节点与专家链交织（pre-
 C1 每层是原子、**不跨设备**（`DENSE_PLACEMENT §3.2`）；专家**跨设备**（RAM + Vulkan0 +
 …）。所以整层包是扇出/扇入形状：
 
-```
+```text
 C1 前段（设备A） --cur--> [ 专家闭包 pool0（设备A） ]--\
                  \--cur--> [ 专家闭包 pool1（设备B） ]--+--> C1 尾段（残差，设备A）
                  \--cur--> [ 专家闭包 pool2（RAM）  ]--/

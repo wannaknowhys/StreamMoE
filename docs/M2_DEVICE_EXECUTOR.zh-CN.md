@@ -167,7 +167,7 @@ per-device arena、无设备侧整链。
 
 与最终设计（每设备专家列 mini graph，§1-§7）的差距，按依赖序列出：
 
-**分析层（verify/assign）——大多已落地，需设备化**
+### 分析层（verify/assign）——大多已落地，需设备化
 
 - [x] 闭包收集 + 链内依赖/last-use + 布局（best-fit out_off/result_bytes）——完成（e6995dd, 488930f）。
 - [ ] `moe_node_plan`（每步 in[prod+off] 相对偏移）——布局只覆盖每节点 out 偏移；输入仍由执行器临时解析。
@@ -175,7 +175,7 @@ per-device arena、无设备侧整链。
       按 compute 节点表达（该设备产生某节点输出的哪个切片、需要它哪些输入）。每设备对**自己
       的列**跑完整节点链（算到 contribution），不只 mm。
 
-**Per-device arena（用户决策 2026-09-05：不做按设备收缩）**
+### Per-device arena（用户决策 2026-09-05：不做按设备收缩）
 
 - [ ] 参与一层的每个设备各申请**一整层结果块**（现有 best-fit 布局的 result_bytes）——**不**
       按设备列切 arena。理由：各设备布局几何相同（同一 out_off[]）、简单统一；设备列只是运行
@@ -183,14 +183,14 @@ per-device arena、无设备侧整链。
       （小；arena 跨层复用）。
 - [ ] 桶执行：设备在自己块内**只算自己分到的桶（列）**，其余切片不动。
 
-**执行器资源**
+### 执行器资源
 
 - [ ] per-device ping-pong / 事件跟踪（async GPU 不能让下一层覆写在飞结果，§3 同步纪律）。
 - [ ] 执行入口从 verify 产物 + 本次 pin 分布**实例化模板**（填 data/ids/偏移，不改结构）。
 - [ ] 每设备列执行：设备沿层内每个 compute 节点的**自己切片**走（同节点链、限自己列），
       设备侧直达 contribution，无 host 往返。
 
-**异步执行骨架**
+### 异步执行骨架
 
 - [ ] `exec_round_vk` → 异步提交（`graph_compute_async`）+ 完成跟踪，取代每 round 同步+回读。
 - [ ] CPU/VK 重叠：设备图异步提交后主线继续算 CPU 列，层尾 converge。
@@ -198,14 +198,14 @@ per-device arena、无设备侧整链。
       merge/scatter，§5）。
 - [ ] 每个参与设备各持自己的**整层结果块**（§4.1 几何，每设备一块，不按列切）。
 
-**验证门**
+### 验证门
 
 - [ ] 设备执行落地后纯设备数值门（K6 形态；注意 GPU 对 CPU 无绝对还原——验证结构等价而非字节
       一致，见 BACKEND_DIVERGENCE_ANALYSIS.md §6）。
 - [ ] M8 UT（布局自检、设备规划、merge）——test 链接问题是 blocker（stmoe_vk_* 符号需
       ggml-vulkan 链接，B33）。
 
-**profile（延后，§6）**
+### profile（延后，§6）
 
 - [ ] profile ring + 每设备完成时间戳；slot_request_t 已带 total_tokens/start_rdtsc 字段。
 
@@ -417,13 +417,13 @@ CPU 阶段无法伪造 DMA（原则 11）：它验证 compact 桶链 + 累加器
 
 匿名 per-token 跨专家折叠 = 对每 token 在其路由专家上做归约（llama-graph.cpp 2274-2304）：
 
-```
+```text
 moe_out[t] = Σ_{k ∈ topk(t)}  contrib(k, t)        // 归约域 = 专家
 ```
 
 多 device 靠结合律重排同一归约（只差浮点求和顺序——宽松 gate，§7.3）：
 
-```
+```text
 moe_out[t] = Σ_{d ∈ devices}  acc_d[t]
 acc_d[t]   = Σ_{k ∈ topk(t) ∩ device_d}  contrib(k, t)   // 专家轴已收缩
 ```

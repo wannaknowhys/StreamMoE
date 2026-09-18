@@ -17,7 +17,7 @@
 
 ## 布局修正（P3）
 
-```
+```text
 GGUF Header + KV Metadata
 Tensor Info（含 _exps 占位 offset，图构建用，route B 不读数据）
 Dense 数据（含 scale，真实写在 tensor_info offset）   <- denseDataEnd

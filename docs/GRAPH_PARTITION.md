@@ -11,7 +11,7 @@
 > §2/§7 (C1/C2 categories, closure analysis), `docs/STREAMMOE_GGUF_FORMAT.md` §3
 > (C1/C2/C3/C4), `docs/M2_DEVICE_EXECUTOR.md` (per-device executor),
 > `docs/BUCKET_EXEC_TOKEN_SUBSET.md`.
-
+>
 > **Iron rule - data movement (2026-09-09)**:
 >
 > 1. **ggml tensor bytes**: never dereference or `memcpy` `ggml_tensor::data` on
@@ -44,7 +44,7 @@ whole `ggml_cgraph` before the scheduler splits. A `STREAM_MOE_TEMP`-gated dump
 `ggml_backend_buffer_get_type` when the tensor already has a buffer (weights do;
 compute nodes get theirs later at sched split). Reproduce:
 
-```
+```cmd
 STREAM_MOE_TMP_GRAPH_DUMP=1 build\StreamMoE_dump_dbg\llama-build\bin\llama-cli.exe ^
   -m <model> -p hi -n 1 -c 2048 -t 16 --expert-backend --fit off ^
   --moe-expert-pools RAM:<N> --dense-placement C1:RAM,C2:RAM --no-warmup < nul > dump.txt 2>&1
@@ -192,7 +192,7 @@ C1 is atomic per layer and does **not** cross devices (`DENSE_PLACEMENT.md`
 §3.2); experts **do** cross devices (RAM + Vulkan0 + ...). So the layer package
 is a fan-out / fan-in shape:
 
-```
+```text
 C1 prefix (device A) --cur--> [ expert closure pool0 (device A) ]--\
                       \--cur--> [ expert closure pool1 (device B) ]--+--> C1 tail (residual, device A)
                       \--cur--> [ expert closure pool2 (RAM)      ]--/

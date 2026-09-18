@@ -138,10 +138,12 @@ build\<tag>\
 当只应用 route-b patch（或任何 vendored 改动）时，commit 的标准流程：
 
 1. **更新 patch**（cmd 重定向，PS `>` 会写 UTF-16 导致 `git apply` 失败）：
+
    ```bat
    rem 各 patch 各管各的文件，用文件列表限定，绝不 `git diff >` 全量抄（会把其他 patch 混进来）
    cmd /c "git -C third_party/llama.cpp diff -- <文件列表> > patches\<patch名>.patch"
    ```
+
 2. **验证可还原**：`git -C third_party/llama.cpp apply --check -R patches\<patch名>.patch`
 3. **提交**：`git add patches/<patch名>.patch` + `git commit` + `git push`（父仓库）
 

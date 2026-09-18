@@ -123,7 +123,7 @@ dst。纪律（必选非测试）：**graph_compute 返回前，等所有内部�
 现状单池目录已带 pool 维（entries 是 (L,E)×pool、scan 扫多池）——保留。要改的是物理槽
 寻址：
 
-```
+```text
 device_pool[] = {
   ggml_backend 句柄, 物理基址(显存/内存), 槽 stride, 容量,
   每池层组划分(subpools_), 每池槽 meta,
@@ -133,7 +133,7 @@ device_pool[] = {
 
 **每设备固定执行区**：预分配一块按最坏层形状：
 
-```
+```text
 arena = [ staging(cur 副本) | exec 区(链中间原位覆盖) | result(专家贡献) ]
 ```
 

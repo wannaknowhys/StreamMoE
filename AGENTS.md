@@ -75,6 +75,21 @@
     - 唯一例外：**用户明确下令**临时关闭某功能；AI 不得自作主张 gate off。
     - 配套构建（见 build.bat / PROJECT_STRUCTURE.md §10）：`StreamMoE_latest` 与 `StreamMoE_dump_dbg` 都是"最新功能"构建（`STREAM_MOE_LATEST`，新功能默认开），区别仅是 `dbg` 多带 `STREAM_MOE_TEMP` 诊断 dump/print；专门用于**体验/复现 bug 态**。生产构建 `StreamMoE_dump` 保持稳定（新功能 opt-in），三者并存。
 
+## 修订（2026-09-17）
+
+- **编译唯一入口：永远只使用 `build.bat`**。包括主程序、库、测试、临时 harness、增量编译和 clean rebuild；禁止直接调用 CMake、Ninja、clang-cl、cl、lib 等工具绕过入口，禁止手工拆库或混链旧产物。入口不支持所需目标时，先讨论并补齐 `build.bat` 支持，不另造编译命令。
+- Gemma prefill 回归使用固定 129-token 输入，按整个序列的 cosine 分布判定；首 token 的已知偏差不单独判失败。当前采用 `cos >= 0.99` 的 token 比例至少 90%，同时报告 hidden 分布和低于 0.9 的比例，不追 bit 一致。
+
+## 项目必知速记（2026-09-17 阅读重要文档后整理）
+
+- 文档包含历史方案和未同步 TODO，不能把旧命令、旧阶段结论直接当成当前实现。优先采用用户最新决定、本文修订、`docs/CHECKPOINT.md` 的最新验证记录；发生矛盾先核实，不凭旧稿回退功能。
+- 推理入口是 vendored `llama-cli` / `llama-server`；自研 CLI/server/engine 已删除。Route B 沿用官方算子，专家权重不走 mmap，使用 SoA 张量列槽池和唯一紧凑桶执行器；真实 token 子集的 gather、scatter 必须保持同一 tight order。
+- `dev_layer()` 表达逻辑 STREAMMOE 归属，`dev_layer_physical()` 表达物理 C1 设备。KV、DSV4 compressor、recurrent state 跟 C1；FA 纳入整层捕获，算子能力按实际设备检查，不支持就明确报错，不静默 CPU fallback。
+- 每设备 arena 按生命周期组织 carry 与 scratch；xfer 的 shell 身份必须包含 producer、consumer device、stage、consumer layer。允许跨层复用存储，不允许按首次层分配的同一个 shell 跨消费层复用。导出保留张量不能提前被 arena 覆盖。
+- 2026-09-17 固定 129-token 验证：设备 dense 对本次 RAM 参考为 123/129（95.3%）cos >= 0.99，RAM 对冻结基线为 121/129（93.8%）；embd/hidden 均无 token 低于 0.9。证据在 `temp/embedding_probe_2026-09-17T19-07-02-705Z/`。这只覆盖已测配置，不代表所有设备路径均已验证。
+- vendored 改动留工作区，主仓库 frag/patch 负责记录；补丁顺序 macros → tsc_timer → route-b → prefill。重放区分原始字节一致和仅 CRLF 规范化后一致，不能混称。临时脚本、harness、日志、重放 clone 放 `temp/`，正式编译产物放 `build/<tag>/`。
+- 异步 IO、并发 in-flight、避免冗余搬运是终态底线；文件切片 4K 对齐不等于所有目标布局天然免 staging。Linux 真异步 DIO、层内跨设备细粒度 stage、profile/并发验收仍需按最新源码与状态核实，不能把设计文档当作完成证明。
+
 ## 三、协作规则
 
 - 开始任务前：先读本文件 + `docs/CHECKPOINT.md`（当前状态）+ `docs/PROJECT_STRUCTURE.md`（结构）。
@@ -101,19 +116,30 @@
 | 调度/池（dir 二维、异步装载、全局线程、驱逐打分） | `docs/EXPERT_SCHEDULER_DESIGN.md`                                                                        |
 | GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）      | `docs/ROUTE_B_GPU_PHASE.md`                                                                              |
 | dense 放置与驻留管理（C1/C2 策略、迁移判据）      | `docs/DENSE_PLACEMENT.md`                                                                                |
+| 设备端 dense 闭包与跨设备流转（C1/MoE/C2）        | `docs/DEVICE_DENSE_CLOSURE.md`                                                                           |
 | 每设备 arena 规划（区间打包、carry 管线）         | `docs/PER_DEVICE_ARENA.md`                                                                               |
 | 整图分区（四区域、接缝 leaves、buft 标记）        | `docs/GRAPH_PARTITION.md`                                                                                |
 | route B 整层拥有（整层执行、跨设备搬运）          | `docs/ROUTE_B_LAYER_OWNERSHIP.md`                                                                        |
+| 层执行器设计（三段 arena、轻量 mini-graph）       | `docs/LAYER_EXECUTOR_DESIGN.md`                                                                          |
+| L2 整层执行审查（A~E 风险清单与防御）             | `docs/L2_WHOLE_LAYER_REVIEW.md`                                                                          |
+| M2 设备执行器设计（设备 mini-graph、异步骨架）    | `docs/M2_DEVICE_EXECUTOR.md`                                                                             |
 | 紧凑多桶快速路径 / 算子融合                       | `docs/BUCKET_FAST_PATH.md`                                                                               |
+| 桶执行 token 子集紧凑收集                         | `docs/BUCKET_EXEC_TOKEN_SUBSET.md`                                                                       |
 | token 子集 scatter-add 规划                       | `docs/SCATTER_PLAN.md`                                                                                   |
+| 专家移动流水线与 (L,E) 驱逐设计                   | `docs/EXPERT_MOVE_PIPELINE.md`                                                                           |
+| VRAM DMA 搬运与 staging 规约                      | `docs/VRAM_DMA_MOVE.md`                                                                                  |
 | 吞吐基准评测（单次/多轮、参数矩阵）               | `docs/BENCHMARK.md`                                                                                      |
 | 多模型池 / 异构子池                               | `docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md`                                                      |
 | GGUF 格式 v1/v2 / RAID0 分片                      | `docs/STREAMMOE_GGUF_FORMAT.md`                                                                          |
+| Route-B 加载器与 GGUF 输入格式                    | `docs/ROUTE_B_LOADER_FORMATS.md`                                                                         |
+| 图构建输出点与阶段宏补丁规则                      | `docs/GRAPH_BUILD_OUTPUT.md`                                                                             |
+| 后端数值差异分析与基线控制                        | `docs/BACKEND_DIVERGENCE_ANALYSIS.md`                                                                    |
 | prefill 交叉验证 / 专家历史模拟 / repack 排查     | `docs/PREFILL_CROSS_VALIDATION.md`、`docs/EXPERT_TRACE_SIMULATION.md`、`docs/REPACK_DIVERGENCE_DEBUG.md` |
 | delegate 排查方法论 / bug 清单                    | `docs/DEBUG_DELEGATION.md`、`docs/BUG_TRACKER.md`                                                        |
 | patch 拆分/更新踩坑                               | `docs/PATCH_SPLITTING_PITFALLS.md`                                                                       |
 | 迁移上游工具 / 可执行程序路线                     | `docs/UPSTREAM_TOOLS_MIGRATION.md`、`docs/LLAMA_EXE_ROADMAP.md`                                          |
 | 冒烟/测试/采样                                    | `docs/SMOKE_TESTING.md`、`docs/TEST_FLOW.md`、`docs/SAMPLING.md`                                         |
+| Mock 规范与测试桩原则                             | `docs/MOCK.md`                                                                                           |
 | ASan 构建                                         | `docs/ASAN_BUILD.md`                                                                                     |
 | v2 架构修正                                       | `docs/V2_ARCHITECTURE_REVISION.md`                                                                       |
 

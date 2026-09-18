@@ -76,7 +76,7 @@ with all-void arguments** from a frag included at the route-B anchor of
 `ggml_vk_buffer_read` are visible. The scheduler declares it `extern` and calls
 it directly; no vulkan/ggml type crosses the boundary.
 
-```
+```text
 ggml-vulkan.cpp (vendored, patched)
    + route-B anchor includes stmoe_routeb_vk_dma.frag
       exports: stmoe_vk_dma_read(void*, size_t, void*, size_t)

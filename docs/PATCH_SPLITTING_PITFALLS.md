@@ -21,30 +21,30 @@
 
 ## 拆分脚本 / 工具链坑
 
-4. **classify 返回类型必须一致**：`['route-b', h]` 被 `for...of` 遍历时会把字符串 `'route-b'`
+1. **classify 返回类型必须一致**：`['route-b', h]` 被 `for...of` 遍历时会把字符串 `'route-b'`
    拆成单个字符（`target='r'`）→ `plan['r']` undefined。统一返回数组的数组 `[['route-b', h]]`。
 
-5. **PowerShell `$P` 与 `$p` 大小写不敏感**：`foreach($p in @(...))` 会覆盖外层 `$P` → 路径拼接错乱
+2. **PowerShell `$P` 与 `$p` 大小写不敏感**：`foreach($p in @(...))` 会覆盖外层 `$P` → 路径拼接错乱
    （`route-b-inject.patch/route-b-inject.patch`）。循环变量避开大写名（用 `$PDIR`）。
 
-6. **PowerShell 里 `node -e "..."` 的 `%d`**：PS 把 `%` 当取余运算符 → 命令直接报错。写临时
+3. **PowerShell 里 `node -e "..."` 的 `%d`**：PS 把 `%` 当取余运算符 → 命令直接报错。写临时
    js/patch 文件（用 Write 工具）再执行，避免内联转义地狱。
 
-7. **CRLF 检查**：本次原 patch 是 LF-only（`fs.readFileSync` 后无需 `\r` 处理）。如果源文件是
+4. **CRLF 检查**：本次原 patch 是 LF-only（`fs.readFileSync` 后无需 `\r` 处理）。如果源文件是
    CRLF，`split('\n')` 会残留 `\r` 导致上下文不匹配——先用 `node -e` 检测 `\r\n` 再决定。
 
-8. **`git apply --verbose` 的 "Hunk #N succeeded at M (offset -K lines)"**：`K` 是 git 自己的 fuzz
+5. **`git apply --verbose` 的 "Hunk #N succeeded at M (offset -K lines)"**：`K` 是 git 自己的 fuzz
    偏移；如果出现非预期 offset，说明手动行号与 git apply 的自动累计叠加错了。
 
 ## 验证方法（拆分后必须做）
 
-9. temp clone 子模块到 clean 基线（`git clone --no-checkout` + `checkout <baseline>`）→ 按顺序
+1. temp clone 子模块到 clean 基线（`git clone --no-checkout` + `checkout <baseline>`）→ 按顺序
    `git apply --check` 每个 patch → 全部应用 → `git diff <patch-state-commit>` 应为**空**。
    本次：4 拆分 patch + `prefill-export-llama.patch` 顺序应用 == `ffe029953`（route B + prefill
    全量状态），逐字节一致，证明拆分无损。
 
-10. hunk 上下文不匹配时，用 `git show HEAD:<file>` 与生成 patch 的上下文行做**逐字符 JSON 对比**
-    （`JSON.stringify` 看前导空格数），别靠肉眼。
+2. hunk 上下文不匹配时，用 `git show HEAD:<file>` 与生成 patch 的上下文行做**逐字符 JSON 对比**
+   （`JSON.stringify` 看前导空格数），别靠肉眼。
 
 ## 验证仓库命令速记
 
@@ -64,16 +64,20 @@ git -C temp/llama_verify diff --stat ffe029953   rem 应为空
 
 1. 先确保当前工作区状态已提交（含 A+B+后续修改）；未提交则先 commit 或 stash。
 2. 临时分支从干净基线重建 A 和 B：
-   ```
+
+   ```bat
    git -C temp/llama_verify checkout f280b2698
    git -C temp/llama_verify checkout -b patch-export
    git -C temp/llama_verify apply A.patch ... && git commit -m "A"     rem commit A
    git -C temp/llama_verify apply B.patch ... && git commit -m "B"     rem commit B
    ```
+
 3. 生成后续修改的增量 diff（相对"B 应用后的状态"）：
-   ```
+
+   ```cmd
    cmd /c "git -C third_party/llama.cpp diff <A+B状态commit> <修复后commit> -- <改动文件> > temp\fix.diff"
    ```
+
    在临时分支 apply 该 diff -> `git add -A && git commit --amend`（并入 B commit）。
 4. 导出新 B.patch：
    - format-patch（含 email 头）：`git format-patch -1 --stdout > B.patch`

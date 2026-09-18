@@ -90,7 +90,7 @@ scheduler 把**已经有 buffer** 的 tensor 当作 pre-allocated（`ggml-backen
 每设备一块 arena buffer，**一次 sizing、永不增长**（增长会让已设的 `data` 指针失效），
 切成三个固定子区：
 
-```
+```text
 [ carry region（最前，固定 base）][ compact region ][ closure block ]
 ```
 

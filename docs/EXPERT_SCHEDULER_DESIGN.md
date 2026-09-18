@@ -31,7 +31,7 @@
 
 ## 3. slot_meta：64 位原子字 + 状态机（`slot.h`）
 
-```
+```text
 bit 63........32 | 31........3 | 2 1 0
     generation   |  refcount   | state
 ```
@@ -62,7 +62,7 @@ bit 63........32 | 31........3 | 2 1 0
 
 ## 6. 计算面 API（供 graph_compute / cb_eval）
 
-```
+```text
 pin_expert(layer, expert)  → expert_handle_t{slot, generation, ...}
   1. 查 dir → 命中 → slots_[s].try_pin()（READY 且 CAS refcount++）→ 返回 (slot, gen)
   2. UNASSIGNED → push 请求 → wait_version → 重查（循环，上限 100000 次）
@@ -81,7 +81,7 @@ unpin(handle)              → slots_[slot].unpin()（refcount--，0 后可驱�
 
 **驱逐打分**（当前）：
 
-```
+```text
 score = 0.5 * freq + 0.5 * (1.0 - generation / 1e9)
 freq  = stats_.get_adaptive_frequency(owner)   // EST1，读时按当前最大分归一化（B27 已修）
 ```
@@ -118,7 +118,7 @@ freq  = stats_.get_adaptive_frequency(owner)   // EST1，读时按当前最大�
 
 新增每 `(layer,expert)` 的 **EMA 实时频率**（pin 时更新，比 EST1 平滑、实时）：
 
-```
+```text
 freq_ema[e] = lambda * freq_ema[e] + (1 - lambda) * 1    // lambda ~ 0.95
 ```
 

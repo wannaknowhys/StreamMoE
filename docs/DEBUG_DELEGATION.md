@@ -33,7 +33,7 @@
 
 ## 3. 调用链与 log 计划（按函数进出打 log）
 
-```
+```text
 ggml_backend_graph_compute(cpu, gf)                 [iso 入口]
   -> ggml_compute_forward_mul_mat_id                 [KDBG enter 已打: src1_cont/ne/nb/type/vdt/rowsize]
      -> wdata 布局分配                                [未打]
@@ -119,7 +119,7 @@ int32_t e = *(const int32_t*)((const char*)ids->data + (size_t)t * ids->nb[1] + 
 
 ### 运行时验证（修复后 delegate 读到的 L3 gate ids）
 
-```
+```text
 [ids] blk.3.ffn_gate_exps.weight nb1=1024:
   t0 = e235,e117,e129,e68,e47,e71
   t1 = e208,e90,e71,e255,e6,e128      <- 修复前误读 e217,e161,...

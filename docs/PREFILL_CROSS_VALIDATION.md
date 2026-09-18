@@ -41,7 +41,7 @@ node tools\verify_prefill.js temp\export_std\prefill_export.bin temp\export_moe\
 
 ## 导出文件格式（PREFEXP1，析构时一次性写）
 
-```
+```text
 u32 n_embd_rows, u32 n_embd_dim
 per row: u32 token_pos, float embd[n_embd_dim]       ; LM head 输入（result_norm，output tokens）
 u32 n_hid_rows, u32 n_hid_dim

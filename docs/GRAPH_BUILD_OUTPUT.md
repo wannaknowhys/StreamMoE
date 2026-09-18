@@ -37,7 +37,7 @@ Rule of thumb: **only shared structures that BOTH feature patches modify need th
 
 ### Direct edit in the feature patch (one owner)
 
-- **prefill (`prefill-export-llama.patch`)** owns: `src/llama-context.cpp` (cb_eval swap, export_t_* publish, capture_* , export_token_seq, dtor flush), `src/llama-context.h` (export_* members), `src/llama-kv-cache.h/.cpp`, `tools/server/server.cpp`, `tools/server/server-context.cpp` (export_dir mapping). Prefill-specific code inside those is wrapped in `#ifdef STREAM_MOE_PREFILL_EXPORT` so a route-B-only build compiles nothing extra.
+- **prefill (`prefill-export-llama.patch`)** owns: `src/llama-context.cpp` (cb_eval swap, `export_t_*` publish, `capture_*`, export_token_seq, dtor flush), `src/llama-context.h` (`export_*` members), `src/llama-kv-cache.h/.cpp`, `tools/server/server.cpp`, `tools/server/server-context.cpp` (export_dir mapping). Prefill-specific code inside those is wrapped in `#ifdef STREAM_MOE_PREFILL_EXPORT` so a route-B-only build compiles nothing extra.
 - **route-b (`route-b-inject.patch`)** owns: `common/speculative.cpp/.h`, `src/llama-model-loader.cpp`, `src/llama-model.cpp`, `src/llama.cpp`, `tools/server/server-context.cpp` (route_b_setup injection), `common/CMakeLists.txt`. `llama-context.cpp` is **not** touched by route-b today — no overlap with prefill there.
 - The three build entry points and the output[]/n_outputs/out_ids logic above are all `llama-context.cpp` / `llama-graph.cpp` / `server-context.cpp` / `common.cpp` — currently owned by prefill only, so hooking them is a **direct patch edit** (wrapped in `#ifdef STREAM_MOE_PREFILL_EXPORT`), no phase-1 needed.
 
@@ -46,6 +46,7 @@ Rule of thumb: **only shared structures that BOTH feature patches modify need th
 The only true shared-structure collision is `common_params` (declared in `common/common.h`, parsed in `common/common.cpp` / `common/arg.cpp`, `llama.h` params) — both features add fields:
 
 - **Phase 1 (`streammoe-macros.patch`)** adds only anchor `#include`s to the shared struct:
+
   ```cpp
   struct common_params {
   #ifdef STREAM_MOE_PREFILL_EXPORT
@@ -58,6 +59,7 @@ The only true shared-structure collision is `common_params` (declared in `common
       ...
   };
   ```
+
 - **Feature patches only ADD `.frag` files** (`common/stmoe_routeb_*.frag`, `common/stmoe_prefill_*.frag`, `include/stmoe_prefill_llama_*.frag`) — they never edit `common.h/common.cpp/arg.cpp/llama.h` again, so apply order between phase-2a/2b is irrelevant and patches never conflict.
 - Macros are defined at **compile time** by `build.bat llamalibs <tag>`: `main` -> `-DSTREAM_MOE_ROUTE_B`; `upstream_dump` -> `-DSTREAM_MOE_PREFILL_EXPORT`; `StreamMoE_dump` -> both; undefined macro -> the include line is skipped by the preprocessor (phase-1 alone compiles as pure upstream).
 

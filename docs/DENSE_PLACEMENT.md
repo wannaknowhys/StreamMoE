@@ -88,7 +88,7 @@ For one C1 layer with `Np` parameters, `b` bytes/param, effective CPU/GPU
 throughput `P_cpu`/`P_gpu`, link bandwidth `BW`, and a decision window of `T`
 tokens:
 
-```
+```text
 compute saved  = T * 2 * Np * (1/P_cpu - 1/P_gpu)
 migration cost = (Np*b + KV_bytes) / BW
 migrate  <=>  T > (b + KV_bytes/Np) / (2 * BW * (1/P_cpu - 1/P_gpu))
@@ -128,7 +128,7 @@ treated as not given.
 
 **Phase 1a (first milestone): whole-set device selection.**
 
-```
+```text
 --dense-placement <spec>
   spec  := item[,item...]
   item  := C1:<dev>            # ALL C1 layers (whole)
@@ -154,7 +154,7 @@ target.
 
 **Phase 1b (later): per-layer table.**
 
-```
+```text
   item  := ... | L<a>[-<b>]:<dev> | LAYER:<dev> | OUTPUT:<dev>
 ```
 

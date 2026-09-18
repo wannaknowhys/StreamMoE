@@ -58,7 +58,7 @@ ub512 投影：olmoe 62 MB → ~0.3 MB，gemma 160 MB → ~11 MB，deepseek 2630
 `layout_arena` 改为每设备规划器。每设备一份 `region_plan_t`。区域按**生命周期**分，
 不按阶段分：
 
-```
+```cpp
 struct region_plan_t {
     std::string dev;                     // "" = host
     ggml_backend_buffer_t buf;           // 每设备一个 grow-only

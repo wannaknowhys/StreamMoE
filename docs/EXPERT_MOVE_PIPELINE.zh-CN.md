@@ -49,7 +49,7 @@ batch_ready ptr, needed[8]=512bit bitmap}`。
 
 ### 3.1 现状（3 个并行数组，均按 (L,E) 索引）
 
-```
+```text
 entries_  [(L,E)*n_pools + pool]  -> slot          （专家 -> 每池槽）
 versions_ [(L,E)]                 -> u32           （等待/唤醒版本）
 last_used_[(L,E)]                 -> u64           （recency，跨池）
@@ -84,7 +84,7 @@ owner_    [slot]                  -> (L,E)         （槽 -> 专家，反向）
 
 状态（per (L,E) × pool；一个专家可同时占 RAM + VRAM 副本）：
 
-```
+```text
 ABSENT       无槽      不在本池
 LOADING      槽 Y      已预约，DIO 在飞（槽 IO_INFLIGHT），未 READY
 READY        槽 Y      可 pin（现行为）
@@ -116,7 +116,7 @@ cq 携带字节少，但 `drain_completions` 从 `done[i]->user_data` 拿回任�
 
 调度线程决定把 (L,E) 装进池 p 槽 s 时：
 
-```
+```text
 dir(L,E,p) = LOADING(slot=s)   // 先发布意图（seq-cst store = 可见点）
 owner 侧：（已删，见 §4）
 slots_[s].begin_reload()       // 物理槽 -> IO_INFLIGHT
@@ -128,7 +128,7 @@ slots_[s].begin_reload()       // 物理槽 -> IO_INFLIGHT
 **完成侧写序是镜像，同样必须遵守。** 计算线程扫到 `dir = READY` 时必须能 pin
 物理槽。故完成收尾为：
 
-```
+```text
 slots_[s].mark_ready()            // 物理槽 -> READY（释放读者）
 memory fence (seq-cst)
 dir(L,E,p) : LOADING -> READY     // 至此计算线程扫到 READY 才合法
@@ -143,7 +143,7 @@ dir(L,E,p) : LOADING -> READY     // 至此计算线程扫到 READY 才合法
 exec **刻意对驻留无状态**：它不读状态迁移、不区分 ABSENT / LOADING / MOVING_IN。
 它只尝试 pin，把失败的重新请求：
 
-```
+```text
 exec pin_layer(bitmap):
   loop:
     for each needed (L,E):
@@ -241,7 +241,7 @@ move 任务 ring，仿 async-load ring buffer 模式。
 
 ### 5.5 一次 v2r move 的状态舞步
 
-```
+```text
 调度线程（设备区满，需给新专家 X 腾槽）：
   按 (L,E) 驱逐（§6）选 victim V
   begin_evict(源槽)                 // READY -> EVICTING（挡住新 try_pin）
@@ -281,7 +281,7 @@ worker 也在源槽上取一个 refcount pin，那个 drain 会自锁（refcount
 驱逐回答"本池要为 layer-L 批腾 K 个空槽"。victim 从最靠近 L 的层选（decode 内
 刚算完的层最可能已陈旧），再往远层，score 阈值按层距放宽：
 
-```
+```text
 for delta = 1, 2, ...:
   for each 本池驻留的 (L-delta, e):
      if 槽 READY && refcount==0 && score(e) <= threshold(delta): 候选
@@ -321,7 +321,7 @@ per-model，MULTI_MODEL_POOL）只服务一个 exec 请求。于是"谁在等"�
 
 ### 7.1 活跃槽纪律
 
-```
+```text
 调度循环（global worker 轮询各 per-model scheduler；模型间互不阻塞——
 每个有自己的活跃槽）：
   per model:
@@ -413,17 +413,17 @@ wake exec。exec 永远看不到"半 pin 的 B"。
 **两个登记时刻的竞态，必须编码 + 测试（Claude 审阅）**：
 
 1. **登记前 settle（丢事件窗口）**：某专家在 exec scan（B 含它为 LOADING）之后、
-   scheduler 登记 active_ **之前**就 settle 成 READY（先跑的是 drain 那轮，当时无
+   scheduler 登记 `active_` **之前**就 settle 成 READY（先跑的是 drain 那轮，当时无
    active_）——它的 drain 事件就此永久丢失。修法：登记步骤必须在同一轮**现查每个 B 项的
    当前状态**（READY→当场 pin；ABSENT→当场装载；LOADING→留给 drain）。不是隐含前提，
    是硬验收用例："B 项在登记前一瞬 settle"仍必须被 pin。
-2. **B 里 ABSENT 项需要显式装载**：把 ABSENT 项塞进 active_.still_need 不会让它自己变
-   LOADING——必须有人显式 alloc + submit。漏掉这步 = active_ 永远等一个没人装的专家
+2. **B 里 ABSENT 项需要显式装载**：把 ABSENT 项塞进 `active_.still_need` 不会让它自己变
+   LOADING——必须有人显式 alloc + submit。漏掉这步 = `active_` 永远等一个没人装的专家
    （活锁）。写进登记步骤（上面 accept_requests 的 ABSENT 分支），不能靠隐含。
 
 **exec 侧——单程 pin_layer（取代 §3.5 loop / §7.3 两轮）**：
 
-```
+```text
 exec pin_layer(layer, needed, await, out):
   A = {}; B = {}
   for each needed (L,E):

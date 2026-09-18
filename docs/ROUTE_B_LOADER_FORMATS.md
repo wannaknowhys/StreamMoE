@@ -5,7 +5,7 @@
 > Source of truth for this doc: `src/loader/model_builder.cpp` / `src/loader/model.h`
 > (shared read model) + `src/convert/writer.cpp` (write direction). The converter
 > is now pure C++ and shares `model_t` with the loader.
-
+>
 > **2026-09 revision (supersedes v1-as-superset and whole-block-DIO below)**:
 > ggml-vulkan hardcodes the per-expert stride to the single-tensor compact size
 > (`ne0*ne1`), so route B is moving to **struct-of-array pools (one column per
@@ -66,7 +66,7 @@ Written by `src/convert/writer.cpp`, read by `parse_model` (`src/loader/model_bu
 
 Unified planner + uniform async DIO:
 
-```
+```text
 input path(s)
   -> format detect (layout KV + incomplete flag, both in file header)
   -> per-format planner -> uniform plan:

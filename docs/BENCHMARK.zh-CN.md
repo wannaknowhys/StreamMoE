@@ -32,7 +32,7 @@ route B 与纯粹原版用同一套方法学。
 `tools/run_bench.js` 复用 `run_export.js` 的 model/engine/task 笛卡尔 + `${VAR}`
 环境变量展开。
 
-```
+```bash
 node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]>
                         [--port N] [--health-timeout S] [--out FILE] [--dry-run]
 ```

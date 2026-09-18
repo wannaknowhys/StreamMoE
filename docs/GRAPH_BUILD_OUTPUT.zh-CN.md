@@ -46,6 +46,7 @@ prefill 和 decode 都走**入口 #2**（`process_ubatch`）——区别只在 u
 唯一真正的共享结构冲突是 **`common_params`**（`common/common.h` 声明、`common/common.cpp` / `common/arg.cpp` 解析、`llama.h` 的 params）——两个功能都要加字段：
 
 - **Phase 1（streammoe-macros.patch）**只在共享结构里加 include 锚点：
+
   ```cpp
   struct common_params {
   #ifdef STREAM_MOE_PREFILL_EXPORT
@@ -58,6 +59,7 @@ prefill 和 decode 都走**入口 #2**（`process_ubatch`）——区别只在 u
       ...
   };
   ```
+
 - **功能 patch 只新增 `.frag` 文件**（`common/stmoe_routeb_*.frag`、`common/stmoe_prefill_*.frag`、`include/stmoe_prefill_llama_*.frag`）——**不再改** `common.h/common.cpp/arg.cpp/llama.h`，所以 phase2a/2b 的 apply 顺序无关、永不冲突。
 - 宏由 `build.bat llamalibs <tag>` **编译时定义**：`main` -> `-DSTREAM_MOE_ROUTE_B`；`upstream_dump` -> `-DSTREAM_MOE_PREFILL_EXPORT`；`StreamMoE_dump` -> 两者；宏未定义时 include 行被预处理跳过（phase1 单独可编译 = 纯上游等价）。
 

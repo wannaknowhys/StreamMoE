@@ -117,6 +117,7 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
 ## 生命周期 / 还原
 
 - patch 备份：`patches/route-b-inject.patch`（**必须用 cmd 重定向生成**，PS 5.1 的 `>` 会写 UTF-16，导致 `git apply` 报 "No valid patches"）：
+
   ```bat
   rem 在父仓库根目录执行（cmd 重定向字节透传，产出纯文本 patch）
   rem 各 patch 各管各的文件，用文件列表限定（绝不 `git diff >` 全量抄，会把其他 patch 混进来）
@@ -124,6 +125,7 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
   rem 校验 patch 有效（在已应用的工作区应通过 reverse-check）
   git -C third_party/llama.cpp apply --check -R patches\route-b-inject.patch
   ```
+
 - **已跟踪依赖**：`third_party/llama.cpp/src/tsc_timer.h`（`[TMR]` 启动计时，被 route-b-inject 的
   `src/llama.cpp` / `src/llama-context.cpp` include）。**已提交进 vendored 子模块**（2026-08-28，
   route-b-inject 应用后无需重建）——内容是一个 `sm_tmr::timer`（chrono，析构打印 `[TMR] name dur=xx ms`）。
