@@ -1,4 +1,8 @@
-﻿#include "profile/profiler.h"
+﻿#ifndef STREAMMOE_BUILD_VIA_SCRIPT
+#error "This project must be compiled using build.bat only."
+#endif
+
+#include "profile/profiler.h"
 #include "common/logger.h"
 
 #include <cstdio>

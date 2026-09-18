@@ -1,3 +1,7 @@
+#ifndef STREAMMOE_BUILD_VIA_SCRIPT
+#error "This project must be compiled using build.bat only."
+#endif
+
 // Unit tests for the route B control plane (src/backend/slot.h).
 // Model-agnostic, cross-platform (no llama.cpp dependency).
 #include "backend/slot.h"

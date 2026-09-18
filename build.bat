@@ -1,5 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
+set "STREAMMOE_SCRIPT_CL=!CL! /DSTREAMMOE_BUILD_VIA_SCRIPT=1"
+set "CL=!STREAMMOE_SCRIPT_CL!"
 rem =====================================================================
 rem  StreamMoE Build Utility (thin dispatcher)
 rem  Build rules live in CMakeLists.txt; this file only forwards to
@@ -207,6 +209,7 @@ if not exist "%VSVARS%" (
 )
 call "%VSVARS%" >nul
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+set "CL=!STREAMMOE_SCRIPT_CL!"
 if not exist build\asan\llama-build mkdir build\asan\llama-build
 "%CMAKE%" -S third_party/llama.cpp -B build/asan/llama-build -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^

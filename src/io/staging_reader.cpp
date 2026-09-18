@@ -1,4 +1,8 @@
-﻿#include "io/staging_reader.h"
+﻿#ifndef STREAMMOE_BUILD_VIA_SCRIPT
+#error "This project must be compiled using build.bat only."
+#endif
+
+#include "io/staging_reader.h"
 #include "common/logger.h"
 #include <cstring>
 #include <cassert>

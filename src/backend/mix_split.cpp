@@ -1,3 +1,7 @@
+#ifndef STREAMMOE_BUILD_VIA_SCRIPT
+#error "This project must be compiled using build.bat only."
+#endif
+
 #include "backend/mix_split.h"
 
 #include <algorithm>
