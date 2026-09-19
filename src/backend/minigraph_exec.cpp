@@ -67,6 +67,50 @@ struct parsed_node_t {
 #define MOE_ID_AT(ids, t, k) \
     (*(const int32_t*)((const char*)(ids)->data + (size_t)(t) * (ids)->nb[1] + (size_t)(k) * (ids)->nb[0]))
 
+// Fast host-pinned staging buffer for device->host control-plane inspection (e.g. routing ids).
+// Bypasses the unpinned fallback in ggml-vulkan that serializes every get_async call.
+struct pinned_control_staging_t {
+    ggml_backend_buffer_t buf = nullptr;
+    size_t                size = 0;
+    ggml_backend_dev_t    dev = nullptr;
+
+    ~pinned_control_staging_t() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+        }
+    }
+
+    void * ensure(ggml_backend_dev_t d, size_t needed) {
+        if (!d) return nullptr;
+        if (dev != d && buf) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+            size = 0;
+        }
+        dev = d;
+        if (needed <= size && buf) {
+            return ggml_backend_buffer_get_base(buf);
+        }
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+        }
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(d);
+        if (!host_buft) return nullptr;
+        const size_t alloc_sz = ((needed + 65535) / 65536) * 65536;
+        buf = ggml_backend_buft_alloc_buffer(host_buft, alloc_sz);
+        if (!buf) {
+            size = 0;
+            return nullptr;
+        }
+        size = alloc_sz;
+        return ggml_backend_buffer_get_base(buf);
+    }
+};
+
+static pinned_control_staging_t g_pinned_control;
+
 // Host image of a tensor for host-side inspection (iron rule): returns t->data
 // when host-resident, else a backend-agnostic copy in `buf`. Never dereference
 // t->data directly - the tensor may live on a device backend.
@@ -74,8 +118,22 @@ static const uint8_t * host_image(const ggml_tensor * t, std::vector<uint8_t> & 
     if (!t->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
         return static_cast<const uint8_t *>(t->data);
     }
-    buf.resize(ggml_nbytes(t));
-    tensor_read_host(t, buf.data(), 0, buf.size());
+    const size_t nbytes = ggml_nbytes(t);
+    buf.resize(nbytes);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    void * p_stage = dev ? g_pinned_control.ensure(dev, nbytes) : nullptr;
+    const char * dev_name = dev ? ggml_backend_dev_name(dev) : nullptr;
+    ggml_backend_t be = dev_name ? route_b_device_backend(dev_name) : nullptr;
+
+    if (p_stage && be) {
+        ggml_backend_tensor_get_async(be, t, p_stage, 0, nbytes);
+        ggml_backend_synchronize(be);
+        std::memcpy(buf.data(), p_stage, nbytes);
+    } else {
+        tensor_read_host(t, buf.data(), 0, nbytes);
+    }
     return buf.data();
 }
 
