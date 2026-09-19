@@ -26,6 +26,7 @@ set CMD=%1
 if "%CMD%"=="" set CMD=build
 set TAG=%2
 if "%TAG%"=="" set TAG=main
+set NAME=%3
 set OUT=build\%TAG%
 set LLAMA_BUILD=%OUT%\llama-build
 
@@ -34,6 +35,7 @@ if "%CMD%"=="build" goto build
 if "%CMD%"=="test" goto test
 if "%CMD%"=="clean" goto clean
 if "%CMD%"=="convert" goto convert
+if "%CMD%"=="harness" goto harness
 if "%CMD%"=="asan" goto asan
 echo Unknown command: %CMD%
 goto help
@@ -256,6 +258,31 @@ copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
 echo [+] converter built: %OUT%\bin\stream_moe_convert.exe
 exit /b 0
 
+:harness
+echo [StreamMoE] Building diagnostics harness "%NAME%" (tag %TAG%) into %OUT%\bin\%NAME%.exe ...
+if not "%NAME%"=="" goto harness_have_name
+echo [-] usage: build.bat harness TAG NAME  (source: diagnostics/NAME.cpp)
+exit /b 1
+:harness_have_name
+if exist "diagnostics\%NAME%.cpp" goto harness_have_src
+echo [-] missing diagnostics\%NAME%.cpp
+exit /b 1
+:harness_have_src
+if exist "%LLAMA_BUILD%\src\llama.lib" goto harness_have_libs
+echo [-] libllama libs missing for tag %TAG%. Run first: build.bat llamalibs %TAG%
+exit /b 1
+:harness_have_libs
+if exist "%OUT%\bin" goto harness_have_outdir
+mkdir "%OUT%\bin"
+:harness_have_outdir
+if "%VULKAN_SDK%"=="" set VULKAN_SDK=C:\VulkanSDK\1.4.357.0
+"%CLANGXX%" /std:c++17 /O2 /EHsc /D_CRT_SECURE_NO_WARNINGS /I third_party/llama.cpp/ggml/include /I third_party/llama.cpp/include "diagnostics\%NAME%.cpp" "%LLAMA_BUILD%\ggml\src\ggml-base.lib" "%LLAMA_BUILD%\ggml\src\ggml-cpu.lib" "%LLAMA_BUILD%\ggml\src\ggml-vulkan\ggml-vulkan.lib" "%LLAMA_BUILD%\ggml\src\ggml.lib" "%LIBOMP%" "%VULKAN_SDK%\Lib\vulkan-1.lib" advapi32.lib /link /OUT:"%OUT%\bin\%NAME%.exe"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+for %%I in ("%CLANGXX%") do set LLVM_BIN_DIR=%%~dpI
+copy /Y "!LLVM_BIN_DIR!libomp.dll" "%OUT%\bin\libomp.dll" >nul
+echo [+] harness built: %OUT%\bin\%NAME%.exe
+exit /b 0
+
 :clean
 echo [StreamMoE] Removing build\ (all tags)...
 if exist build rmdir /s /q build
@@ -279,6 +306,7 @@ echo                                (build\StreamMoE_latest)
 echo   llamalibs StreamMoE_dump_dbg - latest features + STREAM_MOE_TEMP diagnostic
 echo                                code (build\StreamMoE_dump_dbg; debug only)
 echo   build.bat convert        - build C++ converter (build^<tag^>\bin\stream_moe_convert.exe)
+echo   build.bat harness ^<tag^> ^<name^> - build diagnostics\^<name^>.cpp harness (build^<tag^>\bin\^<name^>.exe)
 echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0
