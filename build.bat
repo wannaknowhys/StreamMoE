@@ -21,7 +21,7 @@ set CLANG=F:/Dev/LLVM/bin/clang-cl.exe
 set CLANGXX=F:/Dev/LLVM/bin/clang-cl.exe
 set RC=F:/Dev/LLVM/bin/llvm-rc.exe
 set LIBOMP=F:/Dev/LLVM/lib/libomp.lib
-set LIBOMP_DLL=F:/Dev/LLVM/bin/libomp.dll
+set LIBOMP_DLL=F:\Dev\LLVM\bin\libomp.dll
 
 set CMD=%1
 if "%CMD%"=="" set CMD=build
