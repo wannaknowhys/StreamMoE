@@ -1431,33 +1431,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                                                        ggml_backend_t cpu,
                                                        expert_scheduler & sched,
                                                        const moe_layer_exec_t * ex,
-                                                       const std::vector<expert_handle_t>& pins) {
-    const ggml_tensor * ids = nullptr;
-    for (const auto * cn : ex->compute) {
-        if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { ids = cn->src[2]; break; }
-    }
-    if (!ids) return GGML_STATUS_FAILED;
-    const uint32_t n_k = static_cast<uint32_t>(ids->ne[0]);
-    const uint32_t n_t = static_cast<uint32_t>(ids->ne[1]);
-    // Empty chain: the last layer is narrowed to the requested output tokens
-    // (inp_out_ids), so a non-final prefill ubatch has zero output tokens and
-    // its MoE is a 0-token no-op in llama.cpp. There is nothing to execute.
+                                                       const std::vector<expert_handle_t>& pins,
+                                                       const ggml_tensor * ids,
+                                                       uint32_t n_k, uint32_t n_t,
+                                                       const std::vector<int32_t>& ids_compact) {
     if (n_t == 0 || n_k == 0) return GGML_STATUS_SUCCESS;
-    if (!ids->data) return GGML_STATUS_FAILED;
     const uint32_t n_expert = sched.topology().n_expert;
     const uint32_t n_pools  = sched.n_pools();
-
-    // Compact routing ids (honors the real row stride: hash layers are compact,
-    // argsort layers are sparse). build_mix_plan wants [t*n_k + k]. ids may live
-    // on a device backend (gating on C1:Vulkan0) - use a host image (iron rule).
-    std::vector<uint8_t> ids_host;
-    const uint8_t * ids_bytes = host_image(ids, ids_host);
-    std::vector<int32_t> ids_compact((size_t) n_k * n_t, 0);
-    for (uint32_t t = 0; t < n_t; ++t) {
-        for (uint32_t k = 0; k < n_k; ++k) {
-            ids_compact[(size_t) t * n_k + k] = moe_id_at(ids_bytes, ids, (int) t, (int) k);
-        }
-    }
 
     // Per-expert pool from the pinned handles (pin_layer returns one per active
     // expert with its pool). -1 = not active / unknown.
@@ -2283,27 +2263,40 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     }
 #endif
 
+    // Find the single routing ids tensor for this MoE layer.
+    const ggml_tensor * ids = nullptr;
+    for (const auto * cn : ex->compute) {
+        if (cn && cn->op == GGML_OP_MUL_MAT_ID && cn->src[2]) { ids = cn->src[2]; break; }
+    }
+    if (!ids) return GGML_STATUS_FAILED;
+    const uint32_t n_k = static_cast<uint32_t>(ids->ne[0]);
+    const uint32_t n_t = static_cast<uint32_t>(ids->ne[1]);
+    // Empty chain: 0-token no-op.
+    if (n_t == 0 || n_k == 0) return GGML_STATUS_SUCCESS;
+    if (!ids->data) return GGML_STATUS_FAILED;
+
+    // Single D2H readback of routing ids per layer (iron rule: avoid redundant transfers).
+    std::vector<uint8_t> ids_host;
+    const uint8_t * ids_bytes = host_image(ids, ids_host);
+    std::vector<int32_t> ids_compact((size_t) n_k * n_t, 0);
+    for (uint32_t t = 0; t < n_t; ++t) {
+        for (uint32_t k = 0; k < n_k; ++k) {
+            ids_compact[(size_t) t * n_k + k] = moe_id_at(ids_bytes, ids, (int) t, (int) k);
+        }
+    }
+
     // Pin the layer's whole active expert set (all mm nodes share the ids).
     // Batch semantics: ONE request carrying the whole layer's expert bitmap;
     // missing experts load concurrently (IOCP n-way), exec wakes once.
     std::vector<keyed_expert_t> keys;
-    auto add_key = [&](uint32_t l, uint32_t e) {
-        for (const auto & x : keys) if (x.layer == l && x.expert == e) return;
-        keys.push_back({ l, e });
-    };
-    for (const auto * cn : ex->compute) {
-        if (!cn || cn->op != GGML_OP_MUL_MAT_ID || !cn->src[0] || !cn->src[2]) continue;
-        parsed_node_t pn = parse_weight_name(cn->src[0]->name);
-        if (!pn.ok) continue;
-        const ggml_tensor * ids = cn->src[2];
-        if (!ids->data) continue;
-        std::vector<uint8_t> ids_host;
-        const uint8_t * ib = host_image(ids, ids_host);
-        for (int t = 0; t < ids->ne[1]; ++t)
-            for (int k = 0; k < ids->ne[0]; ++k) {
-                const int32_t e = moe_id_at(ib, ids, t, k);
-                if (e >= 0 && e < static_cast<int32_t>(topo.n_expert)) add_key(pn.layer, static_cast<uint32_t>(e));
+    for (int32_t e : ids_compact) {
+        if (e >= 0 && e < static_cast<int32_t>(topo.n_expert)) {
+            bool exists = false;
+            for (const auto & x : keys) {
+                if (x.expert == static_cast<uint32_t>(e)) { exists = true; break; }
             }
+            if (!exists) keys.push_back({ static_cast<uint32_t>(layer), static_cast<uint32_t>(e) });
+        }
     }
     // All keys belong to `layer` (burst is per-layer); build the needed bitmap.
     if (!keys.empty() && keys[0].layer != static_cast<uint32_t>(layer)) {
@@ -2344,7 +2337,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // The compact-chain bucket engine is the only executor: a full-width single
     // bucket by default (no env), or an env-selected multi-bucket cut.
     run_layer_xfers(layer, ROUTE_B_XFER_CLOSURE);   // cur on the closure's device
-    const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins);
+    const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins, ids, n_k, n_t, ids_compact);
 #ifdef STREAM_MOE_TEMP
     dump_node_hash(layer, "moe", dense_head);   // head nodes still live at the tail?
 #endif
