@@ -21,6 +21,7 @@ set CLANG=F:/Dev/LLVM/bin/clang-cl.exe
 set CLANGXX=F:/Dev/LLVM/bin/clang-cl.exe
 set RC=F:/Dev/LLVM/bin/llvm-rc.exe
 set LIBOMP=F:/Dev/LLVM/lib/libomp.lib
+set LIBOMP_DLL=F:/Dev/LLVM/bin/libomp.dll
 
 set CMD=%1
 if "%CMD%"=="" set CMD=build
@@ -159,10 +160,9 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 rem OpenMP runtime DLL lives in the LLVM bin dir (lib/libomp.dll does not exist) -
 rem copy it next to the binaries or llama-server dies with STATUS_DLL_NOT_FOUND.
-for %%I in ("%CLANG%") do set LLVM_BIN_DIR=%%~dpI
-copy /Y "%LLVM_BIN_DIR%libomp.dll" "%LLAMA_BUILD%\bin\libomp.dll" >nul
+copy /Y "%LIBOMP_DLL%" "%LLAMA_BUILD%\bin\libomp.dll" >nul
 if %ERRORLEVEL% NEQ 0 (
-    echo [-] failed to copy libomp.dll from "%LLVM_BIN_DIR%"
+    echo [-] failed to copy libomp.dll from "%LIBOMP_DLL%"
     exit /b %ERRORLEVEL%
 )
 echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
@@ -191,7 +191,7 @@ rem test_async_dio is DISABLED (SoA refactor - see CMakeLists.txt) - keep the
 rem list in sync with the enabled test targets there.
 "%NINJA%" -C "%OUT%\cmake" test_moe_loader test_profiler test_scheduler test_slot test_mix_plan test_scatter_plan
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
+copy /Y "%LIBOMP_DLL%" "%OUT%\bin\libomp.dll" >nul
 echo [StreamMoE] Running ctest ...
 "%NINJA%" -C "%OUT%\cmake" test
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
@@ -254,7 +254,7 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 "%NINJA%" -C "%OUT%\cmake" stream_moe_convert
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-copy /Y "%LIBOMP:.lib=.dll%" "%OUT%\bin\libomp.dll" >nul
+copy /Y "%LIBOMP_DLL%" "%OUT%\bin\libomp.dll" >nul
 echo [+] converter built: %OUT%\bin\stream_moe_convert.exe
 exit /b 0
 
@@ -278,8 +278,7 @@ mkdir "%OUT%\bin"
 if "%VULKAN_SDK%"=="" set VULKAN_SDK=C:\VulkanSDK\1.4.357.0
 "%CLANGXX%" /std:c++17 /O2 /EHsc /D_CRT_SECURE_NO_WARNINGS /I third_party/llama.cpp/ggml/include /I third_party/llama.cpp/include "diagnostics\%NAME%.cpp" "%LLAMA_BUILD%\ggml\src\ggml-base.lib" "%LLAMA_BUILD%\ggml\src\ggml-cpu.lib" "%LLAMA_BUILD%\ggml\src\ggml-vulkan\ggml-vulkan.lib" "%LLAMA_BUILD%\ggml\src\ggml.lib" "%LIBOMP%" "%VULKAN_SDK%\Lib\vulkan-1.lib" advapi32.lib /link /OUT:"%OUT%\bin\%NAME%.exe"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-for %%I in ("%CLANGXX%") do set LLVM_BIN_DIR=%%~dpI
-copy /Y "!LLVM_BIN_DIR!libomp.dll" "%OUT%\bin\libomp.dll" >nul
+copy /Y "%LIBOMP_DLL%" "%OUT%\bin\libomp.dll" >nul
 echo [+] harness built: %OUT%\bin\%NAME%.exe
 exit /b 0
 
