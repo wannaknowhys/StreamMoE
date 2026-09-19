@@ -1056,13 +1056,34 @@ static ggml_tensor * bucket_source_leaf(chain_ctx_t & c, const ggml_tensor * src
         ggml_backend_buft_is_host(ggml_backend_buffer_get_type(src->buffer));
     const size_t bytes = ggml_nbytes(l);
     if (c.dev) {
+        bool same_device = false;
+        if (c.dev->be && src->buffer) {
+            ggml_backend_dev_t s_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+            ggml_backend_dev_t d_dev = ggml_backend_get_device(c.dev->be);
+            if (s_dev && d_dev && s_dev == d_dev) {
+                same_device = true;
+            }
+        }
+        if (same_device) {
+            l->buffer    = src->buffer;
+            l->data      = src->data;
+            l->view_src  = src->view_src;
+            l->view_offs = src->view_offs;
+            return l;
+        }
         const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
         l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
-        std::vector<uint8_t> tmp(bytes);
-        tensor_read_host(src, tmp.data(), 0, bytes);
-        tensor_write_host(l, tmp.data(), 0, bytes);
+        if (src_host && src->data) {
+            tensor_write_host(l, src->data, 0, bytes);
+        } else if (src->buffer) {
+            ggml_backend_tensor_copy(src, l);
+        } else {
+            std::vector<uint8_t> tmp(bytes);
+            tensor_read_host(src, tmp.data(), 0, bytes);
+            tensor_write_host(l, tmp.data(), 0, bytes);
+        }
     } else if (src_host) {
         l->data = const_cast<void *>(src->data);
     } else {
@@ -1778,7 +1799,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     const bool moe_out_host = moe_out && moe_out->data &&
         (!moe_out->buffer ||
          ggml_backend_buft_is_host(ggml_backend_buffer_get_type(moe_out->buffer)));
-    const bool direct_out = single_target && moe_out_host &&
+    const bool direct_out = single_target && moe_out && moe_out->data &&
         moe_out->nb[0] == sizeof(float) && moe_out->nb[1] == (size_t) d_out * sizeof(float);
 
 #ifdef STREAM_MOE_TEMP
@@ -1841,6 +1862,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     tmr_acc_t & _tt = (n_t == 1) ? g_tail_dec : g_tail_pre;
     auto _ch_t0 = std::chrono::steady_clock::now();
 #endif
+    bool has_cpu_round = false;
     for (uint32_t ri = 0; ri < n_rounds; ++ri) {
         const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
@@ -1849,6 +1871,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             auto it = dev_targets.find(r.pool);
             if (it != dev_targets.end()) dt = &it->second;
         }
+        if (!dt) has_cpu_round = true;
         c.dev = dt;
         c.gf  = dt ? dt->gf : gf_cpu;
         b.r = &r;
@@ -1914,7 +1937,10 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             // Single target: per_token is the whole answer -> write moe_out
             // directly, no ACC, no host fold.
             if (dt) dt->result = per_token;
-            else    per_token->data = moe_out->data;
+            else if (moe_out_host) per_token->data = moe_out->data;
+            else {
+                b.bind_fresh(per_token, (size_t)(c.d_out * c.n_t) * sizeof(float), false);
+            }
         } else {
             // acc_d[d_out, n_t] += per_token tight columns, one ggml_acc per run.
             ggml_tensor * acc = nullptr;
@@ -2025,14 +2051,35 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #ifdef STREAM_MOE_TEMP
         { g_tsync.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tt0).count(); g_tsync.n++; _tt0 = std::chrono::steady_clock::now(); }
 #endif
+        const bool single_dev_target = (dev_targets.size() == 1 && !has_cpu_round);
+        bool moe_out_same_dev = false;
+        if (moe_out && moe_out->buffer) {
+            ggml_backend_dev_t m_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(moe_out->buffer));
+            ggml_backend_dev_t t_dev = ggml_backend_get_device(t.be);
+            if (m_dev && t_dev && m_dev == t_dev) moe_out_same_dev = true;
+        }
         if (direct_out) {
-            // single target: the device result IS the layer output -> one D2H
-            // readback, then a backend-agnostic write into moe_out (which may be
-            // device-resident under a C1 placement).
+            // single target: the device result IS the layer output
             if (t.result) {
-                std::vector<uint8_t> tmp(acc_bytes);
-                ggml_backend_tensor_get(t.result, tmp.data(), 0, acc_bytes);
-                tensor_write_host(moe_out, tmp.data(), 0, acc_bytes);
+                if (moe_out_same_dev) {
+                    ggml_backend_tensor_copy(t.result, moe_out);
+                } else if (moe_out_host) {
+                    ggml_backend_tensor_get(t.result, moe_out->data, 0, acc_bytes);
+                } else {
+                    ggml_backend_tensor_copy(t.result, moe_out);
+                }
+            }
+        } else if (single_dev_target) {
+            // Single device target with all rounds: t.acc is the complete result.
+            // Avoid roundtrip through host!
+            if (t.acc) {
+                if (moe_out_same_dev) {
+                    ggml_backend_tensor_copy(t.acc, moe_out);
+                } else if (moe_out_host) {
+                    ggml_backend_tensor_get(t.acc, moe_out->data, 0, acc_bytes);
+                } else {
+                    ggml_backend_tensor_copy(t.acc, moe_out);
+                }
             }
         } else {
             dev_accs[di].assign(acc_sz, 0.0f);
@@ -2104,7 +2151,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #ifdef STREAM_MOE_TEMP
     _tt0 = std::chrono::steady_clock::now();
 #endif
-    if (!direct_out) {
+    const bool single_dev_target = (dev_targets.size() == 1 && !has_cpu_round);
+    if (!direct_out && !single_dev_target) {
         if (!layer_fold(ex, d_out, n_t, accs)) return GGML_STATUS_FAILED;
     }
 #ifdef STREAM_MOE_TEMP
