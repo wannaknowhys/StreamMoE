@@ -567,7 +567,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             // The closure's own layout now indexes the merged scratch, so the
             // executor (moe_chain_fullalloc_buffer base + out_off) lands in the
             // same pool as the dense head/tail.
-            if (ex && !ex->compute.empty()) {
+            if (ex && !ex->compute.empty() && D == closure_dev) {
                 moe_layer_exec_t * mut = const_cast<moe_layer_exec_t*>(ex);
                 for (size_t i = 0; i < ex->compute.size(); ++i) {
                     auto oit = plan.scratch_off.find(ex->compute[i]);
@@ -859,10 +859,15 @@ void * moe_chain_fullalloc_buffer(size_t need_bytes) {
     // plan buffer (which may be a device buffer under mixed RAM+device pools). It
     // is sized by moe_chain_set_full_alloc(ex->result_bytes), which layout_arena
     // leaves at the (final, per-device) closure layout, so the twins' out_off fits.
-    if (!g_fullalloc_buf) return nullptr;   // set_full_alloc(layer_sum) must run first
     if (need_bytes > g_fullalloc_cap) {
-        fprintf(stderr, "[route_b_cap] ERROR: full-alloc overflow need=%zu cap=%zu\n", need_bytes, g_fullalloc_cap);
-        return nullptr;
+        size_t new_cap = (g_fullalloc_cap == 0) ? need_bytes : std::max(need_bytes, g_fullalloc_cap * 2);
+        aligned_free_ptr(g_fullalloc_buf);
+        g_fullalloc_buf = aligned_alloc_ptr(new_cap, 64);
+        g_fullalloc_cap = g_fullalloc_buf ? new_cap : 0;
+        if (!g_fullalloc_buf) {
+            fprintf(stderr, "[route_b_cap] ERROR: full-alloc alloc failed need=%zu\n", need_bytes);
+            return nullptr;
+        }
     }
     return g_fullalloc_buf;
 }

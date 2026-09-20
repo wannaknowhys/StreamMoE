@@ -487,16 +487,26 @@ struct exec_scratch_t {
     // Grow-only host copies of device-source leaves read on a CPU round
     // (bucket_source_leaf). Independent of f32/i32 so the fragile shared bump
     // sizing cannot be overrun by a leaf read (docs/DEVICE_DENSE_CLOSURE.md 3.8).
-    std::vector<uint8_t>       leaf_host;
+    std::vector<uint8_t>              leaf_host;
+    std::vector<std::vector<uint8_t>> leaf_blocks;
     size_t i32_used = 0, f32_used = 0, leaf_used = 0;
     void reset() {
         i32_used = 0; f32_used = 0; leaf_used = 0;
         plan_ids.clear(); plan_scatter.clear(); plan_rounds.clear();
         sp_order.clear(); sp_segs.clear();
+        leaf_blocks.clear();
     }
     int32_t * a32(size_t n) { int32_t * p = i32.data() + i32_used; i32_used += n; return p; }
     float   * af32(size_t n) { float * p = f32.data() + f32_used; f32_used += n; return p; }
-    uint8_t * abytes(size_t n) { uint8_t * p = leaf_host.data() + leaf_used; leaf_used += n; return p; }
+    uint8_t * abytes(size_t n) {
+        if (leaf_used + n > leaf_host.size()) {
+            leaf_blocks.emplace_back(n);
+            return leaf_blocks.back().data();
+        }
+        uint8_t * p = leaf_host.data() + leaf_used;
+        leaf_used += n;
+        return p;
+    }
 };
 static thread_local exec_scratch_t g_scratch;
 #ifdef STREAM_MOE_TEMP
@@ -1863,6 +1873,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     auto _ch_t0 = std::chrono::steady_clock::now();
 #endif
     bool has_cpu_round = false;
+    ggml_tensor * cpu_result = nullptr;
     for (uint32_t ri = 0; ri < n_rounds; ++ri) {
         const mix_round_t & r = rounds[ri];
         if (r.width == 0 || r.n_active == 0) continue;
@@ -1936,10 +1947,15 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         if (direct_out) {
             // Single target: per_token is the whole answer -> write moe_out
             // directly, no ACC, no host fold.
-            if (dt) dt->result = per_token;
-            else if (moe_out_host) per_token->data = moe_out->data;
-            else {
-                b.bind_fresh(per_token, (size_t)(c.d_out * c.n_t) * sizeof(float), false);
+            if (dt) {
+                dt->result = per_token;
+            } else {
+                cpu_result = per_token;
+                if (moe_out_host) {
+                    per_token->data = moe_out->data;
+                } else {
+                    b.bind_fresh(per_token, (size_t)(c.d_out * c.n_t) * sizeof(float), false);
+                }
             }
         } else {
             // acc_d[d_out, n_t] += per_token tight columns, one ggml_acc per run.
@@ -2028,6 +2044,9 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         ggml_backend_graph_compute(cpu, gf_cpu) != GGML_STATUS_SUCCESS) {
         LOG_ERROR("stream_moe: CPU chain graph compute failed L" << layer);
         return GGML_STATUS_FAILED;
+    }
+    if (cpu_result && !moe_out_host && moe_out) {
+        tensor_write_host(moe_out, cpu_result->data, 0, (size_t)(c.d_out * c.n_t) * sizeof(float));
     }
     std::vector<std::vector<float>> dev_accs(dev_targets.size());
     std::vector<const float *> accs;
@@ -2436,7 +2455,15 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     // Hidden outputs live in the per-layer full-alloc block (result-buffer
     // layout when verify produced one, else the full-alloc sum).
     {
-        const size_t need = (ex && ex->layout_ok) ? ex->result_bytes : lsum;
+        size_t max_out = (ex && ex->layout_ok) ? ex->result_bytes : 0;
+        if (ex && ex->layout_ok) {
+            for (size_t i = 0; i < ex->compute.size(); ++i) {
+                if (i < ex->out_off.size() && ex->out_off[i] >= 0 && ex->compute[i]) {
+                    max_out = std::max(max_out, (size_t) ex->out_off[i] + ggml_nbytes(ex->compute[i]));
+                }
+            }
+        }
+        const size_t need = std::max(max_out, lsum);
         moe_chain_set_full_alloc(need);
     }
 
