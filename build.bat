@@ -37,6 +37,8 @@ if "%CMD%"=="test" goto test
 if "%CMD%"=="clean" goto clean
 if "%CMD%"=="convert" goto convert
 if "%CMD%"=="harness" goto harness
+if "%CMD%"=="history" goto history
+if "%CMD%"=="history-clean" goto history_clean
 if "%CMD%"=="asan" goto asan
 echo Unknown command: %CMD%
 goto help
@@ -282,6 +284,22 @@ copy /Y "%LIBOMP_DLL%" "%OUT%\bin\libomp.dll" >nul
 echo [+] harness built: %OUT%\bin\%NAME%.exe
 exit /b 0
 
+:history
+rem History binaries (orchestrated by tools/build_history.js - thin forwarder
+rem only, no build logic here): check out <commit> in temp/wt_<short>/, apply
+rem that commit's own vendored patch stack, build historical
+rem `llamalibs <tag>` with that commit's own recipe (old recipes only know
+rem plain tags), then move only bin/ to build\<tag>_<short>/ and drop the
+rem worktree. Failure keeps the worktree as the scene; success removes it.
+rem %2 = commit, %3.. = tags and/or --force/--allow-unknown.
+node tools\build_history.js %*
+exit /b %ERRORLEVEL%
+
+:history_clean
+rem Remove a leftover history worktree: build.bat history-clean <commit>
+node tools\build_history.js --clean %2
+exit /b %ERRORLEVEL%
+
 :clean
 echo [StreamMoE] Removing build\ (all tags)...
 if exist build rmdir /s /q build
@@ -306,6 +324,9 @@ echo   llamalibs StreamMoE_dump_dbg - latest features + STREAM_MOE_TEMP diagnost
 echo                                code (build\StreamMoE_dump_dbg; debug only)
 echo   build.bat convert        - build C++ converter (build^<tag^>\bin\stream_moe_convert.exe)
 echo   build.bat harness ^<tag^> ^<name^> - build diagnostics\^<name^>.cpp harness (build^<tag^>\bin\^<name^>.exe)
+echo   build.bat history ^<commit^> ^<tag...^> - history binary: worktree checkout + historical
+echo                                llamalibs + move bin/ to build^^<tag^^>_^^<short^^> (tools/build_history.js)
+echo   build.bat history-clean ^<commit^> - drop a leftover history worktree
 echo   build.bat asan          - ASan llama-server w/ route-B via MSVC cl (build\asan)
 echo See docs/PROJECT_STRUCTURE.md for the build layout pattern.
 exit /b 0
