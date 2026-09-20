@@ -168,22 +168,54 @@ async function main() {
 
   // Apply that commit's own vendored patch stack (all of it: the historical
   // worktree state is the full stack applied, never a subset).
+  // Stacked patches overlap in the same files, so once the full stack is on,
+  // per-patch forward/reverse --check both fail for every patch below the top.
+  // Only the TOP patch reverse-checks reliably (nothing sits above it), plus a
+  // marker file records exactly which patch bytes were applied.
+  const crypto = require('node:crypto');
+  const sha256 = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  const present = PATCH_STACK.filter((rel) => fs.existsSync(path.join(wtPath, rel)));
+  const shas = {};
+  for (const rel of present) shas[rel] = sha256(path.join(wtPath, rel));
+  const markerPath = path.join(wtPath, '.history_stack.json');
+  let stackOk = false;
   const applied = [];
-  for (const rel of PATCH_STACK) {
-    const p = path.join(wtPath, rel);
-    if (!fs.existsSync(p)) { info('skip missing ' + rel); continue; }
-    if (git(['-C', sub, 'apply', '--check', '--', p]).status === 0) {
-      const r = git(['-C', sub, 'apply', '--', p]);
-      if (r.status !== 0) fail('apply failed for ' + rel + ', scene kept at ' + wtPath + ':\n' + r.stderr);
-      applied.push(rel);
-      info('applied ' + rel);
-    } else if (git(['-C', sub, 'apply', '--reverse', '--check', '--', p]).status === 0) {
-      applied.push(rel + ' (already)');
-      info('already applied, skip ' + rel);
-    } else {
-      fail('patch does not apply: ' + rel + ', scene kept at ' + wtPath);
+  try {
+    const m = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    if (m.commit === full && JSON.stringify(m.patches) === JSON.stringify(shas) &&
+        git(['-C', sub, 'status', '--porcelain']).stdout.trim() !== '') {
+      stackOk = true;
+      for (const rel of present) applied.push(rel + ' (marker)');
+      info('patch stack verified by marker, skip');
+    }
+  } catch (e) { /* no usable marker */ }
+  if (!stackOk && present.length > 0) {
+    const top = present[present.length - 1];
+    if (git(['-C', sub, 'apply', '--reverse', '--check', '--', path.join(wtPath, top)]).status === 0) {
+      stackOk = true;
+      for (const rel of present) applied.push(rel + ' (assumed: top of stack present)');
+      info('top of stack already applied, assuming full stack, skip');
     }
   }
+  if (!stackOk) {
+    for (const rel of present) {
+      const p = path.join(wtPath, rel);
+      if (git(['-C', sub, 'apply', '--check', '--', p]).status === 0) {
+        const r = git(['-C', sub, 'apply', '--', p]);
+        if (r.status !== 0) fail('apply failed for ' + rel + ', scene kept at ' + wtPath + ':\n' + r.stderr);
+        applied.push(rel);
+        info('applied ' + rel);
+      } else if (git(['-C', sub, 'apply', '--reverse', '--check', '--', p]).status === 0) {
+        applied.push(rel + ' (already)');
+        info('already applied, skip ' + rel);
+      } else {
+        fail('patch does not apply: ' + rel + ', scene kept at ' + wtPath);
+      }
+    }
+  }
+  try {
+    fs.writeFileSync(markerPath, JSON.stringify({ commit: full, patches: shas }, null, 2), 'utf8');
+  } catch (e) { info('cannot write stack marker (non-fatal): ' + e.message); }
   try {
     const others = fs.readdirSync(path.join(wtPath, 'patches'))
       .filter((f) => f.endsWith('.patch'))
@@ -193,24 +225,34 @@ async function main() {
 
   for (const tag of tags) {
     const dest = path.join(BUILD_DIR, tag + '_' + short);
-    if (fs.existsSync(dest) && !force) {
-      fail('exists, refusing to overwrite: ' + dest + ' (rerun with --force). Scene kept at ' + wtPath);
+    const destExe = path.join(dest, 'bin', 'llama-server.exe');
+    // llamalibs binaries live in <tag>/llama-build/bin (ninja -C LLAMA_BUILD);
+    // tag-root bin/ is only for test/convert/harness outputs.
+    const wtBin = path.join(wtPath, 'build', tag, 'llama-build', 'bin');
+    const wtExe = path.join(wtBin, 'llama-server.exe');
+    if (fs.existsSync(destExe) && !force) {
+      info('already done, skip ' + tag + ' -> ' + dest);
+      continue;
     }
     const logFile = path.join(TEMP_DIR, 'history_' + short + '_' + tag + '.log');
-    info('building llamalibs ' + tag + ' @ ' + short + ' (log ' + logFile + ')');
-    const res = await runTee('cmd.exe', ['/c', 'build.bat', 'llamalibs', tag], wtPath, logFile);
-    if (res.code !== 0 || res.err) {
-      fail('build failed for tag ' + tag + ' (code ' + res.code + '). Scene kept at ' + wtPath + ', log ' + logFile);
-    }
-    const binDir = path.join(wtPath, 'build', tag, 'bin');
-    const serverExe = path.join(binDir, 'llama-server.exe');
-    if (!fs.existsSync(serverExe)) {
-      fail('expected binary missing: ' + serverExe + '. Scene kept at ' + wtPath + ', log ' + logFile);
+    if (fs.existsSync(wtExe)) {
+      info('worktree binary found, move without rebuild: ' + tag);
+    } else {
+      info('building llamalibs ' + tag + ' @ ' + short + ' (log ' + logFile + ')');
+      const res = await runTee('cmd.exe', ['/c', 'build.bat', 'llamalibs', tag], wtPath, logFile);
+      if (res.code !== 0 || res.err) {
+        fail('build failed for tag ' + tag + ' (code ' + res.code + '). Scene kept at ' + wtPath + ', log ' + logFile);
+      }
+      if (!fs.existsSync(wtExe)) {
+        fail('expected binary missing: ' + wtExe + '. Scene kept at ' + wtPath + ', log ' + logFile);
+      }
     }
     if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
     fs.mkdirSync(dest, { recursive: true });
-    moveDir(binDir, path.join(dest, 'bin'));
-    try { fs.renameSync(logFile, path.join(dest, 'build.log')); } catch (e) { info('log left at ' + logFile); }
+    moveDir(wtBin, path.join(dest, 'bin'));
+    if (fs.existsSync(logFile)) {
+      try { fs.renameSync(logFile, path.join(dest, 'build.log')); } catch (e) { info('log left at ' + logFile); }
+    }
     const manifest = {
       commit: full,
       short: short,
