@@ -46,7 +46,7 @@
    - **commit 顺便 push**——本地提交后立即 `git push origin main`，保持远程同步（用户会看 GitHub 确认进度）。
 
 10. **文档双语文档 + 落地**
-    - 设计文档写英文 + 简体中文两版（`[English](x.md) | [简体中文](x.zh-CN.md)`）；讨论定的方案要落地成 md 并提交。
+    - 设计文档写英文 + 简体中文两版（`[English](README.md) | [简体中文](README.zh-CN.md)`）；讨论定的方案要落地成 md 并提交。
 
 11. **代码只写给终态，CPU 阶段必须以 GPU 等价为准绳（2026-09-06 用户立）**
     - 核心判据：**这个方案在 GPU 上（vulkan/CUDA）能不能按同样的结构跑？**
@@ -101,51 +101,55 @@
 
 ### 重要必读（会话开始 / 大改动前）
 
-| 文档                                 | 内容                                                      |
-| :----------------------------------- | :-------------------------------------------------------- |
-| `docs/CHECKPOINT.md`                 | 当前状态、下一步、验证命令（会话恢复先读）                |
-| `docs/PROJECT_STRUCTURE.md`          | 目录/产物/规范、vendored patch 纪律                       |
-| `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` | route B 核心设计（第三路径：官方内核 + 均匀 stride 槽池） |
-| `docs/Backend.md`                    | 自定义 backend / expert pool 调度设计                     |
-| `docs/VENDORED_MODIFICATIONS.md`     | vendored 改动汇总 + patch 记录                            |
+| 文档                                                       | 内容                                                      |
+| :--------------------------------------------------------- | :-------------------------------------------------------- |
+| [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md)                 | 当前状态、下一步、验证命令（会话恢复先读）                |
+| [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)   | 目录/产物/规范、vendored patch 纪律                       |
+| [`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md`](docs/LLAMA_MOE_NO_MMAP_RESEARCH.md) | route B 核心设计（第三路径：官方内核 + 均匀 stride 槽池） |
+| [`docs/Backend.md`](docs/Backend.md)                       | 自定义 backend / expert pool 调度设计                     |
+| [`docs/VENDORED_MODIFICATIONS.md`](docs/VENDORED_MODIFICATIONS.md) | vendored 改动汇总 + patch 记录                            |
 
 ### 按场景读取
 
-| 场景                                              | 文档                                                                                                     |
-| :------------------------------------------------ | :------------------------------------------------------------------------------------------------------- |
-| 调度/池（dir 二维、异步装载、全局线程、驱逐打分） | `docs/EXPERT_SCHEDULER_DESIGN.md`                                                                        |
-| GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）      | `docs/ROUTE_B_GPU_PHASE.md`                                                                              |
-| dense 放置与驻留管理（C1/C2 策略、迁移判据）      | `docs/DENSE_PLACEMENT.md`                                                                                |
-| 设备端 dense 闭包与跨设备流转（C1/MoE/C2）        | `docs/DEVICE_DENSE_CLOSURE.md`                                                                           |
-| 每设备 arena 规划（区间打包、carry 管线）         | `docs/PER_DEVICE_ARENA.md`                                                                               |
-| 整图分区（四区域、接缝 leaves、buft 标记）        | `docs/GRAPH_PARTITION.md`                                                                                |
-| route B 整层拥有（整层执行、跨设备搬运）          | `docs/ROUTE_B_LAYER_OWNERSHIP.md`                                                                        |
-| 层执行器设计（三段 arena、轻量 mini-graph）       | `docs/LAYER_EXECUTOR_DESIGN.md`                                                                          |
-| L2 整层执行审查（A~E 风险清单与防御）             | `docs/L2_WHOLE_LAYER_REVIEW.md`                                                                          |
-| M2 设备执行器设计（设备 mini-graph、异步骨架）    | `docs/M2_DEVICE_EXECUTOR.md`                                                                             |
-| 紧凑多桶快速路径 / 算子融合                       | `docs/BUCKET_FAST_PATH.md`                                                                               |
-| 桶执行 token 子集紧凑收集                         | `docs/BUCKET_EXEC_TOKEN_SUBSET.md`                                                                       |
-| token 子集 scatter-add 规划                       | `docs/SCATTER_PLAN.md`                                                                                   |
-| 专家移动流水线与 (L,E) 驱逐设计                   | `docs/EXPERT_MOVE_PIPELINE.md`                                                                           |
-| VRAM DMA 搬运与 staging 规约                      | `docs/VRAM_DMA_MOVE.md`                                                                                  |
-| 吞吐基准评测（单次/多轮、参数矩阵）               | `docs/BENCHMARK.md`                                                                                      |
-| 多模型池 / 异构子池                               | `docs/MULTI_MODEL_POOL.md`、`docs/MULTI_SUBPOOL.md`                                                      |
-| GGUF 格式 v1/v2 / RAID0 分片                      | `docs/STREAMMOE_GGUF_FORMAT.md`                                                                          |
-| Route-B 加载器与 GGUF 输入格式                    | `docs/ROUTE_B_LOADER_FORMATS.md`                                                                         |
-| 图构建输出点与阶段宏补丁规则                      | `docs/GRAPH_BUILD_OUTPUT.md`                                                                             |
-| 后端数值差异分析与基线控制                        | `docs/BACKEND_DIVERGENCE_ANALYSIS.md`                                                                    |
-| prefill 交叉验证 / 专家历史模拟 / repack 排查     | `docs/PREFILL_CROSS_VALIDATION.md`、`docs/EXPERT_TRACE_SIMULATION.md`、`docs/REPACK_DIVERGENCE_DEBUG.md` |
-| delegate 排查方法论 / bug 清单                    | `docs/DEBUG_DELEGATION.md`、`docs/BUG_TRACKER.md`                                                        |
-| patch 拆分/更新踩坑                               | `docs/PATCH_SPLITTING_PITFALLS.md`                                                                       |
-| 迁移上游工具 / 可执行程序路线                     | `docs/UPSTREAM_TOOLS_MIGRATION.md`、`docs/LLAMA_EXE_ROADMAP.md`                                          |
-| 冒烟/测试/采样                                    | `docs/SMOKE_TESTING.md`、`docs/TEST_FLOW.md`、`docs/SAMPLING.md`                                         |
-| Mock 规范与测试桩原则                             | `docs/MOCK.md`                                                                                           |
-| ASan 构建                                         | `docs/ASAN_BUILD.md`                                                                                     |
-| v2 架构修正                                       | `docs/V2_ARCHITECTURE_REVISION.md`                                                                       |
+| 场景                                                 | 文档                                                                                                     |
+| :--------------------------------------------------- | :------------------------------------------------------------------------------------------------------- |
+| 调度/池（dir 二维、异步装载、全局线程、驱逐打分）    | [`docs/EXPERT_SCHEDULER_DESIGN.md`](docs/EXPERT_SCHEDULER_DESIGN.md)                                     |
+| GPU/多设备（vulkan、HOST_VISIBLE、EMA 放置）         | [`docs/ROUTE_B_GPU_PHASE.md`](docs/ROUTE_B_GPU_PHASE.md)                                                 |
+| dense 放置与驻留管理（C1/C2 策略、迁移判据）         | [`docs/DENSE_PLACEMENT.md`](docs/DENSE_PLACEMENT.md)                                                     |
+| 设备端 dense 闭包与跨设备流转（C1/MoE/C2）           | [`docs/DEVICE_DENSE_CLOSURE.md`](docs/DEVICE_DENSE_CLOSURE.md)                                           |
+| 拓扑分段执行（C2≠C1 跨设备段边界调度与非层节点搬运） | [`docs/DEVICE_SEGMENT_EXEC.md`](docs/DEVICE_SEGMENT_EXEC.md)                                             |
+| 每设备 arena 规划（区间打包、carry 管线）            | [`docs/PER_DEVICE_ARENA.md`](docs/PER_DEVICE_ARENA.md)                                                   |
+| 整图分区（四区域、接缝 leaves、buft 标记）           | [`docs/GRAPH_PARTITION.md`](docs/GRAPH_PARTITION.md)                                                     |
+| route B 整层拥有（整层执行、跨设备搬运）             | [`docs/ROUTE_B_LAYER_OWNERSHIP.md`](docs/ROUTE_B_LAYER_OWNERSHIP.md)                                     |
+| 层执行器设计（三段 arena、轻量 mini-graph）          | [`docs/LAYER_EXECUTOR_DESIGN.md`](docs/LAYER_EXECUTOR_DESIGN.md)                                         |
+| L2 整层执行审查（A~E 风险清单与防御）                | [`docs/L2_WHOLE_LAYER_REVIEW.md`](docs/L2_WHOLE_LAYER_REVIEW.md)                                         |
+| M2 设备执行器设计（设备 mini-graph、异步骨架）       | [`docs/M2_DEVICE_EXECUTOR.md`](docs/M2_DEVICE_EXECUTOR.md)                                               |
+| 紧凑多桶快速路径 / 算子融合                          | [`docs/BUCKET_FAST_PATH.md`](docs/BUCKET_FAST_PATH.md)                                                   |
+| 桶执行 token 子集紧凑收集                            | [`docs/BUCKET_EXEC_TOKEN_SUBSET.md`](docs/BUCKET_EXEC_TOKEN_SUBSET.md)                                   |
+| token 子集 scatter-add 规划                          | [`docs/SCATTER_PLAN.md`](docs/SCATTER_PLAN.md)                                                           |
+| 专家移动流水线与 (L,E) 驱逐设计                      | [`docs/EXPERT_MOVE_PIPELINE.md`](docs/EXPERT_MOVE_PIPELINE.md)                                           |
+| VRAM DMA 搬运与 staging 规约                         | [`docs/VRAM_DMA_MOVE.md`](docs/VRAM_DMA_MOVE.md)                                                         |
+| 异步改造与高性能流水线路线图                         | [`docs/ASYNC_PIPELINE_ROADMAP.md`](docs/ASYNC_PIPELINE_ROADMAP.md)                                       |
+| 吞吐基准评测（单次/多轮、参数矩阵）                  | [`docs/BENCHMARK.md`](docs/BENCHMARK.md)                                                                 |
+| 多模型池 / 异构子池                                  | [`docs/MULTI_MODEL_POOL.md`](docs/MULTI_MODEL_POOL.md)、[`docs/MULTI_SUBPOOL.md`](docs/MULTI_SUBPOOL.md) |
+| GGUF 格式 v1/v2 / RAID0 分片                         | [`docs/STREAMMOE_GGUF_FORMAT.md`](docs/STREAMMOE_GGUF_FORMAT.md)                                         |
+| Route-B 加载器与 GGUF 输入格式                       | [`docs/ROUTE_B_LOADER_FORMATS.md`](docs/ROUTE_B_LOADER_FORMATS.md)                                       |
+| 图构建输出点与阶段宏补丁规则                         | [`docs/GRAPH_BUILD_OUTPUT.md`](docs/GRAPH_BUILD_OUTPUT.md)                                               |
+| 后端数值差异分析与基线控制                           | [`docs/BACKEND_DIVERGENCE_ANALYSIS.md`](docs/BACKEND_DIVERGENCE_ANALYSIS.md)                             |
+| prefill 交叉验证 / 专家历史模拟 / repack 排查        | [`docs/PREFILL_CROSS_VALIDATION.md`](docs/PREFILL_CROSS_VALIDATION.md)、[`docs/EXPERT_TRACE_SIMULATION.md`](docs/EXPERT_TRACE_SIMULATION.md)、[`docs/REPACK_DIVERGENCE_DEBUG.md`](docs/REPACK_DIVERGENCE_DEBUG.md) |
+| delegate 排查方法论 / bug 清单                       | [`docs/DEBUG_DELEGATION.md`](docs/DEBUG_DELEGATION.md)、[`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md)   |
+| patch 拆分/更新踩坑                                  | [`docs/PATCH_SPLITTING_PITFALLS.md`](docs/PATCH_SPLITTING_PITFALLS.md)                                   |
+| 迁移上游工具 / 可执行程序路线                        | [`docs/UPSTREAM_TOOLS_MIGRATION.md`](docs/UPSTREAM_TOOLS_MIGRATION.md)、[`docs/LLAMA_EXE_ROADMAP.md`](docs/LLAMA_EXE_ROADMAP.md) |
+| 冒烟/测试/采样                                       | [`docs/SMOKE_TESTING.md`](docs/SMOKE_TESTING.md)、[`docs/TEST_FLOW.md`](docs/TEST_FLOW.md)、[`docs/SAMPLING.md`](docs/SAMPLING.md) |
+| Mock 规范与测试桩原则                                | [`docs/MOCK.md`](docs/MOCK.md)                                                                           |
+| ASan 构建                                            | [`docs/ASAN_BUILD.md`](docs/ASAN_BUILD.md)                                                               |
+| v2 架构修正                                          | [`docs/V2_ARCHITECTURE_REVISION.md`](docs/V2_ARCHITECTURE_REVISION.md)                                   |
+| 开发进行中全景与待办任务跟踪                         | [`docs/WORK_IN_PROGRESS.md`](docs/WORK_IN_PROGRESS.md)、[`docs/TODO.md`](docs/TODO.md)                   |
 
 ### 可以不读（参考/历史）
 
-| 文档                        | 内容                            |
-| :-------------------------- | :------------------------------ |
-| `docs/REVIEW_2026_08_28.md` | 早期审查对照（结论已并入代码）  |
-| `docs/LLAMA_MMAP_CALLS.md`  | mmap 调用点调试地图（低优先级） |
+| 文档                                                 | 内容                            |
+| :--------------------------------------------------- | :------------------------------ |
+| [`docs/REVIEW_2026_08_28.md`](docs/REVIEW_2026_08_28.md) | 早期审查对照（结论已并入代码）  |
+| [`docs/LLAMA_MMAP_CALLS.md`](docs/LLAMA_MMAP_CALLS.md)   | mmap 调用点调试地图（低优先级） |
+

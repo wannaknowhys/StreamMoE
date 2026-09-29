@@ -1,4 +1,4 @@
-[English](DEVICE_SEGMENT_EXEC.md) | [简体中文](DEVICE_SEGMENT_EXEC.zh-CN.md)
+[English](./DEVICE_SEGMENT_EXEC.md) | [简体中文](./DEVICE_SEGMENT_EXEC.zh-CN.md)
 
 # Device-Segmented Execution (Path B)
 
