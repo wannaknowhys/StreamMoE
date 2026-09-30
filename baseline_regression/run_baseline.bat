@@ -27,6 +27,16 @@ setlocal
 set ROOT=%~dp0..
 cd /d "%ROOT%"
 set BR=baseline_regression
+call "%ROOT%\temp\sm_env.bat" 2>nul
+
+if "%SM_OLMOE%"=="" (
+    echo [-] SM_OLMOE is not set. Please define SM_OLMOE in temp\sm_env.bat or environment.
+    exit /b 1
+)
+if not exist "%SM_OLMOE%" (
+    echo [-] SM_OLMOE file not found: %SM_OLMOE%
+    exit /b 1
+)
 
 set "BL=%~1"
 if "%BL%"=="" set "BL=%BR%\baseline\moe_129_8192"
@@ -121,7 +131,12 @@ set "OUTP=%OUT:\=/%"
 node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0;let min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;if(Number.isNaN(v))continue;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' comparable='+n+' cos_min='+(n===0?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
 
 echo.
+echo [7/7] olmoe place-* regression (hi.json vs standard baseline) ...
+node "%BR%\tools\verify_places.js" --bin-override "%MOE_BIN%" --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
+if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
+
+echo.
 echo =====================================================================
-if "%PASS%"=="1" ( echo RESULT: PASS - moe within gate, upstream IDENTICAL to baseline ) else ( echo RESULT: FAIL - see above )
+if "%PASS%"=="1" ( echo RESULT: PASS - all baseline and place regression checks passed ) else ( echo RESULT: FAIL - see above )
 echo =====================================================================
 exit /b 0
