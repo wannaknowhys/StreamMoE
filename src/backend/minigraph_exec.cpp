@@ -1812,6 +1812,12 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     // references x rounds is an upper bound. (Missed before -> a gating leaf such
     // as gemma `ffn_moe_gate` overran the staging buffer.) Over-estimation is
     // safe: the staging buffer is grow-only and persists across layers.
+    //
+    // Note: append_op_bucket only executes non-MUL_MAT_ID and non-fold ops.
+    // MUL_MAT_ID operands (weight, cur, ids) are staged/bound specially and
+    // already accounted for above. Fold nodes (is_out and anonymous ADD nodes)
+    // are replaced by append_expert_fold / acc, so their src views (cur_experts[i])
+    // are never uploaded.
     size_t ext_ref = 0;
     {
         auto in_compute = [&](const ggml_tensor * p) -> bool {
@@ -1820,11 +1826,11 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         };
         for (const auto * cn : ex->compute) {
             if (!cn) continue;
+            if (cn->op == GGML_OP_MUL_MAT_ID) continue;
+            const bool is_out = cn->name && strstr(cn->name, "ffn_moe_out") != nullptr;
+            if (is_out || (cn->op == GGML_OP_ADD && !(cn->name && strstr(cn->name, "ffn_moe_"))))
+                continue;
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                // src[0] of a routed mm is the expert weight table: it lives in
-                // the pool shell, never uploaded (its graph nbytes is the whole
-                // expert table, which would blow the estimate).
-                if (cn->op == GGML_OP_MUL_MAT_ID && s == 0) continue;
                 const ggml_tensor * t = cn->src[s];
                 if (!t) continue;
                 const ggml_tensor * p = t;
@@ -1833,7 +1839,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                              p->op == GGML_OP_CONT)) p = p->src[0];
                 if (!p || in_compute(p)) continue;
                 if (p->ne[0] == 1 && p->ne[1] == (int64_t) n_k) continue;   // per-slot: arena gather
-                ext_ref += ggml_nbytes(p) + 4096;
+                const size_t nb = ggml_nbytes(p);
+                ext_ref += nb + 4096;
             }
         }
         stage_est += ext_ref * (n_rounds ? n_rounds : 1);
