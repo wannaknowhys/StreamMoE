@@ -628,6 +628,8 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
         for (const auto & r : route_b_relays()) {
             if (r.layer != layer || !r.src || !r.dst) continue;
             if (executed_relays.count(&r)) continue;
+            if (std::strcmp(stage, "head") == 0 && r.stage == ROUTE_B_XFER_TAIL) continue;
+            if (std::strcmp(stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
             // Match: the relay's source is on the just-flushed device.
             const char * sd = route_b_node_device(r.src);
             const std::string src_key = (sd ? sd : "");
@@ -649,7 +651,7 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
             fprintf(stderr, "[topo_seg] L%d %s: %d relay(s) from '%s'\n",
-                    layer, stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
+                     layer, stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
 #endif
         dispatch_relay_batch(batch, cpu);
     };
@@ -671,6 +673,11 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
         for (const auto & r : route_b_relays()) {
             if (r.layer != layer || !r.src || !r.dst) continue;
             if (executed_relays.count(&r)) continue;
+            // A tail relay (e.g. moe_out) is produced by MoE closure and consumed by tail.
+            // A closure relay (e.g. cur) is produced by head and consumed by closure.
+            // Neither can be an incoming copy before head computes.
+            if (std::strcmp(stage, "head") == 0 && (r.stage == ROUTE_B_XFER_TAIL || r.stage == ROUTE_B_XFER_CLOSURE)) continue;
+            if (std::strcmp(stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
             // Match: relay destination is on the about-to-run device.
             const char * dd = route_b_node_device(r.dst);
             const std::string dst_key = (dd ? dd : "");
@@ -2809,6 +2816,7 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
             for (const auto & r : route_b_relays()) {
                 if (r.layer != layer || !r.src || !r.dst) continue;
                 if (executed_relays.count(&r)) continue;
+                if (r.stage != ROUTE_B_XFER_TAIL) continue;
                 const char * sd = route_b_node_device(r.src);
                 const std::string src_key = (sd ? sd : "");
                 if (src_key != closure_dev) continue;
