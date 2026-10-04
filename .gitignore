@@ -1,4 +1,4 @@
-﻿# Build artifacts (versioned under build\<tag>\)
+# Build artifacts (versioned under build\<tag>\)
 build/
 out/
 
@@ -29,6 +29,7 @@ memwatch_*.log
 
 # Runtime data
 temp/
+.temp/
 
 # Private local env / scripts (real machine paths, prebuilt binaries - never commit)
 private/

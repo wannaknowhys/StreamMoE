@@ -68,14 +68,14 @@ struct parsed_node_t {
 #define MOE_ID_AT(ids, t, k) \
     (*(const int32_t*)((const char*)(ids)->data + (size_t)(t) * (ids)->nb[1] + (size_t)(k) * (ids)->nb[0]))
 
-// Fast host-pinned staging buffer for device->host control-plane inspection (e.g. routing ids).
-// Bypasses the unpinned fallback in ggml-vulkan that serializes every get_async call.
-struct pinned_control_staging_t {
+// Fast host-pinned staging buffer for device transfers (H2D / D2H / control-plane).
+// Bypasses the unpinned fallback in ggml-vulkan that serializes every get_async / set_async call.
+struct pinned_staging_t {
     ggml_backend_buffer_t buf = nullptr;
     size_t                size = 0;
     ggml_backend_dev_t    dev = nullptr;
 
-    ~pinned_control_staging_t() {
+    ~pinned_staging_t() {
         if (buf) {
             ggml_backend_buffer_free(buf);
             buf = nullptr;
@@ -110,7 +110,9 @@ struct pinned_control_staging_t {
     }
 };
 
-static pinned_control_staging_t g_pinned_control;
+static pinned_staging_t g_pinned_control;
+static pinned_staging_t g_pinned_h2d;
+static pinned_staging_t g_pinned_d2h;
 
 // Host image of a tensor for host-side inspection (iron rule): returns t->data
 // when host-resident, else a backend-agnostic copy in `buf`. Never dereference
@@ -404,6 +406,162 @@ static enum ggml_status run_dense_subgraph(ggml_context * ctx, ggml_backend_t ba
     return ggml_backend_graph_compute(backend, g);
 }
 
+struct relay_item_t {
+    const ggml_tensor * src = nullptr;
+    ggml_tensor *       dst = nullptr;
+    size_t              nbytes = 0;
+    size_t              offset = 0;
+};
+
+// Batched true asynchronous cross-device relay dispatch via host-pinned staging.
+// Non-blocking vkCmdCopyBuffer / DMA commands are enqueued in a single pass per device,
+// followed by a single synchronization call per device, eliminating serialization bubbles.
+static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & batch, ggml_backend_t /*cpu*/) {
+    if (batch.empty()) return;
+
+    // Partition items by transfer direction
+    std::vector<relay_item_t> h2h_items;
+    std::vector<relay_item_t> d2d_items;
+    std::unordered_map<ggml_backend_dev_t, std::vector<relay_item_t>> h2d_groups;
+    std::unordered_map<ggml_backend_dev_t, std::vector<relay_item_t>> d2h_groups;
+
+    for (const auto * r : batch) {
+        if (!r || !r->src || !r->dst) continue;
+        const size_t nb = ggml_nbytes(r->src);
+        if (nb == 0) continue;
+
+        const bool src_is_host = !r->src->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(r->src->buffer));
+        const bool dst_is_host = !r->dst->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(r->dst->buffer));
+
+        relay_item_t item{ r->src, r->dst, nb, 0 };
+
+        if (src_is_host && dst_is_host) {
+            h2h_items.push_back(item);
+        } else if (!src_is_host && !dst_is_host) {
+            d2d_items.push_back(item);
+        } else if (src_is_host && !dst_is_host) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r->dst->buffer);
+            ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            h2d_groups[dev].push_back(item);
+        } else {
+            // !src_is_host && dst_is_host
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r->src->buffer);
+            ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            d2h_groups[dev].push_back(item);
+        }
+    }
+
+    // 1. Host-to-Host transfers
+    for (const auto & item : h2h_items) {
+        if (item.src->buffer && item.dst->buffer) {
+            ggml_backend_tensor_copy(item.src, item.dst);
+        } else if (item.dst->buffer && item.src->data) {
+            ggml_backend_tensor_set(item.dst, item.src->data, 0, item.nbytes);
+        } else if (item.src->buffer && item.dst->data) {
+            ggml_backend_tensor_get(item.src, item.dst->data, 0, item.nbytes);
+        } else if (item.src->data && item.dst->data) {
+            std::memcpy(item.dst->data, item.src->data, item.nbytes);
+        }
+    }
+
+    // 2. Device-to-Device transfers
+    for (const auto & item : d2d_items) {
+        if (item.src->buffer && item.dst->buffer) {
+            ggml_backend_tensor_copy(item.src, item.dst);
+        }
+    }
+
+    // 3. Host-to-Device (H2D) transfers via pinned staging
+    for (auto & kv : h2d_groups) {
+        ggml_backend_dev_t dev = kv.first;
+        auto & items = kv.second;
+        if (items.empty()) continue;
+
+        const char * dev_name = dev ? ggml_backend_dev_name(dev) : nullptr;
+        ggml_backend_t be = dev_name ? route_b_device_backend(dev_name) : nullptr;
+
+        size_t needed = 0;
+        for (auto & item : items) {
+            item.offset = needed;
+            needed += ((item.nbytes + 255) / 256) * 256;
+        }
+
+        void * p_stage = dev ? g_pinned_h2d.ensure(dev, needed) : nullptr;
+        if (!p_stage || !be) {
+            // Fallback: synchronous copy
+            for (const auto & item : items) {
+                if (item.src->buffer) {
+                    ggml_backend_tensor_copy(item.src, item.dst);
+                } else if (item.src->data) {
+                    ggml_backend_tensor_set(item.dst, item.src->data, 0, item.nbytes);
+                }
+            }
+        } else {
+            // Pack into pinned staging buffer
+            for (const auto & item : items) {
+                char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
+                if (item.src->buffer) {
+                    ggml_backend_tensor_get(item.src, stage_ptr, 0, item.nbytes);
+                } else if (item.src->data) {
+                    std::memcpy(stage_ptr, item.src->data, item.nbytes);
+                }
+            }
+            // Enqueue asynchronous transfers to device
+            for (const auto & item : items) {
+                char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
+                ggml_backend_tensor_set_async(be, item.dst, stage_ptr, 0, item.nbytes);
+            }
+            // Synchronize device once for the batch
+            ggml_backend_synchronize(be);
+        }
+    }
+
+    // 4. Device-to-Host (D2H) transfers via pinned staging
+    for (auto & kv : d2h_groups) {
+        ggml_backend_dev_t dev = kv.first;
+        auto & items = kv.second;
+        if (items.empty()) continue;
+
+        const char * dev_name = dev ? ggml_backend_dev_name(dev) : nullptr;
+        ggml_backend_t be = dev_name ? route_b_device_backend(dev_name) : nullptr;
+
+        size_t needed = 0;
+        for (auto & item : items) {
+            item.offset = needed;
+            needed += ((item.nbytes + 255) / 256) * 256;
+        }
+
+        void * p_stage = dev ? g_pinned_d2h.ensure(dev, needed) : nullptr;
+        if (!p_stage || !be) {
+            // Fallback: synchronous copy
+            for (const auto & item : items) {
+                if (item.src->buffer && item.dst->buffer) {
+                    ggml_backend_tensor_copy(item.src, item.dst);
+                } else if (item.dst->data) {
+                    ggml_backend_tensor_get(item.src, item.dst->data, 0, item.nbytes);
+                }
+            }
+        } else {
+            // Enqueue asynchronous reads from device into pinned staging buffer
+            for (const auto & item : items) {
+                char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
+                ggml_backend_tensor_get_async(be, item.src, stage_ptr, 0, item.nbytes);
+            }
+            // Synchronize device once for the batch
+            ggml_backend_synchronize(be);
+            // Unpack from pinned staging buffer to destinations
+            for (const auto & item : items) {
+                char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
+                if (item.dst->buffer) {
+                    ggml_backend_tensor_set(item.dst, stage_ptr, 0, item.nbytes);
+                } else if (item.dst->data) {
+                    std::memcpy(item.dst->data, stage_ptr, item.nbytes);
+                }
+            }
+        }
+    }
+}
+
 // Device-segmented execution (docs/DEVICE_SEGMENT_EXEC.md): walk the node list
 // in topological order, group contiguous same-device nodes into segments, and
 // flush each segment via run_dense_subgraph on the real backend.  At each device
@@ -445,6 +603,7 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
     // flushed, so the producer data is ready; the consumer segments have not
     // started yet.
     auto run_boundary_copies = [&](const std::string & src_dev) {
+        std::vector<const route_b_relay_t *> batch;
 #ifdef STREAM_MOE_TEMP
         int matched = 0;
 #endif
@@ -465,20 +624,14 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
                         ggml_nbytes(r.src));
             }
 #endif
-            // Execute the copy.
-            if (r.src->buffer) {
-                ggml_backend_tensor_copy(r.src, r.dst);
-            } else if (r.src->data) {
-                // Bufferless host leaf (positions / freq factors / mask): upload
-                // the host bytes into the device shell.
-                ggml_backend_tensor_set(r.dst, r.src->data, 0, ggml_nbytes(r.src));
-            }
+            batch.push_back(&r);
         }
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
             fprintf(stderr, "[topo_seg] L%d %s: %d relay(s) from '%s'\n",
                     layer, stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
 #endif
+        dispatch_relay_batch(batch, cpu);
     };
 
     // Pre-segment: copy any relays whose DESTINATION is on the about-to-run
@@ -491,6 +644,7 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
     // sources (never from a segment that hasn't run yet).
     std::unordered_set<std::string> flushed_devs;
     auto run_incoming_copies = [&](const std::string & dst_dev) {
+        std::vector<const route_b_relay_t *> batch;
 #ifdef STREAM_MOE_TEMP
         int matched = 0;
 #endif
@@ -517,17 +671,14 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
                         ggml_nbytes(r.src));
             }
 #endif
-            if (r.src->buffer) {
-                ggml_backend_tensor_copy(r.src, r.dst);
-            } else if (r.src->data) {
-                ggml_backend_tensor_set(r.dst, r.src->data, 0, ggml_nbytes(r.src));
-            }
+            batch.push_back(&r);
         }
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
             fprintf(stderr, "[topo_seg] L%d %s: %d incoming relay(s) to '%s'\n",
                     layer, stage, matched, dst_dev.empty() ? "CPU" : dst_dev.c_str());
 #endif
+        dispatch_relay_batch(batch, cpu);
     };
 
     // Walk the list, accumulate segments, flush at transitions.
@@ -2631,17 +2782,15 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
         // of the tail's topo_segment_execute segments.
         {
             const std::string closure_dev = route_b_closure_device();
+            std::vector<const route_b_relay_t *> batch;
             for (const auto & r : route_b_relays()) {
                 if (r.layer != layer || !r.src || !r.dst) continue;
                 const char * sd = route_b_node_device(r.src);
                 const std::string src_key = (sd ? sd : "");
                 if (src_key != closure_dev) continue;
-                if (r.src->buffer) {
-                    ggml_backend_tensor_copy(r.src, r.dst);
-                } else if (r.src->data) {
-                    ggml_backend_tensor_set(r.dst, r.src->data, 0, ggml_nbytes(r.src));
-                }
+                batch.push_back(&r);
             }
+            dispatch_relay_batch(batch, cpu);
         }
         const enum ggml_status tst = topo_segment_execute(ctx, cpu, dense_tail, layer, "tail");
         if (tst != GGML_STATUS_SUCCESS) { LOG_ERROR("stream_moe: dense tail failed L" << layer); return tst; }
