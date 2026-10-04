@@ -1,6 +1,5 @@
 {
   "engine": "upstream-temp0-debug",
-  "bin": "upstream_dump_debug",
   "extra": [
     "--n-gpu-layers",
     "0",

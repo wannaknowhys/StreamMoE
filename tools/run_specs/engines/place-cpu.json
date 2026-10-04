@@ -1,6 +1,5 @@
 {
   "engine": "place-cpu",
-  "bin": "StreamMoE",
   "extra": [
     "--expert-backend",
     "--fit",

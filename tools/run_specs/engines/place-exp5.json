@@ -1,6 +1,5 @@
 {
   "engine": "place-exp5",
-  "bin": "StreamMoE",
   "extra": [
     "--expert-backend",
     "--fit",

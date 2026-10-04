@@ -2,5 +2,6 @@
   "model": "olmoe",
   "modelPath": "${SM_OLMOE}",
   "draft": null,
-  "pool": 8192
+  "pool": 8192,
+  "modelCtx": 4096
 }

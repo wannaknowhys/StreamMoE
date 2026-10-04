@@ -1,0 +1,7 @@
+{
+  "flavor": "upstream_dump",
+  "bin": "upstream_dump",
+  "hasExport": true,
+  "hasRouteB": false,
+  "desc": "Stock llama.cpp baseline (prefill_export, CPU only)"
+}

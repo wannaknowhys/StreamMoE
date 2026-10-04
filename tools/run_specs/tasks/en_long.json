@@ -4,5 +4,6 @@
     "type": "jsonl",
     "path": "benchmark/prompts/en_long.jsonl",
     "maxTurns": 1
-  }
+  },
+  "taskCtx": 8192
 }

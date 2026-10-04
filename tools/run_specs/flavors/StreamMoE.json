@@ -1,0 +1,7 @@
+{
+  "flavor": "StreamMoE",
+  "bin": "StreamMoE",
+  "hasExport": false,
+  "hasRouteB": true,
+  "desc": "Release flagship (route-B + Vulkan, pure inference, no export hooks)"
+}

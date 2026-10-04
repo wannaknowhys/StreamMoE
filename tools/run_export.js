@@ -1,13 +1,14 @@
-// run_export.js - cartesian-product export runner.
+// run_export.js - 4-dimensional cartesian-product export runner.
 //
-// Three spec categories, flat-merged into one run object. All keys across the
-// three must be disjoint; ANY duplicate key on merge aborts (no special-casing).
-//   model : { model, modelPath, draft? }
-//   engine: { engine, bin|binPath, extra? }
-//   task  : { input, feed:{type:prefill|jsonl, ...} }
+// Four spec categories, flat-merged into one run object. All keys across the
+// four must be disjoint; ANY duplicate key on merge aborts (no special-casing).
+//   flavor: { flavor, bin|binPath, hasExport, hasRouteB, desc? }
+//   model : { model, modelPath, draft?, pool?, modelCtx? }
+//   engine: { engine, extra? }
+//   task  : { input, feed:{type:prefill|jsonl, ...}, taskCtx? }
 //
 // Usage:
-//   node tools/run_export.js --models <spec[,spec]> --engines <spec[,spec]> --tasks <spec[,spec]>
+//   node tools/run_export.js --flavors <spec[,spec]> --models <spec[,spec]> --engines <spec[,spec]> --tasks <spec[,spec]>
 //
 // Env:
 //   SM_OUT_ROOT  export root (default <repo>/temp/exports)
@@ -19,25 +20,66 @@ const fs = require('fs');
 const path = require('path');
 const { checkBinaryFreshness } = require('./freshness_check');
 
+const REPO_ROOT = path.resolve(__dirname, '..');
 const PORT = Number(process.env.SM_PORT || 8993);
-const OUT_ROOT = process.env.SM_OUT_ROOT || path.join(__dirname, '..', 'temp', 'exports');
+const OUT_ROOT = process.env.SM_OUT_ROOT || path.join(REPO_ROOT, 'temp', 'exports');
+
+function loadEnvIfPresent() {
+    const envBat = path.join(REPO_ROOT, 'temp', 'sm_env.bat');
+    if (fs.existsSync(envBat)) {
+        const lines = fs.readFileSync(envBat, 'utf8').split('\n');
+        for (const line of lines) {
+            const m = line.trim().match(/^set\s+([A-Za-z0-9_]+)=(.*)$/i);
+            if (m && m[1] && m[2]) {
+                if (process.env[m[1].trim()] === undefined) {
+                    process.env[m[1].trim()] = m[2].trim();
+                }
+            }
+        }
+    }
+}
+loadEnvIfPresent();
+
+const SPEC_DIRS = {
+    flavors: path.join(__dirname, 'run_specs', 'flavors'),
+    models: path.join(__dirname, 'run_specs', 'models'),
+    engines: path.join(__dirname, 'run_specs', 'engines'),
+    tasks: path.join(__dirname, 'run_specs', 'tasks'),
+};
 
 function parseArgv() {
     const a = process.argv.slice(2);
     const p = {};
     for (let i = 0; i < a.length; i++) {
-        if (a[i] === '--models') p.models = a[++i];
+        if (a[i] === '--flavors') p.flavors = a[++i];
+        else if (a[i] === '--models') p.models = a[++i];
         else if (a[i] === '--engines') p.engines = a[++i];
         else if (a[i] === '--tasks') p.tasks = a[++i];
         else if (a[i] === '--bin-override') p.binOverride = a[++i];
         else if (a[i] === '--temp-override') p.tempOverride = a[++i];
         else if (a[i] === '--out-root') p.outRoot = a[++i];
+        else if (a[i] === '--force-export') p.forceExport = true;
     }
     return p;
 }
 
-function readSpecList(csv) {
-    return csv.split(',').map((f) => JSON.parse(fs.readFileSync(f.trim(), 'utf8')));
+function resolveSpecPath(input, category) {
+    const trimmed = input.trim();
+    if (fs.existsSync(trimmed)) return path.resolve(trimmed);
+    const dir = SPEC_DIRS[category];
+    if (dir) {
+        const withExt = path.join(dir, trimmed.endsWith('.json') ? trimmed : trimmed + '.json');
+        if (fs.existsSync(withExt)) return withExt;
+    }
+    throw new Error(`[run_export] Cannot resolve ${category} spec: "${trimmed}"`);
+}
+
+function readSpecList(csv, category) {
+    if (!csv) return [];
+    return csv.split(',').map((f) => {
+        const resolved = resolveSpecPath(f, category);
+        return JSON.parse(fs.readFileSync(resolved, 'utf8').replace(/^\uFEFF/, ''));
+    });
 }
 
 // Resolve ${X}: run field wins, then env. Called AFTER merge so ${pool} (a
@@ -58,43 +100,131 @@ function expandRun(run) {
     return out;
 }
 
-function cartesian(models, engines, tasks) {
+function cartesian(flavors, models, engines, tasks) {
     const out = [];
-    for (const m of models) for (const e of engines) for (const t of tasks) {
-        const run = {};
-        const merge = (src) => {
-            for (const [k, v] of Object.entries(src)) {
-                if (k in run) throw new Error('[run_export] duplicate key across specs: ' + k);
-                run[k] = v;
+    for (const fl of flavors) {
+        for (const m of models) {
+            for (const e of engines) {
+                for (const t of tasks) {
+                    const run = {};
+                    const merge = (src) => {
+                        for (const [k, v] of Object.entries(src)) {
+                            if (k in run) throw new Error('[run_export] duplicate key across specs: ' + k);
+                            run[k] = v;
+                        }
+                    };
+                    merge(fl);
+                    merge(m);
+                    merge(e);
+                    merge(t);
+                    out.push(expandRun(run));
+                }
             }
-        };
-        merge(m); merge(e); merge(t);
-        out.push(expandRun(run));
+        }
     }
     return out;
 }
 
 function binPath(run, binOverride) {
-    if (binOverride) return binOverride;
-    if (run.binPath) return run.binPath;
-    if (!run.bin) throw new Error('[run_export] run.bin or run.binPath required');
-    return path.join(__dirname, '..', 'build', run.bin, 'llama-build', 'bin', 'llama-server.exe');
+    if (binOverride) return path.resolve(binOverride);
+    if (run.binPath) return path.resolve(run.binPath);
+    const tag = run.bin || run.flavor;
+    if (!tag) throw new Error('[run_export] run.bin or run.flavor required');
+    return path.join(REPO_ROOT, 'build', tag, 'llama-build', 'bin', 'llama-server.exe');
 }
 
-function filterExtraArgs(extra, tempOverride) {
-    if (!extra || !Array.isArray(extra)) return [];
-    if (tempOverride === undefined || tempOverride === null) return [...extra];
-    const out = [];
+function computeEffectiveContext(run) {
+    const m = Number(run.modelCtx);
+    const t = Number(run.taskCtx || run.ctx);
+    if (Number.isFinite(m) && Number.isFinite(t)) return Math.min(m, t);
+    if (Number.isFinite(m)) return m;
+    if (Number.isFinite(t)) return t;
+    return 4096;
+}
+
+function buildServerArgs(run, bin, dir, opts = {}) {
+    const effectiveCtx = computeEffectiveContext(run);
+    const threads = Number(run.threads || 16);
+
+    // Parse extra options into a structured map for deduplication
+    const extra = Array.isArray(run.extra) ? [...run.extra] : [];
+    const extraMap = new Map();
+    const positionalExtra = [];
+
     for (let i = 0; i < extra.length; i++) {
-        if (extra[i] === '--temp') {
-            if (i + 1 < extra.length && !extra[i + 1].startsWith('--')) {
-                i++;
+        const item = extra[i];
+        if (typeof item === 'string' && item.startsWith('-')) {
+            if (i + 1 < extra.length && !extra[i + 1].startsWith('-')) {
+                extraMap.set(item, extra[++i]);
+            } else {
+                extraMap.set(item, true);
             }
-            continue;
+        } else {
+            positionalExtra.push(item);
         }
-        out.push(extra[i]);
     }
-    return out;
+
+    // Determine temperature override
+    let tempVal = null;
+    if (opts.tempOverride !== undefined && opts.tempOverride !== null) {
+        tempVal = String(opts.tempOverride);
+    } else if (extraMap.has('--temp')) {
+        tempVal = String(extraMap.get('--temp'));
+    }
+
+    // Determine context size
+    let ctxVal = String(effectiveCtx);
+    if (extraMap.has('-c')) {
+        const extraC = Number(extraMap.get('-c'));
+        if (Number.isFinite(extraC)) ctxVal = String(Math.min(effectiveCtx, extraC));
+    }
+
+    // Determine --fit
+    const fitVal = extraMap.has('--fit') ? String(extraMap.get('--fit')) : 'off';
+
+    // Base CLI arguments
+    const args = [
+        '-m', run.modelPath,
+        '-c', ctxVal,
+        '-t', String(threads),
+        '--fit', fitVal,
+        '--no-warmup',
+        '--host', '127.0.0.1',
+        '--port', String(PORT),
+        '--no-webui'
+    ];
+
+    if (tempVal !== null) {
+        args.push('--temp', tempVal);
+    }
+
+    if (run.draft) {
+        args.push(
+            '--model-draft', run.draft,
+            '--spec-draft-n-max', '5',
+            '--spec-draft-n-min', '1',
+            '--spec-draft-p-min', '0.6'
+        );
+    }
+
+    // Append remaining extra options (excluding handled keys)
+    const handledKeys = new Set(['--temp', '-c', '--ctx-size', '--fit', '-t', '--threads', '-m', '--model', '--host', '--port', '--webui', '--no-webui']);
+    for (const [k, v] of extraMap.entries()) {
+        if (handledKeys.has(k)) continue;
+        args.push(k);
+        if (v !== true) args.push(String(v));
+    }
+    args.push(...positionalExtra);
+
+    // Export directory: ONLY passed when the flavor supports export AND
+    // the task is a prefill export task or explicit export is requested.
+    const isPrefillTask = run.feed && run.feed.type === 'prefill';
+    const shouldExport = Boolean(run.hasExport && (isPrefillTask || opts.forceExport));
+    if (shouldExport) {
+        args.push('--export-dir', dir);
+    }
+
+    return args;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,9 +249,9 @@ function postShutdown() {
     });
 }
 
-function postChat(messages, tempOverride) {
+function postChat(messages, tempOverride, maxTokens) {
     return new Promise((resolve, reject) => {
-        const bodyObj = { model: 'm', messages, max_tokens: 1024, stream: false };
+        const bodyObj = { model: 'm', messages, max_tokens: maxTokens || 1024, stream: false };
         if (tempOverride !== undefined && tempOverride !== null) {
             bodyObj.temperature = Number(tempOverride);
         }
@@ -135,9 +265,6 @@ function postChat(messages, tempOverride) {
                     if (j.error) resolve({ error: String(j.error.message || j.error) });
                     else {
                         const msg = j.choices && j.choices[0] && j.choices[0].message;
-                        // keep the full message object (reasoning_content + content +
-                        // tool_calls etc.) so chat.json can replay exactly what the
-                        // model emitted, even when truncated / ctx-exhausted.
                         resolve({
                             msg: msg || null,
                             content: msg ? (msg.content || '') : '',
@@ -156,29 +283,25 @@ async function feedTask(run, dir, tempOverride) {
     const f = run.feed;
     if (!f || !f.type) throw new Error('[run_export] run.feed.type required (prefill|jsonl)');
     if (f.type === 'prefill') {
-        // prompt snapshot (the exact sent payload) lands in the run dir next to
-        // the exported bins (prefill_from_trace writes it to --out).
         const tokens = String(f.tokens || 10000);
         const c = spawn(process.execPath, [path.join(__dirname, 'prefill_from_trace.js'), '--tokens', tokens, '--out', dir], { stdio: 'inherit' });
         await new Promise((res, rej) => { c.on('exit', (code) => (code === 0 ? res() : rej(new Error('prefill_from_trace exit ' + code)))); });
     } else if (f.type === 'jsonl') {
         const lines = fs.readFileSync(f.path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
         const maxTurns = f.maxTurns || lines.length;
-        const messages = [];   // request body (final content only)
-        const chatLog = [];    // full message objects incl. reasoning_content
+        const messages = [];
+        const chatLog = [];
         for (let i = 0; i < maxTurns; i++) {
             const { system, prompt } = lines[i];
             if (system && String(system).trim()) { messages.push({ role: 'system', content: system }); chatLog.push({ role: 'system', content: system }); }
             messages.push({ role: 'user', content: prompt });
             chatLog.push({ role: 'user', content: prompt });
-            const res = await postChat(messages, tempOverride);
+            const res = await postChat(messages, tempOverride, f.maxTokens);
             if (res.error) { console.log('  turn ' + (i + 1) + '/' + maxTurns + ': ERROR ' + res.error); break; }
             messages.push({ role: 'assistant', content: res.content });
             chatLog.push(res.msg || { role: 'assistant', content: res.content });
             console.log('  turn ' + (i + 1) + '/' + maxTurns + ' done (prompt_tokens=' + res.prompt_tokens + ')');
         }
-        // full conversation incl. complete model messages (thinking + content),
-        // next to the exported bins
         fs.writeFileSync(path.join(dir, 'chat.json'), JSON.stringify(chatLog, null, 2));
         console.log('  chat saved: ' + path.join(dir, 'chat.json') + ' (' + chatLog.length + ' msgs)');
     } else throw new Error('[run_export] unknown feed type ' + f.type);
@@ -186,19 +309,15 @@ async function feedTask(run, dir, tempOverride) {
 
 async function runOne(run, opts = {}) {
     const outRoot = opts.outRoot || OUT_ROOT;
-    const dir = path.join(outRoot, run.model, run.engine, run.input);
+    const dir = path.join(outRoot, run.flavor || 'default', run.model, run.engine, run.input);
     fs.mkdirSync(dir, { recursive: true });
     const bin = binPath(run, opts.binOverride);
     checkBinaryFreshness(bin);
-    const args = ['-m', run.modelPath, '--fit', 'off', '--no-warmup', '-c', '15000', '-t', '16',
-        '--top-p', '0.95', '--host', '127.0.0.1', '--port', String(PORT), '--no-webui'];
-    if (run.draft) args.push('--model-draft', run.draft, '--spec-draft-n-max', '5', '--spec-draft-n-min', '1', '--spec-draft-p-min', '0.6');
-    if (run.extra) args.push(...filterExtraArgs(run.extra, opts.tempOverride));
-    if (opts.tempOverride !== undefined && opts.tempOverride !== null) {
-        args.push('--temp', String(opts.tempOverride));
-    }
-    args.push('--export-dir', dir); // StreamMoE: export via arg (replaces LLM_EXPORT_DIR env)
-    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} -> ${dir} ===`);
+
+    const args = buildServerArgs(run, bin, dir, opts);
+    console.log(`\n=== ${path.basename(bin)} [${run.flavor}] ${run.model}/${run.engine}/${run.input} -> ${dir} ===`);
+    console.log(`  Args: ${args.join(' ')}`);
+
     const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'] });
     try {
         await waitHealth(600000);
@@ -216,14 +335,24 @@ async function runOne(run, opts = {}) {
 (async () => {
     const p = parseArgv();
     if (!p.models || !p.engines || !p.tasks) {
-        console.error('usage: node tools/run_export.js --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]> [--bin-override <path>] [--temp-override <val>] [--out-root <dir>]');
+        console.error('usage: node tools/run_export.js [--flavors <spec[,...]>] --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]> [--bin-override <path>] [--temp-override <val>] [--out-root <dir>]');
         process.exit(2);
     }
     const dry = process.argv.includes('--dry-run');
-    const runs = cartesian(readSpecList(p.models), readSpecList(p.engines), readSpecList(p.tasks));
+
+    // Default flavor is StreamMoE if omitted
+    const flavorsCsv = p.flavors || 'StreamMoE';
+    const flavors = readSpecList(flavorsCsv, 'flavors');
+    const models = readSpecList(p.models, 'models');
+    const engines = readSpecList(p.engines, 'engines');
+    const tasks = readSpecList(p.tasks, 'tasks');
+
+    const runs = cartesian(flavors, models, engines, tasks);
     const effectiveOut = p.outRoot || OUT_ROOT;
     console.log('[run_export] ' + runs.length + ' runs:');
-    for (const r of runs) console.log('  ' + r.model + '/' + r.engine + '/' + r.input + '  ->  ' + path.join(effectiveOut, r.model, r.engine, r.input));
+    for (const r of runs) {
+        console.log(`  [${r.flavor}] ${r.model}/${r.engine}/${r.input}  ->  ${path.join(effectiveOut, r.flavor, r.model, r.engine, r.input)}`);
+    }
     if (dry) { console.log('[run_export] dry-run, not executing'); return; }
     for (const r of runs) await runOne(r, p);
     console.log('\n[run_export] ALL DONE');

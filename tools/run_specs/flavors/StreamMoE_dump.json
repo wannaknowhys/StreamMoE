@@ -1,0 +1,7 @@
+{
+  "flavor": "StreamMoE_dump",
+  "bin": "StreamMoE_dump",
+  "hasExport": true,
+  "hasRouteB": true,
+  "desc": "Test and dump build (route-B + Vulkan + prefill_export)"
+}

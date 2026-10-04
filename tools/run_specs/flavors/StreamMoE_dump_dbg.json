@@ -1,0 +1,7 @@
+{
+  "flavor": "StreamMoE_dump_dbg",
+  "bin": "StreamMoE_dump_dbg",
+  "hasExport": true,
+  "hasRouteB": true,
+  "desc": "Diagnostic debug build (STREAM_MOE_LATEST + STREAM_MOE_TEMP)"
+}

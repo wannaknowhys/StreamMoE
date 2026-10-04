@@ -1,6 +1,5 @@
 {
   "engine": "upstream-vulkan-temp0",
-  "bin": "upstream_vulkan_dump",
   "extra": [
     "--n-gpu-layers",
     "2",

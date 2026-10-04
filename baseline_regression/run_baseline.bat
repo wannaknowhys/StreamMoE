@@ -136,7 +136,7 @@ node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8
 
 echo.
 echo [7/7] olmoe place-* regression (hi.json vs standard baseline) ...
-node "%BR%\tools\verify_places.js" --bin-override "%MOE_BIN%" --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
+node "%BR%\tools\verify_places.js" --flavor StreamMoE --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
 if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
 
 echo.

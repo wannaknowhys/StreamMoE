@@ -1,7 +1,7 @@
 {
   "input": "bench",
   "promptFile": "benchmark/prompts/en_long.jsonl",
-  "ctx": 8192,
+  "taskCtx": 8192,
   "threads": 16,
   "nPredict": 128,
   "warmup": 1,

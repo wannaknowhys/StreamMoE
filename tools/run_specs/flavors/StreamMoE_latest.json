@@ -1,0 +1,7 @@
+{
+  "flavor": "StreamMoE_latest",
+  "bin": "StreamMoE_latest",
+  "hasExport": true,
+  "hasRouteB": true,
+  "desc": "In-progress features build (STREAM_MOE_LATEST default ON)"
+}

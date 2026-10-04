@@ -88,8 +88,8 @@ function cartesian(models, engines, tasks) {
 
 function binPath(run) {
     if (run.binPath) return run.binPath;
-    if (!run.bin) throw new Error('[run_bench] run.bin or run.binPath required');
-    return path.join(REPO_ROOT, 'build', run.bin, 'llama-build', 'bin', 'llama-server.exe');
+    const tag = run.bin || run.flavor || 'StreamMoE';
+    return path.join(REPO_ROOT, 'build', tag, 'llama-build', 'bin', 'llama-server.exe');
 }
 
 // Inline prompt, or the first line's prompt/content of a prompt file.

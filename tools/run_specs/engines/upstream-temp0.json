@@ -1,6 +1,5 @@
 {
   "engine": "upstream-temp0",
-  "bin": "upstream_dump",
   "extra": [
     "--n-gpu-layers",
     "0",

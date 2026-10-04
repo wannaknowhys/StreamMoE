@@ -1,1 +1,7 @@
-{ "model": "gemma", "modelPath": "${SM_GEMMA_ORIG}", "draft": null, "pool": 16384 }
+{
+  "model": "gemma",
+  "modelPath": "${SM_GEMMA_ORIG}",
+  "draft": null,
+  "pool": 16384,
+  "modelCtx": 8192
+}
