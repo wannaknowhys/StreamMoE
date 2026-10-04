@@ -18,6 +18,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
+const { checkBinaryFreshness } = require(path.join(REPO_ROOT, 'tools', 'freshness_check'));
 
 function parseArgv() {
     const a = process.argv.slice(2);
@@ -151,6 +152,7 @@ function runSingleEngine(opts, engineJsonPath) {
     console.log(`[verify_places] Temp override: ${opts.tempOverride}`);
     if (opts.binOverride) {
         console.log(`[verify_places] Bin override : ${opts.binOverride}`);
+        checkBinaryFreshness(opts.binOverride);
     }
     console.log('=====================================================================');
 

@@ -80,6 +80,13 @@
 - **编译唯一入口：永远只使用 `build.bat`**。包括主程序、库、测试、临时 harness、增量编译和 clean rebuild；禁止直接调用 CMake、Ninja、clang-cl、cl、lib 等工具绕过入口，禁止手工拆库或混链旧产物。入口不支持所需目标时，先讨论并补齐 `build.bat` 支持，不另造编译命令。
 - Gemma prefill 回归使用固定 129-token 输入，按整个序列的 cosine 分布判定；首 token 的已知偏差不单独判失败。当前采用 `cos >= 0.99` 的 token 比例至少 90%，同时报告 hidden 分布和低于 0.9 的比例，不追 bit 一致。
 
+## 修订（2026-10-04）
+
+- **双目标同步编译与产物新鲜度纪律（防验证脱节）**：
+  - 修改 `src/` 或 `patches/` 后、运行任何测试/回归脚本前，**必须执行 `.\build.bat llamalibs dual`**，确保生产产物（`build/StreamMoE/.../llama-cli.exe`）与转储/测试产物（`build/StreamMoE_dump/.../llama-server.exe`）原子同步更新。严禁只编译其中一个目标就跑另一个目标的测试。
+  - 所有测试脚本（`tools/run_export.js`、`baseline_regression/tools/verify_places.js`、`baseline_regression/run_baseline.bat`）内置**源码修改时间新鲜度拦截**（`tools/freshness_check.js`）。如果二进制早于源码修改时间，测试会强行终止并报错提示，禁止通过篡改时间或跳过检查绕过。
+  - 回归测试链路强制加入 CLI 混合池快速冒烟测试（`tools/smoke_cli.js`），必须覆盖用户典型场景（如 `RAM:8192,Vulkan0:5120` 混合池 + `llama-cli` 直跑推理），验证输出文本可读性，防止单靠服务端 dump 验证遗漏 CLI 推理错乱/胡话。
+
 ## 项目必知速记（2026-09-17 阅读重要文档后整理）
 
 - 文档包含历史方案和未同步 TODO，不能把旧命令、旧阶段结论直接当成当前实现。优先采用用户最新决定、本文修订、`docs/CHECKPOINT.md` 的最新验证记录；发生矛盾先核实，不凭旧稿回退功能。

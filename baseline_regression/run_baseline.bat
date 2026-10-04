@@ -62,6 +62,10 @@ set KL=%BR%\tools\verify_kl.exe
 if not exist "%MOE_BIN%" ( echo [-] missing %MOE_BIN% - run: build.bat llamalibs StreamMoE_dump & exit /b 1 )
 if not exist "%UP_BIN%" ( echo [-] missing %UP_BIN% - run: build.bat llamalibs upstream_dump & exit /b 1 )
 
+rem ---- Freshness check: reject stale binaries compiled before source modifications ----
+node "%ROOT%\tools\freshness_check.js" "%MOE_BIN%"
+if errorlevel 1 exit /b 1
+
 rem ---- compile verify_kl.exe if missing ----
 if not exist "%KL%" (
     echo [build] verify_kl.exe ...
@@ -134,6 +138,11 @@ echo.
 echo [7/7] olmoe place-* regression (hi.json vs standard baseline) ...
 node "%BR%\tools\verify_places.js" --bin-override "%MOE_BIN%" --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
 if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
+
+echo.
+echo [8/8] llama-cli mixed-pool smoke test ...
+node "%ROOT%\tools\smoke_cli.js"
+if errorlevel 1 ( echo [-] llama-cli smoke test failed & set PASS=0 )
 
 echo.
 echo =====================================================================

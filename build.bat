@@ -44,6 +44,8 @@ echo Unknown command: %CMD%
 goto help
 
 :llamalibs
+if "%TAG%"=="dual" goto llamalibs_dual
+if "%TAG%"=="both" goto llamalibs_dual
 echo [StreamMoE] Building vendored libllama static libs into %LLAMA_BUILD% ...
 if not exist "%LLAMA_BUILD%" mkdir "%LLAMA_BUILD%"
 rem Device-backend switches are forwarded from the environment (empty = OFF).
@@ -168,6 +170,15 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b %ERRORLEVEL%
 )
 echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
+exit /b 0
+
+:llamalibs_dual
+echo [StreamMoE] Building DUAL tags: StreamMoE (release) + StreamMoE_dump (test/dump) ...
+call "%~f0" llamalibs StreamMoE
+if errorlevel 1 ( echo [-] StreamMoE build failed & exit /b 1 )
+call "%~f0" llamalibs StreamMoE_dump
+if errorlevel 1 ( echo [-] StreamMoE_dump build failed & exit /b 1 )
+echo [+] Dual build completed successfully (StreamMoE + StreamMoE_dump).
 exit /b 0
 
 :test
@@ -314,6 +325,7 @@ echo   build.bat test       - Build and run all unit tests
 echo   build.bat clean      - Remove build\ (all tags)
 echo Optional [tag] sub-path for llamalibs/build (default: main).
 echo   llamalibs main           - route-B llama-server (build\main)
+echo   llamalibs dual           - build both StreamMoE (release) and StreamMoE_dump (test)
 echo   llamalibs StreamMoE      - flagship: route-B + vulkan, NO prefill export
 echo                             (build\StreamMoE; llama-cli dialogue / serving)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)

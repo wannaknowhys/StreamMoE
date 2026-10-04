@@ -17,6 +17,7 @@ const { spawn } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { checkBinaryFreshness } = require('./freshness_check');
 
 const PORT = Number(process.env.SM_PORT || 8993);
 const OUT_ROOT = process.env.SM_OUT_ROOT || path.join(__dirname, '..', 'temp', 'exports');
@@ -188,6 +189,7 @@ async function runOne(run, opts = {}) {
     const dir = path.join(outRoot, run.model, run.engine, run.input);
     fs.mkdirSync(dir, { recursive: true });
     const bin = binPath(run, opts.binOverride);
+    checkBinaryFreshness(bin);
     const args = ['-m', run.modelPath, '--fit', 'off', '--no-warmup', '-c', '15000', '-t', '16',
         '--top-p', '0.95', '--host', '127.0.0.1', '--port', String(PORT), '--no-webui'];
     if (run.draft) args.push('--model-draft', run.draft, '--spec-draft-n-max', '5', '--spec-draft-n-min', '1', '--spec-draft-p-min', '0.6');
