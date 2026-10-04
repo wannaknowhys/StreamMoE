@@ -52,23 +52,25 @@ node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <sp
 
 ## 3. Spec structure
 
-Three disjoint spec categories; any duplicate key across them aborts.
+Four disjoint, orthogonal spec categories (under `tools/run_specs/`):
 
-| Category | Keys                                       |
-| :------- | :----------------------------------------- |
-| model    | `model`, `modelPath`, `draft?`, `pool?`    |
-| engine   | `engine`, `bin` &#124; `binPath`, `extra?` |
-| task     | `input`, plus single/jsonl fields below    |
+| Category | Location | Keys |
+| :------- | :------- | :--- |
+| flavor   | `tools/run_specs/flavors/` | `flavor`, `bin` &#124; `binPath`, `hasExport?` |
+| model    | `tools/run_specs/models/`  | `model`, `modelPath`, `modelCtx?`, `draft?`, `pool?` |
+| engine   | `tools/run_specs/engines/` | `engine`, `extra?` (pure placement topologies, decoupled from binaries) |
+| task     | `tools/run_specs/tasks/`   | `input`, `taskCtx?`, plus single/jsonl/prefill fields below |
 
-Engine = binary + placement args:
+### Context negotiation & parameter deduplication
+- **Dual-context negotiation**: `effectiveCtx = Math.min(model.modelCtx ?? 4096, task.taskCtx ?? 4096)`. Eliminates context overflow warnings while respecting model training limits.
+- **Parameter deduplication**: `-c`, `--fit`, `--temp` are deduplicated cleanly across runner base flags and engine specs.
+- **Conditional export**: `--export-dir` is passed ONLY when `flavor.hasExport === true` AND task is a prefill evaluation (`feed.type === 'prefill'`). Chat and generation tasks never pass `--export-dir`, avoiding export buffer synchronization overhead.
 
-- route B: `"bin": "StreamMoE"`,
-  `extra = ["--expert-backend","--fit","off","--moe-expert-pools","RAM:${pool}[,Vulkan0:N]","--dense-placement","C1:<dev>,C2:<dev>"]`
-- stock: `"binPath": "${SM_UPSTREAM_BIN}"`,
-  `extra = ["--fit","off","--n-gpu-layers","<N>"]`
+Engine = placement arguments:
+- route B: `extra = ["--expert-backend","--moe-expert-pools","RAM:${pool}[,Vulkan0:N]","--dense-placement","C1:<dev>,C2:<dev>"]`
+- stock: `extra = ["--n-gpu-layers","<N>"]`
 
 Task fields:
-
 - single: `prompt` | `promptFile`, `promptRepeat?`, `nPredict?`, `warmup?`,
   `repeat?`, `ctx?`, `threads?`
 - jsonl: `feed:{type:"jsonl", path, maxTurns}`, `nPredict?`, `ctx?`, `threads?`
@@ -76,12 +78,11 @@ Task fields:
   `path` is a JSON array of chat messages; it is flattened to plain text and sent
   via `/completion` (model-agnostic, so tool-call templates do not break it).
   `tokens` is a synthetic-filler fallback. `ctx` auto-sizes to fit the prompt
-  unless set; the model's `n_ctx_train` still caps the slot (olmoe = 4096, so use
-  a long-context model for `prefill10000`).
+  unless set; capped by `modelCtx`.
 
 ## 4. Placement matrix (`tools/run_specs/engines/`)
 
-All route-B specs use `bin: StreamMoE`; `${pool}` comes from the model spec.
+All route-B engine specs strictly define placement topology; `${pool}` comes from the model spec. Target binary is selected via `--flavor <name>` (e.g. `StreamMoE`, `StreamMoE_dump`).
 
 | Spec                   | `--dense-placement`     | `--moe-expert-pools`       |
 | :--------------------- | :---------------------- | :------------------------- |

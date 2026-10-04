@@ -89,3 +89,22 @@ rem   baseline\<moe_129_8192 | moe_129_8192_vk | upstream_129>\  —— *_vk 目
 ## verify_kl 单独用法
 
 `tools\verify_kl.exe <model.gguf> <ref.bin> <cand.bin> [--thresh T]`——源 `tools/verify_kl.cpp`，用法细节见 `tools/verify_kl.md`（编译由 bat 自动；手动编译见该 md）。
+
+## 多 Placement 拓扑矩阵回归（verify_places.js，Step 7）
+
+自动化覆盖全量 12 种 placement 拓扑矩阵（`tools/run_specs/engines/place-*.json`），验证在各种 C1/C2 与显存专家池分配下的正确性与推理能力：
+
+```bash
+# 默认使用 StreamMoE (Release) 产物回归
+node baseline_regression/tools/verify_places.js --flavor StreamMoE
+
+# 过滤单一 engine 单测
+node baseline_regression/tools/verify_places.js --flavor StreamMoE --engine place-cpu
+
+# 严格模式（要求输出文本与 CPU 逐字 IDENTICAL，不接受正常浮点 ULP 差异）
+node baseline_regression/tools/verify_places.js --flavor StreamMoE --strict
+```
+
+- **内置二进制新鲜度检查**：当 target binary 的编译修改时间早于 `src/` 或 `patches/` 时直接拦截退出，防止验证与代码脱节。
+- **输出语义连贯性保证**：确保所有拓扑（CPU、纯显存、混合流式）在无崩溃、无上下文溢出告警的前提下生成高质量回复。
+

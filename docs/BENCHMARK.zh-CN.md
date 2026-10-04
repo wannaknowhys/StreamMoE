@@ -47,35 +47,38 @@ node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <sp
 
 ## 3. Spec 结构
 
-三类互斥 spec，跨类重复键直接报错。
+## 3. Spec 结构
+ 
+四类相互解耦的独立 spec（位于 `tools/run_specs/` 目录下）：
 
-| 类别   | 键                                         |
-| :----- | :----------------------------------------- |
-| model  | `model`、`modelPath`、`draft?`、`pool?`    |
-| engine | `engine`、`bin` &#124; `binPath`、`extra?` |
-| task   | `input`，加下面的 single/jsonl 字段        |
+| 类别   | 存放目录 | 键 |
+| :----- | :------- | :--- |
+| flavor | `tools/run_specs/flavors/` | `flavor`、`bin` &#124; `binPath`、`hasExport?` |
+| model  | `tools/run_specs/models/`  | `model`、`modelPath`、`modelCtx?`、`draft?`、`pool?` |
+| engine | `tools/run_specs/engines/` | `engine`、`extra?`（纯 placement 拓扑，彻底解耦二进制路径） |
+| task   | `tools/run_specs/tasks/`   | `input`、`taskCtx?`，加下面的 single/jsonl/prefill 字段 |
 
-engine = 二进制 + placement 参数：
+### 上下文协商与参数去重机制
+- **双端上下文协商**：`effectiveCtx = Math.min(model.modelCtx ?? 4096, task.taskCtx ?? 4096)`。在尊重模型训练上限的同时，彻底消除上下文溢出与 4-slot 撑爆警告。
+- **参数原子去重**：`-c`、`--fit`、`--temp` 等核心参数在 runner 与 engine 之间自动排重，杜绝重复传参告警。
+- **条件式导出保护**：`--export-dir` 仅在 `flavor.hasExport === true` 且任务为 prefill 导出时传递。普通生成/多轮评测绝不传 `--export-dir`，消除逐 token 显卡同步开销，恢复满血吞吐。
 
-- route B：`"bin": "StreamMoE"`，
-  `extra = ["--expert-backend","--fit","off","--moe-expert-pools","RAM:${pool}[,Vulkan0:N]","--dense-placement","C1:<dev>,C2:<dev>"]`
-- 原版：`"binPath": "${SM_UPSTREAM_BIN}"`，
-  `extra = ["--fit","off","--n-gpu-layers","<N>"]`
+engine = placement 参数拓扑：
+- route B：`extra = ["--expert-backend","--moe-expert-pools","RAM:${pool}[,Vulkan0:N]","--dense-placement","C1:<dev>,C2:<dev>"]`
+- 原版：`extra = ["--n-gpu-layers","<N>"]`
 
 task 字段：
-
 - single：`prompt` | `promptFile`、`promptRepeat?`、`nPredict?`、`warmup?`、
   `repeat?`、`ctx?`、`threads?`
 - jsonl：`feed:{type:"jsonl", path, maxTurns}`、`nPredict?`、`ctx?`、`threads?`
 - prefill：`feed:{type:"prefill", path?, tokens?}`、`nPredict?`、`ctx?`、`threads?`。
   `path` 是 JSON 消息数组，会扁平化成纯文本走 `/completion`（模型无关，tool_calls
   模板不会把它顶掉）；`tokens` 是无 path 时的合成 filler 兜底。`ctx` 不设时按 prompt
-  自动放大；但模型 `n_ctx_train` 仍会封顶 slot（olmoe = 4096，所以 `prefill10000`
-  要用长上下文模型）。
+  自动放大，但受 `modelCtx` 封顶。
 
 ## 4. 布局矩阵（`tools/run_specs/engines/`）
 
-所有 route-B spec 用 `bin: StreamMoE`；`${pool}` 来自 model spec。
+所有 route-B engine spec 纯粹定义拓扑；`${pool}` 来自 model spec。执行二进制统一由 `--flavor <name>` 指定（如 `StreamMoE`、`StreamMoE_dump`）。
 
 | Spec                   | `--dense-placement`     | `--moe-expert-pools`       |
 | :--------------------- | :---------------------- | :------------------------- |
