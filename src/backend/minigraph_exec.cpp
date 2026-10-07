@@ -579,6 +579,20 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
     }
 }
 
+// Check if all non-alias compute nodes in a list reside on the given target device.
+static bool is_segment_on_device(const std::vector<ggml_tensor*> & nodes, const std::string & target_dev) {
+    if (nodes.empty()) return false;
+    size_t count = 0;
+    for (const auto * nd : nodes) {
+        if (!nd || is_alias_op(nd)) continue;
+        ++count;
+        const char * d = route_b_node_device(nd);
+        const std::string ndev = (d ? d : "");
+        if (ndev != target_dev) return false;
+    }
+    return count > 0;
+}
+
 // Device-segmented execution (docs/DEVICE_SEGMENT_EXEC.md): walk the node list
 // in topological order, group contiguous same-device nodes into segments, and
 // flush each segment via run_dense_subgraph on the real backend.  At each device
@@ -801,6 +815,11 @@ static void dump_node_hash(int layer, const char * stage, const std::vector<ggml
 }
 #endif
 
+
+static void fix_layer_input_layouts(const moe_layer_exec_t * ex);
+#ifdef STREAM_MOE_TEMP
+static void dump_all_layer_nodes_debug(int32_t layer);
+#endif
 
 // Slot of a pinned (layer, expert), or -1.
 static int32_t pin_slot(const std::vector<expert_handle_t>& pins, uint32_t layer, uint32_t expert) {
@@ -1867,7 +1886,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                                                        const std::vector<expert_handle_t>& pins,
                                                        const ggml_tensor * ids,
                                                        uint32_t n_k, uint32_t n_t,
-                                                       const std::vector<int32_t>& ids_compact) {
+                                                       const std::vector<int32_t>& ids_compact,
+                                                       std::unordered_set<const route_b_relay_t *> & executed_relays,
+                                                       int32_t next_layer,
+                                                       bool & out_fused_tail,
+                                                       bool & out_fused_head_next) {
+    out_fused_tail = false;
+    out_fused_head_next = false;
     if (n_t == 0 || n_k == 0) return GGML_STATUS_SUCCESS;
     const uint32_t n_expert = sched.topology().n_expert;
     const uint32_t n_pools  = sched.n_pools();
@@ -1983,7 +2008,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
     b.c = &c; b.ex = ex; b.ids = ids; b.ids_data = ids;
     b.ids_ne0 = n_k; b.ids_ne1 = n_t;
 
-    ggml_cgraph * gf_cpu = ggml_new_graph(ctx);
+    ggml_cgraph * gf_cpu = ggml_new_graph_custom(ctx, 4096, false);
 
     // Resolve each distinct non-RAM pool to a device target (skip pools without
     // an exec context: their rounds fall back to the CPU host-map read).
@@ -2166,7 +2191,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
         t.arena = dv->arena; t.stage = dv->stage;
         t.arena_map = dv->arena_map; t.stage_map = dv->stage_map;
-        t.gf = ggml_new_graph(ctx);
+        t.gf = ggml_new_graph_custom(ctx, 4096, false);
         t.acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_out, n_t);
         t.acc->nb[0] = 4; t.acc->nb[1] = (size_t) d_out * 4;
         if (!direct_out && single_dev_target && moe_out_same_dev) {
@@ -2359,6 +2384,91 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
     }
     c.dev = nullptr;
+
+    // Opportunistic single-device MoE + Tail(L) [+ Head(L+1)] graph fusion (Tier 2).
+    // If all active expert tokens for layer L compute on a single device,
+    // and Tail(L) (and optionally Head(L+1)) reside on this same device,
+    // chain them directly into t.gf so the hardware queue executes them in a
+    // single queue submission ("single break per layer").
+    const moe_layer_plan_t * plan_tail = moe_chain_layer_plan(layer);
+    const moe_layer_plan_t * plan_head_next = (next_layer == layer + 1) ? moe_chain_layer_plan(next_layer) : nullptr;
+    device_target_t * single_dt = nullptr;
+    std::string single_dev_name;
+
+    if (single_dev_target && dev_targets.size() == 1) {
+        single_dt = &dev_targets.begin()->second;
+        ggml_backend_dev_t bdev = ggml_backend_get_device(single_dt->be);
+        const char * dev_name_c = bdev ? ggml_backend_dev_name(bdev) : "";
+        single_dev_name = dev_name_c ? dev_name_c : "";
+
+        bool can_fuse_tail = (single_dt->moe_out_same_dev && plan_tail && !plan_tail->tail.empty());
+        bool can_fuse_head_next = false;
+        if (can_fuse_tail) {
+            if (!is_segment_on_device(plan_tail->tail, single_dev_name)) {
+                can_fuse_tail = false;
+            } else {
+                for (const auto * nd : plan_tail->tail) {
+                    if (!nd || is_alias_op(nd) || nd->op == GGML_OP_NONE) continue;
+                    if (!ggml_backend_supports_op(single_dt->be, nd)) {
+                        can_fuse_tail = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (can_fuse_tail) {
+            // 1. Dispatch incoming relays for Tail(L) targeting single_dev_name
+            std::vector<const route_b_relay_t *> incoming_tail;
+            for (const auto & r : route_b_relays()) {
+                if (!r.src || !r.dst || executed_relays.count(&r)) continue;
+                if (r.layer != layer || r.stage != ROUTE_B_XFER_TAIL) continue;
+                const char * dd = route_b_node_device(r.dst);
+                const std::string dst_key = (dd ? dd : "");
+                if (dst_key != single_dev_name) continue;
+                incoming_tail.push_back(&r);
+                executed_relays.insert(&r);
+            }
+            dispatch_relay_batch(incoming_tail, cpu, single_dev_name);
+
+            // 2. Append Tail(L) nodes to t.gf
+            for (ggml_tensor * nd : plan_tail->tail) {
+                if (!nd || is_alias_op(nd) || !nd->data || nd->op == GGML_OP_NONE) continue;
+                if (single_dt->gf->n_nodes < single_dt->gf->size) {
+                    single_dt->gf->nodes[single_dt->gf->n_nodes++] = nd;
+                }
+            }
+            out_fused_tail = true;
+
+            // Note on Head(L+1) fusion:
+            // Forward-fusing Head(L+1) into layer L's device graph is intentionally
+            // not performed here because:
+            //   1. Scratch arena reuse: In layout_arena, non-carry scratch space is
+            //      reused across layers (plan.scratch_size = max_L(lb_L)). Merging
+            //      Head(L+1) with MoE(L)+Tail(L) into a single cgraph causes GPU
+            //      scratch memory aliasing between layer L and layer L+1.
+            //   2. Router host synchronization: Head(L+1) computes router top-k
+            //      ids(L+1), which the host CPU must read to pin expert weights
+            //      for layer L+1 before MoE(L+1) can begin.
+            // Therefore, fusing MoE(L) + Tail(L) into a single hardware queue
+            // submission achieves the true "single-break per layer" architecture.
+            can_fuse_head_next = false;
+        }
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TIER2_DEBUG") || std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+            fprintf(stderr, "[fuse_tier2] L%d: dev='%s' can_tail=%d fused_tail=%d can_head=%d fused_head_next=%d (next_L=%d)\n",
+                    layer, single_dev_name.c_str(), can_fuse_tail ? 1 : 0, out_fused_tail ? 1 : 0,
+                    can_fuse_head_next ? 1 : 0, out_fused_head_next ? 1 : 0, next_layer);
+        }
+#endif
+    } else {
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TIER2_DEBUG")) {
+            fprintf(stderr, "[fuse_tier2_skip] L%d: single_dev_target=%d n_devs=%zu has_cpu_round=%d\n",
+                    layer, single_dev_target ? 1 : 0, dev_targets.size(), has_cpu_round ? 1 : 0);
+        }
+#endif
+    }
 
     // Submit device graphs async (overlap with the CPU graph), run the CPU
     // graph on the calling thread, then converge: sync devices, read each acc_d
@@ -2564,6 +2674,47 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #ifdef STREAM_MOE_TEMP
     { _tt.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _ch_t0).count(); _tt.n++; }
 #endif
+    // Dispatch outgoing boundary copies for fused segments if any
+    if (out_fused_tail && single_dt) {
+        std::vector<const route_b_relay_t *> outgoing_tail;
+        for (const auto & r : route_b_relays()) {
+            if (!r.src || !r.dst || executed_relays.count(&r)) continue;
+            if (r.layer != layer || r.stage != ROUTE_B_XFER_TAIL) continue;
+            const char * sd = route_b_node_device(r.src);
+            const std::string src_key = (sd ? sd : "");
+            if (src_key != single_dev_name) continue;
+            outgoing_tail.push_back(&r);
+            executed_relays.insert(&r);
+        }
+        dispatch_relay_batch(outgoing_tail, cpu);
+#ifdef STREAM_MOE_TEMP
+        if (plan_tail) {
+            dump_node_hash(layer, "tail", plan_tail->tail);
+            dump_all_layer_nodes_debug(layer);
+        }
+#endif
+    }
+
+    if (out_fused_head_next && single_dt) {
+        std::vector<const route_b_relay_t *> outgoing_head;
+        for (const auto & r : route_b_relays()) {
+            if (!r.src || !r.dst || executed_relays.count(&r)) continue;
+            if (r.layer != next_layer) continue;
+            if (r.stage != ROUTE_B_XFER_LAYER_FRONT && r.stage != ROUTE_B_XFER_CLOSURE) continue;
+            const char * sd = route_b_node_device(r.src);
+            const std::string src_key = (sd ? sd : "");
+            if (src_key != single_dev_name) continue;
+            outgoing_head.push_back(&r);
+            executed_relays.insert(&r);
+        }
+        dispatch_relay_batch(outgoing_head, cpu);
+#ifdef STREAM_MOE_TEMP
+        if (plan_head_next) {
+            dump_node_hash(next_layer, "head", plan_head_next->head);
+        }
+#endif
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2714,7 +2865,12 @@ static enum ggml_status exec_dense_head(int32_t layer, ggml_context * ctx,
 
 // Execute the MoE closure (pins experts, runs bucket chain, unpins).
 static enum ggml_status exec_moe_closure(int32_t layer, ggml_context * ctx,
-                                         ggml_backend_t cpu, expert_scheduler& sched) {
+                                         ggml_backend_t cpu, expert_scheduler& sched,
+                                         std::unordered_set<const route_b_relay_t *> & executed_relays,
+                                         int32_t next_layer,
+                                         bool & out_fused_tail, bool & out_fused_head_next) {
+    out_fused_tail = false;
+    out_fused_head_next = false;
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
 
@@ -2843,7 +2999,8 @@ static enum ggml_status exec_moe_closure(int32_t layer, ggml_context * ctx,
         moe_chain_set_full_alloc(need);
     }
 
-    const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins, ids, n_k, n_t, ids_compact);
+    const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins, ids, n_k, n_t, ids_compact,
+                                                               executed_relays, next_layer, out_fused_tail, out_fused_head_next);
 #ifdef STREAM_MOE_TEMP
     if (const moe_layer_plan_t * plan = moe_chain_layer_plan(layer)) {
         dump_node_hash(layer, "moe", plan->head);
@@ -2959,9 +3116,12 @@ static enum ggml_status exec_layer_burst(int32_t layer, ggml_context * ctx,
     std::unordered_set<const route_b_relay_t *> executed_relays;
     enum ggml_status st = exec_dense_head(layer, ctx, cpu, executed_relays);
     if (st != GGML_STATUS_SUCCESS) return st;
-    st = exec_moe_closure(layer, ctx, cpu, sched);
+    bool fused_tail = false, fused_head = false;
+    st = exec_moe_closure(layer, ctx, cpu, sched, executed_relays, -1, fused_tail, fused_head);
     if (st != GGML_STATUS_SUCCESS) return st;
-    st = exec_dense_tail(layer, ctx, cpu, executed_relays);
+    if (!fused_tail) {
+        st = exec_dense_tail(layer, ctx, cpu, executed_relays);
+    }
     return st;
 }
 
@@ -3052,10 +3212,14 @@ enum ggml_status moe_exec_mul_mat_id(
         const int32_t L = active_layers[0];
         enum ggml_status st = exec_dense_head(L, ctx, cpu_backend, executed_relays);
         if (st != GGML_STATUS_SUCCESS) return st;
-        st = exec_moe_closure(L, ctx, cpu_backend, sched);
+        bool fused_tail = false, fused_head = false;
+        st = exec_moe_closure(L, ctx, cpu_backend, sched, executed_relays, -1, fused_tail, fused_head);
         if (st != GGML_STATUS_SUCCESS) return st;
-        st = exec_dense_tail(L, ctx, cpu_backend, executed_relays);
-        return st;
+        if (!fused_tail) {
+            st = exec_dense_tail(L, ctx, cpu_backend, executed_relays);
+            if (st != GGML_STATUS_SUCCESS) return st;
+        }
+        return GGML_STATUS_SUCCESS;
     }
 
     // Step 1: Head of the first layer
@@ -3063,25 +3227,53 @@ enum ggml_status moe_exec_mul_mat_id(
     enum ggml_status st = exec_dense_head(L_first, ctx, cpu_backend, executed_relays);
     if (st != GGML_STATUS_SUCCESS) return st;
 
-    // Step 2: Main pipeline across layers (MoE of current layer + fused Tail(L_cur) + Head(L_next))
+    // Step 2: Main pipeline across layers (Tier 2 opportunistic MoE+Tail+Head queue fusion with Tier 1 fallback)
     for (size_t i = 0; i < n_layers - 1; ++i) {
         const int32_t L_cur = active_layers[i];
         const int32_t L_next = active_layers[i + 1];
 
-        st = exec_moe_closure(L_cur, ctx, cpu_backend, sched);
+        bool fused_tail = false;
+        bool fused_head_next = false;
+        st = exec_moe_closure(L_cur, ctx, cpu_backend, sched, executed_relays,
+                              L_next, fused_tail, fused_head_next);
         if (st != GGML_STATUS_SUCCESS) return st;
 
-        st = exec_fused_tail_and_head(L_cur, L_next, ctx, cpu_backend, executed_relays);
-        if (st != GGML_STATUS_SUCCESS) return st;
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TIER2_DEBUG")) {
+            static int g_step_count = 0;
+            if (g_step_count++ < 32) {
+                fprintf(stderr, "[pipe] L%d->L%d: fused_tail=%d fused_head_next=%d\n",
+                        L_cur, L_next, fused_tail ? 1 : 0, fused_head_next ? 1 : 0);
+            }
+        }
+#endif
+
+        if (fused_tail && fused_head_next) {
+            // Both Tail(L_cur) and Head(L_next) fused into the single GPU queue of MoE(L_cur)
+            continue;
+        } else if (fused_tail && !fused_head_next) {
+            // Tail(L_cur) was fused into MoE, but Head(L_next) was not
+            st = exec_dense_head(L_next, ctx, cpu_backend, executed_relays);
+            if (st != GGML_STATUS_SUCCESS) return st;
+        } else {
+            // Tail(L_cur) was not fused with MoE: fall back to fused Tail(L_cur) + Head(L_next)
+            st = exec_fused_tail_and_head(L_cur, L_next, ctx, cpu_backend, executed_relays);
+            if (st != GGML_STATUS_SUCCESS) return st;
+        }
     }
 
     // Step 3: Final layer MoE and Tail
     const int32_t L_last = active_layers[n_layers - 1];
-    st = exec_moe_closure(L_last, ctx, cpu_backend, sched);
+    bool fused_tail_last = false;
+    bool fused_head_last = false;
+    st = exec_moe_closure(L_last, ctx, cpu_backend, sched, executed_relays,
+                          -1, fused_tail_last, fused_head_last);
     if (st != GGML_STATUS_SUCCESS) return st;
 
-    st = exec_dense_tail(L_last, ctx, cpu_backend, executed_relays);
-    if (st != GGML_STATUS_SUCCESS) return st;
+    if (!fused_tail_last) {
+        st = exec_dense_tail(L_last, ctx, cpu_backend, executed_relays);
+        if (st != GGML_STATUS_SUCCESS) return st;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

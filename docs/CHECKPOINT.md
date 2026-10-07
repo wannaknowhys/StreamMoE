@@ -1,9 +1,15 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-09-17（**xfer shell 按层修复 + KV/物理设备解耦 + 参数拒绝**）：xfer shell 复用键纳入 consumer layer，避免跨层复用同一 shell；`dev_layer()` 表示 STREAMMOE 调度设备，`dev_layer_physical()` 表示 C1 物理设备，KV/DSV4 compressor/recurrent state 跟随后者；CLI/env/preset 显式冲突放置参数拒绝。既有 129-token 证据：`temp/embedding_probe_2026-09-17T19-07-02-705Z/manifest.json`（label=`xfer_layer_fixed_129`，ref/dev 均 exit 0）；同目录 `gate_ref_vs_dev.log`：123/129=95.3% PASS，`gate_frozen_vs_ref.log`：121/129=93.8% PASS（embd cos>=0.99 的 token 比例至少 90%，非 bit 一致）。本次仅重生成 route-b patch 与同步本检查点：独立 clone 从 `f280b2698` 按 macros → tsc_timer → route-b-inject → prefill-export-llama 重放，3494 文件仅规范化 CRLF 后逐字节一致；证据 `temp/patch_replay_20260917.log`、`temp/patch_verify_result_20260917.json`。未改源码/frag、未重跑数值测试、未 commit/push，现有未提交 prefill patch 保持原字节。
+> **最近更新**：2026-10-07（**Tier 1+Tier 2 硬件队列图融合 + 单层单断架构 + 4D 笛卡尔积测试套件重构**）：
+> - **图执行融合与流水线**：
+>   - **Tier 1 通用流水线**：引入 `exec_fused_tail_and_head(L_cur, L_next)`，在同设备段内无缝合并 `Tail(L_cur)` 与 `Head(L_next)` 的执行，大幅减少设备切换。
+>   - **Tier 2 单设备 MoE+Tail 硬件 Queue 融合**：在单设备分支中将 `Tail(L)` 算子直接追加进 `MoE(L)` 设备计算图（`single_dt->gf`），单次硬件 Queue 提交完成计算并在层尾统一派发 boundary relay。
+>   - **Scratch Arena 约束与单层单断定型**：明确非 carry scratch 空间在层间复用 offset 0，跨层合并进入 `Head(L+1)` 会引起 GPU 临时张量地址碰撞，且 Router 必须在 CPU 读取 top-k；锁定“单层单断”（`Head(L)` -> CPU Router Pin -> `[MoE(L) + Tail(L)]` 硬件单队提交）。若 Tail 与 MoE 设备不同，则自动优雅回退至 Tier 1。
+>   - **全拓扑 12/12 回归验证**：`verify_places.js --flavor StreamMoE` 覆盖全量 12 种 placement 拓扑全部通过（8 个逐字 IDENTICAL，4 个正常微小浮点差异，全部语义流畅无乱码）；`smoke_cli.js` 混合池 10.4s 通过。
+> - **测试套件 4D 笛卡尔积规范解耦**：彻底重构 `run_specs/`，划分为 `flavors/`（编译能力）、`models/`（模型参数）、`engines/`（硬件 placement）、`tasks/`（评测任务）4 个独立维度。参数原子去重，双端上下文自动协商，`--export-dir` 仅在 prefill 导出时传递。
 >
-> **前次更新**：2026-09-15（**phase 3 设备执行落地**，`102c2eb`/`b525e29`：`设备名→ggml_backend_t` 注册表 + `node→device`，dense head/tail 按 placement 设备跑；通用 stage 化 `xfer` 跨设备搬运（一次拷贝，覆盖 carry/cur/moe_out）；`cur`/`moe_out` backend 无关。run_baseline PASS。前情：2026-09-14（**每设备 arena 规划落地**，`fdd772e`：`layout_arena` 改 per-device `region_plan_t`（每设备 grow-only buffer），两区域按生命周期分——`carry`（跨层流水，逻辑一份、物理 per-device、跨边界 relay）+ `scratch`（层内：dense head/tail 与 MoE closure 合并成一个池）；closure 归专家池设备；`moe_chain_fullalloc_buffer`/`route_b_in_arena` 改按设备查。CPU-only 单 host plan：pack vs sum IDENTICAL、vk gate 121/129、`run_baseline` PASS。前情：**prefill 导出捕获修复** `da932e4`/`f42bd1d`（cb_eval 逐节点 → 选择性 need + 保留张量；compact pack 不是数值 bug）；`StreamMoE_latest`/`StreamMoE_dump_dbg` 构建 + AGENTS 15（禁回滚）；**B38 最后一层 0-token MoE no-op 修复**：大 prompt 非末尾 ubatch 的最后一层 MoE 0 token → 桶引擎 `empty round list`/Compute error；`n_t==0` 直接 no-op，olmoe prefill3000 FAIL→OK。另：`run_bench` SUMMARY 加 task 列；bench 结果记于 `benchmark/results/bench_findings_2026-09-09.txt`。前情：token-subset 桶引擎 + scatter_plan 累加 bf06fe2；**设备执行落地** cae652b/6723f4e。）
+> **前次更新**：2026-09-17（**xfer shell 按层修复 + KV/物理设备解耦 + 参数拒绝**）：xfer shell 复用键纳入 consumer layer，避免跨层复用同一 shell；`dev_layer()` 表示 STREAMMOE 调度设备，`dev_layer_physical()` 表示 C1 物理设备，KV/DSV4 compressor/recurrent state 跟随后者；CLI/env/preset 显式冲突放置参数拒绝。既有 129-token 证据：`temp/embedding_probe_2026-09-17T19-07-02-705Z/manifest.json`（label=`xfer_layer_fixed_129`，ref/dev 均 exit 0）；同目录 `gate_ref_vs_dev.log`：123/129=95.3% PASS，`gate_frozen_vs_ref.log`：121/129=93.8% PASS（embd cos>=0.99 的 token 比例至少 90%，非 bit 一致）。
 
 ---
 
@@ -14,6 +20,24 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 ---
 
 ## 2. 当前状态（✅ 已完成）
+
+### 流水线图融合与单层单断架构（2026-10-07，Tier 1 & Tier 2）
+
+- **背景与目标**：此前每层执行结构为 `Dense Head -> MoE Closure -> Dense Tail`，伴随频繁的主机同步与设备图打断。目标是实现跨层及单层内的硬件计算图融合，消除不必要的 host<->device 往返，达到“单层单断”极简硬件提交。
+- **Tier 1 跨层 Tail(L)+Head(L+1) 贪婪融合**：
+  - 在 `topo_segment_execute` 中引入按设备贪婪连通分量聚集执行（`exec_contiguous_subgraph`），并在 `moe_exec_mul_mat_id` 主循环中引入 `exec_fused_tail_and_head(L_cur, L_next)`。
+  - 将当前层的 dense Tail 与下一层的 dense Head 在同设备段内无缝合并提交，减少设备切换。
+- **Tier 2 单设备 MoE+Tail 硬件 Queue 融合（“单层单断”架构）**：
+  - 在 `exec_layer_burst_chain_buckets` 中：当激活专家运行在单一设备目标（`single_dev_target && dev_targets.size() == 1`），且本层 `Tail(L)` 位于同一设备时，直接将 `Tail(L)` 算子追加到 `MoE(L)` 的设备计算图（`single_dt->gf`）中，形成单个硬件 Queue 提交。
+  - 在计算提交前派发 `Tail(L)` 相关的入向跨设备 relay，并在层尾同步后统一派发出向 boundary relay。
+  - **Scratch Arena 约束与边界定型**：
+    - 探明并修复关键内存陷阱：非 carry 的 scratch 空间在 `layout_arena` 中为各层复用（`scratch_size = max_L(lb_L)`，基地址相同）。若强行跨层融合 `Head(L+1)`，会导致 GPU 临时张量地址碰撞（如引起字符乱码/babbling），且 Router 必须在 CPU 读取 top-k 挑选专家。
+    - 因而硬件队列融合界限定在同层的 `[MoE(L) + Tail(L)]`，形成完整的 `Head(L) -> [CPU Router Pin 唯一打断] -> [MoE(L) + Tail(L)] 硬件单队提交` 结构，真正达成每层只有 1 次主机打断。
+    - 当 `Tail(L)` 与 MoE 不在同一设备时，自动优雅退化为 Tier 1 的 `exec_fused_tail_and_head`。
+- **验证**：
+  - `.\build.bat llamalibs dual` 原子同步编译通过。
+  - `node baseline_regression/tools/verify_places.js --flavor StreamMoE`：覆盖全量 12 种 placement 拓扑全部 PASS，0 运行时错误，全部输出语义连贯流畅的英文文本。
+  - `node tools/smoke_cli.js`：CLI 混合池（`RAM:8192,Vulkan0:5120`）直跑推理 10.4s PASS。
 
 ### 每设备 arena 规划（2026-09-14，`fdd772e`，docs/PER_DEVICE_ARENA.md）
 
