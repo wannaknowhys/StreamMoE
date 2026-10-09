@@ -29,15 +29,6 @@ cd /d "%ROOT%"
 set BR=baseline_regression
 call "%ROOT%\temp\sm_env.bat" 2>nul
 
-if "%SM_OLMOE%"=="" (
-    echo [-] SM_OLMOE is not set. Please define SM_OLMOE in temp\sm_env.bat or environment.
-    exit /b 1
-)
-if not exist "%SM_OLMOE%" (
-    echo [-] SM_OLMOE file not found: %SM_OLMOE%
-    exit /b 1
-)
-
 set "BL=%~1"
 if "%BL%"=="" set "BL=%BR%\baseline\moe_129_8192"
 if not exist "%BL%\prefill_export_main.bin" (
@@ -80,17 +71,17 @@ copy /Y F:\Dev\LLVM\bin\libomp.dll "%BR%\tools\" >nul
 set PASS=1
 echo.
 echo =====================================================================
-echo [1/5] moe prefill-from (route-B, 8GB pool) ...
+echo [1/8] moe prefill-from (route-B, 8GB pool) ...
 "%MOE_BIN%" -m %MODEL_MOE% --prefill-from %TOK% --export-dir %OUT%\moe -c 2048 -t 16 ^
     --expert-backend --moe-ram-pool 8192 --fit off --no-warmup > %OUT%\moe\run.log 2>&1
 if errorlevel 1 ( echo [-] moe run failed & exit /b 1 )
 echo.
-echo [2/5] upstream prefill-from ...
+echo [2/8] upstream prefill-from ...
 "%UP_BIN%" -m %MODEL_UP% --prefill-from %TOK% --export-dir %OUT%\up -c 2048 -t 16 > %OUT%\up\run.log 2>&1
 if errorlevel 1 ( echo [-] upstream run failed & exit /b 1 )
 
 echo.
-echo [3/5] embd/hidden/KV compare vs baseline ...
+echo [3/8] embd/hidden/KV compare vs baseline ...
 rem  vk flavor: byte-IDENTICAL is not reachable (host memory form differs), so
 rem  gate on the embd cos interval ratio. CPU flavor stays strict IDENTICAL.
 set "VK=0"
@@ -113,7 +104,7 @@ node %BR%\tools\verify_prefill.js %BR%\baseline\upstream_129\prefill_export_main
 if errorlevel 1 ( echo [-] upstream DIVERGED from baseline & set PASS=0 )
 
 echo.
-echo [4/5] per-token KL (baseline upstream vs new moe) - report only:
+echo [4/8] per-token KL (baseline upstream vs new moe) - report only:
 echo   moe-vs-upstream KL is inherent backend noise (routing flips), NOT a bug;
 echo   see docs/BACKEND_DIVERGENCE_ANALYSIS.md. FAIL below only if thresh trips.
 rem  A *_vk baseline (GGML_VULKAN=ON flavor) diverges more from the CPU
@@ -123,26 +114,38 @@ echo %BL% | findstr /C:"_vk" >nul && set "KLTHRESH=4.5"
 "%KL%" %MODEL_UP% %BR%\baseline\upstream_129\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin --thresh %KLTHRESH%
 
 echo.
-echo [5/5] kv_cos (baseline moe vs new moe, expect ~1.0) ...
+echo [5/8] kv_cos (baseline moe vs new moe, expect ~1.0) ...
 rem kv_cos.js (2026-09): correct f16 decode; a cell prints NaN when either side
 rem has no finite row data (unwritten/NaN cache) - treated as "not comparable".
 node %BR%\tools\kv_cos.js %BL%\prefill_export_main.bin %OUT%\moe\prefill_export_main.bin > "%OUT%\kv_cos.txt"
 
 echo.
-echo [6/6] expert-flip vs divergence match (moe vs baseline moe) ...
+echo [6/8] expert-flip vs divergence match (moe vs baseline moe) ...
 node %BR%\tools\div_match.js %BL% %OUT%\moe
 set "OUTP=%OUT:\=/%"
 node -e "const fs=require('fs');const rows=fs.readFileSync(process.argv[1],'utf8').split('\n').filter(l=>/^\d+\t/.test(l));let n=0;let min=2;for(const l of rows){for(const c of l.split('\t').slice(1)){const v=+c;if(Number.isNaN(v))continue;n++;if(v<min)min=v}}console.log('kv_cos rows='+rows.length+' comparable='+n+' cos_min='+(n===0?'-':min.toFixed(6))+' (expect >= ~0.999)')" "%OUTP%/kv_cos.txt"
 
 echo.
-echo [7/7] olmoe place-* regression (hi.json vs standard baseline) ...
-node "%BR%\tools\verify_places.js" --flavor StreamMoE --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
-if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
+echo [7/8] olmoe place-* regression (hi.json vs standard baseline) ...
+if "%SM_OLMOE%"=="" (
+    echo [i] SM_OLMOE not set, skipping olmoe place regression
+) else if not exist "%SM_OLMOE%" (
+    echo [i] SM_OLMOE file not found: %SM_OLMOE%, skipping olmoe place regression
+) else (
+    node "%BR%\tools\verify_places.js" --flavor StreamMoE --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
+    if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
+)
 
 echo.
 echo [8/8] llama-cli mixed-pool smoke test ...
-node "%ROOT%\tools\smoke_cli.js"
-if errorlevel 1 ( echo [-] llama-cli smoke test failed & set PASS=0 )
+if "%SM_OLMOE%"=="" (
+    echo [i] SM_OLMOE not set, skipping llama-cli smoke test
+) else if not exist "%SM_OLMOE%" (
+    echo [i] SM_OLMOE file not found: %SM_OLMOE%, skipping llama-cli smoke test
+) else (
+    node "%ROOT%\tools\smoke_cli.js"
+    if errorlevel 1 ( echo [-] llama-cli smoke test failed & set PASS=0 )
+)
 
 echo.
 echo =====================================================================

@@ -30,13 +30,37 @@ const path = require('path');
 const REPO_ROOT = path.join(__dirname, '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function loadEnvIfPresent() {
+    const envBat = path.join(REPO_ROOT, 'temp', 'sm_env.bat');
+    if (fs.existsSync(envBat)) {
+        const lines = fs.readFileSync(envBat, 'utf8').split('\n');
+        for (const line of lines) {
+            const m = line.trim().match(/^set\s+([A-Za-z0-9_]+)=(.*)$/i);
+            if (m && m[1] && m[2]) {
+                if (process.env[m[1].trim()] === undefined) {
+                    process.env[m[1].trim()] = m[2].trim();
+                }
+            }
+        }
+    }
+}
+loadEnvIfPresent();
+
+const SPEC_DIR = path.join(REPO_ROOT, 'tools', 'run_specs');
+
 function parseArgv() {
     const a = process.argv.slice(2);
-    const p = {};
+    const p = {
+        flavors: null,
+        models: null,
+        engines: null,
+        tasks: null,
+    };
     for (let i = 0; i < a.length; i++) {
-        if (a[i] === '--models') p.models = a[++i];
-        else if (a[i] === '--engines') p.engines = a[++i];
-        else if (a[i] === '--tasks') p.tasks = a[++i];
+        if (a[i] === '--flavors' || a[i] === '--flavor') p.flavors = a[++i];
+        else if (a[i] === '--models' || a[i] === '--model') p.models = a[++i];
+        else if (a[i] === '--engines' || a[i] === '--engine') p.engines = a[++i];
+        else if (a[i] === '--tasks' || a[i] === '--task') p.tasks = a[++i];
         else if (a[i] === '--port') p.port = Number(a[++i]);
         else if (a[i] === '--health-timeout') p.healthTimeout = Number(a[++i]) * 1000;
         else if (a[i] === '--out') p.out = a[++i];
@@ -44,8 +68,25 @@ function parseArgv() {
     return p;
 }
 
-function readSpecList(csv) {
-    return csv.split(',').map((f) => JSON.parse(fs.readFileSync(f.trim(), 'utf8').replace(/^\uFEFF/, '')));
+function resolveSpecPath(nameOrPath, category) {
+    if (fs.existsSync(nameOrPath)) return nameOrPath;
+    const asJson = nameOrPath.endsWith('.json') ? nameOrPath : `${nameOrPath}.json`;
+    const inCategory = path.join(SPEC_DIR, category, asJson);
+    if (fs.existsSync(inCategory)) return inCategory;
+    const directInSpecs = path.join(SPEC_DIR, asJson);
+    if (fs.existsSync(directInSpecs)) return directInSpecs;
+    throw new Error(`[run_bench] Cannot resolve ${category} spec: "${nameOrPath}"`);
+}
+
+function loadSpecs(arg, category, defaultVal = null) {
+    if (!arg) {
+        if (defaultVal) return [defaultVal];
+        throw new Error(`[run_bench] Missing required spec for: ${category}`);
+    }
+    return arg.split(',').map((f) => {
+        const resolved = resolveSpecPath(f.trim(), category);
+        return JSON.parse(fs.readFileSync(resolved, 'utf8').replace(/^\uFEFF/, ''));
+    });
 }
 
 function absPath(p) {
@@ -70,18 +111,27 @@ function expandRun(run) {
     return out;
 }
 
-function cartesian(models, engines, tasks) {
+function cartesian(flavors, models, engines, tasks) {
     const out = [];
-    for (const m of models) for (const e of engines) for (const t of tasks) {
-        const run = {};
-        const merge = (src) => {
-            for (const [k, v] of Object.entries(src)) {
-                if (k in run) throw new Error('[run_bench] duplicate key across specs: ' + k);
-                run[k] = v;
+    for (const fl of flavors) {
+        for (const m of models) {
+            for (const e of engines) {
+                for (const t of tasks) {
+                    const run = {};
+                    const merge = (src) => {
+                        for (const [k, v] of Object.entries(src)) {
+                            if (k in run) throw new Error('[run_bench] duplicate key across specs: ' + k);
+                            run[k] = v;
+                        }
+                    };
+                    merge(fl);
+                    merge(m);
+                    merge(e);
+                    merge(t);
+                    out.push(expandRun(run));
+                }
             }
-        };
-        merge(m); merge(e); merge(t);
-        out.push(expandRun(run));
+        }
     }
     return out;
 }
@@ -262,9 +312,9 @@ async function runOne(run, port, healthTimeout) {
     try {
         feed = loadFeed(run);
     } catch (e) {
-        const rec = { ts: new Date().toISOString(), model: run.model, engine: run.engine, input: run.input, bin, kind: 'single', status: 'FAIL', error: e.message };
+        const rec = { ts: new Date().toISOString(), flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, bin, kind: 'single', status: 'FAIL', error: e.message };
         console.error('  FAILED: ' + e.message);
-        return { records: [rec], summary: { model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
+        return { records: [rec], summary: { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
     }
 
     // prefill feed sizes ctx to fit the prompt (+ decode + margin) unless set.
@@ -274,12 +324,12 @@ async function runOne(run, port, healthTimeout) {
     if (run.draft) args.push('--model-draft', run.draft);
     if (run.extra) args.push(...run.extra);
 
-    const base = { ts: new Date().toISOString(), model: run.model, engine: run.engine, input: run.input, bin, args };
+    const base = { ts: new Date().toISOString(), flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, bin, args };
     const records = [];
     let summary;
 
     const mode = feed.prefill ? 'prefill' : feed.mode;
-    console.log(`\n=== ${path.basename(bin)} ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
+    console.log(`\n=== ${path.basename(bin)} [${run.flavor || 'StreamMoE'}] ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let log = '';
     let exited = false;
@@ -311,7 +361,7 @@ async function runOne(run, port, healthTimeout) {
             };
             records.push(rec);
             console.log(`  cold tg=${fmt(rec.cold.decode_tps)} | warm tg=${fmt(rec.median.decode_tps)} pp=${fmt(rec.median.prompt_tps, 1)} (n=${repeat})`);
-            summary = { model: run.model, engine: run.engine, input: run.input, status: 'OK', decode_tps: rec.median.decode_tps, prompt_tps: rec.median.prompt_tps, detail: 'n=' + repeat };
+            summary = { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'OK', decode_tps: rec.median.decode_tps, prompt_tps: rec.median.prompt_tps, detail: 'n=' + repeat };
         } else {
             const messages = [];
             const turnTps = [];
@@ -341,13 +391,13 @@ async function runOne(run, port, healthTimeout) {
                 avg_prompt_tps: mean(ppTps),
             };
             records.push(Object.assign({}, base, { kind: 'summary', status: 'OK' }, agg));
-            summary = Object.assign({ model: run.model, engine: run.engine, input: run.input, status: 'OK', decode_tps: agg.avg_decode_tps, prompt_tps: agg.avg_prompt_tps }, agg);
+            summary = Object.assign({ flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'OK', decode_tps: agg.avg_decode_tps, prompt_tps: agg.avg_prompt_tps }, agg);
             console.log(`  == ${agg.turns} turns: avg tg=${fmt(agg.avg_decode_tps)} (median ${fmt(agg.median_decode_tps)}), avg pp=${fmt(agg.avg_prompt_tps, 1)}, prompt_tok=${totalPrompt}, gen_tok=${totalGen}`);
         }
     } catch (e) {
         const rec = Object.assign({}, base, { kind: feed.mode, status: 'FAIL', error: e.message });
         records.push(rec);
-        summary = { model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message };
+        summary = { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message };
         console.error('  FAILED: ' + e.message);
     } finally {
         await postShutdown(port);
@@ -363,7 +413,7 @@ async function runOne(run, port, healthTimeout) {
 (async () => {
     const p = parseArgv();
     if (!p.models || !p.engines || !p.tasks) {
-        console.error('usage: node tools/run_bench.js --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]> [--port N] [--health-timeout S] [--out FILE]');
+        console.error('usage: node tools/run_bench.js [--flavors <spec[,...]>] --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]> [--port N] [--health-timeout S] [--out FILE]');
         process.exit(2);
     }
     const port = p.port || Number(process.env.SM_BENCH_PORT || 8994);
@@ -371,9 +421,15 @@ async function runOne(run, port, healthTimeout) {
     const out = p.out || process.env.SM_BENCH_OUT ||
         path.join(REPO_ROOT, 'benchmark', 'results', 'bench_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jsonl');
 
-    const runs = cartesian(readSpecList(p.models), readSpecList(p.engines), readSpecList(p.tasks));
+    const defaultFlavor = { flavor: 'StreamMoE' };
+    const flavors = p.flavors ? loadSpecs(p.flavors, 'flavors') : [defaultFlavor];
+    const models = loadSpecs(p.models, 'models');
+    const engines = loadSpecs(p.engines, 'engines');
+    const tasks = loadSpecs(p.tasks, 'tasks');
+
+    const runs = cartesian(flavors, models, engines, tasks);
     console.log('[run_bench] ' + runs.length + ' runs -> ' + out);
-    for (const r of runs) console.log('  ' + r.model + '/' + r.engine + '/' + r.input);
+    for (const r of runs) console.log('  [' + (r.flavor || 'StreamMoE') + '] ' + r.model + '/' + r.engine + '/' + r.input);
     if (process.argv.includes('--dry-run')) { console.log('[run_bench] dry-run, not executing'); return; }
 
     fs.mkdirSync(path.dirname(out), { recursive: true });
@@ -385,9 +441,10 @@ async function runOne(run, port, healthTimeout) {
     }
 
     console.log('\n==================== SUMMARY ====================');
-    console.log('model            task         engine                 decode     pp        status');
+    console.log('flavor           model            task         engine                 decode     pp        status');
     for (const s of summaries) {
         console.log(
+            String(s.flavor || 'StreamMoE').padEnd(16) + ' ' +
             String(s.model).padEnd(16) + ' ' + String(s.input).padEnd(12) + ' ' + String(s.engine).padEnd(22) + ' ' +
             fmt(s.decode_tps).padStart(8) + ' ' + fmt(s.prompt_tps, 1).padStart(9) + '   ' +
             s.status + (s.error ? ' (' + s.error + ')' : '') +

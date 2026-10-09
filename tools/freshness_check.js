@@ -52,6 +52,28 @@ function getLatestSourceMtime(roots = DEFAULT_SOURCE_ROOTS) {
     for (const r of roots) {
         walk(r);
     }
+
+    // Also inspect dirty/modified files in third_party/llama.cpp
+    try {
+        const { execSync } = require('child_process');
+        const out = execSync('git -C third_party/llama.cpp status --porcelain', { cwd: REPO_ROOT, encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+        const lines = out.split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const rel = trimmed.slice(2).trim();
+            const fullPath = path.join(REPO_ROOT, 'third_party', 'llama.cpp', rel);
+            if (fs.existsSync(fullPath)) {
+                try {
+                    const st = fs.statSync(fullPath);
+                    if (st.mtimeMs > latest.time) {
+                        latest = { time: st.mtimeMs, file: fullPath };
+                    }
+                } catch (_) {}
+            }
+        }
+    } catch (_) {}
+
     return latest;
 }
 

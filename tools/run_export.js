@@ -136,7 +136,18 @@ function binPath(run, binOverride) {
 function computeEffectiveContext(run) {
     const m = Number(run.modelCtx);
     const t = Number(run.taskCtx || run.ctx);
-    if (Number.isFinite(m) && Number.isFinite(t)) return Math.min(m, t);
+    const reqTokens = (run.feed && Number.isFinite(Number(run.feed.tokens))) ? Number(run.feed.tokens) : 0;
+
+    if (Number.isFinite(m) && Number.isFinite(t)) {
+        if (reqTokens > 0 && m < reqTokens) {
+            console.warn(`[run_export] WARNING: task requires ${reqTokens} tokens (taskCtx=${t}), exceeding modelCtx=${m}. Preserving taskCtx ${t} to prevent truncation.`);
+            return t;
+        }
+        if (t > m) {
+            console.warn(`[run_export] WARNING: taskCtx (${t}) exceeds modelCtx (${m}). Clamping to min(${m}, ${t}) = ${Math.min(m, t)}.`);
+        }
+        return Math.min(m, t);
+    }
     if (Number.isFinite(m)) return m;
     if (Number.isFinite(t)) return t;
     return 4096;

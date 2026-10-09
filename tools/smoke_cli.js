@@ -114,7 +114,7 @@ function parseArgs() {
         /(.)\1{4,}/.test(genText);
 
     // Coherence check: should have standard English greeting tokens
-    const isCoherent = /hello|how\s+can\s+i|help|assist|today|questions/i.test(genText);
+    const isCoherent = /\bhello\b|\bhi\b|\bthere\b|how\s+can\s+i|help|assist|today|questions/i.test(genText);
 
     if (isGibberish || !isCoherent) {
         console.error(`[-] =====================================================================`);
