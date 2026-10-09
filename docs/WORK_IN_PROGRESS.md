@@ -81,9 +81,12 @@
 - [x] PATCH-DEBT-1（已清，ae990d7）：llama-context 缝 frag 化——macros 4 锚点 + stmoe_routeb_lctx_*.frag + prefill 段重生成，clean-apply 21 文件逐字节一致。原内容：：llama-context.cpp 的 route-b 挂点（顶部 ROUTE_B include route_b_chain.h + 3 处 build_graph 后 verify/assign 块，均 STREAM_MOE_ROUTE_B 宏 gate）需进 route-b-inject.patch——manual hunk against HEAD（行 1358/2431/3418 + include 区）；**连环**：prefill patch 的 llama-context hunk context 需含 route-b 插入行（prefill 后 apply）——两 patch 一起改 + clean-apply 验证
 - [x] PATCH-DEBT-2：common/CMakeLists.txt 的 route_b_chain.cpp 源已补进 route-b patch（CMakeLists 段替换完成）
 
-### H. 长线：消灭 phase2a/2b patch（2026-09 定，不立刻整理）
+### H. 长线：消灭 phase2a/2b patch（2026-09 定，2026-10-09 部分达成）
 
-- [ ] 目标：vendored 改动全经 phase1 打桩（include 锚点）+ 主仓库内容（frag / 独立 cpp via STREAM_MOE_SRC）表达，route-b-inject.patch / prefill-export-llama.patch 最终消失，只留 streammoe-macros.patch。纪律写入 patches/README：小插入→锚点+frag；大块→独立 cpp 或大 frag；不得不直接改 vendored→先问用户。
+- [x] 2b 消除：`prefill-export-llama.patch` 删除——导出体（llama-context ~400 行 + 头字段 + kv `get_v_storage` + server prefill-only/shutdown）全进 phase1 锚点 + `patches/prefill-export/common/*.frag`；新 3 patch 栈干净重放 24 文件逐字节一致
+- [x] 2a 简单部分消除：arg/preset/speculative/CMake/context 钩子全进锚点 + frag；源列表搬 `src/cmake/stmoe_routeb_sources.cmake`（`include(... OPTIONAL)`，`MATCHES route_b` 门控）
+- [ ] 剩余：loader/model/KV×3/llama.cpp 的逻辑改行留 patch（改既有逻辑行，frag 化只是搬家）；kv-cache.cpp 为 macros/route-b 唯一共用文件（hunk 拆分 + 固定顺序，见 patches/README）
+- 原目标存档：vendored 改动全经 phase1 打桩（include 锚点）+ 主仓库内容（frag / 独立 cpp via STREAM_MOE_SRC）表达。纪律（patches/README）：小插入→锚点+frag；大块→独立 cpp 或大 frag；改既有逻辑行→直接 patch hunk；不得不直接改 vendored→先问用户。
 
 ### I. GPU M1 过渡 - 参数 collection 化 + Vulkan 显存池真申请调查（2026-09）
 

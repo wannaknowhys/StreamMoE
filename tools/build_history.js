@@ -23,11 +23,12 @@ const BUILD_DIR = path.join(MAIN_ROOT, 'build');
 // Canonical vendored patch stack (oldest-first). Only entries present in the
 // historical commit are applied; anything else under patches/ is opt-in
 // diagnostics (e.g. memwatch) and is reported but never auto-applied.
+// (2026-10-09: prefill-export-llama.patch eliminated - prefill export is now
+// phase-1 anchors + frags, so the stack is macros -> tsc_timer -> route-b.)
 const PATCH_STACK = [
   'patches/streammoe-macros.patch',
   'patches/tsc_timer.patch',
   'patches/route-b-inject.patch',
-  'patches/prefill-export-llama.patch',
 ];
 
 function info(m) { console.log('[history] ' + m); }

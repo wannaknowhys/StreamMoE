@@ -28,11 +28,53 @@ index 4caff55d1..9d7eccf69 100644
  ### llama.cpp version
  set(LLAMA_VERSION_MAJOR 0)
  set(LLAMA_VERSION_MINOR 2)
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 36f1e0cd5..49e0bc26b 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -179,3 +179,6 @@ if (LLAMA_LLGUIDANCE)
+ endif()
+ 
+ target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
++
++# StreamMoE route-B engine sources live in the parent repo (no-op when building standalone without it).
++include(${CMAKE_CURRENT_SOURCE_DIR}/../../../src/cmake/stmoe_routeb_sources.cmake OPTIONAL)
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 86f8610a5..66dd9dd3e 100644
+index 86f8610a5..c0b2f641b 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1755,6 +1755,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -783,6 +783,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+         std::string value;
+         if (opt.get_value_from_env(value)) {
+             try {
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_arg_track_env.frag"
++#endif
+                 if (opt.handler_void && is_truthy(value)) {
+                     opt.handler_void(params);
+                 }
+@@ -837,6 +840,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+             }
+             try {
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_arg_track_cli.frag"
++#endif
+                 if (opt.handler_void) {
+                     opt.handler_void(params);
+                     continue;
+@@ -888,6 +894,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+     // parse all CLI args now, so that -hf is available below for remote preset resolution
+     parse_cli_args();
+ 
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_placement_check.frag"
++#endif
++
+     postprocess_cpu_params(params.cpuparams,       nullptr);
+     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+ 
+@@ -1755,6 +1765,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                     string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                             }
                         }).set_env("LLAMA_ARG_FLASH_ATTN"));
@@ -102,6 +144,83 @@ index de49dac9f..ede0718dd 100644
      int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
      int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
      int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+diff --git a/common/preset.cpp b/common/preset.cpp
+index 4c61e93ee..59471de25 100644
+--- a/common/preset.cpp
++++ b/common/preset.cpp
+@@ -147,6 +147,9 @@ void common_preset::apply_to_params(common_params & params, const std::set<std::
+             }
+         }
+         // apply each option to params
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_preset_track.frag"
++#endif
+         if (opt.handler_string) {
+             opt.handler_string(params, val);
+         } else if (opt.handler_int) {
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4eef2212e..ca536edc0 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -12,6 +12,10 @@
+ 
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_spec_top.frag"
++#endif
++
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
+@@ -2140,6 +2144,10 @@ struct common_speculative {
+     std::vector<common_speculative_impl *> impl_last;
+ };
+ 
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_spec_body.frag"
++#endif
++
+ static common_ngram_map get_common_ngram_map(
+         common_speculative_type type,
+         const common_params_speculative_ngram_map & config) {
+@@ -2329,7 +2337,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
+         result.devices               = params_spec.devices;
+         result.model                 = params_spec.mparams;
+         result.n_gpu_layers          = params_spec.n_gpu_layers;
+-        result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_spec_buft.frag"
++#endif
+ 
+         if (params_spec.cpuparams.n_threads > 0) {
+             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+@@ -2401,6 +2411,10 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_spec_draft.frag"
++#endif
++
+         llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
+diff --git a/common/speculative.h b/common/speculative.h
+index 12ae31b7d..a9dd60b89 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -5,6 +5,10 @@
+ 
+ struct common_speculative;
+ 
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_spec_stats_decl.frag"
++#endif
++
+ // comma separated list the provided types
+ std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
+ 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index c1d86aaac..58dcb520c 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
@@ -168,10 +287,18 @@ index a04177f9f..83383e960 100644
      LLAMA_API int64_t llama_time_us(void);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..2309a77b5 100644
+index 0402044da..831166d29 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -8,6 +8,9 @@
+@@ -1,4 +1,7 @@
+ #include "llama-context.h"
++#if defined(STREAM_MOE_PREFILL_EXPORT) || defined(STREAM_MOE_ROUTE_B)
++#include "stmoe_prefill_lctx_top_includes.frag"
++#endif
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -8,6 +11,9 @@
  #include "llama-io.h"
  #include "llama-memory.h"
  #include "llama-mmap.h"
@@ -181,17 +308,104 @@ index 0402044da..2309a77b5 100644
  #include "llama-model.h"
  #include "llama-ext.h"
  #include "llama-sampler.h"
-@@ -1364,6 +1367,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
-             ret = GGML_STATUS_FAILED;
+@@ -16,9 +22,6 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+-#include <limits>
+-#include <stdexcept>
+-#include <string>
+ 
+ //
+ // llama_context
+@@ -115,7 +118,9 @@ llama_context::llama_context(
+     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
+     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+     cparams.embeddings              = params.embeddings;
+-    cparams.embeddings_nextn        = false;
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_ctor_embd.frag"
++#endif
+     cparams.embeddings_nextn_masked = false;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
+@@ -139,6 +144,10 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_ctor_cb.frag"
++#endif
++
+     cparams.ctx_other = nullptr;
+ 
+     // TODO: more generic
+@@ -482,6 +491,10 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_dtor.frag"
++#endif
++
+     if (!model.hparams.no_alloc) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+             ggml_backend_t             backend = backend_ptrs[i];
+@@ -1365,6 +1378,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_process.frag"
++#endif
++
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "stmoe_routeb_lctx_process.frag"
 +#endif
- 
++
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -2429,6 +2435,9 @@ ggml_cgraph * llama_context::graph_reserve(
+             ret = GGML_STATUS_ALLOC_FAILED;
+@@ -1632,11 +1653,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_export_body.frag"
++#endif
++
+ int llama_context::decode(const llama_batch & batch_inp) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_decode_head.frag"
++#endif
++
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -1936,6 +1965,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_decode_tail.frag"
++#endif
++
+         // extract nextn embeddings before
+         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
+         {
+@@ -1963,6 +1996,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -2429,6 +2463,9 @@ ggml_cgraph * llama_context::graph_reserve(
      res->reset();
  
      auto * gf = model.build_graph(gparams);
@@ -201,7 +415,16 @@ index 0402044da..2309a77b5 100644
  
      this->n_outputs = save_n_outputs;
  
-@@ -2508,6 +2517,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
+@@ -2502,12 +2539,18 @@ ggml_status llama_context::graph_compute(
+ }
+ 
+ llm_graph_cb llama_context::graph_get_cb() const {
++#ifdef STREAM_MOE_ROUTE_B
++#include "stmoe_routeb_lctx_begingraph.frag"
++#endif
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+             ggml_format_name(cur, "%s-%d", name, il);
          } else {
              ggml_set_name(cur, name);
          }
@@ -211,7 +434,7 @@ index 0402044da..2309a77b5 100644
  
          // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
          // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
-@@ -3416,6 +3428,9 @@ void llama_context::opt_epoch_iter(
+@@ -3416,6 +3459,9 @@ void llama_context::opt_epoch_iter(
              res->reset();
  
              auto * gf = model.build_graph(gparams);
@@ -221,6 +444,78 @@ index 0402044da..2309a77b5 100644
  
              struct ggml_context * ctx_compute_opt;
              {
+@@ -3532,6 +3578,9 @@ llama_context_params llama_context_default_params() {
+         /*.defrag_thold                =*/ -1.0f,
+         /*.cb_eval                     =*/ nullptr,
+         /*.cb_eval_user_data           =*/ nullptr,
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_default_params.frag"
++#endif
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
+         /*.abort_callback              =*/ nullptr,
+@@ -3553,6 +3602,9 @@ llama_context_params llama_context_default_params() {
+ llama_context * llama_init_from_model(
+                  llama_model * model,
+         llama_context_params   params) {
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_init_timer.frag"
++#endif
+     if (!model) {
+         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+         return nullptr;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..116e54f88 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -253,6 +253,7 @@ public:
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++
+ private:
+     llm_graph_params graph_params(
+                         llm_graph_result * res,
+@@ -367,6 +368,10 @@ private:
+     llm_graph_result_ptr gf_res_prev;
+     llm_graph_result_ptr gf_res_reserve;
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_lctx_fields.frag"
++#endif
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ec0f5a753..f83815b5b 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1226,6 +1230,10 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+     return layers[ikv].k;
+ }
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_kv_def.frag"
++#endif
++
+ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 6cb6dbd2f..2cfe074c6 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -163,6 +163,9 @@ public:
+ 
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_kv_decl.frag"
++#endif
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 index a9edbd7be..3a0ac9829 100644
 --- a/tools/server/server-context.cpp
@@ -256,3 +551,39 @@ index a9edbd7be..3a0ac9829 100644
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft();
          const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 5fe2729ba..4a3735dfe 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -112,6 +112,10 @@ int llama_server(int argc, char ** argv) {
+     return llama_server(params, argc, argv);
+ }
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_server_body.frag"
++#endif
++
+ int llama_server(common_params & params, int argc, char ** argv) {
+     bool is_run_by_cli = (argv == nullptr);
+ 
+@@ -163,6 +167,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         params.model_alias.insert(model_name);
+     }
+ 
++#ifdef STREAM_MOE_PREFILL_EXPORT
++#include "stmoe_prefill_server_entry.frag"
++#endif
++
+     // note: this is guaranteed to out-live ctx_http and tools
+     server_mcp mcp_mgr;
+ 
+@@ -244,6 +252,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
+     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
++#if defined(STREAM_MOE_PREFILL_EXPORT) || defined(STREAM_MOE_ROUTE_B)
++#include "stmoe_prefill_server_shutdown.frag"
++#endif
+     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));

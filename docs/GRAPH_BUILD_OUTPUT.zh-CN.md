@@ -31,19 +31,22 @@ prefill 和 decode 都走**入口 #2**（`process_ubatch`）——区别只在 u
 
 **注意**：hidden（`t_h_nextn`）和 embd（`result_norm` = `t_embd`）是**整张图节点张量**——天然覆盖全部 token（layers 对所有 token 算），与 output[] 无关。只有 logits（LM head）才被 n_outputs 剪枝。所以 prefill 导出（prefill-export-llama.patch）即使 server 只置最后 token output，捕获的 embd/hidden 也覆盖全部 token；**只有要全部 token 的 logits 时才需要** `--logits-all` / 全置 output[]。
 
-## 3. 直接 patch 改，还是 phase1 宏包裹？
+## 3. 直接 patch 改，还是 phase1 锚点 + frag？（2026-10-09 修订）
 
-判断准则：**只有"两个功能 patch 都改同一共享结构"时才需要 phase1 include 锚点方案**，其余全部在功能 patch 里直接改。
+判断准则：**纯插入/新代码走 phase1 include 锚点 + 主仓库 frag；只有"改既有逻辑行"才留在功能 patch 里直接改。**
 
-### 功能 patch 直接改（单一属主）
+### phase1 锚点 + frag（插入/新代码，任一功能都适用）
 
-- **prefill（prefill-export-llama.patch）独占**：`src/llama-context.cpp`（cb_eval 替换、export_t_* 发布、capture__、export_token_seq、析构 flush）、`src/llama-context.h`（export__ 成员）、`src/llama-kv-cache.h/.cpp`、`tools/server/server.cpp`、`tools/server/server-context.cpp`（export_dir 映射）。prefill 专属代码在这些文件里包 `#ifdef STREAM_MOE_PREFILL_EXPORT`，保证 route-b-only 构建不编译多余代码。
-- **route-b（route-b-inject.patch）独占**：`common/speculative.cpp/.h`、`src/llama-model-loader.cpp`、`src/llama-model.cpp`、`src/llama.cpp`、`tools/server/server-context.cpp`（route_b_setup 注入）、`common/CMakeLists.txt`。**route-b 目前不碰 `llama-context.cpp`**——与 prefill 在此文件零重叠。
-- 上述 build 三入口 + output[]/n_outputs/out_ids 逻辑都在 `llama-context.cpp` / `llama-graph.cpp` / `server-context.cpp` / `common.cpp`——目前只被 prefill 改——**加 hook 是直接 patch 改**（包 `#ifdef STREAM_MOE_PREFILL_EXPORT`），不需要 phase1。
+- **prefill 导出（2b patch 于 2026-10-09 消除）**：`src/llama-context.cpp`（约 400 行导出体 + 9 处钩子）、`src/llama-context.h`（`export_*` 成员）、`src/llama-kv-cache.h/.cpp`（`get_v_storage`）、`tools/server/server.cpp`（prefill-only + /shutdown）——全部 phase1 锚点 + `patches/prefill-export/common/*.frag`，`#ifdef STREAM_MOE_PREFILL_EXPORT` 门控。
+- **route-b 钩子（2a 于 2026-10-09 瘦身）**：`common/arg.cpp` / `common/preset.cpp`（参数追踪）、`common/speculative.cpp/.h`（draft 池绑定 + 统计）、`src/llama-context.cpp`（`route_b_begin_graph()`）、`common/CMakeLists.txt`（源列表搬 `src/cmake/stmoe_routeb_sources.cmake`）——全部 phase1 锚点 + frag。
+- 两边都要插字段的共享结构（`common_params` / `llama.h`）沿用原锚点 + 各功能 frag 方案。
 
-### phase1 宏包裹（两个 patch 改同一共享结构）
+### 直接 patch 改（改既有逻辑行——2a 剩余）
 
-唯一真正的共享结构冲突是 **`common_params`**（`common/common.h` 声明、`common/common.cpp` / `common/arg.cpp` 解析、`llama.h` 的 params）——两个功能都要加字段：
+- `src/llama-model-loader.cpp/.h`（bounds-check 跳过、route-B 加载分支）、`src/llama-model.cpp/.h`（逻辑/物理设备分离、dense placement）、`src/llama-kv-cache*.cpp` + `llama-memory-recurrent.cpp`（`dev_layer_physical` + no-kv-offload 拒绝）、`src/llama.cpp`（计时器）。frag 只能把这些缩成 1 行锚点调用，改既有行的动作本身消不掉——所以留在 `route-b-inject.patch`。
+- `llama-kv-cache.cpp` 是两个 patch 唯一共用的文件（phase1 的 `get_v_storage` 锚点 + route-b 的 ctor 逻辑，hunk 不重叠，顺序固定 macros → route-b）。
+
+### 共享结构示例（`common_params`）
 
 - **Phase 1（streammoe-macros.patch）**只在共享结构里加 include 锚点：
 
@@ -60,12 +63,11 @@ prefill 和 decode 都走**入口 #2**（`process_ubatch`）——区别只在 u
   };
   ```
 
-- **功能 patch 只新增 `.frag` 文件**（`common/stmoe_routeb_*.frag`、`common/stmoe_prefill_*.frag`、`include/stmoe_prefill_llama_*.frag`）——**不再改** `common.h/common.cpp/arg.cpp/llama.h`，所以 phase2a/2b 的 apply 顺序无关、永不冲突。
+- 功能只新增 `.frag` 文件——不再改共享文件。
 - 宏由 `build.bat llamalibs <tag>` **编译时定义**：`main` -> `-DSTREAM_MOE_ROUTE_B`；`upstream_dump` -> `-DSTREAM_MOE_PREFILL_EXPORT`；`StreamMoE_dump` -> 两者；宏未定义时 include 行被预处理跳过（phase1 单独可编译 = 纯上游等价）。
 
-### 决策清单
+### 决策清单（2026-10-09）
 
-1. 该文件/位置是否被 route-b 和 prefill **都**改？
-   - 是，且是两边都要插字段的共享结构/头（common_params / llama.h）-> **phase1 锚点 + 功能 .frag**。
-   - 是，但位置不重叠（如 llama-context.cpp）-> 各自功能 patch 直接改自己的区域，`#ifdef` 门控；保持 2a/2b hunk 不重叠以维持任意 apply 顺序。
-2. 只被一个功能改 -> **直接 patch 改**（建议 `#ifdef STREAM_MOE_*` 门控，保证其他 tag 构建与上游逐字节一致）。
+1. 纯插入 / 新函数 / 新字段 -> **phase1 锚点 + frag**（vendored 不留直接代码）。
+2. 改既有逻辑行（分支条件、调用目标、边界检查） -> **route-b-inject.patch 直接 hunk**（`#ifdef STREAM_MOE_ROUTE_B` 门控，保证其他 tag 与上游一致）。
+3. 两个 patch 共用文件（目前仅 `llama-kv-cache.cpp`） -> 重生成时按 patch 拆 hunk，顺序固定 macros → route-b。

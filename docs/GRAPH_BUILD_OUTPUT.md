@@ -31,19 +31,22 @@ The "which tokens get logits/embd" decision flows: server decides -> `batch.logi
 
 Note: hidden (`t_h_nextn`) and embd (`result_norm` = `t_embd`) are **whole-tensor** graph nodes — they always cover every token (layers run for all), independent of output[]. Only logits (LM head) is pruned by n_outputs. The prefill export (`prefill-export-llama.patch`) therefore captures all-token embd/hidden even with output[] = last-token-only; `--logits-all` / setting all output[] is only needed for all-token **logits**.
 
-## 3. Patch directly, or phase-1 macro wrap?
+## 3. Patch directly, or phase-1 anchor + frag? (2026-10-09 revised)
 
-Rule of thumb: **only shared structures that BOTH feature patches modify need the phase-1 include-anchor scheme.** Everything else is edited directly in the feature patch.
+Rule of thumb: **pure insertions and new code go through phase-1 include-anchors + main-repo frags; only edits to existing logic lines stay as direct patch hunks.**
 
-### Direct edit in the feature patch (one owner)
+### Phase-1 anchor + frag (insertions / new code, either feature)
 
-- **prefill (`prefill-export-llama.patch`)** owns: `src/llama-context.cpp` (cb_eval swap, `export_t_*` publish, `capture_*`, export_token_seq, dtor flush), `src/llama-context.h` (`export_*` members), `src/llama-kv-cache.h/.cpp`, `tools/server/server.cpp`, `tools/server/server-context.cpp` (export_dir mapping). Prefill-specific code inside those is wrapped in `#ifdef STREAM_MOE_PREFILL_EXPORT` so a route-B-only build compiles nothing extra.
-- **route-b (`route-b-inject.patch`)** owns: `common/speculative.cpp/.h`, `src/llama-model-loader.cpp`, `src/llama-model.cpp`, `src/llama.cpp`, `tools/server/server-context.cpp` (route_b_setup injection), `common/CMakeLists.txt`. `llama-context.cpp` is **not** touched by route-b today — no overlap with prefill there.
-- The three build entry points and the output[]/n_outputs/out_ids logic above are all `llama-context.cpp` / `llama-graph.cpp` / `server-context.cpp` / `common.cpp` — currently owned by prefill only, so hooking them is a **direct patch edit** (wrapped in `#ifdef STREAM_MOE_PREFILL_EXPORT`), no phase-1 needed.
+- **prefill export (2b patch eliminated 2026-10-09)**: `src/llama-context.cpp` (~400-line export body + 9 hook sites), `src/llama-context.h` (`export_*` members), `src/llama-kv-cache.h/.cpp` (`get_v_storage`), `tools/server/server.cpp` (prefill-only + /shutdown) — all phase-1 anchors + `patches/prefill-export/common/*.frag`, gated by `#ifdef STREAM_MOE_PREFILL_EXPORT`.
+- **route-b hooks (2a slimmed 2026-10-09)**: `common/arg.cpp` / `common/preset.cpp` (option tracking), `common/speculative.cpp/.h` (draft pool + stats), `src/llama-context.cpp` (`route_b_begin_graph()`), `common/CMakeLists.txt` (sources moved to `src/cmake/stmoe_routeb_sources.cmake`) — all phase-1 anchors + frags.
+- Shared structs both features inject fields into (`common_params`, `llama.h`) keep the original anchor + per-feature frag scheme.
 
-### Phase-1 macro wrap (BOTH patches touch the same shared struct)
+### Direct patch edit (modifying existing logic lines — 2a remainder)
 
-The only true shared-structure collision is `common_params` (declared in `common/common.h`, parsed in `common/common.cpp` / `common/arg.cpp`, `llama.h` params) — both features add fields:
+- `src/llama-model-loader.cpp/.h` (bounds-check skip, route-B load branch), `src/llama-model.cpp/.h` (logical/physical device split, dense placement), `src/llama-kv-cache*.cpp` + `llama-memory-recurrent.cpp` (`dev_layer_physical` + no-kv-offload rejection), `src/llama.cpp` (timer). A frag can only shrink these to 1-line anchor calls, not eliminate the edit — so they stay in `route-b-inject.patch`.
+- `llama-kv-cache.cpp` is the single file shared by two patches (phase-1 `get_v_storage` anchor + route-b ctor logic, disjoint hunks, fixed order macros -> route-b).
+
+### Shared-struct pattern (example: `common_params`)
 
 - **Phase 1 (`streammoe-macros.patch`)** adds only anchor `#include`s to the shared struct:
 
@@ -60,12 +63,11 @@ The only true shared-structure collision is `common_params` (declared in `common
   };
   ```
 
-- **Feature patches only ADD `.frag` files** (`common/stmoe_routeb_*.frag`, `common/stmoe_prefill_*.frag`, `include/stmoe_prefill_llama_*.frag`) — they never edit `common.h/common.cpp/arg.cpp/llama.h` again, so apply order between phase-2a/2b is irrelevant and patches never conflict.
+- Features only ADD `.frag` files — they never edit the shared file again.
 - Macros are defined at **compile time** by `build.bat llamalibs <tag>`: `main` -> `-DSTREAM_MOE_ROUTE_B`; `upstream_dump` -> `-DSTREAM_MOE_PREFILL_EXPORT`; `StreamMoE_dump` -> both; undefined macro -> the include line is skipped by the preprocessor (phase-1 alone compiles as pure upstream).
 
-### Decision checklist
+### Decision checklist (2026-10-09)
 
-1. Does the file/site get edited by **both** route-b and prefill?
-   - Yes, and it is a shared struct/header both inject fields into (common_params / llama.h) -> **phase-1 anchor + feature .frag**.
-   - Yes, in disjoint locations (e.g. llama-context.cpp) -> each feature patch edits its own region directly, `#ifdef`-gated; still keep apply order phase-2b vs 2a independent by not overlapping hunks.
-2. Owned by exactly one feature -> **direct patch edit** (`#ifdef STREAM_MOE_*` gate recommended so other-tag builds stay byte-identical to upstream).
+1. Pure insertion / new function / new field -> **phase-1 anchor + frag** (no direct vendored code).
+2. Modifies an existing logic line (branch condition, call target, bounds check) -> **direct patch hunk** in `route-b-inject.patch` (`#ifdef STREAM_MOE_ROUTE_B` gate so other-tag builds stay upstream-identical).
+3. New file shared by two patches (only `llama-kv-cache.cpp` today) -> split hunks per patch on regeneration, fixed order macros -> route-b.

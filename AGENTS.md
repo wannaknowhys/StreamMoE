@@ -94,7 +94,7 @@
 - `dev_layer()` 表达逻辑 STREAMMOE 归属，`dev_layer_physical()` 表达物理 C1 设备。KV、DSV4 compressor、recurrent state 跟 C1；FA 纳入整层捕获，算子能力按实际设备检查，不支持就明确报错，不静默 CPU fallback。
 - 每设备 arena 按生命周期组织 carry 与 scratch；xfer 的 shell 身份必须包含 producer、consumer device、stage、consumer layer。允许跨层复用存储，不允许按首次层分配的同一个 shell 跨消费层复用。导出保留张量不能提前被 arena 覆盖。
 - 2026-09-17 固定 129-token 验证：设备 dense 对本次 RAM 参考为 123/129（95.3%）cos >= 0.99，RAM 对冻结基线为 121/129（93.8%）；embd/hidden 均无 token 低于 0.9。证据在 `temp/embedding_probe_2026-09-17T19-07-02-705Z/`。这只覆盖已测配置，不代表所有设备路径均已验证。
-- vendored 改动留工作区，主仓库 frag/patch 负责记录；补丁顺序 macros → tsc_timer → route-b → prefill。重放区分原始字节一致和仅 CRLF 规范化后一致，不能混称。临时脚本、harness、日志、重放 clone 放 `temp/`，正式编译产物放 `build/<tag>/`。
+- vendored 改动留工作区，主仓库 frag/patch 负责记录；补丁顺序 macros → tsc_timer → route-b（2026-10-09 起 2b 已消除）。重放区分原始字节一致和仅 CRLF 规范化后一致，不能混称。临时脚本、harness、日志、重放 clone 放 `temp/`，正式编译产物放 `build/<tag>/`。
 - 异步 IO、并发 in-flight、避免冗余搬运是终态底线；文件切片 4K 对齐不等于所有目标布局天然免 staging。Linux 真异步 DIO、层内跨设备细粒度 stage、profile/并发验收仍需按最新源码与状态核实，不能把设计文档当作完成证明。
 
 ## 三、协作规则

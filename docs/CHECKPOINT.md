@@ -6,6 +6,7 @@
 > - **核心防御加固**：`bucket_upload_leaf` / `bucket_source_leaf` 增加 `stage_size` 缓冲区溢出断言防御（REC-1）；`t.acc` in-place 别名前严格校验 `moe_out_contiguous` 连续性步长（REC-2）；`flush_segment` 缺失 backend 时显式报错中止、禁止静默 CPU fallback（REC-6a）。
 > - **回归验证**：`.\build.bat llamalibs dual` 原子同步编译；`verify_places.js --flavor StreamMoE` 12 拓扑 100% 运行成功（8 IDENTICAL + 4 微小浮点差异，全部语义流畅）；`smoke_cli.js` 混合池 9.96s PASS。
 > - **详见**：`docs/REVIEW_2026_10_07.md` 与 `docs/REVIEW_2026_10_07.zh-CN.md`。
+> - **2026-10-09 补记（phase 2b 消除 + 2a 瘦身，已验证）**：prefill 导出体全进 frag（2b patch 删除）；2a 只剩 8 文件逻辑改行；新 3 patch 栈干净重放 24 文件逐字节一致。`.\build.bat llamalibs dual` 双 tag 编译通过；`verify_places.js --flavor StreamMoE` 12 拓扑 0 ERROR（8 IDENTICAL + 4 已知 fp 微差，全部流畅，与 10-07 画像一致）；`smoke_cli.js` 11.7s PASS；`run_baseline.bat moe_129_8192_vk` **PASS**（embd gate 121/129=93.8% 与冻结基线同值，KL 0.40 < 4.5，upstream IDENTICAL）。途中抓到真回归 1 个：`/shutdown` 注册被误包进 PREFILL 宏导致 route_b-only  binary 丢端点、run_export 卡死——已改回 `PREFILL||ROUTE_B` 双宏门控并直测 200 + 干净退出。
 >
 > **前次更新**：2026-10-07（**Tier 1+Tier 2 硬件队列图融合 + 单层单断架构 + 4D 笛卡尔积测试套件重构**）：
 > - **图执行融合与流水线**：
@@ -63,14 +64,14 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 ### vendored patch 体系（2026-09-03 重构：frag 全主仓库 + features 宏机制）
 
-- **vendored HEAD = 纯上游 `f280b2698`**，工作区是 4 patch 叠加的未提交修改态（不是 clean）；2026-09-17 已从实际工作区重生成 route-b 差量并验证重放。
+- **vendored HEAD = 纯上游 `f280b2698`**，工作区是 3 patch 叠加的未提交修改态（不是 clean）；2026-10-09 已重整为 macros → tsc_timer → route-b（2b 消除）。
 - **features 宏机制**：`build.bat llamalibs <tag>` 传 `-DSTREAM_MOE_FEATURES`（route_b / prefill_export / route_b,prefill_export）→ vendored 根 `CMakeLists.txt` features 块全局 `add_compile_definitions` + `include_directories`（主仓库 frag 目录）。**宏不拼 CXX_FLAGS**。宏对当次构建全部 target 生效（防静默丢弃）。
 - **frag 全在主仓库**（随主仓库 commit）：`patches/route-b/common/`、`patches/prefill-export/common/`、`patches/prefill-export/include/`——vendored `include/` 已清空。
-- **4 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
+- **3 个 patch**（`patches/`，phase 结构，干净 worktree apply 验证逐字节一致）：
   - **Phase 1（必选，互不依赖）**：`streammoe-macros.patch`（根 CMakeLists features 块 + 共享文件 include 锚点：arg/common.cpp/h/llama.h/server-context 3 锚点）+ `tsc_timer.patch`（[TMR] `sm_tmr`，`STREAM_MOE_TMR` env 门控）
-  - **Phase 2a（可选）**：`route-b-inject.patch`（2026-09-17 重生成，14 文件，273 行新增/15 行删除）：保留 common/CMakeLists STREAM_MOE_SRC、speculative.cpp/h、llama-model-loader.cpp/h、llama.cpp；更新 llama-model.cpp/h 的逻辑/物理设备分离；新增 common/arg.cpp、common/preset.cpp 参数追踪、llama-context.cpp 的 `route_b_begin_graph()`、llama-kv-cache.cpp / llama-kv-cache-dsv4.cpp / llama-memory-recurrent.cpp 的物理设备选择与冲突拒绝。**无 frag new-file，不重复 phase1 的根 features、llama.h、common/common、Vulkan hostmap/dma、server-context 锚点；不重复 prefill 导出段。**
-  - **Phase 2b（可选）**：`prefill-export-llama.patch`（prefill 专属：llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）——**无 frag new-file**
-- **应用顺序与本次验证（2026-09-17）**：macros → tsc_timer → route-b-inject → prefill-export-llama；独立 clone `temp/patch_replay_20260917`，`core.autocrlf=false`，各 patch `--check` 后顺序 apply。3494 文件中 61 文件原字节相同、3433 文件仅 CRLF 不同；仅将 CRLF 规范化为 LF 后零差异。prefill 仅有预期的 context +3 / KV +4 行定位偏移，未修改其 patch。日志 `temp/patch_replay_20260917.log`，校验结果 `temp/patch_verify_result_20260917.json`；真实 vendored 与主仓库源码/frag 的 SHA-256 未变。
+  - **Phase 2a（可选）**：`route-b-inject.patch`（2026-10-09 瘦身，只剩改既有逻辑行的 8 文件）：`llama-model-loader.cpp/h`（bounds check skip）、`llama-model.cpp/h`（逻辑/物理设备分离 + dense placement）、`llama.cpp`（计时器）、`llama-kv-cache.cpp` / `llama-kv-cache-dsv4.cpp` / `llama-memory-recurrent.cpp`（物理设备选择与冲突拒绝）。原 `common/CMakeLists`（源列表搬 `src/cmake/stmoe_routeb_sources.cmake`）、`arg.cpp`、`preset.cpp`、`speculative.cpp/h`、`llama-context.cpp` 钩子已全进 phase1 锚点 + frag。
+  - **Phase 2b（已消除，2026-10-09）**：`prefill-export-llama.patch` 删除——prefill 导出体（llama-context ~400 行 + 头字段 + kv `get_v_storage` + server prefill-only/shutdown）全搬 `patches/prefill-export/common/*.frag` + phase1 锚点，功能与宏门控不变。
+- **应用顺序与本次验证（2026-10-09）**：macros → tsc_timer → route-b-inject；独立 worktree `temp/patch_replay_new`（`core.autocrlf=false`），3 patch 顺序 apply 与工作区 24 文件**逐字节一致**；26 个新 frag 与术前原块逐一对拍一致 + 括号配平。kv-cache.cpp 是 macros/route-b 唯一共用文件（hunk 不重叠，顺序固定）。工具 `tools/build_history.js` PATCH_STACK 已同步（去 2b）。
 - **宏隔离**：无宏（features 空 / 只 phase1）= 纯上游等价（include 行预处理跳过）。编译目录：`main`→route_b；`StreamMoE`→route_b（无导出代码的旗舰对话 build，见下）；`upstream_dump`/`upstream_vulkan_dump`→prefill_export；`StreamMoE_dump`→两者；`asan`→route_b（MSVC cl，`build.bat asan`）。**GGML_VULKAN 默认 ON 的 tag**：`StreamMoE` + `upstream_vulkan_dump` + `StreamMoE_dump`（route-B 的 Vulkan0 device-pool 路径需要设备注册；`--expert-backend` **隐含 no-op-offload**，见下）；`upstream_dump`/`main` 默认 OFF。env `GGML_VULKAN=OFF` 可覆盖。
 - **op_offload 与数值形态**：llama 默认 `op_offload=true`（把 host 计算自动 offload 到 device，-ngl 0 也占 Vulkan0 compute buffer ~1.3G）。`--expert-backend` 在 frag 里隐含 `--no-op-offload`（route B 拥有专家放置权，3932d33）——Vulkan0 splits=0 实测。但 **GGML_VULKAN=ON 编译本身改变数值**（CPU buft 换 Vulkan0 host buft 等 host 内存形态，gate 边界 expert-flip 级噪声）——回归按构建形态选基线：CPU-only 编对 `baseline_regression\baseline\moe_129_8192`，默认 vulkan 编对 `moe_129_8192_vk`（run_baseline.bat 首参，见该 README）。
 - **当前任务追踪**：`docs/WORK_IN_PROGRESS.md`。
@@ -185,7 +186,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
 3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。
 4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 并发验收 UT（test_scheduler 链接问题需先修）。
-5. **H 长线**：消灭 phase2a/2b patch（vendored 改动全经 phase1 打桩 + 主仓库内容）。
+5. **H 长线（2026-10-09 部分达成）**：2b 已消灭、2a 简单部分已消灭（见 §2）；剩余 2a 逻辑改行（loader/model/KV/llama.cpp）保留 patch——改既有逻辑行的动作 frag 化只是搬家。
 6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
 
 ### 顺手

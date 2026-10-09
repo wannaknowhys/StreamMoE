@@ -4,20 +4,19 @@
 > 用途：升级/还原/审阅时对照。所有改动都围绕"route B 专家池注入 + dense/moe 分流 + KV 实测显示"。
 > 基线：f280b2698。
 
-## 修改文件总览（route-b-inject.patch，7 文件）
+## 修改文件总览（route-b-inject.patch，8 文件，2026-10-09 瘦身后只剩逻辑改行）
 
-> phase-1 `streammoe-macros.patch` 另含共享锚点（根 CMakeLists features 块 + `arg.cpp` / `common.cpp` / `common.h` / `include/llama.h` / `tools/server/server-context.cpp` 的 include 锚点），
-> phase-2b `prefill-export-llama.patch` 另含 `src/llama-context.cpp/h`、`src/llama-kv-cache.cpp/h`、`tools/server/server.cpp`。此处只列 route-b 专属。
+> phase-1 `streammoe-macros.patch` 另含共享锚点（根 CMakeLists features 块 + `arg.cpp` / `common/common.cpp` / `common/common.h` / `common/preset.cpp` / `common/speculative.cpp` / `common/speculative.h` / `common/CMakeLists.txt` / `include/llama.h` / `src/llama-context.cpp` / `src/llama-context.h` / `src/llama-kv-cache.cpp` / `src/llama-kv-cache.h` / `tools/server/server.cpp` / `tools/server/server-context.cpp` 的 include 锚点），
+> prefill 导出（`src/llama-context.cpp/h` 导出体 + 字段、`src/llama-kv-cache.cpp/h` 的 `get_v_storage`、`tools/server/server.cpp` 的 prefill-only/shutdown）2026-10-09 已全进 phase1 锚点 + frag（2b patch 删除）。此处只列 route-b 专属逻辑改行。
 
 | 文件                                                       | 改动                                                                        | 用途                                                                                                                                                                                                                 |
 | :--------------------------------------------------------- | :-------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `common/CMakeLists.txt`                                    | `STREAM_MOE_SRC` 源列表 + include + Windows 库                              | 把父仓库 route B 源编译进 llama-server/cli（含 backend/io/loader/pool/server + `route_b_chain.cpp` / `mix_split.cpp` / `scatter_plan.cpp` / `model_builder.cpp` / `topo_builder.cpp`；async_dio 按平台选 win/posix） |
-| `common/speculative.cpp` / `.h`                            | draft 加载前注入 route_b_setup                                              | **多模型池**：draft 挂自己的 overrides（不重用主模型）                                                                                                                                                               |
 | `src/llama-model-loader.cpp` / `.h`                        | route B 加载钩子（专家张量 buft 覆盖 / 池装载）                             | 专家张量走池而非 mmap                                                                                                                                                                                                |
-| `src/llama-model.cpp`                                      | route B 设备注册 / 专家放置接线                                             | 设备池 + 调度                                                                                                                                                                                                        |
+| `src/llama-model.cpp` / `.h`                               | route B 设备注册 / 专家放置接线（逻辑/物理设备分离）                       | 设备池 + 调度                                                                                                                                                                                                        |
 | `src/llama.cpp`                                            | route B 后端注册 + `[TMR]` 计时 include                                     | 设备注册早于模型加载                                                                                                                                                                                                 |
-| `common/arg.cpp` / `common/common.cpp` / `common/common.h` | （phase1 锚点 + frag）参数 + `common_init_from_params` 注入 `route_b_setup` | 主模型加载前初始化专家池 + 挂 `tensor_buft_overrides`                                                                                                                                                                |
-| `tools/server/server-context.cpp`                          | （phase1 锚点 + frag）route_b_setup 注入 + KV 内存打印                      | 加载后打印实际 KV + draft 统计                                                                                                                                                                                       |
+| `src/llama-kv-cache.cpp` / `llama-kv-cache-dsv4.cpp` / `llama-memory-recurrent.cpp` | 物理设备选择 + `--no-kv-offload` 冲突拒绝                  | KV 跟随 C1 物理设备（与 phase1 的 kv `get_v_storage` 锚点共文件，hunk 不重叠）                                                                                                                                       |
+
+> 以下已于 2026-10-09 搬为 phase1 锚点 + frag，不在 route-b patch 内：`common/CMakeLists.txt`（源列表 → `src/cmake/stmoe_routeb_sources.cmake`）、`common/arg.cpp` / `common/preset.cpp`（参数追踪）、`common/speculative.cpp` / `.h`（draft 池绑定 + 统计）、`src/llama-context.cpp`（`route_b_begin_graph()`）。phase1 锚点文件（`common/common.cpp` / `common/common.h` 参数、`tools/server/server-context.cpp` 注入 + KV 打印）保持不变。
 
 ## 逐文件明细
 
@@ -121,7 +120,8 @@ SRV_INF("KV Cache Memory (llama.cpp actual): %.2f MB\n", kv_bytes / 1024.0 / 102
   ```bat
   rem 在父仓库根目录执行（cmd 重定向字节透传，产出纯文本 patch）
   rem 各 patch 各管各的文件，用文件列表限定（绝不 `git diff >` 全量抄，会把其他 patch 混进来）
-  cmd /c "git -C third_party/llama.cpp diff HEAD -- common/CMakeLists.txt common/speculative.cpp common/speculative.h src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model.cpp src/llama.cpp > patches\route-b-inject.patch"
+  rem 注意 kv-cache.cpp 与 macros 共享（macros 要 anchor hunk、route-b 要 ctor hunk）——生成后需手工拆 hunk，见 patches/README.md
+  cmd /c "git -C third_party/llama.cpp diff HEAD -- src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model.cpp src/llama-model.h src/llama.cpp src/llama-kv-cache.cpp src/llama-kv-cache-dsv4.cpp src/llama-memory-recurrent.cpp > patches\route-b-inject.patch"
   rem 校验 patch 有效（在已应用的工作区应通过 reverse-check）
   git -C third_party/llama.cpp apply --check -R patches\route-b-inject.patch
   ```

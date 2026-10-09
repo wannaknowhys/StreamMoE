@@ -26,9 +26,15 @@
 ### Phase 1（必选，互不依赖）
 - `streammoe-macros.patch`：
   - `CMakeLists.txt`（根——features 块）
-  - `common/arg.cpp`（route-b/prefill args 锚点）
+  - `common/arg.cpp`（route-b/prefill args 锚点 + route-b 参数追踪/placement 检查锚点）
   - `common/common.cpp` / `common/common.h`（route-b/prefill 锚点）
+  - `common/preset.cpp`（route-b 参数追踪锚点）
+  - `common/speculative.cpp` / `common/speculative.h`（route-b draft 池/统计锚点）
+  - `common/CMakeLists.txt`（`include(src/cmake/stmoe_routeb_sources.cmake OPTIONAL)`——引擎源列表搬主仓库）
   - `include/llama.h`（prefill 3 锚点：includes/params/apis——frag 在 `patches/prefill-export/include/`）
+  - `src/llama-context.cpp` / `src/llama-context.h`（route-b 5 锚点 + prefill 导出 10 锚点）
+  - `src/llama-kv-cache.cpp` / `src/llama-kv-cache.h`（prefill `get_v_storage` 锚点）
+  - `tools/server/server.cpp`（prefill prefill-only/shutdown 锚点）
   - `tools/server/server-context.cpp`（**3 锚点**：route-b spec slot/dtore + prefill nout）
   - `ggml/src/ggml-vulkan/ggml-vulkan.cpp`（**1 锚点**：`STREAM_MOE_ROUTE_B` 保护 include
     `stmoe_routeb_vk_hostmap.frag`——函数体在 `patches/route-b/common/`；2026-09 由原
@@ -36,15 +42,18 @@
 - `tsc_timer.patch`：`src/tsc_timer.h`（[TMR] `sm_tmr::timer`，析构打印经 `STREAM_MOE_TMR` env 门控）
 
 ### Phase 2a（可选）route-b-inject.patch
-- `common/CMakeLists.txt`（`STREAM_MOE_SRC` = 主仓库 `src/`，源列表 + PRIVATE include——引擎代码编进 llama-common）
-- `common/speculative.cpp` / `common/speculative.h`（route-b draft 池绑定 + 统计）
+
+> 2026-10-09 起只含**改既有逻辑行**的部分（frag 化不了的）：`src/llama-model-loader.cpp` / `.h`（bounds check skip）、`src/llama-model.cpp` / `.h`（逻辑/物理设备分离 + dense placement）、`src/llama.cpp`、KV 三文件物理设备选择与冲突拒绝。`common/CMakeLists.txt`（STREAM_MOE_SRC 源列表，已搬 `src/cmake/stmoe_routeb_sources.cmake`）、`common/arg.cpp`、`common/preset.cpp`、`common/speculative.cpp` / `.h`、`src/llama-context.cpp` 全部走 phase1 锚点 + frag。
+
 - `src/llama-model-loader.cpp` / `src/llama-model-loader.h`（bounds check skip）
 - `src/llama-model.cpp`、`src/llama.cpp`
+- `src/llama-model.h`（`dev_layer_physical` / `route_b_enabled` 声明）
+- `src/llama-kv-cache.cpp` / `src/llama-kv-cache-dsv4.cpp` / `src/llama-memory-recurrent.cpp`（物理设备选择与冲突拒绝；kv-cache.cpp 另有 phase1 的 `get_v_storage` 锚点——两 patch 唯一共用文件，hunk 不重叠，顺序 macros → route-b 固定）
+- `common/arg.cpp` / `common/preset.cpp`（参数追踪）、`common/speculative.cpp` / `.h`（draft 池绑定 + 统计）、`src/llama-context.cpp`（`route_b_begin_graph()`）、`common/CMakeLists.txt`（STREAM_MOE_SRC 源列表）——**2026-10-09 已全部 frag 化，见 phase1**
 
-### Phase 2b（可选）prefill-export-llama.patch
-- `src/llama-context.cpp` / `src/llama-context.h`（prefill 导出 + 专家历史 + cb_eval 图内抓取）
-- `src/llama-kv-cache.cpp` / `src/llama-kv-cache.h`
-- `tools/server/server.cpp`（/shutdown 端点）
+### Phase 2b（已消除，2026-10-09）
+
+- `prefill-export-llama.patch` **已删除**：prefill 导出（llama-context.cpp/h + llama-kv-cache.cpp/h + server.cpp）全部搬为 phase1 锚点 + `patches/prefill-export/common/*.frag`（~400 行导出体 = `stmoe_prefill_export_body.frag`）。prefill 功能无变化，`STREAM_MOE_PREFILL_EXPORT` 宏门控不变。
 
 > 注意：route-b / prefill **不含任何 frag new-file**（frag 在主仓库常驻）；**不含 server-context**
 > 专属改动（锚点全在 phase1 macros）。转换器不再需要 gguf patch（4K 对齐经内存 seed 上下文实现，
@@ -54,12 +63,11 @@
 
 ```
 git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_timer.patch \
-    patches\route-b-inject.patch patches\prefill-export-llama.patch
+    patches\route-b-inject.patch
 ```
 
-- Phase 1 必选（顺序可互换）；2a/2b 可选组合。
-- 验证（A4 做过）：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（2026-09 去
-  gguf-alignment 后 20 文件）。
+- Phase 1 必选（顺序可互换）；2a 可选。
+- 验证：临时 worktree 检出 HEAD → 按序 apply → 与工作区逐字节一致（2026-10-09：新 3 patch 栈 24 文件逐字节一致，见 `temp/patch_replay_new` 方法）。
 - 叠加纪律（README 旧版铁律沿用）：在已有 patch 基础上改代码前先 commit 父仓库 + 快照
   `git -C third_party/llama.cpp diff > temp/patch_backup_<date>/working-tree-full.patch`。
 - 每次 vendored 改动收尾：重生成受影响 patch → 临时 worktree apply 验证逐字节一致 → commit。
@@ -87,7 +95,8 @@ git -C third_party/llama.cpp apply patches\streammoe-macros.patch patches\tsc_ti
 
 ## 补丁铁律（添加 2026-09：消灭 phase2a/2b patch 的长线目标）
 
-＞ 长线目标：**消灭 phase2a/2b 的 patch 文件**（route-b-inject.patch / prefill-export-llama.patch 最终消失）——vendored 改动全经 **phase1 打桩（include 锚点）** + 主仓库内容（frag / 独立 cpp）表达，只留 streammoe-macros.patch。现在不立刻整理（部分已走 frag/独立 cpp，逐步迁移）。
+＞ 长线目标（2026-10-09 进展）：**phase2b 已消除**（prefill-export-llama.patch 删除，导出体全进 frag）；2a 简单部分已消除（arg/preset/speculative/CMake/context 钩子全进锚点+frag，源列表搬 `src/cmake/`）。剩余 2a 逻辑改行（loader/model/KV/llama.cpp）因改的是既有逻辑行而保留 patch——frag 只能缩成 1 行锚点调用，改行动
+作本身消灭不掉。只留 streammoe-macros.patch + route-b-inject.patch + tsc_timer.patch。
 
 **vendored 需改动时的处理：**
 1. 小插入（钩子/几行调用）→ 不直接 patch vendored：R phase1 → phase1 加 include 锚点→ apply phase1 → 写 frag 内容（主仓库 patches/<phase>/）
