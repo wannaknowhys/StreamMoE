@@ -604,7 +604,8 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
                                              const std::vector<ggml_tensor*> & list,
                                              int32_t layer, const char * stage,
                                              std::unordered_set<const route_b_relay_t *> & executed_relays,
-                                             int32_t layer_head = -1) {
+                                             int32_t layer_head = -1,
+                                             size_t tail_len = 0) {
     if (list.empty()) return GGML_STATUS_SUCCESS;
 
     const bool is_fused = (layer_head >= 0);
@@ -627,17 +628,37 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
                              const std::string & dev) -> enum ggml_status {
         if (seg.empty()) return GGML_STATUS_SUCCESS;
         ggml_backend_t be = dev.empty() ? cpu : route_b_device_backend(dev.c_str());
+        if (!dev.empty() && !be) {
+            LOG_ERROR("stream_moe: device backend not found for '" << dev << "'");
+            return GGML_STATUS_FAILED;
+        }
         if (!be || std::strcmp(ggml_backend_name(be), "STREAMMOE") == 0) {
-            be = cpu;   // never recurse into ourselves; host fallback
+            be = cpu;   // host fallback for empty dev
         }
         return run_dense_subgraph(ctx, be, seg, layer, stage);
+    };
+
+    // Track nodes belonging to the tail portion in fused execution.
+    std::unordered_set<const ggml_tensor*> tail_nodes;
+    if (is_fused && tail_len > 0) {
+        for (size_t i = 0; i < tail_len && i < list.size(); ++i) {
+            tail_nodes.insert(list[i]);
+        }
+    }
+    auto is_src_in_tail = [&](const ggml_tensor * t) -> bool {
+        const ggml_tensor * p = t;
+        while (p) {
+            if (tail_nodes.count(p)) return true;
+            p = p->view_src;
+        }
+        return false;
     };
 
     // Execute relay copies from a source device to ALL consumer devices for this
     // layer.  Called at segment boundaries: the source segment has just been
     // flushed, so the producer data is ready; the consumer segments have not
     // started yet.
-    auto run_boundary_copies = [&](const std::string & src_dev) {
+    auto run_boundary_copies = [&](const std::string & src_dev, bool seg_has_tail, bool seg_has_head) {
         std::vector<const route_b_relay_t *> batch;
 #ifdef STREAM_MOE_TEMP
         int matched = 0;
@@ -648,10 +669,18 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
 
             if (is_fused) {
                 bool match_layer = false;
-                if (r.layer == layer) {
+                if (r.layer == layer && seg_has_tail) {
                     match_layer = (r.stage == ROUTE_B_XFER_TAIL);
                 } else if (r.layer == layer_head) {
-                    match_layer = (r.stage == ROUTE_B_XFER_LAYER_FRONT || r.stage == ROUTE_B_XFER_CLOSURE);
+                    // In fused tail-head execution, relays produced by tail (e.g. carry to next layer)
+                    // trigger when the tail portion flushes. Relays produced by head (including
+                    // CLOSURE inputs) must NEVER trigger during tail and only trigger when head flushes.
+                    if (seg_has_tail && r.stage == ROUTE_B_XFER_LAYER_FRONT && is_src_in_tail(r.src)) {
+                        match_layer = true;
+                    }
+                    if (seg_has_head && (r.stage == ROUTE_B_XFER_LAYER_FRONT || r.stage == ROUTE_B_XFER_CLOSURE) && !is_src_in_tail(r.src)) {
+                        match_layer = true;
+                    }
                 }
                 if (!match_layer) continue;
             } else {
@@ -681,7 +710,7 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
             fprintf(stderr, "[topo_seg] L%d%s %s: %d relay(s) from '%s'\n",
-                     layer, is_fused ? "+next" : "", stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
+                    layer, is_fused ? "+next" : "", stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
 #endif
         dispatch_relay_batch(batch, cpu);
     };
@@ -691,11 +720,9 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
     // topo_segment_execute call.  This handles leaf inputs (inp_tokens,
     // positions, attention mask) and cross-device operands from outside the
     // current node list (e.g. carry from a previous layer).
-    //
-    // Track which devices have been flushed so we only copy from already-ready
-    // sources (never from a segment that hasn't run yet).
     std::unordered_set<std::string> flushed_devs;
-    auto run_incoming_copies = [&](const std::string & dst_dev, bool will_flush_same_dev) {
+    auto run_incoming_copies = [&](const std::string & dst_dev, bool will_flush_same_dev,
+                                   bool seg_has_tail, bool seg_has_head) {
         std::vector<const route_b_relay_t *> batch;
 #ifdef STREAM_MOE_TEMP
         int matched = 0;
@@ -706,9 +733,9 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
 
             if (is_fused) {
                 bool match_layer = false;
-                if (r.layer == layer) {
+                if (r.layer == layer && seg_has_tail) {
                     match_layer = (r.stage == ROUTE_B_XFER_TAIL);
-                } else if (r.layer == layer_head) {
+                } else if (r.layer == layer_head && seg_has_head) {
                     match_layer = (r.stage == ROUTE_B_XFER_LAYER_FRONT);
                 }
                 if (!match_layer) continue;
@@ -753,6 +780,7 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
 
     // Walk the list, accumulate segments, flush at transitions.
     std::vector<ggml_tensor*> seg;
+    std::vector<size_t> seg_indices;
     std::string cur_dev;
     bool started = false;
     for (size_t i = 0; i < list.size(); ++i) {
@@ -769,26 +797,34 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
                         layer, is_fused ? "+next" : "", stage, seg.size(), cur_dev.empty() ? "CPU" : cur_dev.c_str(),
                         d.empty() ? "CPU" : d.c_str());
 #endif
-            run_incoming_copies(cur_dev, !seg.empty());
+            const bool seg_has_tail = is_fused ? (seg_indices.front() < tail_len) : true;
+            const bool seg_has_head = is_fused ? (seg_indices.back() >= tail_len) : true;
+            run_incoming_copies(cur_dev, !seg.empty(), seg_has_tail, seg_has_head);
             const enum ggml_status st = flush_segment(seg, cur_dev);
             if (st != GGML_STATUS_SUCCESS) return st;
-            run_boundary_copies(cur_dev);
+            run_boundary_copies(cur_dev, seg_has_tail, seg_has_head);
             flushed_devs.insert(cur_dev);
             seg.clear();
+            seg_indices.clear();
             cur_dev = d;
         }
         seg.push_back(list[i]);
+        seg_indices.push_back(i);
     }
     // Flush the last segment and its outgoing copies.
+    if (!seg.empty()) {
 #ifdef STREAM_MOE_TEMP
-    if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && !seg.empty())
-        fprintf(stderr, "[topo_seg] L%d%s %s: flush last %zu nodes on '%s'\n",
-                layer, is_fused ? "+next" : "", stage, seg.size(), cur_dev.empty() ? "CPU" : cur_dev.c_str());
+        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG"))
+            fprintf(stderr, "[topo_seg] L%d%s %s: flush last %zu nodes on '%s'\n",
+                    layer, is_fused ? "+next" : "", stage, seg.size(), cur_dev.empty() ? "CPU" : cur_dev.c_str());
 #endif
-    run_incoming_copies(cur_dev, !seg.empty());
-    const enum ggml_status st = flush_segment(seg, cur_dev);
-    if (st != GGML_STATUS_SUCCESS) return st;
-    run_boundary_copies(cur_dev);
+        const bool seg_has_tail = is_fused ? (seg_indices.front() < tail_len) : true;
+        const bool seg_has_head = is_fused ? (seg_indices.back() >= tail_len) : true;
+        run_incoming_copies(cur_dev, !seg.empty(), seg_has_tail, seg_has_head);
+        const enum ggml_status st = flush_segment(seg, cur_dev);
+        if (st != GGML_STATUS_SUCCESS) return st;
+        run_boundary_copies(cur_dev, seg_has_tail, seg_has_head);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1185,6 +1221,7 @@ struct device_target_t {
     uint8_t *              stage_map = nullptr;
     size_t                 arena_used = 0;    // bump region (above result_bytes)
     size_t                 stage_used = 0;
+    size_t                 stage_size = 0;
     size_t                 acc_off = 0;       // acc_d[d_out, n_t] inside the arena
     ggml_tensor *          acc = nullptr;     // device accumulator shell
     ggml_tensor *          result = nullptr;  // single-target direct output shell
@@ -1395,6 +1432,12 @@ static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
     if (c.dev && host_data) {
         const size_t bytes = ggml_nbytes(l);
         const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
+        if (c.dev->stage_size > 0 && off + bytes > c.dev->stage_size) {
+            LOG_ERROR("stream_moe: stage buffer overflow on pool " << c.dev->pool
+                      << " (need " << off + bytes << ", cap " << c.dev->stage_size << ")");
+            GGML_ASSERT(off + bytes <= c.dev->stage_size && "stage buffer overflow");
+            return nullptr;
+        }
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
         l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
@@ -1440,6 +1483,12 @@ static ggml_tensor * bucket_source_leaf(chain_ctx_t & c, const ggml_tensor * src
             return l;
         }
         const size_t off = (c.dev->stage_used + 63u) & ~size_t(63u);
+        if (c.dev->stage_size > 0 && off + bytes > c.dev->stage_size) {
+            LOG_ERROR("stream_moe: stage buffer overflow on pool " << c.dev->pool
+                      << " (need " << off + bytes << ", cap " << c.dev->stage_size << ")");
+            GGML_ASSERT(off + bytes <= c.dev->stage_size && "stage buffer overflow");
+            return nullptr;
+        }
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
         l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
@@ -2191,10 +2240,13 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
         }
         t.arena = dv->arena; t.stage = dv->stage;
         t.arena_map = dv->arena_map; t.stage_map = dv->stage_map;
+        t.stage_size = dv->stage ? ggml_backend_buffer_get_size(dv->stage) : 0;
         t.gf = ggml_new_graph_custom(ctx, 4096, false);
         t.acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_out, n_t);
         t.acc->nb[0] = 4; t.acc->nb[1] = (size_t) d_out * 4;
-        if (!direct_out && single_dev_target && moe_out_same_dev) {
+        const bool moe_out_contiguous = moe_out && moe_out->data &&
+            moe_out->nb[0] == sizeof(float) && moe_out->nb[1] == (size_t) d_out * sizeof(float);
+        if (!direct_out && single_dev_target && moe_out_same_dev && moe_out_contiguous) {
             t.acc->buffer = moe_out->buffer;
             t.acc->data   = moe_out->data;
         } else {
@@ -2573,7 +2625,9 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             // Single device target with all rounds: t.acc is the complete result.
             // Avoid roundtrip through host!
             if (t.acc) {
-                if (moe_out_same_dev) {
+                const bool moe_out_contiguous = moe_out && moe_out->data &&
+                    moe_out->nb[0] == sizeof(float) && moe_out->nb[1] == (size_t) d_out * sizeof(float);
+                if (moe_out_same_dev && moe_out_contiguous) {
                     // ELIDED: accumulated directly into moe_out in-place on same device
                 } else if (moe_out_host) {
                     ggml_backend_tensor_get(t.acc, moe_out->data, 0, acc_bytes);
@@ -3056,7 +3110,7 @@ static enum ggml_status exec_fused_tail_and_head(int32_t layer_tail, int32_t lay
 
     if (list.empty()) return GGML_STATUS_SUCCESS;
 
-    const enum ggml_status tst = topo_segment_execute(ctx, cpu, list, layer_tail, "tail_head", executed_relays, layer_head);
+    const enum ggml_status tst = topo_segment_execute(ctx, cpu, list, layer_tail, "tail_head", executed_relays, layer_head, dense_tail.size());
     if (tst != GGML_STATUS_SUCCESS) {
         LOG_ERROR("stream_moe: fused tail_head failed L" << layer_tail << " -> L" << layer_head);
         return tst;

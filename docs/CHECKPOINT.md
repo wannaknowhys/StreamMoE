@@ -1,7 +1,13 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-10-07（**Tier 1+Tier 2 硬件队列图融合 + 单层单断架构 + 4D 笛卡尔积测试套件重构**）：
+> **最近更新**：2026-10-09（**Muse 代码审查第一阶段闭环：P0-1 融合 Relay 权属门控 + 边界防御加固**）：
+> - **P0-1 融合 Relay 时序提前修复**：在 `topo_segment_execute` 中引入 `tail_nodes` 权属判据与段位置门控。Tail 执行期仅触发本层 Tail relay 与源在 Tail 的 cross-layer carry；Head 执行期才触发源在 Head 的 LAYER_FRONT 与 CLOSURE relay，彻底解决跨设备 dense 放置下闭包陈旧数据消费问题。
+> - **核心防御加固**：`bucket_upload_leaf` / `bucket_source_leaf` 增加 `stage_size` 缓冲区溢出断言防御（REC-1）；`t.acc` in-place 别名前严格校验 `moe_out_contiguous` 连续性步长（REC-2）；`flush_segment` 缺失 backend 时显式报错中止、禁止静默 CPU fallback（REC-6a）。
+> - **回归验证**：`.\build.bat llamalibs dual` 原子同步编译；`verify_places.js --flavor StreamMoE` 12 拓扑 100% 运行成功（8 IDENTICAL + 4 微小浮点差异，全部语义流畅）；`smoke_cli.js` 混合池 9.96s PASS。
+> - **详见**：`docs/REVIEW_2026_10_07.md` 与 `docs/REVIEW_2026_10_07.zh-CN.md`。
+>
+> **前次更新**：2026-10-07（**Tier 1+Tier 2 硬件队列图融合 + 单层单断架构 + 4D 笛卡尔积测试套件重构**）：
 > - **图执行融合与流水线**：
 >   - **Tier 1 通用流水线**：引入 `exec_fused_tail_and_head(L_cur, L_next)`，在同设备段内无缝合并 `Tail(L_cur)` 与 `Head(L_next)` 的执行，大幅减少设备切换。
 >   - **Tier 2 单设备 MoE+Tail 硬件 Queue 融合**：在单设备分支中将 `Tail(L)` 算子直接追加进 `MoE(L)` 设备计算图（`single_dt->gf`），单次硬件 Queue 提交完成计算并在层尾统一派发 boundary relay。
