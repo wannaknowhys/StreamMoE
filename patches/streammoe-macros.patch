@@ -287,7 +287,7 @@ index a04177f9f..83383e960 100644
      LLAMA_API int64_t llama_time_us(void);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..831166d29 100644
+index 0402044da..f1b539f09 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,7 @@
@@ -308,28 +308,19 @@ index 0402044da..831166d29 100644
  #include "llama-model.h"
  #include "llama-ext.h"
  #include "llama-sampler.h"
-@@ -16,9 +22,6 @@
- #include <cinttypes>
- #include <cmath>
- #include <cstring>
--#include <limits>
--#include <stdexcept>
--#include <string>
- 
- //
- // llama_context
-@@ -115,7 +118,9 @@ llama_context::llama_context(
+@@ -115,7 +121,11 @@ llama_context::llama_context(
      cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
      cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
      cparams.embeddings              = params.embeddings;
--    cparams.embeddings_nextn        = false;
 +#ifdef STREAM_MOE_PREFILL_EXPORT
 +#include "stmoe_prefill_ctor_embd.frag"
++#else
+     cparams.embeddings_nextn        = false;
 +#endif
      cparams.embeddings_nextn_masked = false;
      cparams.offload_kqv             = params.offload_kqv;
      cparams.no_perf                 = params.no_perf;
-@@ -139,6 +144,10 @@ llama_context::llama_context(
+@@ -139,6 +149,10 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -340,7 +331,7 @@ index 0402044da..831166d29 100644
      cparams.ctx_other = nullptr;
  
      // TODO: more generic
-@@ -482,6 +491,10 @@ llama_context::~llama_context() {
+@@ -482,6 +496,10 @@ llama_context::~llama_context() {
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
@@ -351,7 +342,7 @@ index 0402044da..831166d29 100644
      if (!model.hparams.no_alloc) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              ggml_backend_t             backend = backend_ptrs[i];
-@@ -1365,6 +1378,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1365,6 +1383,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -366,7 +357,7 @@ index 0402044da..831166d29 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-@@ -1632,11 +1653,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1632,11 +1658,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -386,7 +377,7 @@ index 0402044da..831166d29 100644
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -1936,6 +1965,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1936,6 +1970,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  
@@ -397,7 +388,7 @@ index 0402044da..831166d29 100644
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
          {
-@@ -1963,6 +1996,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1963,6 +2001,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
              copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
@@ -405,7 +396,7 @@ index 0402044da..831166d29 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -2429,6 +2463,9 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2429,6 +2468,9 @@ ggml_cgraph * llama_context::graph_reserve(
      res->reset();
  
      auto * gf = model.build_graph(gparams);
@@ -415,7 +406,7 @@ index 0402044da..831166d29 100644
  
      this->n_outputs = save_n_outputs;
  
-@@ -2502,12 +2539,18 @@ ggml_status llama_context::graph_compute(
+@@ -2502,12 +2544,18 @@ ggml_status llama_context::graph_compute(
  }
  
  llm_graph_cb llama_context::graph_get_cb() const {
@@ -434,7 +425,7 @@ index 0402044da..831166d29 100644
  
          // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
          // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
-@@ -3416,6 +3459,9 @@ void llama_context::opt_epoch_iter(
+@@ -3416,6 +3464,9 @@ void llama_context::opt_epoch_iter(
              res->reset();
  
              auto * gf = model.build_graph(gparams);
@@ -444,7 +435,7 @@ index 0402044da..831166d29 100644
  
              struct ggml_context * ctx_compute_opt;
              {
-@@ -3532,6 +3578,9 @@ llama_context_params llama_context_default_params() {
+@@ -3532,6 +3583,9 @@ llama_context_params llama_context_default_params() {
          /*.defrag_thold                =*/ -1.0f,
          /*.cb_eval                     =*/ nullptr,
          /*.cb_eval_user_data           =*/ nullptr,
@@ -454,7 +445,7 @@ index 0402044da..831166d29 100644
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.abort_callback              =*/ nullptr,
-@@ -3553,6 +3602,9 @@ llama_context_params llama_context_default_params() {
+@@ -3553,6 +3607,9 @@ llama_context_params llama_context_default_params() {
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
@@ -517,21 +508,22 @@ index 6cb6dbd2f..2cfe074c6 100644
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..3a0ac9829 100644
+index a9edbd7be..e9ece1acd 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -634,7 +634,9 @@ struct server_slot {
+@@ -634,7 +634,11 @@ struct server_slot {
                      "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
          }
  
--        common_speculative_print_stats(spec);
 +#ifdef STREAM_MOE_ROUTE_B
 +#include "stmoe_routeb_sc_slot_stats.frag"
++#else
+         common_speculative_print_stats(spec);
 +#endif
      }
  
      json to_json(bool only_metrics = false) const {
-@@ -809,6 +811,9 @@ public:
+@@ -809,6 +813,9 @@ public:
      }
  
      ~server_context_impl() {
@@ -541,7 +533,7 @@ index a9edbd7be..3a0ac9829 100644
          if (!sleeping) {
              // destroy() is already called when entering sleeping state
              // we don't call it again here to avoid double free
-@@ -967,6 +972,9 @@ private:
+@@ -967,6 +974,9 @@ private:
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
