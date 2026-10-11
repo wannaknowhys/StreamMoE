@@ -7,7 +7,7 @@
 > - **回归验证**：`.\build.bat llamalibs dual` 原子同步编译；`verify_places.js --flavor StreamMoE` 12 拓扑 100% 运行成功（8 IDENTICAL + 4 微小浮点差异，全部语义流畅）；`smoke_cli.js` 混合池 9.96s PASS。
 > - **详见**：`docs/REVIEW_2026_10_07.md` 与 `docs/REVIEW_2026_10_07.zh-CN.md`。
 > - **2026-10-09 补记（phase 2b 消除 + 2a 瘦身，已验证）**：prefill 导出体全进 frag（2b patch 删除）；2a 只剩 8 文件逻辑改行；新 3 patch 栈干净重放 24 文件逐字节一致。`.\build.bat llamalibs dual` 双 tag 编译通过；`verify_places.js --flavor StreamMoE` 12 拓扑 0 ERROR（8 IDENTICAL + 4 已知 fp 微差，全部流畅，与 10-07 画像一致）；`smoke_cli.js` 11.7s PASS；`run_baseline.bat moe_129_8192_vk` **PASS**（embd gate 121/129=93.8% 与冻结基线同值，KL 0.40 < 4.5，upstream IDENTICAL）。途中抓到真回归 1 个：`/shutdown` 注册被误包进 PREFILL 宏导致 route_b-only  binary 丢端点、run_export 卡死——已改回 `PREFILL||ROUTE_B` 双宏门控并直测 200 + 干净退出。
-> - **2026-10-11 补记（patch 直接改行审计 + 3 处 impurities 回填）**：11 处动原版行中 route-b 6 处逻辑改行全必要；macros 侧回填 3 处——`embeddings_nextn` 补 `#else = false`（POD 未初始化 latent UB）、`<limits>/<stdexcept>/<string>` 搬回无条件（恢复纯上游可编译性）、server-context `print_stats` 补 `#else` 原调用。重放 24/24 一致，dual 增量编过，place-cpu IDENTICAL + dump 导出 44 token 全文件正常。
+> - **2026-10-11 补记（patch 直接改行审计 + 3 处 impurities 回填 + spec_buft 残留清除）**：11 处动原版行中 route-b 6 处逻辑改行全必要；macros 侧回填 3 处——`embeddings_nextn` 补 `#else = false`（POD 未初始化 latent UB）、`<limits>/<stdexcept>/<string>` 搬回无条件（恢复纯上游可编译性）、server-context `print_stats` 补 `#else` 原调用；进一步清除历史残留 `stmoe_routeb_spec_buft.frag` 并还原 `speculative.cpp:2332` 为原版无条件执行（消除伪宏包装）。重放 24/24 一致，dual 增量编过，smoke_cli 11.4s PASS。
 >
 > **前次更新**：2026-10-07（**Tier 1+Tier 2 硬件队列图融合 + 单层单断架构 + 4D 笛卡尔积测试套件重构**）：
 > - **图执行融合与流水线**：
