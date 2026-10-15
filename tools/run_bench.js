@@ -137,9 +137,35 @@ function cartesian(flavors, models, engines, tasks) {
 }
 
 function binPath(run) {
-    if (run.binPath) return run.binPath;
+    if (run.binPath) return path.resolve(run.binPath);
     const tag = run.bin || run.flavor || 'StreamMoE';
     return path.join(REPO_ROOT, 'build', tag, 'llama-build', 'bin', 'llama-server.exe');
+}
+
+function computeEffectiveContext(run, feed, nPredict = 128) {
+    const m = Number(run.modelCtx);
+    const t = Number(run.taskCtx || run.ctx);
+    const reqTokens = (feed && feed.prefill)
+        ? Math.max(16384, (feed.tokens || 0) + nPredict + 4096)
+        : ((run.feed && Number.isFinite(Number(run.feed.tokens))) ? Number(run.feed.tokens) : 0);
+
+    if (feed && feed.prefill && !t) {
+        return reqTokens;
+    }
+
+    if (Number.isFinite(m) && Number.isFinite(t)) {
+        if (reqTokens > 0 && m < reqTokens) {
+            console.warn(`[run_bench] WARNING: task requires ${reqTokens} tokens (taskCtx=${t}), exceeding modelCtx=${m}. Preserving taskCtx ${t} to prevent truncation.`);
+            return t;
+        }
+        if (t > m) {
+            console.warn(`[run_bench] WARNING: taskCtx (${t}) exceeds modelCtx (${m}). Clamping to min(${m}, ${t}) = ${Math.min(m, t)}.`);
+        }
+        return Math.min(m, t);
+    }
+    if (Number.isFinite(m)) return m;
+    if (Number.isFinite(t)) return t;
+    return (feed && feed.prefill) ? reqTokens : 8192;
 }
 
 // Inline prompt, or the first line's prompt/content of a prompt file.
@@ -317,8 +343,7 @@ async function runOne(run, port, healthTimeout) {
         return { records: [rec], summary: { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
     }
 
-    // prefill feed sizes ctx to fit the prompt (+ decode + margin) unless set.
-    const ctx = Number(run.ctx || (feed.prefill ? Math.max(16384, (feed.tokens || 0) + nPredict + 4096) : 8192));
+    const ctx = computeEffectiveContext(run, feed, nPredict);
     const args = ['-m', run.modelPath, '--host', '127.0.0.1', '--port', String(port),
         '-c', String(ctx), '-t', String(threads), '--no-warmup', '--no-webui'];
     if (run.draft) args.push('--model-draft', run.draft);
@@ -329,7 +354,8 @@ async function runOne(run, port, healthTimeout) {
     let summary;
 
     const mode = feed.prefill ? 'prefill' : feed.mode;
-    console.log(`\n=== ${path.basename(bin)} [${run.flavor || 'StreamMoE'}] ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
+    const flTag = run.binPath ? `stock:${path.basename(bin)}` : (run.flavor || 'StreamMoE');
+    console.log(`\n=== ${path.basename(bin)} [${flTag}] ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let log = '';
     let exited = false;
