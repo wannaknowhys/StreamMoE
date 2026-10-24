@@ -31,8 +31,9 @@ const REPO_ROOT = path.join(__dirname, '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function loadEnvIfPresent() {
-    const envBat = path.join(REPO_ROOT, 'temp', 'sm_env.bat');
-    if (fs.existsSync(envBat)) {
+    const envCandidates = [path.join(REPO_ROOT, 'temp', 'sm_env.bat'), path.join(REPO_ROOT, 'private', 'env.bat')];
+    for (const envBat of envCandidates) {
+        if (fs.existsSync(envBat)) {
         const lines = fs.readFileSync(envBat, 'utf8').split('\n');
         for (const line of lines) {
             const m = line.trim().match(/^set\s+([A-Za-z0-9_]+)=(.*)$/i);
@@ -41,6 +42,7 @@ function loadEnvIfPresent() {
                     process.env[m[1].trim()] = m[2].trim();
                 }
             }
+        }
         }
     }
 }
