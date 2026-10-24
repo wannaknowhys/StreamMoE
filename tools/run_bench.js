@@ -312,7 +312,7 @@ function statsOf(t) {
 async function postCompletion(port, prompt, nPredict) {
     const j = await postJson(port, '/completion', { prompt, n_predict: nPredict, temperature: 0, cache_prompt: false, stream: false });
     if (j.error) return { error: String(j.error.message || j.error) };
-    return statsOf(j.timings || {});
+    return Object.assign(statsOf(j.timings || {}), { content: j.content || '' });
 }
 
 // Chained /v1/chat/completions. cache_prompt=true: real multi-turn reuse.
@@ -332,17 +332,30 @@ function median(xs) {
 }
 const fmt = (x, d) => (x == null ? '-' : Number(x).toFixed(d == null ? 2 : d));
 
-async function runOne(run, port, healthTimeout) {
+async function runOne(run, port, healthTimeout, txtFile = null) {
     const bin = binPath(run);
     const threads = Number(run.threads || 16);
     const nPredict = Number(run.nPredict || 128);
     const warmup = run.warmup != null ? Number(run.warmup) : 1;
     const repeat = Number(run.repeat || 3);
 
+    const writeTxt = (str) => {
+        if (txtFile) {
+            try { fs.appendFileSync(txtFile, str + '\n', 'utf8'); } catch (_) {}
+        }
+    };
+
     let feed;
     try {
         feed = loadFeed(run);
     } catch (e) {
+        if (txtFile) {
+            writeTxt('================================================================================');
+            writeTxt(`RUN: [${run.flavor || 'StreamMoE'}] ${run.model} | ${run.engine} | ${run.input}`);
+            writeTxt(`DATE: ${new Date().toISOString()}`);
+            writeTxt('================================================================================\n');
+            writeTxt(`--- [ERROR] ---\n${e.message}\n`);
+        }
         const rec = { ts: new Date().toISOString(), flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, bin, kind: 'single', status: 'FAIL', error: e.message };
         console.error('  FAILED: ' + e.message);
         return { records: [rec], summary: { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message } };
@@ -351,6 +364,19 @@ async function runOne(run, port, healthTimeout) {
     const mode = feed.prefill ? 'prefill' : feed.mode;
     const flTag = run.binPath ? `stock:${path.basename(bin)}` : (run.flavor || 'StreamMoE');
     console.log(`\n=== ${path.basename(bin)} [${flTag}] ${run.model}/${run.engine}/${run.input} (${mode})${feed.source ? ' ' + feed.source : ''} ===`);
+
+    writeTxt('================================================================================');
+    writeTxt(`RUN: [${flTag}] ${run.model} | ${run.engine} | ${run.input} (${mode})`);
+    writeTxt(`DATE: ${new Date().toISOString()}`);
+    writeTxt('================================================================================\n');
+
+    if (feed.mode === 'single') {
+        if (feed.prefill) {
+            writeTxt(`[User]: (prefill input omitted, ~${feed.tokens || 0} tokens)\n`);
+        } else {
+            writeTxt(`[User]:\n${feed.prompt}\n`);
+        }
+    }
 
     const ctx = computeEffectiveContext(run, feed, nPredict);
     const args = ['-m', run.modelPath, '--host', '127.0.0.1', '--port', String(port),
@@ -375,15 +401,19 @@ async function runOne(run, port, healthTimeout) {
             const rec = Object.assign({}, base, { kind: 'single', status: 'OK', error: null, cold: null, warmup: [], steady: [], median: null });
             rec.cold = await postCompletion(port, feed.prompt, nPredict);
             if (rec.cold.error) throw new Error('cold request: ' + rec.cold.error);
+            writeTxt(`--- [Cold Run] (prompt: ${rec.cold.prompt_n} tok, pp: ${fmt(rec.cold.prompt_tps, 1)}, tg: ${fmt(rec.cold.decode_tps)}) ---\n[Assistant]:\n${rec.cold.content || ''}\n`);
+
             for (let i = 0; i < warmup; i++) {
                 const r = await postCompletion(port, feed.prompt, nPredict);
                 if (r.error) throw new Error('warmup request: ' + r.error);
                 rec.warmup.push(r);
+                writeTxt(`--- [Warmup ${i + 1}/${warmup}] (prompt: ${r.prompt_n} tok, pp: ${fmt(r.prompt_tps, 1)}, tg: ${fmt(r.decode_tps)}) ---\n[Assistant]:\n${r.content || ''}\n`);
             }
             for (let i = 0; i < repeat; i++) {
                 const r = await postCompletion(port, feed.prompt, nPredict);
                 if (r.error) throw new Error('steady request: ' + r.error);
                 rec.steady.push(r);
+                writeTxt(`--- [Repeat ${i + 1}/${repeat}] (prompt: ${r.prompt_n} tok, pp: ${fmt(r.prompt_tps, 1)}, tg: ${fmt(r.decode_tps)}) ---\n[Assistant]:\n${r.content || ''}\n`);
             }
             rec.median = {
                 prompt_n: rec.steady[0] ? rec.steady[0].prompt_n : null,
@@ -405,6 +435,14 @@ async function runOne(run, port, healthTimeout) {
                 const r = await postChat(port, messages, nPredict);
                 if (r.error) throw new Error('turn ' + (i + 1) + ': ' + r.error);
                 messages.push({ role: 'assistant', content: r.content });
+
+                writeTxt(`--- [Turn ${i + 1}/${feed.maxTurns}] (prompt: ${r.prompt_n} tok, pp: ${fmt(r.prompt_tps, 1)}, tg: ${fmt(r.decode_tps)}) ---`);
+                if (system && String(system).trim()) {
+                    writeTxt(`[System]:\n${system}\n`);
+                }
+                writeTxt(`[User]:\n${prompt}\n`);
+                writeTxt(`[Assistant]:\n${r.content || ''}\n`);
+
                 records.push(Object.assign({}, base, {
                     kind: 'turn', status: 'OK', turn: i + 1,
                     prompt_tokens: r.prompt_n, prompt_tps: r.prompt_tps, decode_tps: r.decode_tps, gen_n: r.gen_n, cache_n: r.cache_n,
@@ -426,6 +464,7 @@ async function runOne(run, port, healthTimeout) {
             console.log(`  == ${agg.turns} turns: avg tg=${fmt(agg.avg_decode_tps)} (median ${fmt(agg.median_decode_tps)}), avg pp=${fmt(agg.avg_prompt_tps, 1)}, prompt_tok=${totalPrompt}, gen_tok=${totalGen}`);
         }
     } catch (e) {
+        writeTxt(`\n--- [ERROR] ---\n${e.message}\n`);
         const rec = Object.assign({}, base, { kind: feed.mode, status: 'FAIL', error: e.message });
         records.push(rec);
         summary = { flavor: run.flavor || 'StreamMoE', model: run.model, engine: run.engine, input: run.input, status: 'FAIL', error: e.message };
@@ -463,10 +502,21 @@ async function runOne(run, port, healthTimeout) {
     for (const r of runs) console.log('  [' + (r.flavor || 'StreamMoE') + '] ' + r.model + '/' + r.engine + '/' + r.input);
     if (process.argv.includes('--dry-run')) { console.log('[run_bench] dry-run, not executing'); return; }
 
+    const now = new Date();
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const tsDir = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}T${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`;
+    const txtOutDir = path.join(REPO_ROOT, 'temp', 'bench_outputs', tsDir);
+    fs.mkdirSync(txtOutDir, { recursive: true });
+    console.log('[run_bench] txt outputs -> ' + txtOutDir);
+
     fs.mkdirSync(path.dirname(out), { recursive: true });
     const summaries = [];
-    for (const r of runs) {
-        const { records, summary } = await runOne(r, port, healthTimeout);
+    for (let idx = 0; idx < runs.length; idx++) {
+        const r = runs[idx];
+        const seqStr = String(idx + 1).padStart(2, '0');
+        const safeInput = String(r.input || 'task').replace(/[/\\?%*:|"<>]/g, '_');
+        const txtFile = path.join(txtOutDir, `${seqStr}_${r.flavor || 'StreamMoE'}__${r.model}__${r.engine}__${safeInput}.txt`);
+        const { records, summary } = await runOne(r, port, healthTimeout, txtFile);
         for (const rec of records) fs.appendFileSync(out, JSON.stringify(rec) + '\n');
         summaries.push(summary);
     }
@@ -483,4 +533,5 @@ async function runOne(run, port, healthTimeout) {
         );
     }
     console.log('[run_bench] results: ' + out);
+    console.log('[run_bench] txt outputs: ' + txtOutDir);
 })();
