@@ -53,6 +53,21 @@ struct tmr_acc_t {
     const char * name; double ms = 0; long n = 0;
     ~tmr_acc_t() { if (std::getenv("STREAM_MOE_TMR")) fprintf(stderr, "[TMR] %s total=%.1f ms n=%ld avg=%.3f ms\n", name, ms, n, n ? ms / n : 0.0); }
 };
+
+// Scope guard for tmr_acc_t (same output as the inline guards).
+struct tmr_scope_guard_t {
+    tmr_acc_t & a;
+    std::chrono::steady_clock::time_point t0;
+    tmr_scope_guard_t(tmr_acc_t & a_) : a(a_), t0(std::chrono::steady_clock::now()) {}
+    ~tmr_scope_guard_t() {
+        a.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        a.n++;
+    }
+};
+
+// Current ubatch token count, set by the top-level executor so per-stage timers
+// can split decode (n_t == 1) from prefill.
+static thread_local int64_t g_ubatch_nt = 0;
 #endif
 
 // "blk.N.ffn_gate_exps.weight" -> N and branch ("ffn_gate_exps.weight" etc.)
@@ -2831,6 +2846,10 @@ static void dump_all_layer_nodes_debug(int32_t layer) {
 static enum ggml_status exec_dense_head(int32_t layer, ggml_context * ctx,
                                         ggml_backend_t cpu,
                                         std::unordered_set<const route_b_relay_t *> & executed_relays) {
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_head_dec{ "head_dec" }, g_head_pre{ "head_pre" };
+    tmr_scope_guard_t _hguard{ (g_ubatch_nt == 1) ? g_head_dec : g_head_pre };
+#endif
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
 #ifdef STREAM_MOE_TEMP
     if (layer == 0 && std::getenv("STREAM_MOE_TMP_BIN_DIR")) route_b_begin_ubatch();
@@ -3074,6 +3093,10 @@ static enum ggml_status exec_moe_closure(int32_t layer, ggml_context * ctx,
 static enum ggml_status exec_fused_tail_and_head(int32_t layer_tail, int32_t layer_head,
                                                  ggml_context * ctx, ggml_backend_t cpu,
                                                  std::unordered_set<const route_b_relay_t *> & executed_relays) {
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_fth_dec{ "fused_tail_head_dec" }, g_fth_pre{ "fused_tail_head_pre" };
+    tmr_scope_guard_t _fguard{ (g_ubatch_nt == 1) ? g_fth_dec : g_fth_pre };
+#endif
     // 1. Pre-tail: copy closure-produced tensors (e.g. moe_out) to the tail's device.
     {
         const std::string closure_dev = route_b_closure_device();
@@ -3128,6 +3151,10 @@ static enum ggml_status exec_fused_tail_and_head(int32_t layer_tail, int32_t lay
 static enum ggml_status exec_dense_tail(int32_t layer, ggml_context * ctx,
                                         ggml_backend_t cpu,
                                         std::unordered_set<const route_b_relay_t *> & executed_relays) {
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_tail_dec{ "dense_tail_dec" }, g_tail_pre{ "dense_tail_pre" };
+    tmr_scope_guard_t _tguard{ (g_ubatch_nt == 1) ? g_tail_dec : g_tail_pre };
+#endif
     // Pre-tail: copy closure-produced tensors (e.g. moe_out) to the tail's device.
     {
         const std::string closure_dev = route_b_closure_device();
@@ -3191,6 +3218,18 @@ enum ggml_status moe_exec_mul_mat_id(
     const ggml_tensor* const* nodes = cgraph->nodes;
     const int n_nodes = cgraph->n_nodes;
     if (n_nodes == 0) return GGML_STATUS_SUCCESS;
+#ifdef STREAM_MOE_TEMP
+    {
+        int64_t nt = 0;
+        for (int i = 0; i < n_nodes && nt == 0; ++i) {
+            const ggml_tensor * nd = nodes[i];
+            if (nd && nd->op == GGML_OP_MUL_MAT_ID && nd->src[2]) nt = nd->src[2]->ne[1];
+        }
+        g_ubatch_nt = nt;
+    }
+    static tmr_acc_t g_eval_dec{ "eval_dec" }, g_eval_pre{ "eval_pre" };
+    tmr_scope_guard_t _eguard{ (g_ubatch_nt == 1) ? g_eval_dec : g_eval_pre };
+#endif
 #ifdef STREAM_MOE_TEMP
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
         int in = 0, shown = 0;

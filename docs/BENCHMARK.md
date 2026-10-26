@@ -181,3 +181,50 @@ Tentative reading (NOT a conclusion):
   GPU re-enables `op_offload`.
 - **Next: re-test with gemma** (larger dense + heavier experts, C1+C2 fit in
   VRAM) before drawing any conclusion.
+
+### 2026-10-26 - where decode time goes (TMR + Vulkan launch probe, RX590)
+
+Method: `StreamMoE_dump_dbg` (`STREAM_MOE_TEMP`) with `STREAM_MOE_TMR=1`,
+`STREAM_MOE_TIER2_DEBUG=1`, `STREAM_MOE_TMP_PREWARM=1`; olmoe, `-p hi -n 24`,
+16 threads. TEMP-gated timers: `eval` (whole delegate call), `head`,
+`dense_tail`, `fused_tail_head` (per call, decode bucket).
+
+Per-token decomposition (ms, 23 decode tokens, 16 layers):
+
+| config | eval | head | fused tail+head | MoE closure (burst) | of which `tail_sync` |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| place-cpu | 20.6 | 0.4 | 5.5 (15 x 0.37) | 12.7 (16 x 0.79) | - |
+| place-c1 (C1 on GPU) | 75.7 | 2.7 | 49.3 (15 x 3.29) | 21.2 (16 x 1.33) | - |
+| place-exp5 (experts on GPU) | 60.0 | 1.1 | 19.4 (15 x 1.29) | 37.3 (16 x 2.33) | 31.6 (16 x 1.98) |
+| place-c1c2-exp5 | 80.8 | 40.8 (16 x 2.55) | - (Tier-2 fuses tail) | 40.1 (16 x 2.50) | 31.6 |
+
+Launch probe (`diagnostics/vk_launch_probe.cpp`,
+`build.bat harness StreamMoE vk_launch_probe`, graph = N small F32 adds):
+
+| N nodes in one graph | Vulkan0 (ms) | CPU (ms) |
+| ---: | ---: | ---: |
+| 1 | 0.20 | 0.003 |
+| 8 | 0.51 | 0.010 |
+| 38 | 2.13 | 0.039 |
+| 76 | 4.02 | 0.077 |
+| 38 ops as 38 one-node graphs | 6.65 | 0.363 |
+| async enqueue only (38 nodes) | 0.42 | 0.28 |
+
+Reading:
+
+- One Vulkan graph submission costs **~0.17 ms + ~51 us per node** on this
+  driver; splitting 38 ops into 38 submissions costs 3.1x (6.65 vs 2.13 ms).
+- Route-B runs 2 device graphs per layer (head ~46 nodes; MoE+tail ~35-60).
+  At ~51 us/node that is 2.5-3.3 ms per graph, which is exactly what the TMR
+  buckets show. The software structure is not the bottleneck - the per-node
+  dispatch is.
+- Stock-vulkan's 41 t/s is also dispatch-bound here (~11 us/node enqueue), so
+  the RX590 Vulkan ceiling for this model is roughly 20-40 t/s even with zero
+  host breaks.
+- Consequence: on this GPU, decode is faster on the CPU (place-cpu 39 t/s) for a
+  1B-active model; GPU placement pays off for prefill (pp 383.6 at
+  c1c2-exp5 vs 177.8 on CPU) but not for decode.
+- A P100/CUDA target must be measured with the same probe before optimizing the
+  break structure: at ~3 us/node the current 2 graphs/layer cost ~0.3 ms and the
+  streaming design is fine; if it is still tens of us, per-(layer, stage) CUDA
+  graph capture/replay is the structural answer.

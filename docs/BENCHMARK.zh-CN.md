@@ -175,3 +175,45 @@ private\bench.bat --models tools\run_specs\models\gemma.json ^
 - 疑似原因：1B-active 模型上 GPU decode 本来就不快，加上 route B VRAM 池路径的
   跨设备/同步/搬迁开销；dense C1 上 GPU 还会重新打开 `op_offload`。
 - **下一步：换 gemma 重测**（dense 更重、专家更多、C1+C2 能进 VRAM）后再下结论。
+
+### 2026-10-26 - decode 时间到底花在哪（TMR + Vulkan 提交微基准，RX590）
+
+方法：`StreamMoE_dump_dbg`（`STREAM_MOE_TEMP`）+ `STREAM_MOE_TMR=1`、
+`STREAM_MOE_TIER2_DEBUG=1`、`STREAM_MOE_TMP_PREWARM=1`；olmoe，`-p hi -n 24`，16 线程。
+新增 TEMP 计时桶：`eval`（整个 delegate 调用）、`head`、`dense_tail`、
+`fused_tail_head`（decode 桶）。
+
+每 token 分解（ms，23 个 decode token，16 层）：
+
+| 配置 | eval | head | fused tail+head | MoE 闭包（burst） | 其中 `tail_sync` |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| place-cpu | 20.6 | 0.4 | 5.5（15 x 0.37） | 12.7（16 x 0.79） | - |
+| place-c1（C1 上 GPU） | 75.7 | 2.7 | 49.3（15 x 3.29） | 21.2（16 x 1.33） | - |
+| place-exp5（专家上 GPU） | 60.0 | 1.1 | 19.4（15 x 1.29） | 37.3（16 x 2.33） | 31.6（16 x 1.98） |
+| place-c1c2-exp5 | 80.8 | 40.8（16 x 2.55） | -（Tier-2 融合 tail） | 40.1（16 x 2.50） | 31.6 |
+
+提交微基准（`diagnostics/vk_launch_probe.cpp`，
+`build.bat harness StreamMoE vk_launch_probe`，图 = N 个小 F32 add）：
+
+| 单图节点数 | Vulkan0（ms） | CPU（ms） |
+| ---: | ---: | ---: |
+| 1 | 0.20 | 0.003 |
+| 8 | 0.51 | 0.010 |
+| 38 | 2.13 | 0.039 |
+| 76 | 4.02 | 0.077 |
+| 38 个 op 拆成 38 次单节点图 | 6.65 | 0.363 |
+| 仅 async 入队（38 节点） | 0.42 | 0.28 |
+
+结论：
+
+- 该驱动下**一次 Vulkan 图提交 ≈ 0.17 ms 固定 + 每节点 ≈ 51 µs**；把 38 个 op 拆成
+  38 次提交要 3.1 倍代价（6.65 vs 2.13 ms）。
+- route-B 每层 2 张设备图（head ≈ 46 节点；MoE+tail ≈ 35-60 节点），按 ~51 µs/节点
+  正好是 2.5-3.3 ms/图，与 TMR 完全对上。**瓶颈是逐节点 dispatch，不是软件结构。**
+- 原版 vulkan 的 41 t/s 在这里同样是 dispatch-bound（入队 ~11 µs/节点），所以 RX590
+  Vulkan 在这个模型上的上限大致就是 20-40 t/s，即使零断点。
+- 结果：这个 GPU 上 1B-active 模型 decode 仍是 CPU 快（place-cpu 39 t/s）；GPU 放置
+  的收益在 prefill（c1c2-exp5 pp 383.6 vs CPU 177.8），不在 decode。
+- P100/CUDA 目标必须先用同一个探针测：若每节点 ~3 µs，当前 2 图/层只值 ~0.3 ms，
+  流式结构没问题；若仍是几十 µs，则**按 (layer, stage) 做 CUDA graph 捕获/重放**才是
+  结构性解。
