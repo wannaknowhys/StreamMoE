@@ -173,12 +173,19 @@ echo [+] llamalibs done for tag %TAG% (libllama + llama-cli + llama-server)
 exit /b 0
 
 :llamalibs_dual
-echo [StreamMoE] Building DUAL tags: StreamMoE (release) + StreamMoE_dump (test/dump) ...
+rem The regression suite (baseline_regression/run_baseline.bat, verify_places.js,
+rem smoke_cli.js) consumes three tags: the release dialogue build (StreamMoE),
+rem the dump/export build (StreamMoE_dump) and the clean upstream reference
+rem (upstream_dump). Rebuild all three atomically so no stale binary can be
+rem verified against a newer source tree.
+echo [StreamMoE] Building DUAL tags: StreamMoE (release) + StreamMoE_dump (test/dump) + upstream_dump (reference) ...
 call "%~f0" llamalibs StreamMoE
 if errorlevel 1 ( echo [-] StreamMoE build failed & exit /b 1 )
 call "%~f0" llamalibs StreamMoE_dump
 if errorlevel 1 ( echo [-] StreamMoE_dump build failed & exit /b 1 )
-echo [+] Dual build completed successfully (StreamMoE + StreamMoE_dump).
+call "%~f0" llamalibs upstream_dump
+if errorlevel 1 ( echo [-] upstream_dump build failed & exit /b 1 )
+echo [+] Triple build completed successfully (StreamMoE + StreamMoE_dump + upstream_dump).
 exit /b 0
 
 :test
@@ -325,7 +332,7 @@ echo   build.bat test       - Build and run all unit tests
 echo   build.bat clean      - Remove build\ (all tags)
 echo Optional [tag] sub-path for llamalibs/build (default: main).
 echo   llamalibs main           - route-B llama-server (build\main)
-echo   llamalibs dual           - build both StreamMoE (release) and StreamMoE_dump (test)
+echo   llamalibs dual           - build all three regression tags: StreamMoE (release),
 echo   llamalibs StreamMoE      - flagship: route-B + vulkan, NO prefill export
 echo                             (build\StreamMoE; llama-cli dialogue / serving)
 echo   llamalibs upstream_dump  - prefill-only export (build\upstream_dump)

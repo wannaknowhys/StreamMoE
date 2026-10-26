@@ -461,7 +461,7 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
         } else if (item.src->buffer && item.dst->data) {
             ggml_backend_tensor_get(item.src, item.dst->data, 0, item.nbytes);
         } else if (item.src->data && item.dst->data) {
-            std::memcpy(item.dst->data, item.src->data, item.nbytes);
+            tensor_write_host(item.dst, item.src->data, 0, item.nbytes);
         }
     }
 
@@ -504,7 +504,7 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
                 if (item.src->buffer) {
                     ggml_backend_tensor_get(item.src, stage_ptr, 0, item.nbytes);
                 } else if (item.src->data) {
-                    std::memcpy(stage_ptr, item.src->data, item.nbytes);
+                    tensor_read_host(item.src, stage_ptr, 0, item.nbytes);
                 }
             }
             // Enqueue asynchronous transfers to device
@@ -572,7 +572,7 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
                 if (item.dst->buffer) {
                     ggml_backend_tensor_set(item.dst, stage_ptr, 0, item.nbytes);
                 } else if (item.dst->data) {
-                    std::memcpy(item.dst->data, stage_ptr, item.nbytes);
+                    tensor_write_host(item.dst, stage_ptr, 0, item.nbytes);
                 }
             }
         }

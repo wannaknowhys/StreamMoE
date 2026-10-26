@@ -1,7 +1,7 @@
 # Baseline Regression（基线回归）
 
 > 每次改代码 + 编译完后跑一遍，确认 129-token prefill-from 产物仍与 known-good 基线一致。
-> 用法：仓库根 `baseline_regression\run_baseline.bat [基线moe目录] [待验证目录]`（需先 `build.bat llamalibs StreamMoE_dump` 与 `upstream_dump`）。
+> 用法：仓库根 `baseline_regression\run_baseline.bat [基线moe目录] [待验证目录]`（需先 `build.bat llamalibs dual`——2026-10-26 起 dual 同时构建 `StreamMoE` / `StreamMoE_dump` / `upstream_dump` 三个 tag，脚本会分别检查两个二进制的源码新鲜度）。
 
 ## 数值形态（flavor）与基线选择——先读
 

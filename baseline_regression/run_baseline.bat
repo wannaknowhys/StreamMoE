@@ -56,6 +56,10 @@ if not exist "%UP_BIN%" ( echo [-] missing %UP_BIN% - run: build.bat llamalibs u
 rem ---- Freshness check: reject stale binaries compiled before source modifications ----
 node "%ROOT%\tools\freshness_check.js" "%MOE_BIN%"
 if errorlevel 1 exit /b 1
+rem  The upstream reference must be fresh too: a stale upstream_dump binary would
+rem  "match" the frozen upstream baseline while the current source says otherwise.
+node "%ROOT%\tools\freshness_check.js" "%UP_BIN%"
+if errorlevel 1 exit /b 1
 
 rem ---- compile verify_kl.exe if missing ----
 if not exist "%KL%" (

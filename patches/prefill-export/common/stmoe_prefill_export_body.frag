@@ -31,10 +31,12 @@ static bool moe_export_eval_cb(ggml_tensor * t, bool ask, void * ud) {
     }
     if ((std::getenv("STREAM_MOE_TMP_CB_HASH") || std::getenv("STREAM_MOE_TMP_BIN_DIR")) && t && t->name && t->data) {
         ggml_backend_t b = ggml_backend_sched_get_tensor_backend(ctx->get_sched(), t);
+        ggml_backend_buffer_t tb = t->view_src ? t->view_src->buffer : t->buffer;
         const size_t nb = ggml_nbytes(t);
         std::vector<uint8_t> buf(nb);
         if (b) { ggml_backend_tensor_get_async(b, t, buf.data(), 0, nb); ggml_backend_synchronize(b); }
-        else   { std::memcpy(buf.data(), t->data, nb); }
+        else if (tb) { ggml_backend_tensor_get(t, buf.data(), 0, nb); }
+        else   { std::memcpy(buf.data(), t->data, nb); }  // iron-rule-exempt: host tensor, no backend buffer
         stream_moe::route_b_dump_node_bin(-1, t->name, ggml_op_name(t->op), (int) t->type,
                                           t->ne[0], t->ne[1], buf.data(), nb);
         if (std::getenv("STREAM_MOE_TMP_CB_HASH")) {
@@ -158,14 +160,18 @@ void llama_context::export_capture_experts(ggml_tensor * t) {
     const size_t isz = ggml_element_size(ids);
     // ids may live on a device backend (e.g. Vulkan0) mid-graph; read via sched.
     // route-B minigraph tensors (STREAMMOE#...) are NOT in the sched hash - in
-    // that case the ids data is host-valid, so fall back to a direct copy.
+    // that case read through the tensor buffer when one is bound, and fall back
+    // to a direct copy only for a buffer-less host tensor.
     std::vector<uint8_t> raw(ggml_nbytes(ids));
     ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(get_sched(), ids);
+    ggml_backend_buffer_t ibuf = ids->view_src ? ids->view_src->buffer : ids->buffer;
     if (ib) {
         ggml_backend_tensor_get_async(ib, ids, raw.data(), 0, raw.size());
         ggml_backend_synchronize(ib);
+    } else if (ibuf) {
+        ggml_backend_tensor_get(ids, raw.data(), 0, raw.size());
     } else {
-        memcpy(raw.data(), ids->data, raw.size());
+        memcpy(raw.data(), ids->data, raw.size());  // iron-rule-exempt: host tensor, no backend buffer
     }
     const int32_t * base = (const int32_t *) raw.data();
     for (int tt = 0; tt < ids->ne[1]; ++tt) {

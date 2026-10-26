@@ -82,9 +82,9 @@
 
 ## 修订（2026-10-04）
 
-- **双目标同步编译与产物新鲜度纪律（防验证脱节）**：
-  - 修改 `src/` 或 `patches/` 后、运行任何测试/回归脚本前，**必须执行 `.\build.bat llamalibs dual`**，确保生产产物（`build/StreamMoE/.../llama-cli.exe`）与转储/测试产物（`build/StreamMoE_dump/.../llama-server.exe`）原子同步更新。严禁只编译其中一个目标就跑另一个目标的测试。
-  - 所有测试脚本（`tools/run_export.js`、`baseline_regression/tools/verify_places.js`、`baseline_regression/run_baseline.bat`）内置**源码修改时间新鲜度拦截**（`tools/freshness_check.js`）。如果二进制早于源码修改时间，测试会强行终止并报错提示，禁止通过篡改时间或跳过检查绕过。
+- **同步编译与产物新鲜度纪律（防验证脱节）**：
+  - 修改 `src/` 或 `patches/` 后、运行任何测试/回归脚本前，**必须执行 `.\build.bat llamalibs dual`**，确保三个回归产物原子同步更新：生产/对话产物（`build/StreamMoE/.../llama-cli.exe`）、转储/测试产物（`build/StreamMoE_dump/.../llama-server.exe`）、上游参照产物（`build/upstream_dump/.../llama-server.exe`）。严禁只编译其中一个目标就跑另一个目标的测试。（2026-10-26 起 dual = 这三个 tag。）
+  - 所有测试脚本（`tools/run_export.js`、`baseline_regression/tools/verify_places.js`、`baseline_regression/run_baseline.bat`）内置**源码修改时间新鲜度拦截**（`tools/freshness_check.js`）。`run_baseline.bat` 现在同时检查 moe 与 upstream 两个二进制；任一早于源码修改时间即强行终止并报错提示，禁止通过篡改时间或跳过检查绕过。
   - 回归测试链路强制加入 CLI 混合池快速冒烟测试（`tools/smoke_cli.js`），必须覆盖用户典型场景（如 `RAM:8192,Vulkan0:5120` 混合池 + `llama-cli` 直跑推理），验证输出文本可读性，防止单靠服务端 dump 验证遗漏 CLI 推理错乱/胡话。
 
 ## 项目必知速记（2026-09-17 阅读重要文档后整理）
