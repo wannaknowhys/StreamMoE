@@ -1,14 +1,17 @@
-# 设备侧 fold + 每层单次提交（设计）
+# 设备侧 fold + 提交单元 arena + head 融合（设计）
 
 [English](DEVICE_FOLD_HEAD_FUSION.md) | [简体中文](DEVICE_FOLD_HEAD_FUSION.zh-CN.md)
 
-> 状态：**设计提案，2026-10-26；未实现。** 针对唯一执行器
-> `exec_layer_burst_chain_buckets`（`src/backend/minigraph_exec.cpp`）的两项改动：
+> 状态：**A 已确认（2026-10-26）。B 修订为：arena 按"提交单元"规划，替代按层的
+> scratch parity。** 针对唯一执行器 `exec_layer_burst_chain_buckets`
+> （`src/backend/minigraph_exec.cpp`）的两项改动：
 >
-> - **A. 设备侧 fold**：把每池 partial accumulator 与 `moe_out` 留在 tail 所在设备，
->   不再把每个设备 partial 读回 host 做 host fold（只影响 multi-target 路径）。
-> - **B. 每层单次提交**：把 `[MoE(L) + Tail(L) + Head(L+1)]` 合成一张设备图；需要
->   **per-layer scratch parity**，因为当前 arena 把所有层共用同一段 scratch 窗口。
+> - **A. 设备侧 fold**（已确认）：把每池 partial accumulator 与 `moe_out` 留在 tail 所在
+>   设备，不再把每个设备 partial 读回 host 做 host fold（只影响 multi-target 路径）。
+> - **B. 提交单元 arena + 每层单次提交**：以提交单元
+>   `[closure(L) + tail(L) + head(L+1)]` 为单位做 liveness 打包（单元内按活跃区间复用，
+>   单元之间复用同一窗口），再把这个单元融成一张设备图。这取代了之前的"按层 parity"：
+>   parity 用 2×scratch 绕开别名，而单元规划是**证明**复用合法，且不额外占内存。
 >
 > 相关：`M2_DEVICE_EXECUTOR.md`（§7.8 出口、§7.9 设备 round）、`PER_DEVICE_ARENA.md`
 > （§6 区域、§7 open items）、`DEVICE_DENSE_CLOSURE.md`（3.6 每设备 `moe_out`、
@@ -56,19 +59,29 @@
 所以 GPU 路径上的 fold = D2H + host fold + H2D 写回设备 buffer。
 
 scratch：`plan.scratch_size = max over layers`，每层 offset 都从 0 在**同一窗口**里打包
-（[route_b_chain.cpp:565-578](src/backend/route_b_chain.cpp:565)）；节点 data =
-`base + carry1 + carryN + scratch_off`。这就是跨层融合会别名的原因。
+（[route_b_chain.cpp:506-578](src/backend/route_b_chain.cpp:506)）；节点 data =
+`base + carry1 + carryN + scratch_off`；`ex->result_bytes` 就是这个层窗口（`lb`），而闭包
+运行期 bump（`pool_bump`，[:2195-2211](src/backend/minigraph_exec.cpp:2195)）从
+`base = result_bytes` 开始，即**在静态区之后**。这既是跨层融合别名的原因，也说明运行期
+bump 本来就在静态布局之外。
 
 Tier-2 在"单设备 target"时已融合 `MoE(L)+Tail(L)`
 （[minigraph_exec.cpp:2464-2530](src/backend/minigraph_exec.cpp:2464)）；head 融合被硬关
 （[:2526](src/backend/minigraph_exec.cpp:2526)），`out_fused_head_next` 从未置 true，所以
 [:3348](src/backend/minigraph_exec.cpp:3348) 的 `continue` 是死代码。
 
-## 3. 设计 A —— 设备侧 fold（multi-target）
+carry：`carry1` 是 cross-1 边界张量集合、**按层奇偶双缓冲**
+（[route_b_chain.cpp:462-481](src/backend/route_b_chain.cpp:462)）；`carryN` 作为 retained
+打包（[483-494](src/backend/route_b_chain.cpp:483)）；两者都在设备边界 relay。KV 归
+llama，不在 arena 里。
+
+## 3. 设计 A —— 设备侧 fold（已确认）
+
+**决定（2026-10-26）：按原设计通过，先于 B 实现。**
 
 ### 3.1 目标 / 非目标
 
-目标：当一层的 round 同时落在 host 与一个或多个设备上时，在 **tail 所在设备**上产出
+目标：一层的 round 同时落在 host 与一个或多个设备上时，在 **tail 所在设备**上产出
 `moe_out`，不做 host fold 往返，并把设备同步从 2 次降到 1 次。
 
 非目标：改单 target 路径（已 elide）；P2P 设备互拷（本栈没有 semaphore 暴露）；把 CPU
@@ -179,7 +192,7 @@ Staging：每设备一块 grow-only 主机可见 buffer，大小
 - TMR 前后对比：`tail_read`/`tail_fold` 应降到 ~0，`tail_sync` 次数减少 1。
 - expert history 不变（路由与 fold 无关）。
 
-## 4. 设计 B —— 每层单次提交（scratch parity + head fusion）
+## 4. 设计 B —— 提交单元 arena + head 融合
 
 ### 4.1 真正的阻塞
 
@@ -188,20 +201,96 @@ Staging：每设备一块 grow-only 主机可见 buffer，大小
 CHECKPOINT 记录过这种并图造成 GPU 地址碰撞（输出乱码）。**router ids 回读不是阻塞**：
 ids(L+1) 在图返回后才读，正好是当前每层已有的那次同步点。
 
-### 4.2 parity 布局
+### 4.2 提交单元：定义
 
-- `plan.scratch_stride = max_L(lb_L)`（今天的 `scratch_size`）。
-- `plan.scratch_size = 2 * scratch_stride`（parity 0/1）。
-- 层 L 的基址 = `off_scratch + (L & 1) * scratch_stride`；`scratch_off[node]` 相对该基址。
-- 闭包节点 `ex->out_off[i]` 保持相对；执行器的 `moe_chain_fullalloc_buffer`/`bind_fresh`
-  基址加上同一 parity 偏移，`result_bytes = scratch_stride`。
-- CPU full-alloc block（`moe_chain_set_full_alloc`）同样按 2× 申请（保持一致；将来 CPU
-  侧也可能并图）。
-- `xfer` shell 已按 consumer layer 键控，不受影响。
-- 内存成本：每设备 +scratch_stride（olmoe decode 8MB→16MB，prefill 128MB→256MB；
-  gemma/deepseek 同量级）。可接受。
+执行器每 token 的结构是：
 
-### 4.3 资格谓词（每层、运行时结构判定）
+```
+U0      = [ head(L0) ]
+U_k     = [ closure(L_k) + tail(L_k) + head(L_k+1) ]      k = 0 .. n-2
+U_last  = [ closure(L_{n-1}) + tail(L_{n-1}) ]
+```
+
+每个单元以 ids 回读（每层唯一 host break）结尾，即结束在**同步点**。单元内节点严格按
+closure -> tail -> head 的顺序执行；单元之间可以复用同一窗口，因为同步已经回收所有在飞
+读取。
+
+于是规划变成：
+
+- 每个单元的非 carry、非 view 节点，沿用现有 `pack_interval` 做 liveness 打包（按设备），
+  时间轴跨整个单元（`head(L+1)` 的节点排在 `tail(L)` 之后）；
+- `unit_stride = max over units(打包大小 + 运行期 bump 上界)`；
+- `scratch_size = unit_stride`，每个单元都用同一窗口（offset 0），和今天按层复用完全
+  同构，只是"单元"更大；
+- 闭包的 `out_off` 与 `result_bytes` 取单元中闭包那一段的打包结果；运行期 bump
+  （`pool_bump`）仍从 `base = unit_static` 开始（静态区之后），与今天一致；
+- CPU full-alloc（`moe_chain_set_full_alloc`）用同一个单元窗口尺寸。
+
+### 4.3 为什么合法（以及为什么 parity 是 hack）
+
+- **单元之间**复用合法，因为中间有同步；**单元内部**只有在 liveness 允许时才能复用——
+  这正是 `pack_interval` 已经在算的东西。
+- 单元边界由**放置和图结构**（每层一个 head、每层一个 ids barrier）决定，**不由运行时
+  路由决定**：一个 token 的专家落 RAM 还是 VRAM 只改变跑哪些 round，不改变节点集合与
+  顺序。所以单元规划在 build 期确定、跨 token 稳定。
+- parity（2×scratch）只是为了在没有同步的跨层组合下"绕过"别名；单元规划对真正的组合
+  证明同一性质，而且只用一个窗口。内存：不翻倍（单元 ≈ 最大层大小，外加一个现在活过
+  拼接点的 tail→head 张量，一个 hidden 大小）。
+
+### 4.4 单元规划覆盖什么
+
+| buffer | 在单元内？ | 由谁处理 |
+| :--- | :--- | :--- |
+| dense head/tail 临时量 | 是 | 单元 liveness 打包 |
+| 闭包静态节点（`out_off`、`result_bytes`） | 是 | 单元 liveness 打包 |
+| 闭包运行期 bump（`pool_bump`：孪生/gather/fold） | 是（黑盒） | 预留 `unit_static` 之后，按设备取上界 |
+| tail(L) 产出、head(L+1) 消费的张量 | **是** | 单元 scratch（不是 carry）；同设备时其 relay 消失 |
+| tail/head 跨设备边 | 否（两张设备 plan） | xfer shell（目前独立区域；以后可并入单元打包） |
+| closure(L) 的 `cur`（由 head(L) 产出） | 否（跨 ids barrier） | `carry1`（parity） |
+| cross-N retained 状态 | 否 | `carryN` |
+| KV cache | 否 | llama 管理 |
+
+也就是说：**生命周期完整落在单元内的东西全部并入同一份 plan**；只有跨 ids barrier 的
+`carry1` 与 retained 的 `carryN` 保持特殊。这与"除了 cross buffer 之外都一次性搞定"一致
+——另外要补充：cross-1 是被 ids barrier 逼出来的，不是 plan 的缺陷。
+
+### 4.5 多残差流
+
+plan 是逐张量的，所以 k 条残差流就是每个边界 k 个张量：
+
+- 单元内消费完的流 → 单元 scratch；
+- 跨 ids barrier 的流 → `carry1`，它的边界集合本来就是"集合"（parity 作用于整个集合，
+  是集合 2×，不是每条流 2×）；
+- retained 的流 → `carryN`。
+
+不需要新机制。但本设计之外仍有两个假设：**每层一个 MoE 闭包**（`g_layer_exec` 每层一个
+`moe_layer_exec_t`，闭包取第一个 `MUL_MAT_ID`），以及每层一个 accumulator
+（`acc_d`/`moe_out`）。如果将来某架构每层有多个 MoE 块，那是另一项改动。
+
+### 4.6 注意 / 非目标
+
+1. **运行期 bump 区**不在静态 liveness 模型里。保留今天的规则
+   （`base = unit_static + acc`，bump 在后），保证它不可能压到 tail/head 静态区；每设备
+   上界 = `max over layers(pool_bump)`。
+2. **每设备两块 buffer**：设备 arena 与 CPU full-alloc block 都按 `out_off` 索引，两者
+   都要用单元窗口定尺寸。
+3. **xfer shell** 第一步不吸收（保持独立区域，按 consumer layer 打包，与今天一致）。
+4. 单元规划是**纯布局**改动，必须在当前"两图/两次提交"路径上验证**逐字节一致**之后，
+   才允许打开融合。
+
+### 4.7 head 融合的构造（单元规划落地之后）
+
+- 在 Tier-2 块（[:2464-2530](src/backend/minigraph_exec.cpp:2464)）里，append 完 tail
+  节点后，按拓扑序 append `Head(L+1)` 的 dense 节点（它们已在单元窗口内，offset 已经
+  规划好）。
+- **提交前**派发 `Head(L+1)` 的 incoming relay（同设备放置时多数是内部边；外部的是
+  KV/positions，已在设备上）。图里不能出现"源在本图更晚才产出"的 relay。
+- 置 `out_fused_head_next = true`；调用侧循环已有
+  `fused_tail && fused_head_next -> continue`（[:3348](src/backend/minigraph_exec.cpp:3348)）。
+- ids(L+1) 由下一轮 `exec_moe_closure(L+1)` 在本层 sync 之后读取；pin 路径不变。
+- 保留 Tier-1 作为回退。
+
+### 4.8 资格谓词（每层、运行时结构判定）
 
 ```
 fuse_head_next(L) =
@@ -214,70 +303,59 @@ fuse_head_next(L) =
 
 不满足就保持今天的行为（Tier-1 融合 tail+next head，或分开 head）。
 
-### 4.4 构造
+### 4.9 正确性不变量
 
-- 在 `exec_layer_burst_chain_buckets` 的 Tier-2 块
-  （[:2464-2530](src/backend/minigraph_exec.cpp:2464)）里，append 完 tail 节点后，按拓扑序
-  append `Head(L+1)` 的 dense 节点。
-- **提交前**派发 Head(L+1) 的 incoming relay（同设备放置时多数是内部边；外部的是
-  KV/positions，已在设备上）。图里不能出现"源在本图更晚才产出"的 relay。
-- 置 `out_fused_head_next = true`；调用侧循环已有
-  `fused_tail && fused_head_next -> continue`（[:3348](src/backend/minigraph_exec.cpp:3348)）。
-- ids(L+1) 由下一轮 `exec_moe_closure(L+1)` 在本层 sync 之后读取；pin 路径不变。
-- 保留 Tier-1 作为回退：head 不可融合的层仍走 `exec_fused_tail_and_head`。
-
-### 4.5 与 A 的关系
-
-- 同设备（单池）：A 是 no-op（已 elide），B 可单独落地。
-- 混合池 + 单物理设备：B 需要 A（fold 必须在 D 上、先于 tail，而 tail 在融合图里）。
-  先 A 后 B，B 的谓词再纳入混合情况。
-- 多物理设备：B 的谓词保持 false（head 可能在别的设备），继续 Tier-1。
-
-### 4.6 正确性不变量
-
-1. 融合图内任何两节点不得共享 scratch 字节，除非可证明同时死亡。parity 按层保证；层内
-   仍按现有 `pack_interval` 顺序。
-2. 融合节点表按拓扑序；tail(L) 在 head(L+1) 之前，且 head 节点不得读取尚未发出的 tail 节点。
-3. `executed_relays` 记账必须在融合调用内共享，保证 tail/head relay 只派发一次。
+1. 单元内任意两节点不得共享 scratch 字节，除非在单元执行顺序下活跃区间不相交；跨单元
+   边界复用必须被同步分隔（按构造它一定被分隔）。
+2. 融合节点表按拓扑序；tail(L) 在 head(L+1) 之前，且 head 节点不得读取尚未发出的 tail
+   节点。
+3. `executed_relays` 记账在融合调用内共享，保证 tail/head relay 只派发一次。
 4. 每层 Tier-1 与 Tier-2 互斥（Tier-1 分支加断言 `!(fused_tail && fused_head_next)`）。
 5. 最后一层没有 `Head(L+1)`；`exec_moe_closure(-1)` 路径不变。
-6. 数值：并图不改变任何算术，只改变提交分组 → 输出应与两图路径**逐字节一致**（同内核、
-   同顺序）。出现差异一律当 bug。
+6. 数值：单元规划（只改布局）与融合（只改提交分组）都不改变算术 → 两者都应与当前路径
+   **逐字节一致**。出现差异一律当 bug。
 
-### 4.7 失败模式与处置
+### 4.10 失败模式与处置
 
 | 失败 | 处置 |
 | :--- | :--- |
 | head 节点在 D 上不支持 | 谓词 false → Tier-1 回退 |
-| scratch parity 未分配到（设备 OOM） | 谓词 false + log（绝不静默别名） |
+| 单元窗口分配失败（设备 OOM） | 明确失败；绝不静默别名 |
 | relay 的源在图中更晚产出 | 谓词 false（建图前检查） |
 | 融合图超过 `gf->size` | 扩容（禁止今天的静默丢节点；[:2508](src/backend/minigraph_exec.cpp:2508) 要改成硬错） |
 | ids(L+1) 缺失 / 0-token | 保留 B38 的 0-token 提前返回 |
 
-### 4.8 验证
+### 4.11 验证
 
-- 与 A 相同的门禁；另外用 `STREAM_MOE_TMP_DUMP` 对 gemma + deepseek 逐层比对
-  `moe_out`/hidden（B 预期逐字节一致）。
-- TMR：`head` 桶应降到 1 次/token（c1c2exp5 现在是 16 次），每层提交数应为 1。
-- `verify_places` 12/12；`run_baseline` PASS；`smoke_cli` PASS。
+- 步骤 B0（只做单元规划、不融合）：`run_baseline` PASS 且 moe/upstream **IDENTICAL**；
+  `verify_places` 不变（8 逐字 + 同样 4 个已知 DIFF）；smoke PASS。这是强门禁：布局改动
+  不得移动数值。
+- 步骤 B1（融合）：gemma + deepseek 逐层 `STREAM_MOE_TMP_DUMP` 的 `moe_out`/hidden 对
+  B0 必须逐字节一致；TMR `head` 桶降到 1 次/token、每层提交数变为 1；12/12 拓扑 0 ERROR。
+- TMR 前后：`chain_tail`/`tail_sync` 与提交次数。
 
 ## 5. 顺序、成本、预期收益
 
 | 步骤 | 触及 | 风险 | 预期 |
 | :--- | :--- | :--- | :--- |
-| A. 设备侧 fold | 出口块 + fold plan + staging + arena 尺寸 | 中（multi-target 路径） | 混合池每层省 1 次 sync、1 次 D2H/H2D（olmoe ~0.2-0.4ms/层；deepseek 更大） |
-| B. parity + head fusion | `layout_arena` + Tier-2 块 + 循环 | 中高（别名证明） | 每层少 1 次提交（RX590 ~0.2-0.3ms/层；CUDA replay 后更大） |
+| B0. 提交单元 arena 规划（纯布局、不融合） | `layout_arena` scratch 段 + `result_bytes`/窗口 + CPU full-alloc + 设备 `arena_used` | 中（布局），数值风险为零 | 解除别名约束；**scratch 不额外占内存**（不同于 parity 的 2×）；不谈性能 |
+| A. 设备侧 fold | 出口块 + fold plan + staging | 中（multi-target 路径） | 混合池每层省 1 次 sync、1 次 D2H/H2D（olmoe ~0.2-0.4ms/层；deepseek 更大） |
+| B1. head 融合 | Tier-2 块 + 循环 | 中（别名已可证明） | 每层少 1 次提交（RX590 ~0.2-0.3ms/层；CUDA replay 后更大） |
 
-A 是混合池上 B 的前置；单设备放置时 B 可独立落地。两者都**不替代** `BENCHMARK.md` 测到的
-逐节点 dispatch 成本：RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
-必须先用同一个 probe 测，再决定 B 要走多远。
+B0 是 B1 的前置，可先落地（行为中性）；A 独立、混合池必需；B1 把目前死掉的
+`can_fuse_head_next` 路径接通。三者都不替代 `BENCHMARK.md` 测到的逐节点 dispatch 成本：
+RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）必须先用同一个 probe
+测，再决定 B1 要走多远。
 
 ## 6. 待确认
 
-1. 多物理设备的 foreign partial 路径现在就做，还是只做"同一物理设备"？
+1. 多物理设备的 foreign partial 路径（A）现在就做，还是只做"同一物理设备"？
    （目标是单 P100 + RAM，第一里程碑不需要前者。）
-2. parity 取 2 还是 N（N = 最大融合深度）？看一眼层就够；只有将来做跨层批处理才需要 N>2。
-3. 是否需要 TEMP dump（`STREAM_MOE_TMP_FOLD_DUMP`）逐层对比设备 fold 与 host fold？
-   建议要，仅 bring-up 用。
-4. 将来 CUDA replay：round-shape cache 用 `(layer, stage, width, n_active)` 作键够不够？
+2. 单元规划：`head(L0)` 与末尾 `[closure+tail]` 按文中作为独立单元（按同步论证是的），
+   还是给它们更小的第二窗口？（建议共用同一窗口，它们本来就是最大层量级。）
+3. B0 是否顺手把 `xfer` shell 吸收进单元打包，还是保持独立 xfer 区域、以后再并？
+   （建议以后——一次只改一件事。）
+4. B0 是否顺手把 tail(L)→head(L+1) 的内部 carry 降级为单元 scratch？
+   （单元建好后很便宜，但会改 relay 集合；建议等 B0 验证逐字节一致后单独一步。）
+5. 将来 CUDA replay：round-shape cache 用 `(layer, stage, width, n_active)` 作键够不够？
    （decode 的 width ∈ [0..n_k]。）
