@@ -2,17 +2,19 @@
 
 [English](EXPERT_MOVE_PIPELINE.md) | [简体中文](EXPERT_MOVE_PIPELINE.zh-CN.md)
 
-> Status: **design, 2026-09** - a working session decided the next scheduler
-> redesign. The landed batch-pin layer (slot_request bitmap / wake-once, see
-> WORK_IN_PROGRESS L) is the base this builds on. This doc captures the FULL
-> design so nothing is lost between sessions.
+> Status: **design, 2026-09; M1-M5 landed** (M5 2026-09-05), M6 partial, M7/M8
+> open - see the revision box below and §9 build order. A working session decided
+> the next scheduler redesign. The landed batch-pin layer (slot_request bitmap /
+> wake-once, see WORK_IN_PROGRESS L) is the base this builds on. This doc captures
+> the FULL design so nothing is lost between sessions.
 > Related: `docs/WORK_IN_PROGRESS.md` L / J, `docs/Backend.md` §2/§4,
 > `docs/EXPERT_SCHEDULER_DESIGN.md`, `src/backend/scheduler.{h,cpp}`,
 > `src/backend/slot.h`.
 >
 > **2026-09-04 revision**: build-order steps 1-4 landed (M1-M4, commits
-> 6b6300e / dbaff8f / 45b14de / fdf4982). M5 (active-slot accounting) and M7
-> (doc convergence) still open; M6 partial. Step 4's v2r is now transfer-queue
+> 6b6300e / dbaff8f / 45b14de / fdf4982). M5 (active-slot accounting) **landed
+> 2026-09-05** (slot_request_t 96 -> 104 B); M6 partial; M7 (doc convergence)
+> still open; M8 (concurrency UTs) still open. Step 4's v2r is now transfer-queue
 > DMA, which **overturns §5.2's "CPU-memcpy-only" conclusion** - see the
 > revision box there and `docs/VRAM_DMA_MOVE.md`.
 
@@ -563,20 +565,22 @@ failure signal". The ledger lives in active_, not in hack bumps.
 1. Directory: widen to (L,E)-keyed state (A1); keep owner_ until step 3 compiles. **[done - M1, 6b6300e]**
 2. Load path: publish LOADING before begin_reload (ordering invariant); single
    active request slot per model (removes duplicate-load window; §7.1).
-   **[done for the LOADING-before + state-aware accept side - M2, dbaff8f;
-   single-active-slot NOT done - it is part of M5]**
+   **[done - M2 (dbaff8f) + M5 single-active-slot (2026-09-05)]**
 3. Eviction: (L,E)-keyed layer-distance selection inside alloc_or_evict; delete
    `owner_` (8 uses, all in alloc_or_evict, already enumerated). **[done - M3, 45b14de]**
 4. Move pipeline: move_task ring + 1 worker (v2r + r2v) + completion drain;
    wire v2r into eviction of a device victim; r2v available for placement
    policy later. **[done - M4, fdf4982; v2r now DMA per §5.2 revision - 717bac8]**
 5. Scheduler-side accounting: active-slot counter, drain-unified bump, wake-once
-   (§7); exec side becomes stateless pin+resubmit (§3.5). **[NOT done - M5 open]**
-6. Verify: pure-RAM IDENTICAL (as today); VRAM single-device run reaches
-   `exec_mm_vk` (this is the K6/L6b blocker); UT for directory states + move
-   ring + eviction ordering. **[partial - M6: pure-RAM path unchanged (RAM sources
-   have dev_buf==null -> memcpy), DMA content gate 0 BAD, VRAM demote storms
-   eliminated; exec_mm_vk arrival + state/move UT still open]**
+   (§7); exec side becomes stateless pin+resubmit (§3.5). **[done - M5, 2026-09-05;
+   slot_request_t 96 -> 104 B (+failed)]**
+6. Verify: pure-RAM IDENTICAL (as today); VRAM single-device run reaches the
+   device executor; UT for directory states + move ring + eviction ordering.
+   **[partial - M6: pure-RAM path unchanged (RAM sources have dev_buf==null ->
+   memcpy), DMA content gate 0 BAD, VRAM demote storms eliminated; the old
+   `exec_mm_vk` arrival check is obsolete (legacy path deleted, device rounds now
+   run per-device bucket graphs - see docs/M2_DEVICE_EXECUTOR.md §7.9); state/move
+   UT still open (M8)]**
 
 ## 10. Files touched
 

@@ -2,7 +2,10 @@
 
 [English](ROUTE_B_LAYER_OWNERSHIP.md) | [简体中文](ROUTE_B_LAYER_OWNERSHIP.zh-CN.md)
 
-> Status: **design, 2026-09-10**. Converged from the "cur copy / seam" discussion.
+> Status: **design, 2026-09-10; landed 2026-09-15** (whole-layer capture +
+> device-local buffers + per-device arena + generic xfer; dynamic C1 migration
+> still open - see `DENSE_PLACEMENT.md` Phase 2). Converged from the "cur copy /
+> seam" discussion.
 > Supersedes the per-GPU-MoE-backend sketch (that sketch fixes only static
 > placement). Related: `ROUTE_B_GPU_PHASE.md` (whole-layer self-scheduling),
 > `M2_DEVICE_EXECUTOR.md` (per-device executor + arena), `DENSE_PLACEMENT.md`

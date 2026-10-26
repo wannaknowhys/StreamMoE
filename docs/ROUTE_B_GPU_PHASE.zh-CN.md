@@ -2,7 +2,10 @@
 
 # Route B 多设备专家池设计方案（Phase B）
 
-> 状态：设计，**2026-09 多次修订**（取代 2026-08-29 旧版）。基于 route B 第三路径（官方
+> 状态：设计，**2026-09 多次修订；2026-10-26 更新落地状态**（取代 2026-08-29 旧版）：
+> M1 完成；**M2 完成**（数据层 + per-device 执行器，`docs/M2_DEVICE_EXECUTOR.md` §7.9）；
+> **M3 部分**（多设备分段已按拓扑序执行，同层 C1 跨设备拆分仍无入口）；**M4 部分**
+> （迁移原语 = 异步 move worker + v2r DMA，r2v 放置策略未用）。基于 route B 第三路径（官方
 > `ggml_mul_mat_id` 内核 + 均匀 stride 槽池，`docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7）。
 > 保留已验证事实：Vulkan/CUDA 原生支持 `MUL_MAT_ID` + 池槽 3D 布局；RX 590 真实 8 GiB
 > `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` 堆；GGML_VULKAN=ON 干净构建。

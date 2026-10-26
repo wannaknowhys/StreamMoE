@@ -2,7 +2,10 @@
 
 [English](BUCKET_FAST_PATH.md) | [简体中文](BUCKET_FAST_PATH.zh-CN.md)
 
-> 状态：设计讨论（2026-09-09），**未实现**。对应 `docs/WORK_IN_PROGRESS.md` P1。
+> 状态：**已实现**（设计 2026-09-09；P1-a..P1-g 与 P1b fold 选择同日落地）。
+> 唯一执行器现在建图期按 §9 条件发射恒等节点，`append_expert_fold` 按 fold 字节数
+> 选择 SUM_ROWS / per-k add 链。本文仍未覆盖 P2（每层 submit+sync）。
+> 对应 `docs/WORK_IN_PROGRESS.md` P1。
 > 目标：在满宽 / 单设备场景下，省掉唯一执行器 `exec_layer_burst_chain_buckets`
 > （`src/backend/minigraph_exec.cpp`）里恒等与单目标归约带来的固定开销。
 > 本文记录讨论结论、精确判据、转置（CONT）分析、风险与验证口径。

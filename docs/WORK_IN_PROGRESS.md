@@ -68,12 +68,12 @@
 
 - [x] G1 调研完成：gemma4 门控自定义在 gemma4.cpp（attn_out 上 rms_norm+scale+gate_inp_s+mm，dense 域），probs_in 传入 build_moe_ffn；链 = softmax/topk/weights(norm_w) -> fused gate_up MUL_MAT_ID -> view gate/up -> geglu_split -> down MUL_MAT_ID -> mul weights -> 逐expert view/add -> moe_out；每层 2 个 MUL_MAT_ID；post_norm_2 在链外 dense 域（build_moe_ffn 实际调用参数：gate_up merged/up_down_mm_id/norm_w/gating/down 等）+ 现状 minigraph 接口
 - [x] G2 定案：执行形态 A = 逐节点 mini-graph + 数据私有（不建影子链/不重建拓扑，拓扑来自主图 -> 无 per-arch 重建器）；私有 arena 中间 / view 指针偏移 / moe_out 直写主图 dst；专家视图接口 = resolve(L,E)->{pool,slot 基址/stride}；mock 点清单见 docs/MOCK.md
-- [ ] G3 实现：graph_compute 收整层 -> 重建 -> 官方核执行（中间 arena 不写主图链中间）
-- [ ] G4 CPU 伪双 device_pool + ids 分组/汇总逻辑
-- [ ] G5 数值对齐官方（v2/prefill 对比）
+- [x] G3 ~~实现：graph_compute 收整层 -> 重建 -> 官方核执行~~ —— 已由 O 节实现取代（整层 capture + 桶引擎，见 2026-09-08 段）
+- [x] G4 ~~CPU 伪双 device_pool + ids 分组/汇总逻辑~~ —— 已由 O 节实现取代（per-pool round + pin_layer 返回 pool）
+- [x] G5 ~~数值对齐官方（v2/prefill 对比）~~ —— 已由 O 节回归覆盖（纯 RAM IDENTICAL / 设备 cos gate）
 
 - [x] G3a verify 安全网落地（494f670）：route_b_chain 模块 + llama-context 三处 build 挂点 + CMake 源；gemma 验证 420 hidden/0 external。**patch 欠账**：vendored llama-context.cpp（route-b 挂点 hunk，与 prefill 同文件需手动 hunk）+ common/CMakeLists.txt（route_b_chain.cpp 源）待补进 route-b patch
-- [ ] G3b 执行器（方案已定）：supports_op 接 moe_chain_node_is_privatizable（非 view 计算节点）；moe_exec phase2 对非 MUL_MAT_ID 计算节点（geglu/mul/add/moe_out——无权重、src 主图真写）用**手动 1 节点 cgraph**（ggml_new_graph + nodes[0]=原节点）官方 cpu 核直跑，**无需 per-op 重建**；view 衔接 + MUL_MAT_ID w3d 不变；顺序=split 节点序。第一版真写 dst 对齐数值，再切藏 arena + 链尾 unpin
+- [x] G3b ~~执行器（方案已定）~~：已由 G3b stage-1/stage-2 取代（见下两行）
 
 - [x] G3b stage-1 完成（d9f5bbb）：显式收编（preset 180 链计算节点 -> stream_moe）+ 修 has_moe 早退 + resolve 单池 fallback + 手动 1-node cgraph 执行无权重链节点；**回归 IDENTICAL**（整层链我们执行、真写主图 dst）。debug log 已清。patch 欠账：llama-context 3 处 assign 调用（vendored，route-b patch 待补）
 - [x] G3b stage-2 私有化完成（0829d50/双模式）：乒乓+fullalloc 双模式回归 IDENTICAL（前置聚合问题经乒乓共享持久区绕开）。原内容：：前置 = sched 每节点仍单 split（不聚合整层——中间跨 split 必须真写主图），需先查 pass5 为何预设同 backend 仍拆单节点（聚合后中间才可在同 graph_compute 内自己区迭代）；再改 moe_exec 中间 dst -> 私有 arena + 链尾 unpin
@@ -284,7 +284,8 @@
 >   129-token 64MB 跑通 14.4s（DIO/计算主导，demote 已摊销）。exec_mm_vk 到达 + 新 UT 待补
 > - [ ] M7 文档同步（设计文档 §8 open questions 逐条收敛；EXPERT_MOVE_PIPELINE 更新 M4 DMA）
 > - [ ] M8 UT：M5 §7.4 四个并发验收用例（登记前 settle / B 含 ABSENT / B 中途失败回滚 / 单活跃）——
->       test_scheduler 目前因 stmoe_vk_dma_read 链接问题不编（既有），M8 需先修 test 链接或改独立测试
+>       **test_scheduler 链接问题已修复**（f68d442 改为 per-pool DMA 回调，不再引用 stmoe_vk_dma_read；
+>       当前 ctest 6/6 通过且含 test_scheduler）。M8 缺的是 4 个 UT 本身，不再有链接前置。
 
 - [x] M2-2 真并行骨架：per-device 整链 cgraph + async 提交 + CPU/VK 重叠 + acc_d 回读 + host fold（WIP O / M2 §7.9；overlap 已验证 = 串行，逐层 acc IDENTICAL）
 - [x] M2-3 出口 scatter 通用化（随 per-pool round + `layer_fold` 落地）：每 pool 一个 round，折进各自 acc，host 端按参与集 fold；设备 acc 走 `tensor_get` DMA 回读
@@ -308,7 +309,8 @@
 
 当前代码：79d0f7c 函数拆分（fold off 全铺 = IDENTICAL 回归基线，保留）；
 09c0c52 §7.8 单 device 三段（acc_d→add_in→host fold，device_used=1，数值 = 预期 ulp 分布）。
-待做：三函数真桶化（紧凑链重建）+ 桶循环 + 逐层 dump 宽松 gate。
+**已完成（2026-09-07/08）**：三函数真桶化（紧凑链重建）+ 桶循环 + 逐层 dump 宽松 gate 均已落地，
+后续由「token-subset round」接 `build_mix_plan` 取代 k-slot 切分（见下文 2026-09-08 段）。
 
 **落地（2026-09-07，STREAM_MOE_TEMP / dbg 构建 / env STREAM_MOE_TMP_CHAIN_BUCKETS）**：
 CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（minigraph_exec.cpp）：
@@ -322,17 +324,20 @@ CPU 单 pool 两桶原型引擎已写进 `exec_layer_burst_chain_buckets`（mini
 - 验证：129-token prefill-from（v2align，`temp/chain_buckets_gate.bat`）：
   - `one`（紧凑构建器单满宽桶）vs `full`（旧满宽 clone fold 路径）**30 层 moe_out 逐字节一致** → 紧凑孪生引擎几何正确；
   - `cut3`（[0,3)+[3,8) 两桶）L0 maxAbs 7.6e-6 ≤ 1e-5（唯一同输入可比层）；L1+ 因折序 ULP 经层间残差放大 + L3+ argsort 专家翻转发散（已归档噪声类，非 bug）。
-- 待做：逆序桶序看 ULP 上限；token 子集 scatter-add（mock 挡）；deepseek 的 clamp/swiglu 紧凑克隆；把紧凑孪生孪生键从"per-bucket 重建"提升到跨桶复用（REPEAT/外部 scale 表与桶无关）。
+- **已完成**：token 子集 scatter-add（scatter_plan 接入，2026-09-08）、deepseek 的 clamp/swiglu 紧凑克隆
+  （2026-09-08 设备实测 `RAM:71680 + Vulkan0:1024`，cos gate 内）。
+- 待做：逆序桶序看 ULP 上限；把紧凑孪生键从"per-bucket 重建"提升到跨桶复用（REPEAT/外部 scale 表与桶无关）。
 
-**scatter_plan 设计（2026-09-07，docs/SCATTER_PLAN.md 双语文档已落，等用户）**：
+**scatter_plan 设计（2026-09-07 定案，docs/SCATTER_PLAN.md 双语文档已落；2026-09-08 已实现）**：
 
 - 语义确认：tight 重排（如桶 token {0,2,3,4} → {0,2,4,3}）+ acc 等差段（src 连续 len 列 → dst 等差 base/Δ）。
 - **ggml_acc 支持 dst 等差间隔（Δ≠1）**：CPU 核 dst[offset+i1*nb1]+=src1[...]，nb1=Δ*d_out*4、offset=base*d_out*4，中间 dst 列不动（ops.cpp:1215-1233 验证）。
 - 重排消费在 **cur 拷贝层**（首 mm 前按 tight 序收集 cur → 链列序继承 → per_token 天然分段）。
 - per-token 受影响输入盘点：cur / ids / weights_norm（per-slot 路由权重，slot 切片+token 重排）；专家权重与 scale REPEAT 表不受影响。
-- 待做：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp。
+- 已落地（2026-09-08）：scatter_plan.h/.cpp 纯模块（贪心最大 run 抽取）+ test_scatter_plan.cpp
+  （ctest 6/6，含 30 任务 grid 与固定用例）；executor 已按 order/segs 消费。
 
-**收敛计划（2026-09-07 冻结，未执行——先做 out_off buffer 改造）**：
+**收敛计划（2026-09-07 冻结；已执行，见下文"删 A 收敛完成"）**：
 
 - 目标：唯一执行引擎 = 紧凑链 buckets 引擎；删 A 全族（exec_split_legacy_impl / exec_mixed_mm /
   exec_one_burst / hide_output / hide_burst / refresh_aliases / `tmp_split_*` 自测 / exec_round_cpu|vk /
@@ -507,7 +512,7 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
 （冷启专家装载）+ `burst_tail` 5.4s（CPU 图+设备 sync+acc 回读+host fold）+ `burst_rounds`
 0.08s（host 规划+紧凑图构建+提交）。
 
-- [ ] **P1 统一路径 + 建图期条件发射 + scratch 灭小 vector（2026-09-09 定）**：
+- [x] **P1 统一路径 + 建图期条件发射 + scratch 灭小 vector（2026-09-09 定；P1-a..P1-g 全部落地）**：
       设计见 `docs/BUCKET_FAST_PATH.md`（EN）/ `.zh-CN.md` §9。用户拍板：**单一执行器不变**，
       单 pool 靠建图期不生成多余节点（等价图优化）；**CONT 保留**（P1b 再量）；
       **`mix_plan` 并入 scratch**。判据（每桶独立）：cur 省略 `n_active==n_t`；
@@ -539,7 +544,7 @@ t->data=stmoe_vk_buffer_host_offset(buffer, off)`（`vk_ptr_base+off`）。
     `place-c1c2-exp5`：P1 **pp 404.4 / tg 18.28** vs 同会话 HEAD 384.1 / 17.67（记录 380.5 / 17.81）。
   - 回归/性能（2026-09-09，P1-c/d/e 后）：三配置仍 **IDENTICAL**、单测 6/6；bench 同款
     **pp 391.9 / tg 18.66**（与 c/d/e 前同量级，符合预期——hygiene 不改算力）。
-- [ ] **P1b fold 路径按桶 token 数二选一（per-k add 链 vs SUM_ROWS）**：
+- [x] **P1b fold 路径按桶 token 数二选一（per-k add 链 vs SUM_ROWS）**（转正见下）：
   - 现状 `append_expert_fold` = `permute → cont(转置) → sum_rows → cont_2d`。**约束**：转置
     CONT 删不掉而不动 SUM_ROWS——Vulkan `sum_rows` shader 只认连续 ne0（无 nb00；CPU 也
     assert nb0==4），转置视图喂不进去。要删转置 = 换掉 SUM_ROWS。

@@ -2,7 +2,8 @@
 
 [English](PER_DEVICE_ARENA.md) | [简体中文](PER_DEVICE_ARENA.zh-CN.md)
 
-> Status: **design, 2026-09-14**. Follows the promotion of whole-layer ownership
+> Status: **implemented, 2026-09-14** (phase 3 landed 2026-09-15; open items in
+> §7). Follows the promotion of whole-layer ownership
 > to production (`LAYER_EXECUTOR_DESIGN.md`). The single host arena is too big
 > and ignores `--dense-placement`; this doc plans the per-device arena.
 > Related: `ROUTE_B_LAYER_OWNERSHIP.md` (target shape, §3.4/§3.5/§3.8),
@@ -300,7 +301,10 @@ generic stage-tagged transfer insertion above: carry, `cur` and `moe_out` all
 move through the `xfer` region.
 
 Still open: C1 **split** across devices (a within-layer head -> head edge would
-need a finer stage than `LAYER_FRONT`); device-side validation (C1/C2 on Vulkan).
+need a finer stage than `LAYER_FRONT`). Device-side validation is **done**:
+C1/C2 on Vulkan + mixed expert pools pass the 129-token gate (123/129, evidence
+`temp/embedding_probe_2026-09-17T19-07-02-705Z`) and the 12 placement topologies
+run clean (2026-10-26).
 Caveat: the rewire mutates the captured graph's `src` after the scheduler's
 tensor-backend pass - safe while route B owns the whole layer, but must be
 re-checked if that changes.

@@ -2,7 +2,8 @@
 
 # Route B Multi-Device Expert Pool - Design (Phase B)
 
-> Status: design, **revised 2026-09** (supersedes the 2026-08-29 draft). Builds
+> Status: design, **revised 2026-09; landed per §8** (M1 complete, M2 complete,
+> M3/M4 partial). Supersedes the 2026-08-29 draft. Builds
 > on route B third path (official `ggml_mul_mat_id` kernel + uniform-stride slot
 > pool, `docs/LLAMA_MOE_NO_MMAP_RESEARCH.md` §7).
 > Verified facts carried over: Vulkan and CUDA natively support `MUL_MAT_ID`
@@ -287,14 +288,16 @@ then decide whether a custom layer table earns its keep.
 
 ## 8. Milestones (risk-decreasing)
 
-> Status (2026-09): M1's CPU private-chain skeleton is complete (G3 stages,
-> IDENTICAL). A **data-layer-first subset of M2 landed ahead of the executor**
-> (docs/WORK_IN_PROGRESS.md J): vram pool allocation -> host-map channel
-> (`stmoe_vk_buffer_host_ptr`, RX590 DEVICE_LOCAL|HOST_VISIBLE) -> experts load
-> into vram and the CPU executes straight from its host mapping -> device
-> eviction demotes to RAM. The executor still runs one region at a time (single
-> region per active set); per-region dispersion (J6) shares its structure with
-> the M2/M3 per-device sub-computes and is deferred to the GPU-execution work.
+> Status (2026-09, updated 2026-10-26): M1 complete (whole-layer capture +
+> private chain, IDENTICAL). **M2 complete**: the data-layer-first subset
+> (docs/WORK_IN_PROGRESS.md J) plus the per-device executor landed
+> (`docs/M2_DEVICE_EXECUTOR.md` §7.9 - per-device bucket graphs, CPU/VK overlap,
+> acc_d readback + host fold; `--moe-expert-pools RAM:N,Vulkan0:M`). **M3 partial**:
+> multi-device segments execute in topological order (`topo_segment_execute`), but
+> same-layer cross-device C1 dispersion still has no placement syntax (C1 split is
+> open). **M4 partial**: the device migration primitives landed as the async move
+> worker (v2r demote via transfer-queue DMA, `docs/EXPERT_MOVE_PIPELINE.md` M4);
+> r2v placement policy is not used yet.
 
 - **M1** - CPU-only private-chain skeleton: per-layer private mini-graph
   (topology replayer for the gemma arch; official kernels, intermediates in our

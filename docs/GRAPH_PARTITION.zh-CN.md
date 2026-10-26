@@ -243,9 +243,9 @@ leaf 在 host、没有 Vulkan 池时复制循环为空，两者都正常——�
 - [x] `exec_layer_burst_chain_buckets` 与 `exec_layer_burst` 的 pin keys：用
       `host_image()` + `moe_id_at()` 读 ids（仅当 ids buffer 非 host-resident 时才拷贝；
       compact-ids 构建与 round 规划仍留 host）。
-- [x] 设备冒烟：gemma `C1:Vulkan0` + Vulkan 池干净跑通（exit 0）。注意 ids 拷贝分支是
-      防御性的：当前 sched 会把 ids 拷进我们的 host backend，所以生产路径还没触发；等闭包
-      以设备图跑、ids 设备常驻时才生效。
+- [x] 设备冒烟：gemma `C1:Vulkan0` + Vulkan 池干净跑通（exit 0）。ids 拷贝分支**当前每层
+      都命中**（`host_image()`，`minigraph_exec.cpp:2998`）：ids 现在驻留在我们的 STREAMMOE
+      host backend / 设备 round 上，所以 host 拷贝是正常路径，不再是防御性 fallback。
 
 ### C. 同设备接缝：`cur` / `ffn_moe_out` 不出设备
 

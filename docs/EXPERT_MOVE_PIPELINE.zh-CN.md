@@ -9,7 +9,8 @@
 > `docs/EXPERT_SCHEDULER_DESIGN.md`、`src/backend/scheduler.{h,cpp}`、`src/backend/slot.h`。
 >
 > **2026-09-04 修订**：构建顺序 1-4 已落地（M1-M4，commit 6b6300e / dbaff8f /
-> 45b14de / fdf4982）。M5（活跃槽记账）与 M7（文档收敛）未做；M6 部分。步骤 4 的
+> 45b14de / fdf4982）。**M5（活跃槽记账）已于 2026-09-05 落地**（slot_request_t 96→104B）；
+> M6 部分；M7（文档收敛）与 M8（并发 UT）未做。步骤 4 的
 > v2r 现走 transfer-queue DMA，**推翻了 §5.2 的"只能 CPU memcpy"结论**——见该节
 > 修订框与 `docs/VRAM_DMA_MOVE.md`。
 
@@ -476,19 +477,19 @@ exec 算完对 A∪B 逐个 unpin()。**绝不重复 pin B**（refcount 已被 s
 
 1. Directory：加宽为 (L,E) 键状态（A1）；owner_ 留到第 3 步编译通过。**[done - M1, 6b6300e]**
 2. 装载路径：begin_reload 前先发布 LOADING（顺序不变量）；每模型单活跃请求槽
-   （消灭重复装载窗口；§7.1）。**[先发 LOADING + state-aware accept 已做 - M2,
-   dbaff8f；单活跃槽未做——属 M5]**
+   （消灭重复装载窗口；§7.1）。**[已做 - M2 (dbaff8f) + M5 单活跃槽（2026-09-05）]**
 3. 驱逐：alloc_or_evict 内改 (L,E) 键层距选择；删 owner_（8 处用，全在此函数，
    已枚举）。**[done - M3, 45b14de]**
 4. Move 管线：move_task ring + 1 worker（v2r + r2v）+ 完成 drain；把 v2r 接进
    device victim 的驱逐；r2v 留给将来放置策略。**[done - M4, fdf4982；v2r 现为
    DMA（§5.2 修订）- 717bac8]**
 5. 调度侧记账：活跃槽计数 + drain 统一 bump + wake-once（§7）；exec 侧改无状态
-   pin+resubmit（§3.5）。**[未做 - M5 open]**
-6. 验证：纯 RAM IDENTICAL（如今天）；VRAM 单设备运行到达 `exec_mm_vk`
-   （这是 K6/L6b 阻塞项）；directory 状态 + move ring + 驱逐顺序的 UT。
+   pin+resubmit（§3.5）。**[已做 - M5，2026-09-05；slot_request_t 96→104B（+failed）]**
+6. 验证：纯 RAM IDENTICAL（如今天）；VRAM 单设备运行到达设备执行器
+   （旧 `exec_mm_vk` 验收点已随 legacy 路径删除，见 `docs/M2_DEVICE_EXECUTOR.md` §7.9）；
+   directory 状态 + move ring + 驱逐顺序的 UT。
    **[部分 - M6：纯 RAM 路径不变（RAM 源 dev_buf==null → memcpy）、DMA 内容门
-   0 BAD、VRAM demote 风暴消除；exec_mm_vk 到达 + 状态/move UT 未做]**
+   0 BAD、VRAM demote 风暴消除；设备执行已到达（per-device bucket 图）；状态/move UT 未做]**
 
 ## 10. 涉及文件
 

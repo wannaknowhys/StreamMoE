@@ -2,8 +2,9 @@
 
 [English](SCATTER_PLAN.md) | [简体中文](SCATTER_PLAN.zh-CN.md)
 
-> Status: **design, 2026-09**. Feeds the CPU two-bucket compact-chain prototype
-> (docs/WORK_IN_PROGRESS.md M2-5) and the eventual per-device mini-graph
+> Status: **implemented** (design 2026-09; module, executor consumption and unit
+> tests landed 2026-09-08). Feeds the CPU two-bucket compact-chain prototype
+> (docs/WORK_IN_PROGRESS.md M2-5) and the per-device mini-graph
 > (docs/M2_DEVICE_EXECUTOR.md SS7.8). A bucket here = one `mix_round_t` of a
 > `mix_plan_t` (docs/Backend.md J6 / mix_split): a full rectangle `[w_b,
 n_active]` of routed (token, slot) columns.
@@ -89,48 +90,25 @@ in `order`). A single generic tight-gather helper serves all three.
 
 ## 3. Module interface (pure, no ggml/llama dependency)
 
-New files `src/backend/scatter_plan.h/.cpp`, same style as `mix_split` (pure,
+Implemented in `src/backend/scatter_plan.h/.cpp`, same style as `mix_split` (pure,
 deterministic, offline-unit-testable). The module owns the run definition and
-the greedy policy - callers only supply the token sequence.
+the greedy policy - callers only supply the token sequence. Storage is
+caller-owned (grow-only buffers reused across layers, `exec_scratch_t`); the
+plan points into them:
 
 ```cpp
-#pragma once
-// StreamMoE bucket scatter planning (docs/SCATTER_PLAN.md).
-// Pure / deterministic / model-agnostic - no llama.cpp or ggml dependency.
-#include <cstdint>
-#include <vector>
-
-namespace stream_moe {
-
-// One arithmetic run of acc-dst columns fed by a contiguous src run.
-//   acc_d[.., dst + i*delta] += per_token[.., src + i]   for i in [0, len)
-// dst/delta are dst-column indices into acc_d[d_out, n_t]; the executor turns
-// them into ggml_acc params: nb1 = delta*d_out*esize, offset = dst*d_out*esize.
-struct scatter_seg_t {
-    uint32_t src   = 0;    // tight-order src start column (== run index offset)
-    uint32_t dst   = 0;    // acc-dst column of src[0]
-    uint32_t len   = 0;    // columns in this run (>= 1)
-    uint32_t delta = 0;    // dst column step between consecutive src columns
-};
-
 struct scatter_plan_t {
-    // Tight order: new per-token column i (0..n_active-1) was originally the
-    // active-token entry `order[i]` (index into the input `t` sequence). The
-    // cur-copy layer gathers cur columns in this order.
-    std::vector<uint32_t> order;
-    // Acc runs over the tight order (in tight order, disjoint, cover all
-    // n_active columns). segs.back() ends at src == n_active.
-    std::vector<scatter_seg_t> segs;
-    uint32_t n_active = 0;
-    uint32_t n_t      = 0;
+    const uint32_t *      order = nullptr;   // tight order (n_order entries)
+    const scatter_seg_t * segs  = nullptr;   // arithmetic runs (n_segs entries)
+    uint32_t              n_order = 0;
+    uint32_t              n_segs  = 0;
+    uint32_t              n_active = 0;
+    uint32_t              n_t      = 0;
 };
 
-// Build the plan for one bucket. `t[0..n_active)` = original token id of each
-// active column (a order, i.e. t[a] = scatter[a*w_b].t). n_t = layer token
-// count (bounds: dst+delta*(len-1) < n_t).
-scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t);
-
-} // namespace stream_moe
+scatter_plan_t build_scatter_plan(const uint32_t* t, uint32_t n_active, uint32_t n_t,
+                                  std::vector<uint32_t>& out_order,
+                                  std::vector<scatter_seg_t>& out_segs);
 ```
 
 `order` is the primary output (the cur copy consumes it). `segs` is derivable
@@ -174,7 +152,7 @@ an O(delta_range * n_active) delta sweep per extraction with n_active <= a few
 hundred is fine. The module stays heuristic by design - "fewest runs" is a
 quality goal, not a guarantee.
 
-## 5. Executor consumption (design sketch, not implemented yet)
+## 5. Executor consumption (landed 2026-09-08)
 
 All external per-token inputs are gathered by **ggml-native nodes** from the start
 (principle 11 - GPU-equivalent, no host staging). One generic **index-gather**
@@ -197,9 +175,10 @@ along its row axis with an i32 index leaf built in tight order.
 offset=dst*d_out*4)`. The src slice is contiguous in `per_token` because the
   chain ran in tight order.
 
-## 6. Unit tests (planned)
+## 6. Unit tests (landed: `tests/test_scatter_plan.cpp`, in the test list)
 
-`tests/test_scatter_plan.cpp`, added to the build.bat test list.
+`tests/test_scatter_plan.cpp`, added to the build.bat test list and green in ctest
+(6/6 with the rest of the suite).
 
 ### Config grid (cartesian product)
 

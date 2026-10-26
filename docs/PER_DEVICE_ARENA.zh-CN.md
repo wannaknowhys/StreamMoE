@@ -2,7 +2,7 @@
 
 [English](PER_DEVICE_ARENA.md) | [简体中文](PER_DEVICE_ARENA.zh-CN.md)
 
-> 状态：**设计，2026-09-14**。承接"整层所有权转正"（`LAYER_EXECUTOR_DESIGN.md`）。
+> 状态：**已实现，2026-09-14**（phase 3 于 2026-09-15 落地；开放项见 §7）。承接"整层所有权转正"（`LAYER_EXECUTOR_DESIGN.md`）。
 > 现在的单 host arena 太大、且架空 `--dense-placement`；本文规划每设备 arena。
 > 相关：`ROUTE_B_LAYER_OWNERSHIP.md`（目标形态 §3.4/§3.5/§3.8）、
 > `M2_DEVICE_EXECUTOR.md`（设备执行器）、`DENSE_PLACEMENT.md`（C1/C2）、
@@ -253,8 +253,10 @@ carry1 和 carryN 在每个边界一起搬。
 设备驻留的激活值绝不在 host 上解引用。carry 专用的 relay 已被上面的通用 stage 搬运
 取代：carry、`cur`、`moe_out` 统一走 `xfer` 区。
 
-仍待做：C1 **跨设备拆分**（同层 head → head 的边需要比 `LAYER_FRONT` 更细的 stage）；
-设备侧验证（C1/C2 上 Vulkan）。注意：改指 `src` 发生在 scheduler 的 tensor-backend
+仍待做：C1 **跨设备拆分**（同层 head → head 的边需要比 `LAYER_FRONT` 更细的 stage）。
+设备侧验证**已完成**：C1/C2 上 Vulkan + 混合专家池通过 129-token gate（123/129，证据
+`temp/embedding_probe_2026-09-17T19-07-02-705Z`），12 个 placement 拓扑 0 error（2026-10-26）。
+注意：改指 `src` 发生在 scheduler 的 tensor-backend
 pass 之后——route B 整层拥有时是安全的，但所有权模型若变必须重新检查。
 
 ## 8. 已定结论（2026-09-15）

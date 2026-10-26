@@ -2,8 +2,9 @@
 
 [English](SCATTER_PLAN.md) | [简体中文](SCATTER_PLAN.zh-CN.md)
 
-> 状态：**设计，2026-09**。服务于 CPU 双桶紧凑链原型（docs/WORK_IN_PROGRESS.md M2-5）
-> 以及未来的 per-device mini-graph（docs/M2_DEVICE_EXECUTOR.md §7.8）。此处"桶"=
+> 状态：**已实现**（设计 2026-09；模块、executor 消费点与单测均于 2026-09-08 落地）。
+> 服务于 CPU 双桶紧凑链原型（docs/WORK_IN_PROGRESS.md M2-5）
+> 以及 per-device mini-graph（docs/M2_DEVICE_EXECUTOR.md §7.8）。此处"桶"=
 > `mix_plan_t` 里的一个 `mix_round_t`（docs/Backend.md J6 / mix_split）：路由 (token, slot)
 > 列的一个满矩形 `[w_b, n_active]`。
 
@@ -140,7 +141,7 @@ run 里。
 O(delta_range * n_active) 扫描、n_active 最多几百，没问题。模块按设计是启发式的——
 "run 最少"是质量目标而非保证。
 
-## 5. 执行器消费点（设计草稿，未实现）
+## 5. 执行器消费点（已落地 2026-09-08）
 
 三个外部 per-token 输入一律用 **ggml 原生节点** gather（principle 11——GPU 等价，不做
 host staging）。一个通用 **index-gather** 助手服务三者：把连续源 reshape 成二维、用 tight

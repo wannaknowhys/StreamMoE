@@ -2,25 +2,25 @@
 
 [English](BUCKET_EXEC_TOKEN_SUBSET.md) | [简体中文](BUCKET_EXEC_TOKEN_SUBSET.zh-CN.md)
 
-> Status: **design, 2026-09**. Serves the M2-5 compact-chain engine convergence:
-> after delete-A (2026-09-07) the ONLY executor is `exec_layer_burst_chain_buckets`
-> (minigraph_exec.cpp). Its current buckets are **full-token k-slot slices**
-> (env `STREAM_MOE_TMP_CHAIN_BUCKETS`, default one full-width bucket). This doc
-> upgrades the bucket source to **`build_mix_plan` rounds = true token-subset
-> buckets** (`[w_b, n_active]`, active tokens are a subset of n_t, each token
-> owns `w_b` of its `n_k` slots), and wires the `scatter_plan` module
-> (docs/SCATTER_PLAN.md) as the accumulator writeback. Companion:
-> docs/M2_DEVICE_EXECUTOR.md SS7.5/SS7.6/SS7.7 (per-device accumulator, compact
-> per-bucket chains, ggml_acc as the fold writeback).
+> Status: **implemented** (design 2026-09, landed 2026-09-08). Serves the M2-5
+> compact-chain engine convergence: after delete-A (2026-09-07) the ONLY executor
+> is `exec_layer_burst_chain_buckets` (minigraph_exec.cpp). Its buckets were
+> full-token k-slot slices; this doc upgraded the bucket source to
+> **`build_mix_plan` rounds = true token-subset buckets** (`[w_b, n_active]`,
+> active tokens are a subset of n_t, each token owns `w_b` of its `n_k` slots),
+> and wired the `scatter_plan` module (docs/SCATTER_PLAN.md) as the accumulator
+> writeback. Companion: docs/M2_DEVICE_EXECUTOR.md SS7.5/SS7.6/SS7.7 (per-device
+> accumulator, compact per-bucket chains, ggml_acc as the fold writeback).
 >
 > **2026-09-08 revision (user):** cur gather = 2D reshape + get_rows (SS2.1);
 > arbitrary (t,k) weights = general flat index-gather node (SS2.1a); the test
 > split is a macro-gated throwaway helper inside minigraph_exec.cpp, not a module
 > (SS3); `tmp_split_blocks` is deleted (SS4).
 
-## 1. Current engine shape (what we change)
+## 1. Engine shape before this change (2026-09-07; kept for context)
 
-`exec_layer_burst_chain_buckets` today:
+`exec_layer_burst_chain_buckets` before the change (the "today" of the original
+design):
 
 - bucket list = k-slot half-open ranges over **ALL tokens** (`bk = {[k0,k1)}`,
   `n_active == n_t`), from env cut or default single full-width `[0, n_k)`.
@@ -32,7 +32,10 @@
 - weightless twins narrow the slot axis to `w_b`, token axis stays `n_t`.
 - `append_expert_fold` folds `w_b` -> `[d_out, n_t]`; acc = `ggml_acc_inplace`
   offset 0 into the persistent `acc_d` (n_active == n_t, so same-position add).
-- token-subset buckets are mock-gated (n_active != n_t aborts).
+
+The former limitation "token-subset buckets are mock-gated (n_active != n_t
+aborts)" is **removed**: real `mix_plan` rounds now produce `n_active < n_t` and
+`width < n_k`.
 
 ## 2. Target shape (this doc)
 
@@ -171,13 +174,14 @@ n_pools).rounds`, with `expert_pool[e] = handle.pool` filled from the pinned
    produces them; the forced-split function must keep each token in exactly one
    bucket.
 
-## 6. TODO
+## 6. TODO (all landed 2026-09-08)
 
-1. General index-gather helper (SS2.1a): flat reshape + get_rows for arbitrary
-   (t,k) weights; the cur gather (SS2.1) is the row_size = d instance.
-2. Executor round loop over `mix_round_t`: expert_pool from pins, default
-   build_mix_plan rounds, per-round tight ids, fold -> tight per_token, acc via
-   scatter_plan; delete tmp_split_blocks.
-3. Macro-wrapped test-only forced split (k-parity x t-parity = 4 rounds) + call.
-4. Verify: default single round unchanged vs baselines; forced split -> relaxed
-   gate (maxAbs <= 1e-5 / cos ~= 1.0).
+1. ~~General index-gather helper (SS2.1a)~~ - landed (`bucket_gather_cur` /
+   `bucket_gather_per_slot`).
+2. ~~Executor round loop over `mix_round_t`~~ - landed (expert_pool from pins,
+   `build_mix_plan` rounds, tight ids, scatter_plan acc; `tmp_split_blocks` deleted).
+3. ~~Macro-wrapped test-only forced split~~ - landed, dbg-only
+   (`STREAM_MOE_TMP_BUCKET_ROUNDS`, still compiled under `STREAM_MOE_TEMP`).
+4. ~~Verify~~ - landed: default single round byte-IDENTICAL vs the clean HEAD
+   build; forced 4-round split at `maxAbs <= 1e-5 / cos ~= 1.0`
+   (docs/WORK_IN_PROGRESS.md, 2026-09-08 entry).

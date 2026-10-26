@@ -1,11 +1,28 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-10-09（**Muse 代码审查第一阶段闭环：P0-1 融合 Relay 权属门控 + 边界防御加固**）：
+> **最近更新**：2026-10-26（**构建/门禁恢复 + 已落地项文档同步**；详见下方 2026-10-26 补记）。
+> **前次更新**：2026-10-09（**Muse 代码审查第一阶段闭环：P0-1 融合 Relay 权属门控 + 边界防御加固**）：
 > - **P0-1 融合 Relay 时序提前修复**：在 `topo_segment_execute` 中引入 `tail_nodes` 权属判据与段位置门控。Tail 执行期仅触发本层 Tail relay 与源在 Tail 的 cross-layer carry；Head 执行期才触发源在 Head 的 LAYER_FRONT 与 CLOSURE relay，彻底解决跨设备 dense 放置下闭包陈旧数据消费问题。
 > - **核心防御加固**：`bucket_upload_leaf` / `bucket_source_leaf` 增加 `stage_size` 缓冲区溢出断言防御（REC-1）；`t.acc` in-place 别名前严格校验 `moe_out_contiguous` 连续性步长（REC-2）；`flush_segment` 缺失 backend 时显式报错中止、禁止静默 CPU fallback（REC-6a）。
 > - **回归验证**：`.\build.bat llamalibs dual` 原子同步编译；`verify_places.js --flavor StreamMoE` 12 拓扑 100% 运行成功（8 IDENTICAL + 4 微小浮点差异，全部语义流畅）；`smoke_cli.js` 混合池 9.96s PASS。
-> - **详见**：`docs/REVIEW_2026_10_07.md` 与 `docs/REVIEW_2026_10_07.zh-CN.md`。
+> **2026-10-26 补记（构建/门禁 + 文档同步）**：
+> - **P0-1**：`scripts/check_tensor_data.js` 铁律门禁恢复绿。5 处裸 `memcpy(->data)` 收敛为
+>   [tensor_io.h](src/backend/tensor_io.h) 的 `tensor_read_host`/`tensor_write_host`（新增"无 backend
+>   buffer 的 host 张量"单一豁免分支），prefill 导出 frag 的 2 处改为 buffer 感知 + 注释豁免。
+>   `build.bat test main` 恢复可跑，ctest **6/6**。
+> - **P0-3**：`build.bat llamalibs dual` 现构建 **三个** regression tag（StreamMoE + StreamMoE_dump +
+>   upstream_dump）；`run_baseline.bat` 对 UP_BIN 也做 freshness 检查（此前 upstream 可静默用旧二进制）。
+> - **本机实测**：dual 编译三 tag 通过；`verify_places --flavor StreamMoE` 12/12（8 逐字 + 4 已知 fp 微差，
+>   0 error）；`run_baseline moe_129_8192_vk` **PASS**（embd 121/129=93.8%，upstream IDENTICAL，KL 0.403）；
+>   `smoke_cli` PASS。
+> - **文档**：把"代码已落地、文档仍写未做"的段落同步（BUCKET_FAST_PATH / BUCKET_EXEC_TOKEN_SUBSET /
+>   SCATTER_PLAN / WORK_IN_PROGRESS / EXPERT_MOVE_PIPELINE / EXPERT_SCHEDULER_DESIGN / PER_DEVICE_ARENA /
+>   DEVICE_DENSE_CLOSURE / GRAPH_PARTITION / LAYER_EXECUTOR_DESIGN / M2_DEVICE_EXECUTOR /
+>   ROUTE_B_GPU_PHASE / ROUTE_B_LAYER_OWNERSHIP / ROUTE_B_LOADER_FORMATS / BUG_TRACKER /
+>   PROJECT_STRUCTURE / TODO / ASYNC_PIPELINE_ROADMAP，中英双语同步）。
+> - **前情详见**：`docs/REVIEW_2026_10_07.md` 与 `docs/REVIEW_2026_10_07.zh-CN.md`。
+
 > - **2026-10-09 补记（phase 2b 消除 + 2a 瘦身，已验证）**：prefill 导出体全进 frag（2b patch 删除）；2a 只剩 8 文件逻辑改行；新 3 patch 栈干净重放 24 文件逐字节一致。`.\build.bat llamalibs dual` 双 tag 编译通过；`verify_places.js --flavor StreamMoE` 12 拓扑 0 ERROR（8 IDENTICAL + 4 已知 fp 微差，全部流畅，与 10-07 画像一致）；`smoke_cli.js` 11.7s PASS；`run_baseline.bat moe_129_8192_vk` **PASS**（embd gate 121/129=93.8% 与冻结基线同值，KL 0.40 < 4.5，upstream IDENTICAL）。途中抓到真回归 1 个：`/shutdown` 注册被误包进 PREFILL 宏导致 route_b-only  binary 丢端点、run_export 卡死——已改回 `PREFILL||ROUTE_B` 双宏门控并直测 200 + 干净退出。
 > - **2026-10-11 补记（patch 直接改行审计 + 3 处 impurities 回填 + spec_buft 残留清除）**：11 处动原版行中 route-b 6 处逻辑改行全必要；macros 侧回填 3 处——`embeddings_nextn` 补 `#else = false`（POD 未初始化 latent UB）、`<limits>/<stdexcept>/<string>` 搬回无条件（恢复纯上游可编译性）、server-context `print_stats` 补 `#else` 原调用；进一步清除历史残留 `stmoe_routeb_spec_buft.frag` 并还原 `speculative.cpp:2332` 为原版无条件执行（消除伪宏包装）。重放 24/24 一致，dual 增量编过，smoke_cli 11.4s PASS。
 > - **2026-10-15 补记（run_bench 上下文双端协商补齐 + 运行包装修复）**：在 `tools/run_bench.js` 中补齐 `computeEffectiveContext` 双端协商逻辑，对齐 4D 架构规范的 `modelCtx` 与 `taskCtx` 协商；优化外部 stock 二进制路径解析与日志标签；恢复本地 `private/bench.bat`。实测 5 拓扑（stock-cpu、stock-vulkan、place-cpu、place-c1、place-c1c2）10 turns 全部 OK PASS。
@@ -34,7 +51,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 - **背景与目标**：此前每层执行结构为 `Dense Head -> MoE Closure -> Dense Tail`，伴随频繁的主机同步与设备图打断。目标是实现跨层及单层内的硬件计算图融合，消除不必要的 host<->device 往返，达到“单层单断”极简硬件提交。
 - **Tier 1 跨层 Tail(L)+Head(L+1) 贪婪融合**：
-  - 在 `topo_segment_execute` 中引入按设备贪婪连通分量聚集执行（`exec_contiguous_subgraph`），并在 `moe_exec_mul_mat_id` 主循环中引入 `exec_fused_tail_and_head(L_cur, L_next)`。
+  - 在 `topo_segment_execute` 中按设备分段聚集执行（`exec_fused_tail_and_head` 把 `Tail(L)` 与 `Head(L+1)` 合成一个节点列表，段边界处 flush + relay），并在 `moe_exec_mul_mat_id` 主循环中调用 `exec_fused_tail_and_head(L_cur, L_next)`。
   - 将当前层的 dense Tail 与下一层的 dense Head 在同设备段内无缝合并提交，减少设备切换。
 - **Tier 2 单设备 MoE+Tail 硬件 Queue 融合（“单层单断”架构）**：
   - 在 `exec_layer_burst_chain_buckets` 中：当激活专家运行在单一设备目标（`single_dev_target && dev_targets.size() == 1`），且本层 `Tail(L)` 位于同一设备时，直接将 `Tail(L)` 算子追加到 `MoE(L)` 的设备计算图（`single_dt->gf`）中，形成单个硬件 Queue 提交。
@@ -44,7 +61,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
     - 因而硬件队列融合界限定在同层的 `[MoE(L) + Tail(L)]`，形成完整的 `Head(L) -> [CPU Router Pin 唯一打断] -> [MoE(L) + Tail(L)] 硬件单队提交` 结构，真正达成每层只有 1 次主机打断。
     - 当 `Tail(L)` 与 MoE 不在同一设备时，自动优雅退化为 Tier 1 的 `exec_fused_tail_and_head`。
 - **验证**：
-  - `.\build.bat llamalibs dual` 原子同步编译通过。
+  - `.\build.bat llamalibs dual` 原子同步编译通过（2026-10-26 起 dual = StreamMoE + StreamMoE_dump + upstream_dump 三个 tag，见 §3）。
   - `node baseline_regression/tools/verify_places.js --flavor StreamMoE`：覆盖全量 12 种 placement 拓扑全部 PASS，0 运行时错误，全部输出语义连贯流畅的英文文本。
   - `node tools/smoke_cli.js`：CLI 混合池（`RAM:8192,Vulkan0:5120`）直跑推理 10.4s PASS。
 
@@ -88,7 +105,7 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 - 开发模型 = **v2 chunk**（专家独立化 direct，moe(v2) 与 v1 基线 IDENTICAL）；upstream 对照仍 v1（不认识 v2）。
 - **v2 布局改造定案（2026-09，见 §4 下一步）**：v2 expert-blocks 整专家紧凑块是 vulkan 不兼容槽布局（专家 stride=expert_size）的源头。解法 = **v2 文件块内每个张量切片独立 4K 对齐** + **pool 改张量列区（struct-of-array）**。文件侧 DIO 源对齐，pool 侧槽 stride=单张量紧凑大小（vulkan 硬编码步长）。v1 sections-v1（张量分散 GGUF 原生可读）已否决——GGUF tensor offset 须紧凑单调，无法在张量内做 4K 切片 stride，writeV1 的 per-expert reflow 产出非法 GGUF（llama 加载 offset 校验失败）。
 - 已知限制：执行器**单区**（同层激活集须同池）；mixed 分区执行（WIP J6）与 GPU 每-device 分区同构，GPU 阶段前铺。
-- **下轮重构（2026-09 定稿，见 docs/EXPERT_MOVE_PIPELINE.md）**：directory 加宽 (L,E) 生命周期状态、删 owner_、驱逐改 (L,E) 层距、demote/r2v 异步 move worker、批记账移调度线程——解 L6b 的 vram demote 同步阻塞。**落地状态**：M1-M4 已 commit（6b6300e/dbaff8f/45b14de/fdf4982）；M5（活跃槽记账）未做；M6 部分；M7 文档未同步。
+- **下轮重构（2026-09 定稿，见 docs/EXPERT_MOVE_PIPELINE.md）**：directory 加宽 (L,E) 生命周期状态、删 owner_、驱逐改 (L,E) 层距、demote/r2v 异步 move worker、批记账移调度线程——解 L6b 的 vram demote 同步阻塞。**落地状态**：M1-M4 已 commit（6b6300e/dbaff8f/45b14de/fdf4982）；**M5 已落地（2026-09-05，slot_request_t 96→104B）**；M6 部分；M7 文档未同步。
 - **mixed 执行落地（2026-09）**：所有 MUL_MAT_ID 统一走 per-pool peel rounds（exec_mixed_mm），单池/混合通吃；scratch arena no_alloc（大 batch ctx 不爆）；删老单池快路径（exec_mm_vk/exec_device_chain）。129-token mixed 列级 0 BAD。
 - **v2r demote DMA 提速（2026-09，docs/VRAM_DMA_MOVE.md）**：RX590 rebar host **读 0.02 GB/s**（158ms/专家）是 demote 卡死根因；transfer-queue DMA（ggml_vk_buffer_read + cached staging）**~1ms/专家**（快 100-150×）。r2v 无需改（rebar **写 8 GB/s**）。实测 4-token 64MB（238 demote）内容 0 BAD；129-token 64MB 跑通（DIO/计算主导）。
 - 代码全部主仓库 src（scheduler/minigraph_exec/route_b_inject）+ 唯一 vendored = ggml-vulkan host map + dma frag（patch 记录）。细节：`docs/WORK_IN_PROGRESS.md` J/M 节。
@@ -156,7 +173,8 @@ DeepSeek4 等 MoE 模型，**MoE 专家权重完全不走 mmap、走自研紧凑
 
 | 动作                         | 命令                                                                                                                                                                                                                                                                                                                                 |
 | :--------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| route-b 完整推理             | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe`                                                                                                                                                                                                                                                           |
+| **三个 regression tag**      | **`build.bat llamalibs dual`** → `build\{StreamMoE,StreamMoE_dump,upstream_dump}\llama-build\bin\`（2026-10-26 起 dual 含 upstream_dump；改 `src/`/`patches/` 后跑它，再跑 `run_baseline`）                                                                                                                                        |
+| route-b 完整推理             | `build.bat llamalibs main` → `build\main\llama-build\bin\llama-server.exe`（CPU-only tag；当前缺 vk 符号桩，链接失败见 BUG_TRACKER B33，待与 CUDA 支持一起补）                                                                                                                                                                       |
 | prefill 导出（上游基准）     | `build.bat llamalibs upstream_dump` → `build\upstream_dump\llama-build\bin\llama-server.exe`                                                                                                                                                                                                                                         |
 | 完整栈导出                   | `build.bat llamalibs StreamMoE_dump` → `build\StreamMoE_dump\llama-build\bin\llama-server.exe`（含 vulkan，见 §2）                                                                                                                                                                                                                   |
 | 转换器（C++）                | `build.bat convert main` → `build\main\bin\stream_moe_convert.exe -m <model> -o <out> --format v3`                                                                                                                                                                                                                                   |
@@ -185,9 +203,9 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 
 0. **每设备 arena 执行侧：phase 3 已落地（2026-09-15，`102c2eb`/`b525e29`）**。`route_b_setup` 建 `设备名→ggml_backend_t` 注册表；`layout_arena` 暴露 `node→device`；`exec_layer_burst` 把 dense head/tail 按 placement 设备分组、各在自己 backend 上跑（`run_dense_subgraph`，host→CPU）。**通用跨设备搬运**：每条生产者/消费者设备不同的边，在消费者设备新增的 `xfer` 区分配 shell + 改指 consumer `src`，执行器按 stage（`LAYER_FRONT`/`CLOSURE`/`TAIL`）各跑一次 `ggml_backend_tensor_copy`（生产者被写多次也只搬一次），统一覆盖 carry/`cur`/`moe_out`；`cur` 上传与 `moe_out` 回写改 backend 无关。run_baseline PASS（vk gate 121/129=93.8%，upstream IDENTICAL）。**2026-09-17 更新**：xfer shell 按 consumer layer 区分，KV/dev_layer 物理设备解耦与参数拒绝已进入当前 patch 栈；已有 C1/C2 Vulkan + RAM:71680,Vulkan0:128 的 129-token 设备侧验证（ref/dev exit 0、123/129 PASS；frozen/ref 121/129 PASS），证据见顶部 `embedding_probe_2026-09-17T19-07-02-705Z`。这证明该配置跑通，不扩大为所有 VRAM 崩溃路径均已覆盖。**仍待**：C1 跨设备拆分（同层 head→head 边需更细 stage）。
 1. **K7 文档同步**：SoA 布局 / 设备执行的落地面同步到 `STREAMMOE_GGUF_FORMAT`、`ROUTE_B_LOADER_FORMATS`、`MULTI_SUBPOOL`、`VENDORED_MODIFICATIONS`。K6（vulkan 吃 SoA 列）已由设备执行覆盖（RAM8G+VRAM 混跑 cos 0.982，用户决定不追）。
-2. **deepseek 设备执行实测**：gemma 已验证（RAM8G+Vulkan0:256M）；deepseek（3 w shell + clamp/swiglu，6 w-leaf/层）用 RAM+Vulkan 池跑一遍。
-3. **M2-3 出口 scatter 通用化 / M2-4 profile 埋管**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳未做。
-4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 并发验收 UT（test_scheduler 链接问题需先修）。
+2. **deepseek 设备执行实测（✅ 2026-09-08 完成）**：`RAM:71680 + Vulkan0:1024`（80 槽），95-token prefill-from，设备 round `dev=1` 真在 Vulkan 上跑；对 CPU 桶引擎/上游基线 embd cos 0.9999998 / hidden cos 0.99999997，expert_history 8.6% flip（允许），退出 0 泄漏。gemma 侧同为已验证。
+3. **M2-3 出口 scatter 通用化（✅ 已落地）/ M2-4 profile 埋管（未做）**（M2_DEVICE_EXECUTOR §5/§6）：多设备 fold 已按 pool 分区 + DMA 回读 acc_d；profile ring + per-device 完成时间戳仍未做。
+4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 四个并发验收 UT（**test_scheduler 链接问题已由 f68d442 修复，ctest 6/6 含 test_scheduler**，缺的只是 UT 本身）。
 5. **H 长线（2026-10-09 部分达成）**：2b 已消灭、2a 简单部分已消灭（见 §2）；剩余 2a 逻辑改行（loader/model/KV/llama.cpp）保留 patch——改既有逻辑行的动作 frag 化只是搬家。
 6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
 

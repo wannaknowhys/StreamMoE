@@ -2,8 +2,11 @@
 
 [English](M2_DEVICE_EXECUTOR.md) | [简体中文](M2_DEVICE_EXECUTOR.zh-CN.md)
 
-> Status: design, 2026-09 (revised: no transitional code - implement the final
-> shape directly, component by component). Builds on `docs/ROUTE_B_GPU_PHASE.md`
+> Status: **design, 2026-09; implemented 2026-09-08** (build order §0 items 1-5
+> landed - per-device chains, async submit, CPU/VK overlap, acc_d readback, host
+> fold; §6 profile channel and the M8 UTs are still open). Revised: no
+> transitional code - implement the final
+> shape directly, component by component. Builds on `docs/ROUTE_B_GPU_PHASE.md`
 > (whole-layer self-scheduling, §1/§3) and the landed VRAM data layer
 > (docs/WORK_IN_PROGRESS.md J: host-map channel, experts resident on device,
 > demote-to-RAM).

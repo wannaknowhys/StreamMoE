@@ -79,26 +79,28 @@ unpin(handle)              → slots_[slot].unpin()（refcount--，0 后可驱�
 2. 没有空槽 → **线性扫描**组内所有 `READY && refcount==0` 的槽，算 hybrid score 取最小 → `begin_evict` → `clear_directory` → drain refcount（yield 等归零）→ `begin_reload`。
 3. 全在 pin / in-flight → 返回 -1，请求重入队（sleep 1ms 重试）。
 
-**驱逐打分**（当前）：
+**驱逐打分**（当前，2026-09 起）：
 
 ```text
-score = 0.5 * freq + 0.5 * (1.0 - generation / 1e9)
-freq  = stats_.get_adaptive_frequency(owner)   // EST1，读时按当前最大分归一化（B27 已修）
+score = alpha * 1/(1+recency) + (1-alpha) * freq      // 小者先逐
+recency = max(0, cur_token - last_used_token)
+alpha   = clamp(1 - hit_rate_ema, 0.1, 0.9)           // update_alpha()
+freq    = stats_.get_adaptive_frequency(L,E)          // EST1，读时按当前最大分归一化（B27 已修）
 ```
 
 **回答：score 是纯每次循环算再取最小，没有树/堆。** `alloc_or_evict` 里 `for i = lo..hi` 线性遍历组内全部槽，逐槽算 score 保留最小 victim——O(n_slots)（当前 642~2297 槽，可接受）。无优先队列/树结构。
 
-**`load_slot`**：`read_expert_sync`（同步阻塞 DIO）→ 成功 `mark_ready` + `dir_->set`；失败 `mark_failed`。
+**`start_async_load`**（2026-09 起异步）：提交 async DIO ring（Win IOCP 真异步；POSIX 仍同步 pread，见 B22），完成由 `drain_completions` 收割 → `mark_ready` + `dir_->set`；批量 pin 走 `pin_layer`。
 
-**`scheduler_loop`**：单 worker 线程。pop → 去重（dir 已有 skip）→ alloc_or_evict → load_slot。空队列 sleep 1ms。
+**worker**：一个进程级 global worker 驱动所有池（不再每池一个线程）。pop 批量请求 → 三态 triage（READY→替 pin / ABSENT→装载 / LOADING→等 drain）→ alloc_or_evict → 提交装载。空队列 sleep 1ms。
 
 ## 8. 已知问题与改动路线
 
 | 问题            | 现状                                                               | 方向                                                                                                                              |
 | :-------------- | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
-| score 魔数      | `1e9` 归一化，generation<<1e9 时 recency 区分度≈0（实际只看 freq） | 改 `last_used_token` recency + 动态 α（REVIEW_2026_08_28）                                                                        |
+| score 魔数      | **已落地（2026-09）**：`alpha*recency + (1-alpha)*freq`（§7 代码块） | ~~加 recency + 动态 α~~（REVIEW_2026_08_28 已合并）                                                                                |
 | 驱逐忙等无超时  | `while(refcount != 0) yield()` 无界自旋                            | 加超时 + 日志（L/E + refcount）                                                                                                   |
-| 单线程 + 同步读 | scheduler_loop 单线程，`read_expert_sync` 阻塞，跨专家串行         | **异步 IO 引擎**（IOCP 并发 in-flight / io_uring / io_submit fallback），pin 提交后立即返回，IO 完成 wake（ROUTE_B_GPU_PHASE §3） |
+| 单线程 + 同步读 | **已落地（2026-09）**：异步 DIO ring + 全局单 worker + `pin_layer` 批量 pin | ~~异步 IO 引擎~~（IOCP 已真异步；POSIX io_uring 仍待，见 B22）                                                                    |
 | 线性扫描        | 槽数几千时 OK                                                      | GPU/多池后槽数×设备，考虑按组索引/堆优化驱逐候选                                                                                  |
 | 生命周期位置    | pin/unpin 在 `graph_compute` 按批猜角色                            | 迁 cb_eval（hash 构建期预取 / argsort 首节点 wait / 汇合节点 unpin），见 ROUTE_B_GPU_PHASE §2                                     |
 | 多池（GPU）     | 每模型一个 scheduler                                               | 每模型×每设备一个 scheduler；池选择（pin 时按热度/空闲/后端能力）                                                                 |

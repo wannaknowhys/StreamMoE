@@ -95,9 +95,11 @@ src/
 
 ## 7. tests/（UT）
 
-- `test_async_dio.cpp` / `test_moe_loader.cpp` / `test_profiler.cpp` / `test_scheduler.cpp` / `test_slot.cpp`。
+- `test_moe_loader.cpp` / `test_profiler.cpp` / `test_scheduler.cpp` / `test_slot.cpp` /
+  `test_mix_plan.cpp` / `test_scatter_plan.cpp`（`test_async_dio.cpp` 仍被禁用：SoA 重构后
+  接口不匹配，待重写，见 CMakeLists.txt 注释）。
 - 已删除 mock 时代模块的 UT（pool/scheduler/state_machine/tokenizer/kv）。
-- 运行：`build.bat test <tag>`（CMake/ctest，产物在 `build\<tag>\bin\`，5/5 通过）。
+- 运行：`build.bat test <tag>`（CMake/ctest，产物在 `build\<tag>\bin\`，**6/6 通过**）。
 
 ## 8. build/（产物，多版本共存）
 

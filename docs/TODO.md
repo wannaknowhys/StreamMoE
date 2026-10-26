@@ -68,8 +68,9 @@
 
 ## 阶段 7：dense 位置管理（2026-09，route B 独占专家放置后的下一项）
 
-- [ ] **7.1 dense 层 offload 位置管理**（当前已隐含 `-ngl 0` 作为临时默认）
+- [x] **7.1 dense 层 offload 位置管理（Phase 1a 已落地，2026-09-08）**
   - 背景：`--expert-backend` 已隐含 `no_op_offload`（防 llama 自动 offload host 计算），但 **`n_gpu_layers` 默认 -1（auto = 全量 offload）**，RAM-only 遍仍分配 ~2.5GB GPU buffer。
   - 临时方案：frag 隐含 `params.n_gpu_layers = 0`（显式 `-ngl N` 在后覆盖）——实测 GPU 占用 2508MB → 5MB，纯 RAM 遍数值不变。
-  - 目标：route B 拥有 expert 放置权后，**dense 位置也应成为可管理项**——按预算/层把 dense 层放 GPU（`-ngl N` 语义）、KV cache 介质等统一决策，而非靠用户显式传参或全禁。
-- [ ] **7.2 默认 offload 语义澄清**：`-ngl` 默认 -1（auto）与 route B "纯 CPU 遍应零 GPU" 的矛盾，将来在参数文档/CHECKPOINT 中明确"expert-backend 下 dense offload 需显式 -ngl"。
+  - **落地**：`--dense-placement C1:<dev>,C2:<dev>`（`llama_model_params.dense_placement` → route-b `get_layer_buft_list` 钩子），默认全 CPU；`-ngl` 在 `--expert-backend` 下被拒绝；KV/DSV4/recurrent 跟随物理 C1（`dev_layer_physical`）。详见 `docs/DENSE_PLACEMENT.md` §5。
+  - **仍待（Phase 1b/2）**：按层区间表（`L<a>-<b>:<dev>`）与动态 C1 迁移（需要 managed C1 weight pool，见该文档 §5/§8）。
+- [x] **7.2 默认 offload 语义澄清**：`-ngl` 在 `--expert-backend` 下已显式拒绝（warn + exit），dense 放置只经 `--dense-placement`；`--no-kv-offload` 与 GPU 物理 C1 冲突时报错。见 `docs/DENSE_PLACEMENT.md` §5 与 `docs/CHECKPOINT.md` §2。

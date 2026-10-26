@@ -202,8 +202,8 @@ per-device arena、无设备侧整链。
 
 - [ ] 设备执行落地后纯设备数值门（K6 形态；注意 GPU 对 CPU 无绝对还原——验证结构等价而非字节
       一致，见 BACKEND_DIVERGENCE_ANALYSIS.md §6）。
-- [ ] M8 UT（布局自检、设备规划、merge）——test 链接问题是 blocker（stmoe_vk_* 符号需
-      ggml-vulkan 链接，B33）。
+- [ ] M8 UT（布局自检、设备规划、merge）——**test 链接问题已修复**（f68d442 改为 per-pool
+      DMA 回调，ctest 6/6 含 test_scheduler）；缺的是这 4 个 UT 本身。
 
 ### profile（延后，§6）
 

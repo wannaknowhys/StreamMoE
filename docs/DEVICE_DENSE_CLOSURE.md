@@ -2,10 +2,11 @@
 
 [English](DEVICE_DENSE_CLOSURE.md) | [简体中文](DEVICE_DENSE_CLOSURE.zh-CN.md)
 
-> Status: **design + implementation in progress, 2026-09-15**. Extends whole-layer
-> ownership (`ROUTE_B_LAYER_OWNERSHIP.md`, `LAYER_EXECUTOR_DESIGN.md`) to layers
-> whose dense weights live on a **device** (`--dense-placement C1:<dev>`), and
-> makes every cross-device data movement explicit. Related:
+> Status: **design + implementation, 2026-09-15 (landed parts listed in §4)**.
+> Extends whole-layer ownership (`ROUTE_B_LAYER_OWNERSHIP.md`,
+> `LAYER_EXECUTOR_DESIGN.md`) to layers whose dense weights live on a **device**
+> (`--dense-placement C1:<dev>`), and makes every cross-device data movement
+> explicit. Related:
 > `PER_DEVICE_ARENA.md` (per-device arena), `M2_DEVICE_EXECUTOR.md` (device
 > executor), `DENSE_PLACEMENT.md` (C1/C2), `GRAPH_PARTITION.md` (iron rule).
 
@@ -119,15 +120,22 @@ The dense head/tail keep using the **original** graph nodes (as
 the MoE bucket engine clones for shape narrowing (bucketing), not for buft
 reasons, and the dense path has no shape narrowing.
 
-## 4. Status (2026-09-15)
+## 4. Status (2026-09-15; updated 2026-10-26)
 
-- **Landed:** buft masquerade (3.1), `dev_layer` (3.2), generic xfer with
-  leaf/bufferless coverage and closure-node exclusion, `bucket_source_leaf`
-  (3.7), view `buffer` propagation, host full-alloc for the CPU closure path,
-  strict audit (3.9).
-- **In progress:** per-device closure input/output buffers (3.5), front copies
-  (3.4), per-device `moe_out` + anonymous add (3.6), grow-only buffers (3.8).
-- **Not done:** device-dense numerical validation (`C1:Vulkan0` + Vulkan pool).
+- **Landed:** buft masquerade (3.1), `dev_layer` split into `dev_layer` (=
+  STREAMMOE) + `dev_layer_physical` (= placement device, 3.2), generic xfer with
+  leaf/bufferless coverage and closure-node exclusion (3.4), `bucket_source_leaf`
+  (3.7), per-device closure input/output buffers + per-layer acc clear (3.5),
+  view `buffer` propagation, host full-alloc for the CPU closure path, strict
+  audit (3.9).
+- **Partial:** per-device `moe_out` partial exists (`acc_d`) but the final sum is
+  still the host `layer_fold`; the "anonymous add with one extra per-device src"
+  shape (3.6) is not implemented. Grow-only arena/stage buffers exist, but the
+  `stage_used` bump + size estimate remain (3.8).
+- **Landed:** device-dense numerical validation - C1/C2 on Vulkan + mixed expert
+  pools: 129-token gate 123/129 PASS (`temp/embedding_probe_2026-09-17T19-07-02-705Z`),
+  and 12/12 placement topologies run with 0 errors (8 byte-identical + 4 known
+  backend-noise diffs, 2026-10-26 re-run).
 
 ## 5. Files
 

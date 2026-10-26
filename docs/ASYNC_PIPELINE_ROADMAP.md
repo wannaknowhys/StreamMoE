@@ -13,7 +13,32 @@ This roadmap outlines the systematic architectural transformation to eliminate h
 
 ---
 
-## 2. Core Architectural Principles
+## 2. Status (2026-10-26)
+
+- **Phase 1 (diagnostic harness): landed.** `diagnostics/vk_async_probe.cpp` is in
+  the tree and was the measurement that identified the unpinned fallback
+  (`ggml_backend_tensor_get` -> internal `ggml_vk_synchronize`).
+- **Phase 2 (host-pinned control arena): landed 2026-10-03 (partial spec).** Global
+  pinned staging buffers (`g_pinned_control` / `_h2d` / `_d2h`,
+  `minigraph_exec.cpp:71-115`) and the batched relay dispatch
+  (`dispatch_relay_batch`, `:419-580`) are in production; ids readback still uses
+  one `get_async` + `synchronize` per layer (`host_image`, `:120-141`), and the
+  staging buffers are re-created per device change rather than per context.
+- **Phase 3 (graph inlining / no data-flow D2H): partial.** Same-device `cur` is
+  referenced zero-copy (`bucket_source_leaf`, `:1469-1484`); `moe_out`/`acc` skip
+  D2H only for single-target + same-device (`:2613-2637`), otherwise the acc is
+  read back and folded on the host. Inter-layer residue residency on the device
+  arena is not implemented.
+- **Phase 4 (whole-layer single graph + overlap): partial.** Tier-2 fuses
+  `MoE(L)+Tail(L)` into one device-graph submission (2026-10-07); `Head(L+1)`
+  fusion is deliberately disabled (`can_fuse_head_next = false`,
+  `minigraph_exec.cpp:2507`: scratch aliasing + router ids must return to the
+  host). Cross-layer double buffering / submit-ahead is not implemented - each
+  layer still ends with one `synchronize`.
+
+---
+
+## 3. Core Architectural Principles
 
 1. **GPU Equivalence Principle (AGENTS.md #11)**:
    - Intermediate activations and tensors must reside entirely on the device arena.
@@ -26,7 +51,7 @@ This roadmap outlines the systematic architectural transformation to eliminate h
 
 ---
 
-## 3. Transformation Phases
+## 4. Transformation Phases
 
 ```mermaid
 flowchart TD
@@ -62,7 +87,7 @@ flowchart TD
 
 ---
 
-## 4. Verification & Regression Standard
+## 5. Verification & Regression Standard
 
 Per project specifications:
 - **Build**: Strictly via `build.bat` (`llamalibs`, `test`, `harness`).

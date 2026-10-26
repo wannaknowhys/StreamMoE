@@ -2,7 +2,7 @@
 
 [English](LAYER_EXECUTOR_DESIGN.md) | [简体中文](LAYER_EXECUTOR_DESIGN.zh-CN.md)
 
-> 状态：**提案，2026-09-13**。取代临时的 debug 整层路径（`STREAM_MOE_TEMP`）。
+> 状态：**提案，2026-09-13；R1-R6 已落地（2026-09-13/15），R7 未做**（见 §6）。取代临时的 debug 整层路径（`STREAM_MOE_TEMP`）。
 > 相关：`ROUTE_B_LAYER_OWNERSHIP.md`（目标形态）、`M2_DEVICE_EXECUTOR.md`
 > （每设备执行器 + arena）、`L2_WHOLE_LAYER_REVIEW.md`（bug 清单 + 已定位发散）、
 > `DENSE_PLACEMENT.md`（C1/C2）。

@@ -2,7 +2,7 @@
 
 [English](DEVICE_DENSE_CLOSURE.md) | [简体中文](DEVICE_DENSE_CLOSURE.zh-CN.md)
 
-> 状态：**设计 + 实施进行中，2026-09-15**。把整层拥有（`ROUTE_B_LAYER_OWNERSHIP.md`、
+> 状态：**设计 + 实施（已落地部分见 §4），2026-09-15**。把整层拥有（`ROUTE_B_LAYER_OWNERSHIP.md`、
 > `LAYER_EXECUTOR_DESIGN.md`）扩展到 **dense 权重在设备上** 的层
 > （`--dense-placement C1:<dev>`），并让所有跨设备数据移动显式化。相关：
 > `PER_DEVICE_ARENA.md`（每设备 arena）、`M2_DEVICE_EXECUTOR.md`（设备执行器）、
@@ -96,14 +96,18 @@ dense head/tail 继续用 **原始** 图节点（`run_dense_subgraph` 的做法�
 arena。不克隆：MoE 桶引擎克隆是为了形状收窄（分桶），不是 buft 原因；dense 路径没有形状
 收窄。
 
-## 4. 状态（2026-09-15）
+## 4. 状态（2026-09-15；2026-10-26 更新）
 
-- **已落地**：buft 伪装（3.1）、`dev_layer`（3.2）、通用 xfer（覆盖叶子/无 buffer、排除闭包
-  节点）、`bucket_source_leaf`（3.7）、view `buffer` 传播、CPU 闭包路径的 host full-alloc、
-  严格审计（3.9）。
-- **进行中**：每设备闭包输入/输出 buffer（3.5）、最前面整拷贝（3.4）、每设备 `moe_out` +
-  匿名 add（3.6）、grow-only buffer（3.8）。
-- **未做**：设备端 dense 数值验证（`C1:Vulkan0` + Vulkan 池）。
+- **已落地**：buft 伪装（3.1）、`dev_layer` 拆成 `dev_layer`（= STREAMMOE）+
+  `dev_layer_physical`（= 放置设备，3.2）、通用 xfer（覆盖叶子/无 buffer、排除闭包
+  节点，3.4）、`bucket_source_leaf`（3.7）、每设备闭包输入/输出 buffer + 每层 acc 清零
+  （3.5）、view `buffer` 传播、CPU 闭包路径的 host full-alloc、严格审计（3.9）。
+- **部分落地**：每设备 `moe_out` partial 已有（`acc_d`），但最终求和仍是 host
+  `layer_fold`；"匿名 add 多一个 per-device src"的形态（3.6）未实现。grow-only arena/stage
+  已成，但 `stage_used` bump + 尺寸估算仍在（3.8）。
+- **已落地**：设备端 dense 数值验证 —— C1/C2 上 Vulkan + 混合专家池：129-token gate
+  123/129 PASS（`temp/embedding_probe_2026-09-17T19-07-02-705Z`），12 个 placement
+  拓扑全部跑通、0 error（8 逐字 + 4 已知后端噪声，2026-10-26 复跑）。
 
 ## 5. 涉及文件
 

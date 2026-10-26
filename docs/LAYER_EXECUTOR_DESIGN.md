@@ -2,7 +2,8 @@
 
 [English](LAYER_EXECUTOR_DESIGN.md) | [简体中文](LAYER_EXECUTOR_DESIGN.zh-CN.md)
 
-> Status: **proposal, 2026-09-13**. Replaces the ad-hoc debug whole-layer path
+> Status: **proposal, 2026-09-13; landed 2026-09-13/15** (R1-R6 implemented, R7
+> still open - see §6). Replaces the ad-hoc debug whole-layer path
 > (`STREAM_MOE_TEMP`). Related: `ROUTE_B_LAYER_OWNERSHIP.md` (target shape),
 > `M2_DEVICE_EXECUTOR.md` (per-device executor + arena), `L2_WHOLE_LAYER_REVIEW.md`
 > (bug inventory + located divergences), `DENSE_PLACEMENT.md` (C1/C2).
@@ -282,6 +283,22 @@ Each milestone keeps the production (MoE-only) path numerically IDENTICAL.
 R2 validation: olmoe per-layer bisect L0-L15 all SAME as baseline; full
 whole-layer (all layers / `MAX=14` / `MAX=15`) SAME; gemma whole-layer SAME;
 production `StreamMoE_dump` olmoe/gemma unchanged.
+
+**Landed (2026-09-15):**
+
+- **R3** three-region arena: the single host arena became per-device
+  `region_plan_t {carry1(parity), carryN(retained), scratch(=compact∪closure),
+  xfer}` with BFD interval packing - see `PER_DEVICE_ARENA.md` §6 and
+  `route_b_chain.cpp:53-63,454-628`.
+- **R5** flash attention preserved: dense segments execute the original nodes on
+  the real placement backend (`run_dense_subgraph`); an op the device cannot run
+  fails loudly instead of falling back to CPU (`route_b_chain.cpp:1184-1190`).
+- **R6** C2 takeover: global dense (token_embd/output/output_norm) is captured
+  and executed by route B on its `--dense-placement C2:<dev>` device
+  (`route_b_inject.cpp:330-343`); same-device C1/C2 needs no shell.
+- **R7** not done: op classification (`PURE_ALIAS`/`MATERIALIZING`/`COMPUTE`) and
+  tracer separation remain open (two `is_view_op`/`is_alias_op` copies still
+  exist in `minigraph_exec.cpp` and `route_b_chain.cpp`).
 
 **R1 attribution - own every compute node (fixes DeepSeek whole-layer).** The
 partial attribution left anonymous compute nodes unowned when their producer was

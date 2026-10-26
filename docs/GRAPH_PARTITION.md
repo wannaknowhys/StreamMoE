@@ -268,10 +268,11 @@ Ordered by dependency; each step is independently verifiable.
 - [x] `exec_layer_burst_chain_buckets` and `exec_layer_burst` pin keys: read
       ids through `host_image()` + `moe_id_at()` (host copy only when the ids buffer
       is not host-resident; compact-ids build and round planning stay host-side).
-- [x] Device smoke: gemma `C1:Vulkan0` + Vulkan pool runs clean (exit 0). Note
-      the ids-copy branch is defensive: the current sched copies ids into our host
-      backend, so it is not yet hit in production; it fires once the closure runs
-      as a device graph with ids device-resident.
+- [x] Device smoke: gemma `C1:Vulkan0` + Vulkan pool runs clean (exit 0). The
+      ids-copy branch is **hit every layer in current production** (`host_image()`
+      at `minigraph_exec.cpp:2998`): the ids tensor now lives on our STREAMMOE
+      host backend / device round, so the host copy is the normal path, not a
+      defensive fallback.
 
 ### C. Same-device seam: `cur` / `ffn_moe_out` no round-trip
 

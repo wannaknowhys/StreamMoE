@@ -2,7 +2,7 @@
 
 [English](BUCKET_EXEC_TOKEN_SUBSET.md) | [简体中文](BUCKET_EXEC_TOKEN_SUBSET.zh-CN.md)
 
-> 状态：**设计，2026-09**。服务于 M2-5 紧凑链引擎收敛：删 A（2026-09-07）后唯一执行器 =
+> 状态：**已实现**（设计 2026-09，2026-09-08 落地）。服务于 M2-5 紧凑链引擎收敛：删 A（2026-09-07）后唯一执行器 =
 > `exec_layer_burst_chain_buckets`（minigraph_exec.cpp）。它现在的桶是**全 token k-slot 切**
 > （env `STREAM_MOE_TMP_CHAIN_BUCKETS`，默认单满宽桶）。本文把桶源升级为
 > **`build_mix_plan` rounds = 真 token 子集桶**（`[w_b, n_active]`，active token 是 n_t 的

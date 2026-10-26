@@ -2,10 +2,14 @@
 
 [English](BUCKET_FAST_PATH.md) | [简体中文](BUCKET_FAST_PATH.zh-CN.md)
 
-> Status: design discussion (2026-09-09), **not implemented**. Corresponds to
-> `docs/WORK_IN_PROGRESS.md` P1. Goal: in the full-width / single-device case,
-> remove the fixed overhead of identity ops and single-target reduction in the
-> only executor `exec_layer_burst_chain_buckets` (`src/backend/minigraph_exec.cpp`).
+> Status: **implemented** (design 2026-09-09; P1-a..P1-g landed 2026-09-09, P1b fold
+> selection landed the same day). The single executor now emits the identity ops
+> conditionally at build time (§9), and `append_expert_fold` picks SUM_ROWS vs the
+> per-k add chain by fold size (§8 P1b). Remaining from this doc: P2 (per-layer
+> submit+sync) is *not* covered here. Corresponds to `docs/WORK_IN_PROGRESS.md` P1.
+> Goal: in the full-width / single-device case, remove the fixed overhead of
+> identity ops and single-target reduction in the only executor
+> `exec_layer_burst_chain_buckets` (`src/backend/minigraph_exec.cpp`).
 > This doc records the conclusions, exact predicates, the transpose (CONT)
 > analysis, risks and the validation gate.
 
@@ -230,7 +234,7 @@ submit+sync dominates.
 - Keep the existing TMR diagnostics to compare before/after (device graph node
   count, `chain_tail` / `tail_sync`).
 
-## 8. Tasks (design in §9)
+## 8. Tasks (design in §9) - **all landed 2026-09-09**
 
 - **P1-a** conditional emission: cur/weights gather identity-skip + contiguous
   optimization.
@@ -242,8 +246,12 @@ submit+sync dominates.
 - **P1-e** replace `twin`/`gather_cache` with fixed arrays.
 - **P1-f** regression (default single pool byte-IDENTICAL vs a clean HEAD build +
   forced-bucket relaxed gate + TMR before/after).
-- **P1b** (later) CONT measurement / per-k add chain.
-- **P2** (later) per-layer submit+sync.
+- **P1-g** device arena estimate: per-round bumps summed into `arena_bytes`
+  (32 MB slack removed).
+- **P1b** (later, landed): fold path chosen by `fold_bytes >= 16 MB` -> per-k
+  view+add chain (ping-pong), else the SUM_ROWS path. `STREAM_MOE_TMP_FOLD_ADD` /
+  `_SUM` remain as dbg-only forced switches.
+- **P2** (later, **still open**) per-layer submit+sync.
 
 ## 9. Unified path + build-time conditional emission (agreed 2026-09-09)
 
@@ -292,14 +300,15 @@ offsets:
   becomes `{pool,width,n_active,ids_off,scatter_off}` and rounds use a **fixed
   span array** (cap `n_pools*n_k`).
 
-### 9.3 The one non-trivial node: the fold's CONT (kept in P1)
+### 9.3 The one non-trivial node: the fold's CONT (P1 / P1b)
 
 At a single pool the fold still runs (expert-axis sum), it is not identity/zero;
 the CONT in `permute+cont+sum_rows` is an artifact of `sum_rows` requiring a
 contiguous ne0, not a mathematical necessity. **Decision (2026-09-09): keep CONT
-in P1**; measure in P1b before deciding whether to rewrite the fold as a per-k
-view+add chain (`w_b-1` adds, no transpose; for small decode tensors the extra
-add nodes may be worse).
+in P1**; P1b measured the two shapes and switched at `fold_bytes >= 16 MB` to a
+per-k view+add chain (`w_b-1` adds, no transpose) while keeping SUM_ROWS for
+small/decode folds. Measured crossover: ~256 tokens (2026-09-09, olmoe single
+pool all-VRAM).
 
 ### 9.4 Decisions (2026-09-09)
 

@@ -2,7 +2,8 @@
 
 [English](ROUTE_B_LAYER_OWNERSHIP.md) | [简体中文](ROUTE_B_LAYER_OWNERSHIP.zh-CN.md)
 
-> 状态：**设计，2026-09-10**。由"cur 拷贝 / 接缝"讨论收敛而来。
+> 状态：**设计，2026-09-10；2026-09-15 已落地**（整层捕获 + 设备本地 buffer + 每设备 arena +
+> 通用 xfer；动态 C1 迁移仍未做，见 `DENSE_PLACEMENT.md` Phase 2）。由"cur 拷贝 / 接缝"讨论收敛而来。
 > 取代 per-GPU MoE backend 草案（那个只解决静态放置）。相关：
 > `ROUTE_B_GPU_PHASE.md`（整层自调度）、`M2_DEVICE_EXECUTOR.md`（每设备执行器 +
 > arena）、`DENSE_PLACEMENT.md`（C1/C2 + Phase 2 迁移）、`EXPERT_MOVE_PIPELINE.md`
