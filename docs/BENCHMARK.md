@@ -228,3 +228,7 @@ Reading:
   break structure: at ~3 us/node the current 2 graphs/layer cost ~0.3 ms and the
   streaming design is fine; if it is still tens of us, per-(layer, stage) CUDA
   graph capture/replay is the structural answer.
+- Relay batches (`dispatch_relay_batch`, TMR `relay`): place-c1 0.133 ms/batch x
+  33/token = **4.4 ms/token** (6% of 74.3); place-c1c2-exp5 0.009 ms/batch = 0.14
+  ms/token (same-device, no relays). Relay syncs matter only for cross-device
+  dense placement, not for the VRAM-pool path.

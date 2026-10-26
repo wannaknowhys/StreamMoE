@@ -434,6 +434,10 @@ struct relay_item_t {
 static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & batch, ggml_backend_t /*cpu*/,
                                  const std::string & skip_h2d_sync_dev = "") {
     if (batch.empty()) return;
+#ifdef STREAM_MOE_TEMP
+    static tmr_acc_t g_relay_dec{ "relay_dec" }, g_relay_pre{ "relay_pre" };
+    tmr_scope_guard_t _relay_guard{ (g_ubatch_nt == 1) ? g_relay_dec : g_relay_pre };
+#endif
 
     // Partition items by transfer direction
     std::vector<relay_item_t> h2h_items;
