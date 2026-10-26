@@ -28,7 +28,8 @@ This roadmap outlines the systematic architectural transformation to eliminate h
   referenced zero-copy (`bucket_source_leaf`, `:1469-1484`); `moe_out`/`acc` skip
   D2H only for single-target + same-device (`:2613-2637`), otherwise the acc is
   read back and folded on the host. Inter-layer residue residency on the device
-  arena is not implemented.
+  arena is not implemented; the concrete design (device-side fold for
+  multi-target) is `DEVICE_FOLD_HEAD_FUSION.md` A.
 - **Phase 4 (whole-layer single graph + overlap): partial.** Tier-2 fuses
   `MoE(L)+Tail(L)` into one device-graph submission (2026-10-07); `Head(L+1)`
   fusion is deliberately disabled (`can_fuse_head_next = false`,

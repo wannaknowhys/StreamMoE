@@ -43,6 +43,7 @@ StreamMoE/
 | `TODO.md` / `LLAMA_EXE_ROADMAP.md`                           | 待办 / 可执行程序路线图                                                                                                                  |
 | `DENSE_PLACEMENT.md` / `.zh-CN.md`                           | dense 位置管理（C1/C2 驻留、`--dense-placement` 参数、计算/搬迁 lag 判据、静态 vs 动态迁移）                                             |
 | `PER_DEVICE_ARENA.md` / `.zh-CN.md`                          | 每设备 arena 规划（carry cross-1/cross-N 拆分与双缓冲、per-device compact、C1/C2 跟随 placement、复用区间打包）                          |
+| `DEVICE_FOLD_HEAD_FUSION.md` / `.zh-CN.md`                   | 设备侧 fold（multi-target 去 host fold）+ 每层单图融合（scratch parity + head fusion）的设计与正确性门禁                                   |
 | `ROUTE_B_LAYER_OWNERSHIP.md` / `.zh-CN.md`                   | route B 整层拥有（整层执行、设备本地 buffer、C1 动态搬运、ids join 静态前缀/动态后缀、里程碑 L1-L5）                                     |
 | `GRAPH_PARTITION.md` / `.zh-CN.md`                           | 整图分区（`STREAM_MOE_TMP_GRAPH_DUMP` 全图 dump、C1/gating/专家闭包/C2 四区域、接缝 external leaves、buft 标记、同设备接缝与 C1 闭包化） |
 | `BENCHMARK.md` / `.zh-CN.md`                                 | 布局吞吐基准（`tools/run_bench.js`：cold/steady、jsonl 多轮、原版对比、结果结构）                                                        |

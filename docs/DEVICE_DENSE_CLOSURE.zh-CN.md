@@ -104,7 +104,8 @@ arena。不克隆：MoE 桶引擎克隆是为了形状收窄（分桶），不�
   （3.5）、view `buffer` 传播、CPU 闭包路径的 host full-alloc、严格审计（3.9）。
 - **部分落地**：每设备 `moe_out` partial 已有（`acc_d`），但最终求和仍是 host
   `layer_fold`；"匿名 add 多一个 per-device src"的形态（3.6）未实现。grow-only arena/stage
-  已成，但 `stage_used` bump + 尺寸估算仍在（3.8）。
+  已成，但 `stage_used` bump + 尺寸估算仍在（3.8）。两者的计划见
+  `DEVICE_FOLD_HEAD_FUSION.md`（A：设备侧 fold；B：每层单次提交）。
 - **已落地**：设备端 dense 数值验证 —— C1/C2 上 Vulkan + 混合专家池：129-token gate
   123/129 PASS（`temp/embedding_probe_2026-09-17T19-07-02-705Z`），12 个 placement
   拓扑全部跑通、0 error（8 逐字 + 4 已知后端噪声，2026-10-26 复跑）。

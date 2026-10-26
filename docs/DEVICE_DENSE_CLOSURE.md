@@ -131,7 +131,9 @@ reasons, and the dense path has no shape narrowing.
 - **Partial:** per-device `moe_out` partial exists (`acc_d`) but the final sum is
   still the host `layer_fold`; the "anonymous add with one extra per-device src"
   shape (3.6) is not implemented. Grow-only arena/stage buffers exist, but the
-  `stage_used` bump + size estimate remain (3.8).
+  `stage_used` bump + size estimate remain (3.8). Plan for both: see
+  `DEVICE_FOLD_HEAD_FUSION.md` (A: device-side fold, B: per-layer single
+  submission).
 - **Landed:** device-dense numerical validation - C1/C2 on Vulkan + mixed expert
   pools: 129-token gate 123/129 PASS (`temp/embedding_probe_2026-09-17T19-07-02-705Z`),
   and 12/12 placement topologies run with 0 errors (8 byte-identical + 4 known

@@ -13,7 +13,23 @@
 
 ---
 
-## 2. 核心架构准绳
+## 2. 状态（2026-10-26）
+
+- **第一阶段（探针）：已落地。** `diagnostics/vk_async_probe.cpp` 在树里，正是它定位了
+  非 pinned 时 `ggml_backend_tensor_get` 回退到内部 `ggml_vk_synchronize` 的问题。
+- **第二阶段（Host-Pinned 控制流缓冲）：部分落地（2026-10-03）。** 全局 pinned staging
+  （`g_pinned_control`/`_h2d`/`_d2h`，`minigraph_exec.cpp:71-115`）与批量 relay 派发
+  （`dispatch_relay_batch`，`:419-580`）已进生产；ids 读回仍是每层一次
+  `get_async`+`synchronize`，且 staging 在切设备时重建而非按 context 常驻。
+- **第三阶段（图内化 / 数据流去 D2H）：部分。** 同设备 `cur` 已零拷贝引用
+  （`bucket_source_leaf`）；`moe_out`/acc 只在"单 target + 同设备"时省掉 D2H，否则回读 +
+  host fold。设备侧 fold 的具体设计见 `DEVICE_FOLD_HEAD_FUSION.md` A。
+- **第四阶段（整层单图 + 跨层重叠）：部分。** Tier-2 已把 `MoE(L)+Tail(L)` 合成一次
+  submission（2026-10-07）；`Head(L+1)` 融合被硬关（scratch 别名 + ids 需回 host）。
+  跨层双缓冲尚未实现——每层仍以一次 `synchronize` 结尾。每层单图的方案见
+  `DEVICE_FOLD_HEAD_FUSION.md` B（scratch parity + head fusion）。
+
+## 3. 核心架构准绳
 
 1. **GPU 等价性准绳（AGENTS.md 第 11 条）**：
    - 中间激活值与张量必须完全驻留在设备端 Arena 中。
@@ -26,7 +42,7 @@
 
 ---
 
-## 3. 阶段演进路线
+## 4. 阶段演进路线
 
 ```mermaid
 flowchart TD
@@ -62,7 +78,7 @@ flowchart TD
 
 ---
 
-## 4. 验证与回归规约
+## 5. 验证与回归规约
 
 - **构建入口**：永远使用 `build.bat`。
 - **数值门禁**：固定 129-token 输入，整个序列中 $\cos \ge 0.99$ 的 token 比例达到 90% 即为通过。

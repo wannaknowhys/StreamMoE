@@ -129,6 +129,7 @@
 | 整图分区（四区域、接缝 leaves、buft 标记）           | [`docs/GRAPH_PARTITION.md`](docs/GRAPH_PARTITION.md)                                                     |
 | route B 整层拥有（整层执行、跨设备搬运）             | [`docs/ROUTE_B_LAYER_OWNERSHIP.md`](docs/ROUTE_B_LAYER_OWNERSHIP.md)                                     |
 | 层执行器设计（三段 arena、轻量 mini-graph）          | [`docs/LAYER_EXECUTOR_DESIGN.md`](docs/LAYER_EXECUTOR_DESIGN.md)                                         |
+| 设备侧 fold + 每层单图融合（A/B 方案、正确性门禁）   | [`docs/DEVICE_FOLD_HEAD_FUSION.md`](docs/DEVICE_FOLD_HEAD_FUSION.md)                                     |
 | L2 整层执行审查（A~E 风险清单与防御）                | [`docs/L2_WHOLE_LAYER_REVIEW.md`](docs/L2_WHOLE_LAYER_REVIEW.md)                                         |
 | M2 设备执行器设计（设备 mini-graph、异步骨架）       | [`docs/M2_DEVICE_EXECUTOR.md`](docs/M2_DEVICE_EXECUTOR.md)                                               |
 | 紧凑多桶快速路径 / 算子融合                          | [`docs/BUCKET_FAST_PATH.md`](docs/BUCKET_FAST_PATH.md)                                                   |
