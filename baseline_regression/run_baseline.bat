@@ -58,7 +58,10 @@ node "%ROOT%\tools\freshness_check.js" "%MOE_BIN%"
 if errorlevel 1 exit /b 1
 rem  The upstream reference must be fresh too: a stale upstream_dump binary would
 rem  "match" the frozen upstream baseline while the current source says otherwise.
-node "%ROOT%\tools\freshness_check.js" "%UP_BIN%"
+rem  --no-src: upstream_dump has features=prefill_export only, so it does NOT
+rem  compile the route-B engine under src/; patches/ + the dirty vendored tree
+rem  still apply (its real inputs).
+node "%ROOT%\tools\freshness_check.js" --no-src "%UP_BIN%"
 if errorlevel 1 exit /b 1
 
 rem ---- compile verify_kl.exe if missing ----

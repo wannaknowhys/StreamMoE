@@ -134,13 +134,21 @@ function checkBinaryFreshness(binPath, options = {}) {
 }
 
 if (require.main === module) {
-    const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+    const argv = process.argv.slice(2);
+    // --no-src: a binary that does not compile the route-B engine (e.g.
+    // build/upstream_dump, features=prefill_export only) must not be compared
+    // against src/; patches/ + the dirty vendored tree still apply.
+    const noSrc = argv.includes('--no-src');
+    const roots = noSrc
+        ? [path.join(REPO_ROOT, 'patches')]
+        : undefined;
+    const args = argv.filter((a) => !a.startsWith('--'));
     if (args.length === 0) {
-        console.log('Usage: node tools/freshness_check.js <binPath> [<binPath2> ...] [--no-fresh-check]');
+        console.log('Usage: node tools/freshness_check.js <binPath> [<binPath2> ...] [--no-src] [--no-fresh-check]');
         process.exit(0);
     }
     for (const b of args) {
-        checkBinaryFreshness(b, { verbose: true, strict: true });
+        checkBinaryFreshness(b, { verbose: true, strict: true, roots });
     }
 }
 
