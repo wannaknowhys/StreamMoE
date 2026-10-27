@@ -208,7 +208,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 四个并发验收 UT（**test_scheduler 链接问题已由 f68d442 修复，ctest 6/6 含 test_scheduler**，缺的只是 UT 本身）。
 5. **H 长线（2026-10-09 部分达成）**：2b 已消灭、2a 简单部分已消灭（见 §2）；剩余 2a 逻辑改行（loader/model/KV/llama.cpp）保留 patch——改既有逻辑行的动作 frag 化只是搬家。
 6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
-7. **设备侧 fold + 提交单元 arena + head 融合（设计已写；A 已确认，B 待实现）**：A = multi-target 走设备侧 fold（`moe_out` 常驻、去 host fold）；B0 = arena 按提交单元 `[closure(L)+tail(L)+head(L+1)]` 做 liveness 打包、窗口跨单元复用（取代 parity，不额外占 scratch）；B1 = 把该单元融成一张设备图（打开 Tier-2 head fusion）。挂点、谓词、正确性门禁与回退见 [`docs/DEVICE_FOLD_HEAD_FUSION.md`](DEVICE_FOLD_HEAD_FUSION.md)。2026-10-26 实测：B0/B1/A 省的是同步往返/提交次数（RX590 上合计约 5-10%），不解决 per-node dispatch；价值在混合池路径与将来 CUDA replay。
+7. **设备侧 fold + arena 槽位 + head 融合（设计已写；A 已确认，B 选型待定）**：A = multi-target 走设备侧 fold（`moe_out` 常驻、去 host fold）；B0a = 按层 parity（层 L 用槽位 `L&1`，bump 基址抬到两槽之上；2× 静态 scratch，逐字节一致，推荐先做）；B0b = 同步边界 carry + 提交单元窗口（1× 窗口，但必须先把 head→closure 的 `cur/ids/weights` 从普通 scratch 改成 carry，延后）；B1 = 把 `[closure+tail+head(L+1)]` 融成一张设备图（打开 Tier-2 head fusion）。挂点、谓词、正确性门禁与回退见 [`docs/DEVICE_FOLD_HEAD_FUSION.md`](DEVICE_FOLD_HEAD_FUSION.md)。2026-10-26 实测：这些改动省的是同步往返/提交次数（RX590 上合计约 5-10%），不解决 per-node dispatch；价值在混合池路径与将来 CUDA replay。
 
 ### 顺手
 
