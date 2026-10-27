@@ -2,12 +2,11 @@
 
 [English](DEVICE_FOLD_HEAD_FUSION.md) | [简体中文](DEVICE_FOLD_HEAD_FUSION.zh-CN.md)
 
-> Status: **A accepted (2026-10-26). B has a decision pending (2026-10-27):** the
-> submission-unit window needs the sync-boundary tensors pinned (see §4.1b), so
-> B0 is split into **B0a = per-layer parity** (minimal, recommended) and
-> **B0b = sync-boundary carry + unit window** (lower memory, larger refactor,
-> deferred). Two changes to the only executor
-> `exec_layer_burst_chain_buckets` (`src/backend/minigraph_exec.cpp`):
+> Status: **A accepted (2026-10-26); B0b implemented and verified (2026-10-27).**
+> `layout_arena` now plans per submission unit and pins the head->closure set in
+> a new `sync` region - no parity, no carry reclassification (see §4.2). B1
+> (head fusion) is the remaining step. Background: two changes to the only
+> executor `exec_layer_burst_chain_buckets` (`src/backend/minigraph_exec.cpp`):
 >
 > - **A. Device-side fold** (accepted): keep the per-pool partial accumulator and
 >   `moe_out` on the device that owns the tail, instead of reading every device
@@ -264,7 +263,10 @@ Evidence from the plan dump (`STREAM_MOE_TMP_DUMP_PLAN=1`, olmoe, place-cpu):
 
 Two viable B0s follow.
 
-### 4.2a Option B0a - per-layer parity (recommended)
+### 4.2a Option B0a - per-layer parity (NOT TAKEN)
+
+Kept for the record: this was the low-risk fallback (2x static scratch). B0b
+below was implemented instead, so there is no parity slot anywhere.
 
 Keep the existing per-layer window and give layer L the slot `L & 1`:
 
@@ -282,14 +284,11 @@ Cost: 2x static scratch per device (olmoe prefill 71 MB -> 142 MB; gemma prefill
 128 MB -> 256 MB; bump unchanged). No reclassification, no relay changes, and the
 layout change is byte-identical (offsets only).
 
-### 4.2 Option B0b - submission-unit window (deferred: needs 4.1b)
+### 4.2 Option B0b - submission-unit window (IMPLEMENTED 2026-10-27)
 
-**Prerequisite (4.1b):** the head->closure set must be reclassified as
-sync-boundary carry and pinned, otherwise the window reuse clobbers it. The set
-is small but non-trivial: `cur` (the normed hidden, `ffn_norm-*`), the router
-ids/topk/weights (`ffn_moe_*`), and the residual stream consumed by the tail.
-They currently cross devices through xfer shells, so moving them to `carry1`
-also changes the carry/relay sets - that is the deferred part.
+**Result:** `layout_arena` now plans per unit and pins the head->closure set in a
+new `sync` region. No parity, no carry reclassification: `carry1`/`carryN` keep
+their meaning and relay path. B0a was not needed.
 
 The executor's per-token structure is:
 
@@ -301,36 +300,52 @@ U_last  = [ closure(L_{n-1}) + tail(L_{n-1}) ]
 
 Each unit ends at the ids readback (the only host break per layer), i.e. at a
 **sync**. Within a unit the nodes run in exactly the order
-closure -> tail -> head; across units the window may be reused because the sync
+closure -> tail -> head; across units the window is reused because the sync
 retires every in-flight read.
 
-The plan therefore becomes:
+The implementation (all in `layout_arena`):
 
-- pack every unit's non-carry, non-view nodes with the existing
-  `pack_interval` liveness packing, per device, using a time axis that spans the
-  unit (`head(L+1)`'s nodes are after `tail(L)`'s);
-- `unit_stride = max over units of (packed unit size + runtime bump bound)`;
-- `scratch_size = unit_stride` and every unit uses the same window (offset 0),
-  exactly like today's per-layer reuse, but the unit is bigger;
-- the closure's `out_off` and `result_bytes` are the unit's packed closure part;
-  the runtime bump (`pool_bump`) keeps starting at `base = unit_static`, i.e.
-  after the static region, as today;
-- CPU full-alloc (`moe_chain_set_full_alloc`) is sized by the same unit window.
+- units are built from `g_layer_nodes` + the existing `moe_layer_plan_t.head/tail`
+  and `moe_layer_exec_t.compute` lists, mirroring the executor's pairing;
+- `sync` = captured tensors whose producer unit differs from a consumer unit and
+  which are not already in `carry`. Pinned in `[carry1][carryN][sync][scratch]`;
+  one slot per unit (`sync_size = max over units of the unit's set`), reused
+  across units;
+- every unit's non-view, non-carry, non-sync nodes are packed with
+  `pack_interval` on a time axis that spans the unit (`head(L+1)` after
+  `tail(L)`); `scratch_size = max over units`; the same window (offset 0) is
+  reused across units;
+- the closure's `out_off` and `result_bytes` are the unit's packed closure part
+  (`result_bytes = unit_static`), so the runtime bump starts above every unit
+  static; the CPU full-alloc block and the device arena both index the same
+  `out_off`;
+- the `sync` slot is reused across units because unit k+1 writes its own set
+  only at its **end** (the head nodes), after unit k's consumers ran. That
+  ordering is what makes one slot enough - see the pitfall below.
 
-### 4.3 Why this is legal (and why B0a is the safe subset)
+**Pitfall found during bring-up (must stay fixed):** the consumer scan must skip
+alias/view consumers (`view_src != NULL`). `build_layer_plans` can attribute a
+view of a closure output (e.g. `ffn_moe_weighted`) to the head list of the same
+layer, i.e. a *different* unit; counting that view as a consumer marks closure
+outputs as `sync`. They then share the single sync slot with the previous unit's
+live set (`ffn_norm`/`ffn_inp`), and the closure writes them mid-layer, so later
+rounds read clobbered `cur` - a deterministic numeric change (observed as
+`place-c1c2-exp1` flipping from PASS to DIFF, 8/4 -> 7/5). Skipping view
+consumers and following the real consumer (`ffn_moe_out`) fixes it.
 
-- Reuse is legal **between** units only if every tensor live across the boundary
-  is pinned. The ids barrier is the boundary, and the head->closure set is *not*
-  pinned today (4.1b), so B0b must add that pinning before it can reuse the
-  window.
-- Once pinned, the unit boundary is fixed by the *placement and the graph* (one
-  head per layer, one ids barrier per layer), **not** by the runtime routing:
-  whether a token's experts land in RAM or VRAM changes which rounds run, not
-  which nodes exist or their order. So the unit plan would be build-time
-  deterministic and stable across tokens.
-- B0a (parity) is the same invariant without reclassification: two windows make
-  the fused pair disjoint by construction. It is the recommended first step
-  because it is byte-identical and does not touch the relay path.
+### 4.3 Why this is legal
+
+- Reuse is legal **between** units because a sync separates them. Tensors live
+  across the boundary (`sync`) are pinned; everything else must die inside the
+  unit, which is what `pack_interval` proves.
+- The unit boundary is fixed by the *placement and the graph* (one head per
+  layer, one ids barrier per layer), **not** by the runtime routing: whether a
+  token's experts land in RAM or VRAM changes which rounds run, not which nodes
+  exist or their order. So the plan is build-time deterministic and stable
+  across tokens.
+- `carry` is unchanged: tail(L)->head(L+1) is cross-layer and stays in
+  `carry1`, even though it is now unit-internal. Demoting it to scratch is a
+  separate, later change (it would touch the relay sets).
 
 ### 4.4 What the unit plan covers
 
@@ -341,23 +356,24 @@ The plan therefore becomes:
 | closure runtime bump (`pool_bump`: twins/gathers/fold) | yes (black box) | reserved after `unit_static`, bounded per device |
 | tensor produced by tail(L), consumed by head(L+1) | **yes** | unit scratch (it is carry today; in B0b it is internal and its relay disappears when both are on D) |
 | tail/head cross-device edge | no (two device plans) | xfer shell (today: separate region; can be absorbed into the unit pack later) |
-| `cur` for closure(L) from head(L) | no (crosses the ids barrier) | **currently plain scratch - must become sync-boundary carry in B0b** |
-| router ids/topk/weights (head -> closure) | no (same boundary) | **same: must be pinned in B0b** |
+| `cur` for closure(L) from head(L) | no (crosses the ids barrier) | **`sync` region** (new; one slot per unit) |
+| router ids/topk/weights (head -> closure) | no (same boundary) | `sync` region |
 | cross-N retained state | no | `carryN` |
 | KV cache | no | llama-owned |
 
 So: everything whose whole live range fits inside the unit collapses into one
-plan; only what crosses the ids barrier (`carry1`) or is retained (`carryN`)
-stays special. That matches "everything except the cross buffers" - with the
-addition that cross-1 is forced by the ids barrier, not by the plan.
+plan; only what crosses the ids barrier (`sync`) or is cross-layer (`carry1`) /
+retained (`carryN`) stays special. Measured on olmoe prefill 2048 (place:
+C1/C2 Vulkan, RAM+Vulkan0 pools): `sync` = 8.5 MB/unit, `scratch` = 102 MB,
+`carry1` = 8 MB - i.e. B0b costs +8.5 MB, not the +102 MB of parity.
 
 ### 4.5 Multiple residual streams
 
 The plan is per tensor, so k residual streams are just k tensors per boundary:
 
 - streams consumed inside the unit are unit scratch;
-- streams crossing the ids barrier are `carry1`, whose boundary set is already a
-  set (parity applies to the whole set, so 2x the set, not 2x per stream);
+- streams crossing the ids barrier are `sync`; the slot is per unit and holds the
+  whole set, so k streams cost k tensors once, not k windows;
 - retained streams stay in `carryN`.
 
 No new mechanism is needed. Two assumptions remain outside this design:
@@ -437,10 +453,13 @@ head).
 
 ### 4.11 Verification
 
-- Step B0a (parity only, no fusion): `run_baseline` PASS with **IDENTICAL**
-  moe/upstream; `verify_places` unchanged (8 exact + the same 4 known diffs);
-  smoke PASS. This is the strong gate: layout changes must not move numerics.
-- Step B1 (fusion): per-layer `STREAM_MOE_TMP_DUMP` `moe_out`/hidden vs B0a on
+- Step B0b (unit window + sync region, no fusion): **done 2026-10-27.**
+  `run_baseline moe_129_8192_vk` PASS: moe/upstream **IDENTICAL**, embd gate
+  121/129 = 93.8% (unchanged), KL max 4.027535e-01 (unchanged), places **8 PASS /
+  4 DIFF** (the historical set), smoke PASS; `build.bat test main` 6/6 + guard
+  PASS; `STREAM_MOE_TMP_DUMP_PLAN` shows `sync`=8.5 MB, `scratch`=102 MB on
+  olmoe prefill 2048.
+- Step B1 (fusion): per-layer `STREAM_MOE_TMP_DUMP` `moe_out`/hidden vs B0b on
   gemma + deepseek must be byte-identical; TMR `head` bucket drops to 1
   call/token and per-layer submissions become 1; 12/12 topologies, 0 ERROR.
 - TMR before/after: `chain_tail`/`tail_sync` and the submission count.
@@ -449,16 +468,14 @@ head).
 
 | step | touches | risk | expected |
 | :--- | :--- | :--- | :--- |
-| B0a. per-layer parity (layout only, no fusion) | `layout_arena` scratch section (slot + stdc size), `result_bytes = 2*stride`, device `arena_used` | low; byte-identical | removes the aliasing constraint; 2x static scratch per device; no perf claim |
-| B0b. sync-boundary carry + unit window (optional, deferred) | carry classification + relay sets + `layout_arena` | high (relay path) | 1x window instead of 2x; carry grows by ~1 hidden per boundary |
+| B0b. unit window + `sync` region (layout only) | `layout_arena` (units, sync set, pack, `result_bytes`) + `region_plan_t` | medium; byte-identical | **done 2026-10-27**; +8.5 MB `sync` instead of +102 MB parity; unblocks B1 |
+| B1. head fusion | Tier-2 block + loop | medium (aliasing gone by construction) | -1 submission/layer (~0.2-0.3 ms/layer on RX590; bigger once CUDA replay exists) |
 | A. device-side fold | exit block + fold plan + staging | medium (multi-target path) | mixed-pool: -1 sync, -1 D2H/H2D per layer (~0.2-0.4 ms/layer on olmoe; more on deepseek) |
-| B1. head fusion | Tier-2 block + loop | medium (with B0a the aliasing is gone by construction) | -1 submission/layer (~0.2-0.3 ms/layer on RX590; bigger once CUDA replay exists) |
 
-B0a is a prerequisite for B1 and can land first (it is behavior-neutral); A is
-independent and needed for mixed pools; B1 turns the currently dead
-`can_fuse_head_next` path live. B0b is a memory optimization for later. None of
-them replaces the per-node dispatch cost measured in `BENCHMARK.md`: on RX590 the
-decode ceiling stays ~20-40 t/s even with zero breaks. The target (P100/CUDA)
+B0b landed first (behavior-neutral, strong gate); A is independent and needed
+for mixed pools; B1 turns the currently dead `can_fuse_head_next` path live. None
+of them replaces the per-node dispatch cost measured in `BENCHMARK.md`: on RX590
+the decode ceiling stays ~20-40 t/s even with zero breaks. The target (P100/CUDA)
 must be measured with the same probe before deciding how far to push B1.
 
 ## 6. Open questions
@@ -466,9 +483,8 @@ must be measured with the same probe before deciding how far to push B1.
 1. Should the foreign-device partial path (multi-GPU, A) be implemented now, or
    only the same-physical-device case? (The target is one P100 + RAM, so the
    former is not needed for the first milestone.)
-2. B0a vs B0b: accept parity (2x static scratch, no relay changes) or wait and do
-   the sync-boundary carry refactor (1x window, changes carry/relay sets)?
-   (Recommend B0a now; B0b only if P100 VRAM gets tight.)
+2. ~~B0a vs B0b~~ **resolved 2026-10-27:** B0b implemented (unit window + `sync`
+   region); B0a (parity) dropped.
 3. Do we absorb `xfer` shells into the unit pack in B0b, or keep the separate
    xfer region and do it later? (Recommend later - one change at a time.)
 4. Do we demote the internal tail(L)->head(L+1) carry to unit scratch in B0b?

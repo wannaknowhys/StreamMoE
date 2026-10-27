@@ -74,19 +74,22 @@ struct region_plan_t {
     // carry: the cross-layer pipeline (logically one; physically per-device)
     size_t carry1_bytes;                 // 2 x max boundary pack (layer parity)
     size_t carryN_bytes;                 // retained cross-N
-    // scratch: every within-layer temporary of this device, MERGED:
-    //   compact (dense head/tail) + closure (MoE)
-    size_t scratch_bytes;                // max over layers
+    // sync: same-layer tensors crossing a submission-unit boundary (produced by
+    //   head(L), read by closure/tail(L)); one slot reused per unit (2026-10-27)
+    size_t sync_bytes;
+    // scratch: every temporary of one submission unit, MERGED:
+    //   [closure(L) + tail(L) + head(L+1)], one window reused across units
+    size_t scratch_bytes;                // max over units
     // xfer: consumer-side copies of cross-device producers, one shell per
     //   (producer, device, stage); reused across layers (max over layers)
     size_t xfer_bytes;
-    size_t off_carryN, off_scratch, off_xfer;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off, xfer_off;
+    size_t off_carryN, off_sync, off_scratch, off_xfer;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, sync_off, scratch_off, xfer_off;
     std::set<const ggml_tensor*> cross_device;   // carry a consumer reads remotely
 };
 ```
 
-**Three regions, by liveness.**
+**Four regions, by liveness.**
 
 - **carry** (cross-layer): the residual stream / layer outputs. **Logically one
   pipeline**; physically each device reserves its own grow-only slots. When
@@ -94,11 +97,21 @@ struct region_plan_t {
   it **explicitly** (D2D / transfer-queue; host boundaries via staging) before
   L+1 first reads it - not implicit, not duplicated. CPU-only = one device = no
   move.
-- **scratch** (within-layer): `compact` (dense head/tail) **merged with
-  `closure`** (the MoE computation). Both are per-layer temporaries reused
-  across layers, so on a device they are one pool. The executor's closure
-  offsets (`moe_chain_fullalloc_buffer`) index into this merged pool instead of
-  a separate closure block; `closure` is no longer its own region.
+- **sync** (within-layer, across the ids barrier): tensors produced by
+  `head(L)` and read by `closure(L)` / `tail(L)` (`ffn_inp`, `ffn_norm`, router
+  ids/topk/weights). They are not `carry` (same layer) but they cross a
+  submission-unit boundary, so they are pinned here. One slot is reused across
+  units because unit k+1 writes its own set only at its end (head), after unit
+  k's consumers ran. Classification must skip alias/view consumers
+  (`view_src != NULL`): otherwise a view attributed to the head list marks
+  closure outputs (`ffn_moe_weighted`) as sync and the slot aliases with the
+  previous unit's live set.
+- **scratch** (per submission unit): `compact` (dense head/tail) **merged with
+  `closure`** (the MoE computation) plus the next layer's head. The window is
+  reused across units (the ids readback is the sync); the executor's closure
+  offsets index into this merged pool instead of a separate closure block.
+  `result_bytes` = the unit's packed size, so the runtime bump base stays above
+  every unit static.
 
 **Closure is per-device by construction.** The MoE computation runs where its
 experts live, and every device has its own expert pool, so the closure is

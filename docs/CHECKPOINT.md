@@ -1,8 +1,12 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-10-26（**构建/门禁恢复 + 已落地项文档同步**；详见下方 2026-10-26 补记）。
-> **前次更新**：2026-10-09（**Muse 代码审查第一阶段闭环：P0-1 融合 Relay 权属门控 + 边界防御加固**）：
+> **最近更新**：2026-10-27（**B0b 单元 arena + `sync` 区落地并过门禁**；ids-barrier 结构发现、freshness 误报修复）。
+> - **B0b**：`layout_arena` 改按提交单元 `[closure(L)+tail(L)+head(L+1)]` 规划 scratch；新增 `sync` 区钉住 head→closure 的 `ffn_inp/ffn_norm/ids/weights`（每单元一个槽位，跨单元复用；无 parity、carry/relay 不变）。bring-up 踩坑：同步扫描必须跳过 alias/view 消费者（否则闭包输出被误判 sync，`place-c1c2-exp1` 出现确定性数值漂移）。
+> - **验证**：`run_baseline moe_129_8192_vk` PASS（moe/upstream IDENTICAL、embd 121/129、KL 4.027535e-01、places 8 PASS/4 DIFF）、`build.bat test main` 6/6、`STREAM_MOE_TMP_DUMP_PLAN` 实测 `sync`=8.5MB/`scratch`=102MB（olmoe prefill 2048）。
+> - **门禁修复**：`freshness_check.js` 新增 `--no-src`；`run_baseline.bat` 用它检查 `upstream_dump`（该 tag 只编 prefill_export，不编 `src/`，此前被 route-b 源码时间误报 stale）。
+> **前次更新**：2026-10-26（**构建/门禁恢复 + 已落地项文档同步**；详见下方 2026-10-26 补记）。
+> **2026-10-09 补记（Muse 代码审查第一阶段闭环：P0-1 融合 Relay 权属门控 + 边界防御加固）**：
 > - **P0-1 融合 Relay 时序提前修复**：在 `topo_segment_execute` 中引入 `tail_nodes` 权属判据与段位置门控。Tail 执行期仅触发本层 Tail relay 与源在 Tail 的 cross-layer carry；Head 执行期才触发源在 Head 的 LAYER_FRONT 与 CLOSURE relay，彻底解决跨设备 dense 放置下闭包陈旧数据消费问题。
 > - **核心防御加固**：`bucket_upload_leaf` / `bucket_source_leaf` 增加 `stage_size` 缓冲区溢出断言防御（REC-1）；`t.acc` in-place 别名前严格校验 `moe_out_contiguous` 连续性步长（REC-2）；`flush_segment` 缺失 backend 时显式报错中止、禁止静默 CPU fallback（REC-6a）。
 > - **回归验证**：`.\build.bat llamalibs dual` 原子同步编译；`verify_places.js --flavor StreamMoE` 12 拓扑 100% 运行成功（8 IDENTICAL + 4 微小浮点差异，全部语义流畅）；`smoke_cli.js` 混合池 9.96s PASS。
@@ -208,7 +212,7 @@ agy-run -c "start cmd /k temp\run_export_win.bat"
 4. **M7/M8（EXPERT_MOVE_PIPELINE）**：M7 设计 §8 open questions 收敛；M8 四个并发验收 UT（**test_scheduler 链接问题已由 f68d442 修复，ctest 6/6 含 test_scheduler**，缺的只是 UT 本身）。
 5. **H 长线（2026-10-09 部分达成）**：2b 已消灭、2a 简单部分已消灭（见 §2）；剩余 2a 逻辑改行（loader/model/KV/llama.cpp）保留 patch——改既有逻辑行的动作 frag 化只是搬家。
 6. **D Linux async DIO**：io_uring 真异步（`async_dio_posix.cpp` 现为同步 pread 壳），评估待做。
-7. **设备侧 fold + arena 槽位 + head 融合（设计已写；A 已确认，B 选型待定）**：A = multi-target 走设备侧 fold（`moe_out` 常驻、去 host fold）；B0a = 按层 parity（层 L 用槽位 `L&1`，bump 基址抬到两槽之上；2× 静态 scratch，逐字节一致，推荐先做）；B0b = 同步边界 carry + 提交单元窗口（1× 窗口，但必须先把 head→closure 的 `cur/ids/weights` 从普通 scratch 改成 carry，延后）；B1 = 把 `[closure+tail+head(L+1)]` 融成一张设备图（打开 Tier-2 head fusion）。挂点、谓词、正确性门禁与回退见 [`docs/DEVICE_FOLD_HEAD_FUSION.md`](DEVICE_FOLD_HEAD_FUSION.md)。2026-10-26 实测：这些改动省的是同步往返/提交次数（RX590 上合计约 5-10%），不解决 per-node dispatch；价值在混合池路径与将来 CUDA replay。
+7. **设备侧 fold + arena 槽位 + head 融合（B0b 已落地；A 已确认；B1 下一步）**：`layout_arena` 现按提交单元 `[closure(L)+tail(L)+head(L+1)]` 规划 scratch，并把 head→closure 的 `ffn_inp/ffn_norm/ids/weights` 钉进新的 `sync` 区（每单元一个槽位、跨单元复用；没有 parity、carry 与 relay 路径不变）。踩坑记录：同步扫描必须跳过 alias/view 消费者，否则闭包输出（`ffn_moe_weighted`）会被误判成 sync 并与上一单元仍存活的张量重叠（`place-c1c2-exp1` 8/4→7/5 的确定性数值变化）。验证：`run_baseline moe_129_8192_vk` PASS（moe/upstream IDENTICAL、embd 121/129、KL 4.027535e-01、places 8 PASS/4 DIFF）、`build.bat test main` 6/6、dump 实测 `sync`=8.5MB/`scratch`=102MB（olmoe prefill 2048）。下一步 B1 = 把该单元融成一张设备图（打开 Tier-2 head fusion）；A = multi-target 走设备侧 fold（`moe_out` 常驻、去 host fold）。挂点、谓词、门禁见 [`docs/DEVICE_FOLD_HEAD_FUSION.md`](DEVICE_FOLD_HEAD_FUSION.md) 与 [`docs/PER_DEVICE_ARENA.md`](PER_DEVICE_ARENA.md) §3。2026-10-26 实测：这些改动省的是同步往返/提交次数（RX590 上合计约 5-10%），不解决 per-node dispatch；价值在混合池路径与将来 CUDA replay。
 
 ### 顺手
 

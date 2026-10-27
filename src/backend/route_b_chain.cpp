@@ -54,10 +54,10 @@ struct region_plan_t {
     std::string dev;
     ggml_backend_buffer_t buf = nullptr;
     size_t cap = 0;
-    size_t off_carryN = 0, off_scratch = 0, off_xfer = 0;
-    size_t carry1_size = 0, carryN_size = 0, scratch_size = 0, xfer_size = 0;
+    size_t off_carryN = 0, off_sync = 0, off_scratch = 0, off_xfer = 0;
+    size_t carry1_size = 0, carryN_size = 0, sync_size = 0, scratch_size = 0, xfer_size = 0;
     size_t need = 0;
-    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, scratch_off, xfer_off;
+    std::unordered_map<const ggml_tensor*, size_t> carry1_off, carryN_off, sync_off, scratch_off, xfer_off;
     std::set<const ggml_tensor*> cross_device;   // carry a remote consumer reads
 };
 static std::map<std::string, region_plan_t> g_plans;
@@ -363,6 +363,87 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         if (std::find(cN.begin(), cN.end(), t) == cN.end()) cN.push_back(const_cast<ggml_tensor*>(t));
     }
 #endif
+    // ---- submission units + sync-boundary set (docs/DEVICE_FOLD_HEAD_FUSION.md B0b)
+    // Unit = [closure(L) + tail(L) + head(L+1)]; U0 = [head(L0)];
+    // U_last = [closure(L_last) + tail(L_last)]. Each unit ends at the ids
+    // readback, so its scratch window can be reused by the next unit.
+    // Tensors that cross a unit boundary WITHIN one layer (produced by head(L),
+    // read by closure/tail(L): ffn_norm/ids/weights/residual) are not `carry`
+    // today; they are pinned in the `sync` region, otherwise the next unit's
+    // window would overwrite them.
+    struct unit_t { std::vector<ggml_tensor*> nodes; int closure_layer = -1; };
+    std::vector<unit_t> units;
+    std::map<const ggml_tensor*, int> unit_of;
+    {
+        std::vector<int> lys;
+        for (auto & kv : g_layer_nodes) lys.push_back(kv.first);
+        const int nL = (int) lys.size();
+        std::vector<char> head_taken((size_t) nL, 0);
+        auto add_unit = [&](unit_t && u) {
+            for (auto * nd : u.nodes) if (nd) unit_of[nd] = (int) units.size();
+            units.push_back(std::move(u));
+        };
+        for (int i = 0; i < nL; ++i) {
+            const moe_layer_plan_t * lp = moe_chain_layer_plan(lys[(size_t) i]);
+            const moe_layer_exec_t * ex = moe_chain_layer_exec(lys[(size_t) i]);
+            if (!head_taken[(size_t) i] && lp && !lp->head.empty()) {
+                unit_t u;
+                u.nodes = lp->head;
+                add_unit(std::move(u));
+            }
+            unit_t u;
+            u.closure_layer = lys[(size_t) i];
+            if (ex) u.nodes.insert(u.nodes.end(), ex->compute.begin(), ex->compute.end());
+            if (lp) u.nodes.insert(u.nodes.end(), lp->tail.begin(), lp->tail.end());
+            if (i + 1 < nL && !head_taken[(size_t) i + 1]) {
+                if (const moe_layer_plan_t * lpn = moe_chain_layer_plan(lys[(size_t) i + 1])) {
+                    if (!lpn->head.empty()) {
+                        u.nodes.insert(u.nodes.end(), lpn->head.begin(), lpn->head.end());
+                        head_taken[(size_t) i + 1] = 1;
+                    }
+                }
+            }
+            add_unit(std::move(u));
+        }
+        // Defensive: every captured node still belongs to exactly one unit.
+        for (auto & kv : g_layer_nodes) {
+            int ui = -1;
+            for (int k = 0; k < (int) units.size(); ++k) {
+                if (units[(size_t) k].closure_layer == kv.first) { ui = k; break; }
+            }
+            if (ui < 0) continue;
+            for (auto * nd : kv.second) if (nd && !unit_of.count(nd)) unit_of[nd] = ui;
+        }
+    }
+    // base producer (views unwrapped) -> units that read it. Skip alias
+    // consumers (view_src != NULL): their data is the producer's, they do not
+    // execute, and build_layer_plans can attribute them to the head list of the
+    // same layer (a different unit) - following them would falsely mark closure
+    // outputs (ffn_moe_weighted) as crossing the unit boundary. The real
+    // consumer (e.g. ffn_moe_out) reads the view and is counted below.
+    std::map<const ggml_tensor*, std::set<int>> cons_units;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * nd = gf->nodes[i];
+        if (nd->view_src) continue;
+        auto cu = unit_of.find(nd);
+        if (cu == unit_of.end()) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src) continue;
+            while (src && is_view_op(src)) src = src->src[0];
+            if (!src) continue;
+            if (unit_of.count(src)) cons_units[src].insert(cu->second);
+        }
+    }
+    std::set<const ggml_tensor*> sync;
+    for (auto & kv : unit_of) {
+        const ggml_tensor * nd = kv.first;
+        if (!nd || nd->view_src || carry.count(nd)) continue;
+        auto it = cons_units.find(nd);
+        if (it == cons_units.end()) continue;
+        for (int cu : it->second) if (cu != kv.second) { sync.insert(nd); break; }
+    }
+
     // ---- generic cross-device transfers (docs/PER_DEVICE_ARENA.md 3/SS8.3) ----
     // Every captured edge whose producer and consumer devices differ gets a
     // consumer-side copy (shell) in the consumer device's `xfer` region, and the
@@ -503,19 +584,38 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             if (cd != consumer_dev.end() && cd->second != D) plan.cross_device.insert(nd);
         }
 
-        // --- scratch: dense head/tail + MoE closure, one pool per device.
-        // Time axis = global exec order (head, closure, tail); last_use = the
-        // latest consumer (possibly on another device). Size = max over layers.
-        for (auto & kv : g_layer_nodes) {
-            const moe_layer_plan_t * lp = moe_chain_layer_plan(kv.first);
-            const moe_layer_exec_t * ex = moe_chain_layer_exec(kv.first);
+        // --- sync: same-layer tensors crossing a unit boundary (pinned). Unit k+1
+        // writes its own set only after unit k's consumers ran (unit boundary =
+        // ids readback), so one slot is reused across units.
+        {
+            std::map<int, size_t> unit_bytes;
+            for (const ggml_tensor * nd : sync) {
+                auto dit = dev_of.find(nd);
+                if (nd->view_src || dit == dev_of.end() || dit->second != D) continue;
+                unit_bytes[unit_of[nd]] += ggml_nbytes(nd);
+            }
+            size_t m = 0;
+            for (auto & kv : unit_bytes) m = std::max(m, kv.second);
+            plan.sync_size = (m + 63) & ~size_t(63);
+            std::map<int, size_t> cur;
+            for (const ggml_tensor * nd : sync) {
+                auto dit = dev_of.find(nd);
+                if (nd->view_src || dit == dev_of.end() || dit->second != D) continue;
+                size_t & off = cur[unit_of[nd]];
+                off = (off + 63) & ~size_t(63);
+                plan.sync_off[nd] = off;
+                off += ggml_nbytes(nd);
+            }
+        }
+
+        // --- scratch: one window per submission unit, reused across units.
+        // Time axis = unit exec order (closure -> tail -> head(next)); last_use =
+        // latest consumer inside the unit (cross-unit tensors are carry/sync).
+        for (const unit_t & unit : units) {
+            const moe_layer_exec_t * ex = (unit.closure_layer >= 0) ? moe_chain_layer_exec(unit.closure_layer) : nullptr;
             std::unordered_map<const ggml_tensor*, int> etime;
-            int H = 0;
-            if (lp) for (ggml_tensor * h : lp->head) etime[h] = H++;
-            const int CB = H;   // closure base
-            if (ex) for (size_t i = 0; i < ex->compute.size(); ++i) etime[ex->compute[i]] = CB + (int) i;
-            int T = CB + (ex ? (int) ex->compute.size() : 0);
-            if (lp) for (ggml_tensor * t : lp->tail) { auto e = etime.find(t); if (e == etime.end()) etime[t] = T++; }
+            int T = 0;
+            for (ggml_tensor * nd : unit.nodes) { if (nd && !etime.count(nd)) etime[nd] = T++; }
             std::unordered_map<const ggml_tensor*, int> last_etime;
             for (auto & ep : etime) {
                 const ggml_tensor * node = ep.first;
@@ -533,8 +633,8 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             }
             std::vector<ggml_tensor*> cns;
             std::vector<int> cstart;
-            for (ggml_tensor * nd : kv.second) {
-                if (nd->view_src || carry.count(nd)) continue;
+            for (ggml_tensor * nd : unit.nodes) {
+                if (nd->view_src || carry.count(nd) || sync.count(nd)) continue;
                 if (dev_of[nd] != D) continue;
                 auto et = etime.find(nd);
                 if (et == etime.end()) continue;
@@ -577,7 +677,7 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
                 mut->layout_ok = true;
             }
 #ifdef STREAM_MOE_TEMP
-            if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && kv.first == 0) {
+            if (std::getenv("STREAM_MOE_TMP_COMPACT_DEBUG") && unit.closure_layer == 0) {
                 for (size_t k = 0; k < cns.size(); ++k)
                     fprintf(stderr, "[cpack] b%d L0 %-24s start=%d end=%d off=%lld sz=%zu ptr=%p\n",
                             g_build_id, cns[k]->name ? cns[k]->name : "?", cstart[k], cend[k], (long long) o[k], ggml_nbytes(cns[k]), (const void *) cns[k]);
@@ -611,8 +711,9 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 
         // --- grow-only device buffer (host buft when D == "")
         plan.off_carryN = plan.carry1_size;
-        plan.off_scratch = plan.carry1_size + plan.carryN_size;
-        plan.off_xfer = plan.carry1_size + plan.carryN_size + plan.scratch_size;
+        plan.off_sync   = plan.carry1_size + plan.carryN_size;
+        plan.off_scratch = plan.off_sync + plan.sync_size;
+        plan.off_xfer   = plan.off_scratch + plan.scratch_size;
         plan.need = plan.off_xfer + plan.xfer_size + 4096;
         if (plan.need > plan.cap) {
             if (plan.buf) ggml_backend_buffer_free(plan.buf);
@@ -636,12 +737,15 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
             region_plan_t & plan = pit->second;
             char * base = static_cast<char*>(ggml_backend_buffer_get_base(plan.buf));
             const size_t off_carryN  = plan.carry1_size;
-            const size_t off_scratch = plan.carry1_size + plan.carryN_size;
+            const size_t off_sync    = plan.carry1_size + plan.carryN_size;
+            const size_t off_scratch = plan.off_sync + plan.sync_size;
             nd->buffer = plan.buf;
             auto c1i = plan.carry1_off.find(nd);
             if (c1i != plan.carry1_off.end()) { nd->data = base + c1i->second; continue; }
             auto cNi = plan.carryN_off.find(nd);
             if (cNi != plan.carryN_off.end()) { nd->data = base + off_carryN + cNi->second; continue; }
+            auto si = plan.sync_off.find(nd);
+            if (si != plan.sync_off.end()) { nd->data = base + off_sync + si->second; continue; }
             auto mit = plan.scratch_off.find(nd);
             if (mit != plan.scratch_off.end()) { nd->data = base + off_scratch + mit->second; continue; }
         }
@@ -738,6 +842,25 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
 
     g_plans = plans;   // expose to moe_chain_fullalloc_buffer / route_b_in_arena
     g_node_dev = dev_of;   // expose node -> device to the executor (phase 3)
+    // Per-device plan dump: BEFORE the host-arena early return, so device-only
+    // placements (no host plan) still report the layout.
+    if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
+        fprintf(stderr, "==== per-device plan (%zu device(s), %zu unit(s)) ====\n", g_plans.size(), units.size());
+        for (auto & kv : g_plans) {
+            const region_plan_t & p = kv.second;
+            fprintf(stderr, "  dev=%-12s nodes=%-5zu carry1=%-9zu carryN=%-9zu sync=%-9zu scratch=%-9zu cross_dev=%-4zu cap=%zu\n",
+                    kv.first.empty() ? "CPU(host)" : kv.first.c_str(),
+                    p.carry1_off.size() + p.carryN_off.size() + p.sync_off.size() + p.scratch_off.size(),
+                    p.carry1_size, p.carryN_size, p.sync_size, p.scratch_size, p.cross_device.size(), p.cap);
+            fprintf(stderr, "  dev=%-12s off: carryN=%zu sync=%zu scratch=%zu xfer=%zu need=%zu\n",
+                    kv.first.empty() ? "CPU(host)" : kv.first.c_str(),
+                    p.off_carryN, p.off_sync, p.off_scratch, p.off_xfer, p.need);
+            for (auto & s : p.sync_off)
+                fprintf(stderr, "    sync[%zu] %-28s L%-3d sz=%zu\n", s.second,
+                        s.first->name ? s.first->name : "(anon)",
+                        route_b_official_layer(s.first), ggml_nbytes(s.first));
+        }
+    }
     // Host plan drives the debug/report paths and the CPU executor.
     region_plan_t & hostp = g_plans[""];
     g_arena = hostp.buf;
@@ -829,18 +952,6 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         fprintf(stderr, "[route_b_verify] arena: n_tok=%lld carry1=%zu carryN=%zu scratch=%zu need=%zu cap=%zu bytes (carry=%zu nodes)\n",
                 (long long) n_tok, hostp.carry1_size, hostp.carryN_size, hostp.scratch_size,
                 hostp.need, g_arena_cap, carry.size());
-
-    // Per-device plan: one line per device with its own buffer + region sizes.
-    if (std::getenv("STREAM_MOE_TMP_DUMP_PLAN")) {
-        fprintf(stderr, "==== per-device plan (%zu device(s)) ====\n", g_plans.size());
-        for (auto & kv : g_plans) {
-            const region_plan_t & p = kv.second;
-            fprintf(stderr, "  dev=%-12s nodes=%-5zu carry1=%-9zu carryN=%-9zu scratch=%-9zu cross_dev=%-4zu cap=%zu\n",
-                    kv.first.empty() ? "CPU(host)" : kv.first.c_str(),
-                    p.carry1_off.size() + p.carryN_off.size() + p.scratch_off.size(),
-                    p.carry1_size, p.carryN_size, p.scratch_size, p.cross_device.size(), p.cap);
-        }
-    }
 }
 }
 

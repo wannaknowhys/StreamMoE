@@ -2,9 +2,9 @@
 
 [English](DEVICE_FOLD_HEAD_FUSION.md) | [简体中文](DEVICE_FOLD_HEAD_FUSION.zh-CN.md)
 
-> 状态：**A 已确认（2026-10-26）。B 的选型待定（2026-10-27）**：提交单元窗口需要先把
-> 同步边界张量钉住（见 §4.1b），所以 B0 拆成 **B0a = 按层 parity**（最小改动，推荐）与
-> **B0b = 同步边界 carry + 单元窗口**（更省内存、改动更大，延后）。针对唯一执行器
+> 状态：**A 已确认（2026-10-26）；B0b 已实现并验证（2026-10-27）**：`layout_arena` 现在按
+> 提交单元规划，并把 head→closure 集合钉进新的 `sync` 区——没有 parity、没有 carry 重分类
+> （见 §4.2）。剩下的是 B1（head 融合）。针对唯一执行器
 > `exec_layer_burst_chain_buckets`（`src/backend/minigraph_exec.cpp`）的两项改动：
 >
 > - **A. 设备侧 fold**（已确认）：把每池 partial accumulator 与 `moe_out` 留在 tail 所在
@@ -226,7 +226,10 @@ plan dump 证据（`STREAM_MOE_TMP_DUMP_PLAN=1`，olmoe，place-cpu）：
 
 因此 B0 有两个可行方案。
 
-### 4.2a Option B0a —— 按层 parity（推荐）
+### 4.2a Option B0a —— 按层 parity（未采用）
+
+留档：这是低风险回退方案（2× 静态 scratch）。实际落地的是下面的 B0b，所以现在没有任何
+parity 槽位。
 
 保留现有按层窗口，层 L 用槽位 `L & 1`：
 
@@ -241,12 +244,10 @@ plan dump 证据（`STREAM_MOE_TMP_DUMP_PLAN=1`，olmoe，place-cpu）：
 代价：每设备 2× 静态 scratch（olmoe prefill 71MB→142MB；gemma prefill 128MB→256MB；
 bump 不变）。不重分类、不改 relay，布局改动逐字节一致（只动 offset）。
 
-### 4.2 Option B0b —— 提交单元窗口（延后：需要 4.1b）
+### 4.2 Option B0b —— 提交单元窗口（2026-10-27 已实现）
 
-**前置（4.1b）**：必须先把 head→closure 集合重分类为"同步边界 carry"并钉住，否则窗口
-复用会覆盖它。这个集合不大但不少：`cur`（norm 之后的 hidden，`ffn_norm-*`）、router
-ids/topk/weights（`ffn_moe_*`）、以及 tail 消费的残差流。它们今天经 xfer shell 跨设备，
-挪进 `carry1` 会连带改 carry/relay 集合——这就是延后的部分。
+**结果**：`layout_arena` 现在按单元规划，并把 head→closure 集合钉进新的 `sync` 区。没有
+parity、没有 carry 重分类：`carry1`/`carryN` 的含义与 relay 路径都不变。B0a 不再需要。
 
 执行器每 token 的结构是：
 
@@ -257,29 +258,41 @@ U_last  = [ closure(L_{n-1}) + tail(L_{n-1}) ]
 ```
 
 每个单元以 ids 回读（每层唯一 host break）结尾，即结束在**同步点**。单元内节点严格按
-closure -> tail -> head 的顺序执行；单元之间可以复用同一窗口，因为同步已经回收所有在飞
-读取。
+closure -> tail -> head 的顺序执行；单元之间复用同一窗口，因为同步已经回收所有在飞读取。
 
-于是规划变成：
+实现（全部在 `layout_arena`）：
 
-- 每个单元的非 carry、非 view 节点，沿用现有 `pack_interval` 做 liveness 打包（按设备），
-  时间轴跨整个单元（`head(L+1)` 的节点排在 `tail(L)` 之后）；
-- `unit_stride = max over units(打包大小 + 运行期 bump 上界)`；
-- `scratch_size = unit_stride`，每个单元都用同一窗口（offset 0），和今天按层复用完全
-  同构，只是"单元"更大；
-- 闭包的 `out_off` 与 `result_bytes` 取单元中闭包那一段的打包结果；运行期 bump
-  （`pool_bump`）仍从 `base = unit_static` 开始（静态区之后），与今天一致；
-- CPU full-alloc（`moe_chain_set_full_alloc`）用同一个单元窗口尺寸。
+- 单元由 `g_layer_nodes` + 现有 `moe_layer_plan_t.head/tail`、`moe_layer_exec_t.compute`
+  列表构造，与执行器的配对一致；
+- `sync` = 产出单元与消费单元不同、且不在 `carry` 里的 captured 张量。区域顺序
+  `[carry1][carryN][sync][scratch]`；每个单元一个槽位
+  （`sync_size = max over units(该单元集合大小)`），跨单元复用；
+- 每个单元的非 view、非 carry、非 sync 节点用 `pack_interval` 打包，时间轴跨整个单元
+  （`head(L+1)` 排在 `tail(L)` 之后）；`scratch_size = max over units`，同一窗口
+  （offset 0）跨单元复用；
+- 闭包的 `out_off` 与 `result_bytes` 取单元打包结果（`result_bytes = unit_static`），
+  运行期 bump 从所有单元静态区之后开始；CPU full-alloc block 与设备 arena 都索引同一份
+  `out_off`；
+- `sync` 槽位跨单元复用的前提：单元 k+1 只在**末尾**（head 节点）写自己的 sync 集合，
+  此时单元 k 的消费者已经跑完。下面的坑就是破坏这个前提的后果。
 
-### 4.3 为什么合法（以及为什么 B0a 是安全子集）
+**bring-up 踩到的坑（必须保持修复）**：消费侧扫描必须跳过 alias/view 消费者
+（`view_src != NULL`）。`build_layer_plans` 可能把闭包输出的 view（例如
+`ffn_moe_weighted`）归到同层 head 列表，也就是**另一个单元**；把这个 view 当消费者，
+就会把闭包输出误判成 `sync`。它们于是与上一单元仍存活的 `ffn_norm`/`ffn_inp` 共用同一个
+sync 槽位，而闭包在中途就写它们——后面的 round 读到被覆盖的 `cur`，表现为确定性数值变化
+（实测 `place-c1c2-exp1` 从 PASS 变 DIFF，8/4 → 7/5）。跳过 view 消费者、跟到真正消费者
+（`ffn_moe_out`）后修复。
 
-- **单元之间**复用只有在"跨边界的张量全部被钉住"时才合法。ids barrier 就是边界，而
-  head→closure 集合今天**没有**被钉住（4.1b），所以 B0b 必须先补这个钉住。
-- 钉住之后，单元边界由**放置和图结构**（每层一个 head、每层一个 ids barrier）决定，
-  **不由运行时路由决定**：一个 token 的专家落 RAM 还是 VRAM 只改变跑哪些 round，不改变
-  节点集合与顺序。所以单元规划在 build 期确定、跨 token 稳定。
-- B0a（parity）是同一不变量的无重分类版本：两个窗口让融合对天然不相交。它作为第一步，
-  因为逐字节一致且不碰 relay 路径。
+### 4.3 为什么合法
+
+- **单元之间**复用合法，因为中间有同步；跨边界仍存活的张量（`sync`）被钉住，其余必须
+  死在单元内，这正是 `pack_interval` 证明的东西。
+- 单元边界由**放置和图结构**（每层一个 head、每层一个 ids barrier）决定，**不由运行时
+  路由决定**：一个 token 的专家落 RAM 还是 VRAM 只改变跑哪些 round，不改变节点集合与
+  顺序。所以单元规划在 build 期确定、跨 token 稳定。
+- `carry` 不变：tail(L)→head(L+1) 是跨层的，仍留在 `carry1`（即使它现在在单元内部）。
+  把它降级为 scratch 是后续独立改动（会动 relay 集合）。
 
 ### 4.4 单元规划覆盖什么
 
@@ -290,22 +303,23 @@ closure -> tail -> head 的顺序执行；单元之间可以复用同一窗口�
 | 闭包运行期 bump（`pool_bump`：孪生/gather/fold） | 是（黑盒） | 预留 `unit_static` 之后，按设备取上界 |
 | tail(L) 产出、head(L+1) 消费的张量 | **是** | 单元 scratch（今天它是 carry；B0b 里变为内部，同设备时 relay 消失） |
 | tail/head 跨设备边 | 否（两张设备 plan） | xfer shell（目前独立区域；以后可并入单元打包） |
-| closure(L) 的 `cur`（由 head(L) 产出） | 否（跨 ids barrier） | **今天只是普通 scratch——B0b 必须先变成"同步边界 carry"** |
-| router ids/topk/weights（head → closure） | 否（同一 barrier） | **同上：B0b 要先钉住** |
+| closure(L) 的 `cur`（由 head(L) 产出） | 否（跨 ids barrier） | **`sync` 区（新增，每单元一个槽位）** |
+| router ids/topk/weights（head → closure） | 否（同一 barrier） | `sync` 区 |
 | cross-N retained 状态 | 否 | `carryN` |
 | KV cache | 否 | llama 管理 |
 
 也就是说：**生命周期完整落在单元内的东西全部并入同一份 plan**；只有跨 ids barrier 的
-`carry1` 与 retained 的 `carryN` 保持特殊。这与"除了 cross buffer 之外都一次性搞定"一致
-——另外要补充：cross-1 是被 ids barrier 逼出来的，不是 plan 的缺陷。
+`sync`、跨层的 `carry1`、retained 的 `carryN` 保持特殊。olmoe prefill 2048 实测（C1/C2
+Vulkan + RAM/Vulkan0 混池）：`sync` = 8.5MB/单元、`scratch` = 102MB、`carry1` = 8MB
+——即 B0b 只多花 8.5MB，而不是 parity 的 +102MB。
 
 ### 4.5 多残差流
 
 plan 是逐张量的，所以 k 条残差流就是每个边界 k 个张量：
 
 - 单元内消费完的流 → 单元 scratch；
-- 跨 ids barrier 的流 → `carry1`，它的边界集合本来就是"集合"（parity 作用于整个集合，
-  是集合 2×，不是每条流 2×）；
+- 跨 ids barrier 的流 → `sync`；槽位按单元、装整个集合，所以 k 条流是 k 个张量一次，
+  不是 k 个窗口；
 - retained 的流 → `carryN`。
 
 不需要新机制。但本设计之外仍有两个假设：**每层一个 MoE 闭包**（`g_layer_exec` 每层一个
@@ -372,36 +386,37 @@ fuse_head_next(L) =
 
 ### 4.11 验证
 
-- 步骤 B0a（只做 parity、不融合）：`run_baseline` PASS 且 moe/upstream **IDENTICAL**；
-  `verify_places` 不变（8 逐字 + 同样 4 个已知 DIFF）；smoke PASS。这是强门禁：布局改动
-  不得移动数值。
+- 步骤 B0b（单元窗口 + `sync` 区、不融合）：**2026-10-27 完成**。
+  `run_baseline moe_129_8192_vk` PASS：moe/upstream **IDENTICAL**，embd 门 121/129 =
+  93.8%（不变），KL max 4.027535e-01（不变），places **8 PASS / 4 DIFF**（历史集合），
+  smoke PASS；`build.bat test main` 6/6 + guard PASS；`STREAM_MOE_TMP_DUMP_PLAN` 显示
+  olmoe prefill 2048 的 `sync`=8.5MB、`scratch`=102MB。
 - 步骤 B1（融合）：gemma + deepseek 逐层 `STREAM_MOE_TMP_DUMP` 的 `moe_out`/hidden 对
-  B0a 必须逐字节一致；TMR `head` 桶降到 1 次/token、每层提交数变为 1；12/12 拓扑 0 ERROR。
+  B0b 必须逐字节一致；TMR `head` 桶降到 1 次/token、每层提交数变为 1；12/12 拓扑 0 ERROR。
 - TMR 前后：`chain_tail`/`tail_sync` 与提交次数。
 
 ## 5. 顺序、成本、预期收益
 
 | 步骤 | 触及 | 风险 | 预期 |
 | :--- | :--- | :--- | :--- |
-| B0a. 按层 parity（纯布局、不融合） | `layout_arena` scratch 段（槽位 + `scratch_size`）、`result_bytes = 2*stride`、设备 `arena_used` | 低；逐字节一致 | 解除别名约束；每设备 2× 静态 scratch；不谈性能 |
-| B0b. 同步边界 carry + 单元窗口（可选、延后） | carry 分类 + relay 集合 + `layout_arena` | 高（relay 路径） | 窗口 1× 而不是 2×；carry 每个边界多约 1 个 hidden |
+| B0b. 单元窗口 + `sync` 区（纯布局） | `layout_arena`（单元、sync 集合、打包、`result_bytes`）+ `region_plan_t` | 中；逐字节一致 | **2026-10-27 完成**；+8.5MB `sync` 而不是 parity 的 +102MB；为 B1 铺路 |
+| B1. head 融合 | Tier-2 块 + 循环 | 中（别名按构造已消） | 每层少 1 次提交（RX590 ~0.2-0.3ms/层；CUDA replay 后更大） |
 | A. 设备侧 fold | 出口块 + fold plan + staging | 中（multi-target 路径） | 混合池每层省 1 次 sync、1 次 D2H/H2D（olmoe ~0.2-0.4ms/层；deepseek 更大） |
-| B1. head 融合 | Tier-2 块 + 循环 | 中（B0a 之后别名按构造已消） | 每层少 1 次提交（RX590 ~0.2-0.3ms/层；CUDA replay 后更大） |
 
-B0a 是 B1 的前置，可先落地（行为中性）；A 独立、混合池必需；B1 把目前死掉的
-`can_fuse_head_next` 路径接通；B0b 是以后的内存优化。三者都不替代 `BENCHMARK.md` 测到的
-逐节点 dispatch 成本：RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
-必须先用同一个 probe 测，再决定 B1 要走多远。
+B0b 已先落地（行为中性、强门禁）；A 独立、混合池必需；B1 把目前死掉的
+`can_fuse_head_next` 路径接通。三者都不替代 `BENCHMARK.md` 测到的逐节点 dispatch 成本：
+RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）必须先用同一个 probe
+测，再决定 B1 要走多远。
 
 ## 6. 待确认
 
 1. 多物理设备的 foreign partial 路径（A）现在就做，还是只做"同一物理设备"？
    （目标是单 P100 + RAM，第一里程碑不需要前者。）
-2. B0a 还是 B0b：接受 parity（2× 静态 scratch、不碰 relay），还是等同步边界 carry 重构
-   （窗口 1×，但要改 carry/relay 集合）？（建议先 B0a；只有 P100 显存吃紧才做 B0b。）
-3. B0 是否顺手把 `xfer` shell 吸收进单元打包，还是保持独立 xfer 区域、以后再并？
+2. ~~B0a 还是 B0b~~ **2026-10-27 已定**：B0b 实现（单元窗口 + `sync` 区），B0a（parity）
+   放弃。
+3. B0b 是否顺手把 `xfer` shell 吸收进单元打包，还是保持独立 xfer 区域、以后再并？
    （建议以后——一次只改一件事。）
-4. B0 是否顺手把 tail(L)→head(L+1) 的内部 carry 降级为单元 scratch？
-   （单元建好后很便宜，但会改 relay 集合；建议等 B0 验证逐字节一致后单独一步。）
+4. B0b 是否顺手把 tail(L)→head(L+1) 的内部 carry 降级为单元 scratch？
+   （单元建好后很便宜，但会改 relay 集合；建议等 B0b 验证逐字节一致后单独一步。）
 5. 将来 CUDA replay：round-shape cache 用 `(layer, stage, width, n_active)` 作键够不够？
    （decode 的 width ∈ [0..n_k]。）
