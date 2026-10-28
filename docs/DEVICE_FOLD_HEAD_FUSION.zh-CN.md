@@ -420,3 +420,100 @@ RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
    （单元建好后很便宜，但会改 relay 集合；建议等 B0b 验证逐字节一致后单独一步。）
 5. 将来 CUDA replay：round-shape cache 用 `(layer, stage, width, n_active)` 作键够不够？
    （decode 的 width ∈ [0..n_k]。）
+
+## 7. 待做详细记录
+
+状态 2026-10-27：B0b 已落地（单元 arena + `sync` 区）。剩下两项的状态、挂点与步骤记录
+如下。行号取自 2026-10-27 的 `src/backend/minigraph_exec.cpp`，会漂移；函数名稳定。
+
+### 7.1 A —— 设备侧 fold（multi-target 出口）
+
+**当前路径（要删掉的部分）**：混合池（一部分 round 在 CPU、一部分在设备）时，出口每层做：
+
+1. `ggml_backend_synchronize(t.be)` —— [:2626](src/backend/minigraph_exec.cpp:2626)；
+2. `ggml_backend_tensor_get(t.acc, dev_accs[di], ...)` —— D2H —— [:2666](src/backend/minigraph_exec.cpp:2666)；
+3. `layer_fold(ex, d_out, n_t, accs)` —— host 求和 —— [:2727](src/backend/minigraph_exec.cpp:2727)，定义在 [:1290](src/backend/minigraph_exec.cpp:1290)；
+4. `tensor_write_host(moe_out, ...)` —— H2D 写回 —— [:1308](src/backend/minigraph_exec.cpp:1308)。
+
+同步本来就要为 tail 做，所以 A 省的是两次拷贝 + host fold，不是 sync。`direct_out` 与
+`single_dev_target` 已经是省略路径（[:2632-2656](src/backend/minigraph_exec.cpp:2632)），
+所以 A **只针对 multi-target**（`!direct_out && !single_dev_target`）。
+
+**设计：**
+
+1. `fold_plan_t` —— owner = `moe_out` 所在设备（`moe_out_same_dev` 为真的那个 target；
+   没有就回退 host）。字段：owner pool、`foreign_pools`（其他设备上的 acc）、
+   `needs_cpu_partial`。
+2. staging：每设备一条 grow-only host-visible buffer，
+   `d_out * n_t * 4 * (1 + n_foreign)`，每层重置（层执行在调用线程上串行）。
+3. 在 owner 上建 fold 图，**排在 MoE 图之后**同一队列提交：从 owner acc 开始，每个
+   foreign acc 一个 `ACC`（D2D 或经 staging），每个 CPU partial 一个 `ACC`；结果直接落在
+   `moe_out`（它本来就在 owner 设备上）。
+4. CPU partial：CPU round 写 `c.acc_d`；提交前把它上传到 owner 的 staging 槽位（或者让
+   CPU round 直接写 owner 可读的 host-visible 槽位——arena 本身 host-visible 时零拷贝）。
+5. multi-target 下删掉 `tensor_get`/`layer_fold`/`tensor_write_host` 序列；保留
+   `layer_fold` 作为结构回退（owner 是 host、`moe_out` 不连续、或有算子设备不支持）。
+
+**不变量：**
+
+- `moe_out` 只写一次，由 owner fold 写；
+- fold 提交前每个 partial 都必须完整写出：设备 partial 靠 owner 队列顺序，foreign 设备靠
+  显式 fence，CPU partial 靠 host 拷贝；
+- fold 图在 MoE 图之后提交到 owner 队列；
+- 求和顺序改变（owner-first 而不是 host-first）→ ulp 级差异；门禁用宽松的那套（cos/KL），
+  **不是**逐字节一致；多池拓扑的预期差异要记录；
+- 最终 `moe_out` 回读（导出/采样）不变。
+
+**失败模式：** staging 分配失败 → 回退 host fold（只记一次日志）；foreign 回读失败 →
+向上传播（GGML_STATUS_FAILED）；设备不支持 ACC → 回退 host fold；`moe_out` 不连续/在 host
+→ 回退 host fold。
+
+**验证：** `run_baseline` 用同一套 cos 门禁 PASS（embd/KL），places 8 PASS / 4 DIFF
+（同一集合；多池条目就是已记录的 ulp 差异），TMR `tail_read`/`tail_fold` 降到 ~0、
+`tail_sync` 次数减一；olmoe 混合池约 0.2-0.4ms/层，deepseek 更大。
+
+### 7.2 B1 —— head 融合（Tier-2）
+
+**当前路径（为什么是死的）**：tail 融合建在
+[:2491-2512](src/backend/minigraph_exec.cpp:2491)，随后
+`can_fuse_head_next = false` 被硬编码在
+[:2526](src/backend/minigraph_exec.cpp:2526)，注释（别名理由）在
+[:2514-2526](src/backend/minigraph_exec.cpp:2514)。B0b 已经消掉了那个理由（单元窗口 +
+`sync` 区）。ids 回读不是阻塞：它在图返回之后读，正好是当前每层同步所在的位置。
+
+**范围：** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
+`plan_head_next != nullptr`；其余保持 Tier-1 路径。
+
+**步骤：**
+
+1. tail append（[:2505-2511](src/backend/minigraph_exec.cpp:2505)）之后，按图顺序 append
+   `plan_head_next->head`（跳过 `is_alias_op`、`!data`、`GGML_OP_NONE`）。
+2. 图溢出改成**硬错误**（`n_nodes + n_head > gf->size`）；同时修掉 tail append 在
+   [:2508](src/backend/minigraph_exec.cpp:2508) 的静默丢节点。
+3. 提交前派发 head 的 **incoming** relay：`r.layer == next_layer`、stage
+   `LAYER_FRONT`/`CLOSURE`、dst 设备 == D；**跳过** src 是本图节点的 relay（tail 输出现在
+   是单元内部 scratch，从旧源拷贝就错了——head 直接读它）。
+4. 置 `can_fuse_head_next = true`、`out_fused_head_next = true`；循环在
+   [:3348](src/backend/minigraph_exec.cpp:3348) 的 `continue` 就会跳过
+   `exec_dense_head(L_next)`。
+5. [:2771-2789](src/backend/minigraph_exec.cpp:2771) 的 outgoing relay 块保持原样：它在图
+   之后派发 head→下一层的拷贝，此时 head 输出已经存在。
+
+**谓词：** head 的所有非 alias 节点都在 D 上且 `ggml_backend_supports_op(D)`；没有未派发的
+外部跨设备 src（KV/positions/embd 在设备侧或 setup 时已 stage；tail→head 是内部边）；
+`moe_out_same_dev` 已由 `can_fuse_tail` 保证。
+
+**不变量：** head 节点在 tail 之后按拓扑序；head 不读尚未 emit 的 tail 节点；每个 relay 恰好
+派发一次；ids 在图返回后读；预期逐字节一致（同节点、同顺序、同 buffer）。
+
+**失败模式：** head 算子不支持 → Tier-1 回退；图溢出 → 硬错误（禁止静默丢）；0 token →
+现有 B38 提前返回。
+
+**验证：** 逐层 `moe_out`/hidden dump 对 B0b 逐字节一致；TMR `head` 桶 1 次/token、每层
+1 次提交；places 12/12；`run_baseline` PASS。预期每层少 1 次提交（RX590 约 0.2-0.3ms，
+CUDA replay 之后更大）。
+
+### 7.3 顺序
+
+先 B1（B0b 的直接延续，不需要新的数据搬运），再 A（混合池路径）；两者独立。CUDA replay /
+P100 实测在两者之后。

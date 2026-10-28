@@ -492,3 +492,118 @@ must be measured with the same probe before deciding how far to push B1.
    separate step after B0b is verified byte-identical.)
 5. For CUDA replay later: is the round-shape cache keyed by
    `(layer, stage, width, n_active)` enough? (Decode: width in [0..n_k].)
+
+## 7. Pending work (detailed)
+
+Status 2026-10-27: B0b is in (unit arena + `sync` region). The two remaining items
+are recorded here with their exact anchors. Line numbers are from 2026-10-27
+(`src/backend/minigraph_exec.cpp`) and will drift; the function names are stable.
+
+### 7.1 A - device-side fold (multi-target exit)
+
+**Current path (what to remove):** with a mixed pool (some rounds on the CPU, some
+on a device) the exit does, per layer:
+
+1. `ggml_backend_synchronize(t.be)` - [:2626](src/backend/minigraph_exec.cpp:2626);
+2. `ggml_backend_tensor_get(t.acc, dev_accs[di], ...)` - D2H - [:2666](src/backend/minigraph_exec.cpp:2666);
+3. `layer_fold(ex, d_out, n_t, accs)` - host sum - [:2727](src/backend/minigraph_exec.cpp:2727), definition [:1290](src/backend/minigraph_exec.cpp:1290);
+4. `tensor_write_host(moe_out, ...)` - H2D write-back - [:1308](src/backend/minigraph_exec.cpp:1308).
+
+The sync is needed for the tail anyway; A removes the two copies and the host
+fold, not the sync. `direct_out` and `single_dev_target` are already elided
+([:2632-2656](src/backend/minigraph_exec.cpp:2632)), so this is **multi-target
+only** (`!direct_out && !single_dev_target`).
+
+**Design:**
+
+1. `fold_plan_t` - owner = the device that owns `moe_out` (the target whose
+   `moe_out_same_dev` is true; if none, fall back to host). Fields: owner pool,
+   `foreign_pools` (accs on other devices), `needs_cpu_partial`.
+2. Staging: one grow-only host-visible buffer per device,
+   `d_out * n_t * 4 * (1 + n_foreign)`, reset per layer (layer execution is serial
+   on the calling thread).
+3. Fold graph on the owner, submitted **after** the MoE graph on the owner queue:
+   start from the owner acc, then one `ACC` per foreign acc (D2D or staged) and
+   one per CPU partial; the result lands in `moe_out` directly (it is already on
+   the owner device).
+4. CPU partial: the CPU rounds write `c.acc_d`; upload it into the owner's staging
+   slot before submit (or have the CPU rounds write a host-visible slot the owner
+   reads - zero copy when the arena is host-visible).
+5. Delete the `tensor_get`/`layer_fold`/`tensor_write_host` sequence for
+   multi-target; keep `layer_fold` as the structural fallback (owner is host,
+   `moe_out` not contiguous, or an operand op unsupported by the device).
+
+**Invariants:**
+
+- `moe_out` is written exactly once, by the owner fold;
+- every partial is fully written before the fold is submitted: device partials by
+  queue order on the owner, foreign devices by an explicit fence, CPU by the host
+  copy;
+- the fold is submitted on the owner queue after the MoE graph;
+- summation order changes (owner-first instead of host-first) -> ulp-level
+  differences; the gate is the relaxed one (cos/KL), **not** byte-identical;
+  document the expected diffs on the multi-pool topologies;
+- the final `moe_out` readback (export/sampling) is unchanged.
+
+**Failure modes:** staging allocation fails -> host fold fallback (log once);
+foreign readback fails -> propagate (GGML_STATUS_FAILED); ACC unsupported ->
+host fold fallback; `moe_out` non-contiguous/host -> host fold fallback.
+
+**Verification:** `run_baseline` PASS with the same cos gate (embd/KL), places
+8 PASS / 4 DIFF (same set; multi-pool entries are the documented ulp diffs), TMR
+`tail_read`/`tail_fold` drop to ~0 and the `tail_sync` count drops by one;
+~0.2-0.4 ms/layer on olmoe mixed, more on deepseek.
+
+### 7.2 B1 - head fusion (Tier-2)
+
+**Current path (why it is dead):** the tail fusion is built at
+[:2491-2512](src/backend/minigraph_exec.cpp:2491), then
+`can_fuse_head_next = false` is hard-coded at
+[:2526](src/backend/minigraph_exec.cpp:2526) with the aliasing comment
+[:2514-2526](src/backend/minigraph_exec.cpp:2514). B0b removed that reason (unit
+window + `sync` region). The ids readback is not a blocker: it happens after the
+graph returns, exactly where the per-layer sync already is.
+
+**Scope:** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
+`plan_head_next != nullptr`; everything else keeps the Tier-1 path.
+
+**Steps:**
+
+1. After the tail append ([:2505-2511](src/backend/minigraph_exec.cpp:2505)),
+   append `plan_head_next->head` in graph order (skip `is_alias_op`, `!data`,
+   `GGML_OP_NONE`).
+2. Make graph overflow a **hard error** (`n_nodes + n_head > gf->size`); also fix
+   the tail append's silent drop at
+   [:2508](src/backend/minigraph_exec.cpp:2508) (it must not silently lose nodes).
+3. Dispatch **incoming** head relays before submit: `r.layer == next_layer`,
+   stage `LAYER_FRONT`/`CLOSURE`, dst device == D; **skip** relays whose src is a
+   node of the fused graph (tail outputs are internal scratch now - copying them
+   from a stale source would be wrong; the head reads them directly).
+4. Set `can_fuse_head_next = true` and `out_fused_head_next = true`; the loop's
+   `continue` at [:3348](src/backend/minigraph_exec.cpp:3348) then skips
+   `exec_dense_head(L_next)`.
+5. Keep the outgoing-relay block at
+   [:2771-2789](src/backend/minigraph_exec.cpp:2771) as-is: it dispatches
+   head->next-layer copies **after** the graph, when the head output exists.
+
+**Predicates:** every non-alias head node is on D and
+`ggml_backend_supports_op(D)`; no external cross-device src that is not dispatched
+(KV/positions/embd are device-side or staged at setup; tail->head is internal);
+`moe_out_same_dev` is already required by `can_fuse_tail`.
+
+**Invariants:** head nodes topologically after the tail; no head node reads a tail
+node that has not been emitted; every relay dispatched exactly once; ids read
+after the graph returns; byte-identical expected (same nodes, order, buffers).
+
+**Failure modes:** unsupported head op -> Tier-1 fallback; graph overflow -> hard
+error (never silent drop); 0 tokens -> existing B38 early return.
+
+**Verification:** per-layer `moe_out`/hidden dumps byte-identical to B0b; TMR
+`head` bucket 1 call/token and 1 submission/layer; places 12/12; `run_baseline`
+PASS. Expected: -1 submission/layer (~0.2-0.3 ms on RX590, larger once CUDA
+replay exists).
+
+### 7.3 Order
+
+B1 first (direct continuation of B0b, no new data movement), then A (mixed-pool
+path); they are independent. CUDA replay / P100 measurements come after both.
