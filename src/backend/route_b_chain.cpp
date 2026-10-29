@@ -686,25 +686,38 @@ void layout_arena(ggml_backend_t our_backend, const ggml_cgraph * gf) {
         }
 
         // --- xfer: consumer-side copies of cross-device producers (one shell per
-        // producer/device/stage). A shell is live only during the layer whose
-        // stage consumes it, so the region is reused across layers -> size = max
-        // over layers of that layer's shells on D.
+        // producer/device/stage). A shell is live only during the stage that
+        // consumes it, so each slot is reused across layers -> size per slot =
+        // max over layers of that slot's bytes. Two slots by stage:
+        //   slot 0 = ROUTE_B_XFER_TAIL (layer L's tail)
+        //   slot 1 = LAYER_FRONT / CLOSURE (layer L+1's head, closure inputs)
+        // A fused tail(L)+head(L+1) graph dispatches the head's incoming relays
+        // before the segment, while the tail's moe_out shell is still live. With
+        // one slot, layer L+1's 64KB ffn_moe_weighted shell (0x3C640..0x4C640)
+        // covered layer L's 8KB moe_out shell at 0x4C600 and the head relay
+        // clobbered the first 16 floats of moe_out. Splitting by stage keeps the
+        // two layers' shells disjoint regardless of layer adjacency.
         {
-            std::map<int, size_t> layer_bytes;
+            std::map<int, size_t> slot_layer_bytes[2];
             for (size_t i = 0; i < shell_keys.size(); ++i) {
                 if (shell_keys[i].dev != D) continue;
-                layer_bytes[shell_layers[i]] += ggml_nbytes(shell_dsts[i]);
+                const int slot = (shell_keys[i].stage == ROUTE_B_XFER_TAIL) ? 0 : 1;
+                slot_layer_bytes[slot][shell_layers[i]] += ggml_nbytes(shell_dsts[i]);
             }
-            size_t m = 0;
-            for (auto & kv : layer_bytes) m = std::max(m, kv.second);
-            m = (m + 63) & ~size_t(63);
-            plan.xfer_size = m;
-            std::map<int, size_t> cur;
+            size_t stride[2] = { 0, 0 };
+            for (int s = 0; s < 2; ++s) {
+                size_t m = 0;
+                for (auto & kv : slot_layer_bytes[s]) m = std::max(m, kv.second);
+                stride[s] = (m + 63) & ~size_t(63);
+            }
+            plan.xfer_size = stride[0] + stride[1];
+            std::map<int, size_t> cur[2];
             for (size_t i = 0; i < shell_keys.size(); ++i) {
                 if (shell_keys[i].dev != D) continue;
-                size_t & off = cur[shell_layers[i]];
+                const int slot = (shell_keys[i].stage == ROUTE_B_XFER_TAIL) ? 0 : 1;
+                size_t & off = cur[slot][shell_layers[i]];
                 off = (off + 63) & ~size_t(63);
-                plan.xfer_off[shell_dsts[i]] = off;
+                plan.xfer_off[shell_dsts[i]] = (slot ? stride[0] : 0) + off;
                 off += ggml_nbytes(shell_dsts[i]);
             }
         }

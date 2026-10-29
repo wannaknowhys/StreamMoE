@@ -148,6 +148,19 @@ carry, `cur` (C1 head -> expert pool) and `moe_out` (expert pool -> C1 tail)
 uniformly. The routing **`ids`** are read to the host unconditionally (compact-ids
 build and round planning are host-side), so they need no shell.
 
+**Two xfer slots (2026-10-29).** The region is split by stage: slot 0 holds the
+`ROUTE_B_XFER_TAIL` shells, slot 1 holds `LAYER_FRONT`/`CLOSURE` shells; each slot
+is packed per layer and reused across layers (`xfer_size = stride0 + stride1`).
+This is required because a fused `tail(L)+head(L+1)` graph dispatches the head's
+incoming relays **before** the segment while the tail's `moe_out` shell is still
+live. With one slot, layer L+1's 64KB `ffn_moe_weighted` shell
+(0x3C640..0x4C640) covered layer L's 8KB `moe_out` shell at 0x4C600, and the
+head's H2D relay clobbered the first 16 floats of `moe_out` - the c1c2 text
+nondeterminism (2026-10-27..29, localized with `STREAM_MOE_TMP_STAGE_TRACE` +
+`STREAM_MOE_TMP_RELAY_DBG`). Same-slot reuse **across layers** is still safe
+because a sync separates the calls; only the tail and head of one fused segment
+coexist.
+
 ## 4. Reuse the existing packing
 
 Extract the best-fit-decreasing interval packing currently in

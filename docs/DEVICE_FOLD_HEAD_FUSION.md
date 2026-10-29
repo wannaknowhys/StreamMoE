@@ -355,7 +355,7 @@ consumers and following the real consumer (`ffn_moe_out`) fixes it.
 | closure static nodes (`out_off`, `result_bytes`) | yes | unit liveness pack |
 | closure runtime bump (`pool_bump`: twins/gathers/fold) | yes (black box) | reserved after `unit_static`, bounded per device |
 | tensor produced by tail(L), consumed by head(L+1) | **yes** | unit scratch (it is carry today; in B0b it is internal and its relay disappears when both are on D) |
-| tail/head cross-device edge | no (two device plans) | xfer shell (today: separate region; can be absorbed into the unit pack later) |
+| tail/head cross-device edge | no (two device plans) | xfer shell; the region is split by stage (TAIL vs LAYER_FRONT/CLOSURE) so a fused tail+head's two layers never share a slot (§4.6b) |
 | `cur` for closure(L) from head(L) | no (crosses the ids barrier) | **`sync` region** (new; one slot per unit) |
 | router ids/topk/weights (head -> closure) | no (same boundary) | `sync` region |
 | cross-N retained state | no | `carryN` |
@@ -393,6 +393,20 @@ would need a separate change.
    packed per consumer layer as today).
 4. The unit plan is a **layout-only** change and must be verified byte-identical
    on the current two-graph/two-submission paths before fusion is enabled.
+
+### 4.6b xfer slots (finding 2026-10-29)
+
+A fused `tail(L)+head(L+1)` graph dispatches the head's incoming H2D relays
+**before** the segment, while the tail's `moe_out` shell is still live. The xfer
+region used to pack one slot per layer and reuse it across layers; with two
+layers in one graph, layer L+1's 64KB `ffn_moe_weighted` shell
+(0x3C640..0x4C640) covered layer L's 8KB `moe_out` shell at 0x4C600, and the
+head relay overwrote the first 16 floats of `moe_out`. That was the c1c2 text
+nondeterminism: the tail output is `corrupted_moe_out + ffn_inp`, the stale 16
+floats depended on what the slot held before, so runs diverged (and the 1B model
+degraded into repetition loops). Fix: `xfer_size = stride_tail + stride_other`;
+TAIL shells in slot 0, LAYER_FRONT/CLOSURE shells in slot 1; same-slot reuse
+across layers remains legal because a sync separates the calls.
 
 ### 4.7 Head fusion construction (after the unit plan lands)
 
@@ -566,6 +580,10 @@ graph returns, exactly where the per-layer sync already is.
 
 **Scope:** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
 `plan_head_next != nullptr`; everything else keeps the Tier-1 path.
+
+**Prerequisite (4.6b):** the xfer region's stage slots must stay - the fused
+graph keeps the tail (slot 0) and the head (slot 1) shells disjoint. Without
+that split the head's pre-segment relays overwrite the tail's `moe_out`.
 
 **Steps:**
 

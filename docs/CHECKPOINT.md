@@ -1,7 +1,13 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-10-27（**B0b 单元 arena + `sync` 区落地并过门禁**；ids-barrier 结构发现、freshness 误报修复）。
+> **最近更新**：2026-10-29（**c1c2 文本随机性根因：xfer 槽位重叠 + 修复**；详见下方 2026-10-29 补记）。
+> **2026-10-29 补记（c1c2 文本随机性 / 重复词）**：
+> - **根因**：fused `tail(L)+head(L+1)` 图在段前派发 head 的 incoming H2D relay，此时 tail 的 `moe_out` shell 仍活着；xfer 区域原来按层复用同一组 offset，layer L+1 的 64KB `ffn_moe_weighted` shell（0x3C640..0x4C640）覆盖了 layer L 的 8KB `moe_out` shell（0x4C600），head relay 覆盖其前 16 个 float。tail 输出 = 被覆盖的 `moe_out` + `ffn_inp`，stale 值取决于槽位旧内容 → 不同 run 文本不同，1B 模型进一步退化成重复词。
+> - **定位手段**：TEMP 的 `STREAM_MOE_TMP_STAGE_TRACE`（head/closure/tail 分段 hash + ids）、`STREAM_MOE_TMP_RELAY_DBG`（src/staging/dst 首元素）、`STREAM_MOE_TMP_TRACE_DIR` 的 `# SHELL/# OVERLAP` 地址扫描；首个有效分歧在 layer 14，`relay[0] != moe[0]` 且 `l_out[0] = relay[0] + ffn_inp[0]`。
+> - **修复**：xfer 按 stage 分两槽（slot 0 = TAIL；slot 1 = LAYER_FRONT/CLOSURE），`xfer_size = stride0 + stride1`；跨层同槽复用仍安全（调用之间有 sync）。
+> - **验证**：`run_baseline moe_129_8192_vk` PASS（embd 121/129、upstream IDENTICAL、KL 4.027535e-01、places 8 PASS/4 DIFF、smoke PASS）；c1c2 en release 连跑 **6 次：10 轮全部逐字节一致、无退化**（whole=`62dada06`；修复前 8 次里 T1 有 3 种、T4 全不同、出现 `E/onas` 循环）。
+> **前次更新**：2026-10-27（**B0b 单元 arena + `sync` 区落地并过门禁**；ids-barrier 结构发现、freshness 误报修复）。
 > - **B0b**：`layout_arena` 改按提交单元 `[closure(L)+tail(L)+head(L+1)]` 规划 scratch；新增 `sync` 区钉住 head→closure 的 `ffn_inp/ffn_norm/ids/weights`（每单元一个槽位，跨单元复用；无 parity、carry/relay 不变）。bring-up 踩坑：同步扫描必须跳过 alias/view 消费者（否则闭包输出被误判 sync，`place-c1c2-exp1` 出现确定性数值漂移）。
 > - **验证**：`run_baseline moe_129_8192_vk` PASS（moe/upstream IDENTICAL、embd 121/129、KL 4.027535e-01、places 8 PASS/4 DIFF）、`build.bat test main` 6/6、`STREAM_MOE_TMP_DUMP_PLAN` 实测 `sync`=8.5MB/`scratch`=102MB（olmoe prefill 2048）。
 > - **门禁修复**：`freshness_check.js` 新增 `--no-src`；`run_baseline.bat` 用它检查 `upstream_dump`（该 tag 只编 prefill_export，不编 `src/`，此前被 route-b 源码时间误报 stale）。

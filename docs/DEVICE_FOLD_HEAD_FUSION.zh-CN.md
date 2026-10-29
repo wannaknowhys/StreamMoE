@@ -302,7 +302,7 @@ sync 槽位，而闭包在中途就写它们——后面的 round 读到被覆�
 | 闭包静态节点（`out_off`、`result_bytes`） | 是 | 单元 liveness 打包 |
 | 闭包运行期 bump（`pool_bump`：孪生/gather/fold） | 是（黑盒） | 预留 `unit_static` 之后，按设备取上界 |
 | tail(L) 产出、head(L+1) 消费的张量 | **是** | 单元 scratch（今天它是 carry；B0b 里变为内部，同设备时 relay 消失） |
-| tail/head 跨设备边 | 否（两张设备 plan） | xfer shell（目前独立区域；以后可并入单元打包） |
+| tail/head 跨设备边 | 否（两张设备 plan） | xfer shell；区域按 stage 分槽（TAIL vs LAYER_FRONT/CLOSURE），fused tail+head 的两层不共享槽位（§4.6b） |
 | closure(L) 的 `cur`（由 head(L) 产出） | 否（跨 ids barrier） | **`sync` 区（新增，每单元一个槽位）** |
 | router ids/topk/weights（head → closure） | 否（同一 barrier） | `sync` 区 |
 | cross-N retained 状态 | 否 | `carryN` |
@@ -336,6 +336,17 @@ plan 是逐张量的，所以 k 条残差流就是每个边界 k 个张量：
 3. **xfer shell** 第一步不吸收（保持独立区域，按 consumer layer 打包，与今天一致）。
 4. 单元规划是**纯布局**改动，必须在当前"两图/两次提交"路径上验证**逐字节一致**之后，
    才允许打开融合。
+
+### 4.6b xfer 槽位（2026-10-29 发现）
+
+fused `tail(L)+head(L+1)` 图会在段前派发 head 的 incoming H2D relay，此时 tail 的
+`moe_out` shell 还活着。xfer 区域原来按层打包、跨层复用同一槽位；一个图里同时有两层时，
+layer L+1 的 64KB `ffn_moe_weighted` shell（0x3C640..0x4C640）覆盖了 layer L 的 8KB
+`moe_out` shell（0x4C600），head relay 把 `moe_out` 的前 16 个 float 覆盖掉。这就是 c1c2
+文本随机性的根因：tail 输出 = 被覆盖的 `moe_out` + `ffn_inp`，那 16 个 float 取决于槽位
+之前的内容，所以不同 run 会分叉（1B 模型进一步退化成重复词）。修法：`xfer_size =
+stride_tail + stride_other`；TAIL 壳放槽 0，LAYER_FRONT/CLOSURE 壳放槽 1；跨层同槽复用
+仍然安全，因为调用之间有 sync。
 
 ### 4.7 head 融合的构造（单元规划落地之后）
 
@@ -483,6 +494,9 @@ RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
 
 **范围：** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
 `plan_head_next != nullptr`；其余保持 Tier-1 路径。
+
+**前置（4.6b）：** xfer 区域的 stage 槽位必须保留——fused 图里 tail（槽 0）和 head（槽 1）
+的 shell 必须不相交；否则 head 在段前的 relay 会覆盖 tail 的 `moe_out`。
 
 **步骤：**
 

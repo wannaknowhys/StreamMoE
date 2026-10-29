@@ -452,6 +452,13 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
 
         const bool src_is_host = !r->src->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(r->src->buffer));
         const bool dst_is_host = !r->dst->buffer || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(r->dst->buffer));
+#ifdef STREAM_MOE_TEMP
+        if (std::getenv("STREAM_MOE_TMP_RELAY_DBG") && nb > ggml_nbytes(r->dst)) {
+            std::fprintf(stderr, "[relay OVF] layer=%d stage=%d src=%s src_nb=%zu dst=%s dst_nb=%zu dst_data=%p\n",
+                         r->layer, r->stage, r->src->name ? r->src->name : "?", nb,
+                         r->dst->name ? r->dst->name : "?", ggml_nbytes(r->dst), r->dst->data);
+        }
+#endif
 
         relay_item_t item{ r->src, r->dst, nb, 0 };
 
@@ -526,6 +533,21 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
                     tensor_read_host(item.src, stage_ptr, 0, item.nbytes);
                 }
             }
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TMP_RELAY_DBG")) {
+                for (const auto & item : items) {
+                    const char * nm = item.src->name ? item.src->name : "";
+                    if (!std::strstr(nm, "ffn_moe_out")) continue;
+                    float s0 = 0.0f;
+                    tensor_read_host(item.src, &s0, 0, sizeof(float));
+                    float st0 = 0.0f;
+                    char * sp = static_cast<char *>(p_stage) + item.offset;
+                    std::memcpy(&st0, sp, sizeof(float));
+                    std::fprintf(stderr, "[relaydbg] src=%s s0=%.9g st0=%.9g nb=%zu src_data=%p stage=%p\n",
+                                 nm, s0, st0, item.nbytes, item.src->data, (void *) sp);
+                }
+            }
+#endif
             // Enqueue asynchronous transfers to device
             for (const auto & item : items) {
                 char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
@@ -537,6 +559,20 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
             } else {
                 ggml_backend_synchronize(be);
             }
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TMP_RELAY_DBG")) {
+                for (const auto & item : items) {
+                    const char * nm = item.src->name ? item.src->name : "";
+                    if (!std::strstr(nm, "ffn_moe_out")) continue;
+                    float d0 = 0.0f;
+                    tensor_read_host(item.dst, &d0, 0, sizeof(float));
+                    float s0 = 0.0f;
+                    tensor_read_host(item.src, &s0, 0, sizeof(float));
+                    std::fprintf(stderr, "[relaydbg] dst=%s d0=%.9g s0=%.9g dst_data=%p src_data=%p\n",
+                                 nm, d0, s0, item.dst->data, item.src->data);
+                }
+            }
+#endif
         }
     }
 
@@ -1308,6 +1344,10 @@ static bool layer_fold(const moe_layer_exec_t * ex, int64_t d_out, int64_t n_t,
     tensor_write_host(moe_out, out.data(), 0, slot * sizeof(float));
     return true;
 }
+
+#ifdef STREAM_MOE_TEMP
+static void trace_stage(int32_t layer, const char * stage);
+#endif
 
 // =============== compact-chain bucket engine (the only executor) ==========
 // The ONLY whole-layer executor: the round list comes from build_mix_plan (see
@@ -2788,6 +2828,9 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #endif
     }
 
+#ifdef STREAM_MOE_TEMP
+    trace_stage(layer, "closure");
+#endif
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2806,7 +2849,341 @@ static void fix_layer_input_layouts(const moe_layer_exec_t * ex) {
 }
 
 #ifdef STREAM_MOE_TEMP
+// ==== per-ubatch per-layer trace (c1c2 nondeterminism hunt, 2026-10-28) ====
+// Env:
+//   STREAM_MOE_TMP_TRACE_DIR=<dir>     enable; appends <dir>/trace.log
+//   STREAM_MOE_TMP_TRACE_LAYERS=all|0,3  layer filter (bitmask, layers < 32)
+//   STREAM_MOE_TMP_TRACE_UB_MAX=<n>     stop after n ubatches (0 = no limit)
+//   STREAM_MOE_TMP_TRACE_UB_RANGES=a-b,c-d  only trace ubatches in these ranges
+//   STREAM_MOE_TMP_TRACE_BIN=1          write full node bytes under <dir>/ubNNNN/
+//   STREAM_MOE_TMP_TRACE_PREFILL=1      trace n_t>1 ubatches too (default: decode only)
+// One line per node: ub, nt, layer, index, src, name, op, FNV hash, first value.
+// Routing: one "ids" line per layer (MUL_MAT_ID src[2], the top-k expert ids).
+// Logits: one "argmax" line for result_output (the greedy token).
+static int      g_trace_ub = 0;
+static int64_t  g_trace_nt = 0;
+static bool     g_trace_init = false;
+static bool     g_trace_on = false;
+static bool     g_trace_done = false;
+static uint32_t g_trace_mask = 0xFFFFFFFFu;
+static int      g_trace_ub_max = 0;
+static bool     g_trace_bin = false;
+static bool     g_trace_prefill = false;
+static std::vector<std::pair<int,int>> g_trace_ranges;
+static FILE *   g_trace_fp = nullptr;
+static std::string g_trace_dir;
+
+static uint64_t trace_hash(const void * p, size_t n) {
+    const unsigned char * b = (const unsigned char *) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void trace_init() {
+    if (g_trace_init) return;
+    g_trace_init = true;
+    const char * dir = std::getenv("STREAM_MOE_TMP_TRACE_DIR");
+    if (!dir || !*dir) return;
+    g_trace_dir = dir;
+    std::error_code ec;
+    std::filesystem::create_directories(g_trace_dir, ec);
+    const std::string log = g_trace_dir + "/trace.log";
+    g_trace_fp = std::fopen(log.c_str(), "ab");
+    if (!g_trace_fp) return;
+    g_trace_on = true;
+    if (const char * s = std::getenv("STREAM_MOE_TMP_TRACE_UB_MAX")) g_trace_ub_max = std::atoi(s);
+    if (const char * s = std::getenv("STREAM_MOE_TMP_TRACE_BIN")) g_trace_bin = std::atoi(s) != 0;
+    if (const char * s = std::getenv("STREAM_MOE_TMP_TRACE_PREFILL")) g_trace_prefill = std::atoi(s) != 0;
+    if (const char * s = std::getenv("STREAM_MOE_TMP_TRACE_UB_RANGES")) {
+        const char * p = s;
+        while (*p) {
+            char * end = nullptr;
+            const long a = std::strtol(p, &end, 10);
+            if (end == p) break;
+            p = end;
+            long b = a;
+            if (*p == '-') { b = std::strtol(p + 1, &end, 10); if (end == p + 1) break; p = end; }
+            if (a >= 0 && b >= a) g_trace_ranges.emplace_back((int) a, (int) b);
+            if (*p == ',') ++p;
+        }
+    }
+    if (const char * s = std::getenv("STREAM_MOE_TMP_TRACE_LAYERS")) {
+        if (std::strcmp(s, "all") != 0) {
+            g_trace_mask = 0;
+            const char * p = s;
+            while (*p) {
+                char * end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (v >= 0 && v < 32) g_trace_mask |= (1u << (unsigned) v);
+                p = end;
+                if (*p == ',') ++p;
+            }
+            if (g_trace_mask == 0) g_trace_mask = 0xFFFFFFFFu;
+        }
+    }
+    std::fprintf(g_trace_fp, "# trace start %s\n", g_trace_dir.c_str());
+    std::fflush(g_trace_fp);
+}
+
+static void trace_begin_ubatch(int64_t nt) {
+    trace_init();
+    if (!g_trace_on || g_trace_done) return;
+    ++g_trace_ub;
+    g_trace_nt = nt;
+    if (g_trace_ub_max > 0 && g_trace_ub > g_trace_ub_max) g_trace_done = true;
+}
+
+static void trace_layer(int32_t layer) {
+    if (std::getenv("STREAM_MOE_TMP_STAGE_TRACE")) return;   // stage mode: no full-layer scan
+    trace_init();
+    if (!g_trace_on || g_trace_done) return;
+    if (layer < 0 || layer >= 32 || !(g_trace_mask & (1u << (unsigned) layer))) return;
+    if (g_trace_nt != 1 && !g_trace_prefill) return;
+    if (!g_trace_ranges.empty()) {
+        bool in = false;
+        for (const auto & r : g_trace_ranges) if (g_trace_ub >= r.first && g_trace_ub <= r.second) { in = true; break; }
+        if (!in) return;
+    }
+    const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);
+    if (!all || all->empty()) return;
+
+    std::unordered_map<const ggml_tensor*, char> nodeset;
+    nodeset.reserve(all->size() * 2);
+    for (auto * t : *all) if (t) nodeset[t] = 1;
+
+    std::string ubdir;
+    if (g_trace_bin) {
+        char b[64];
+        std::snprintf(b, sizeof(b), "/ub%04d", g_trace_ub);
+        ubdir = g_trace_dir + b;
+        std::error_code ec;
+        std::filesystem::create_directories(ubdir, ec);
+    }
+
+    auto dump_one = [&](const ggml_tensor * t, size_t idx, int src) {
+        if (!t || !t->data) return;
+        const size_t nb = ggml_nbytes(t);
+        if (nb == 0) return;
+        std::vector<uint8_t> host(nb);
+        tensor_read_host(t, host.data(), 0, nb);
+        const uint64_t h = trace_hash(host.data(), nb);
+        double v0 = 0.0;
+        if (t->type == GGML_TYPE_F32 && nb >= 4) v0 = *(const float *) host.data();
+        else if (t->type == GGML_TYPE_I32 && nb >= 4) v0 = (double) *(const int32_t *) host.data();
+        std::fprintf(g_trace_fp, "ub=%d nt=%lld L=%d n=%zu src=%d %-28s %-12s h=%016llx v0=%.6g nb=%zu\n",
+                     g_trace_ub, (long long) g_trace_nt, layer, idx, src,
+                     t->name ? t->name : "?", ggml_op_name(t->op),
+                     (unsigned long long) h, v0, nb);
+        if (g_trace_bin && src < 0) {
+            std::string nm = t->name ? t->name : "anon";
+            for (char & c : nm) if (c == '/' || c == '\\' || c == ':' || c == ' ' || c == '*') c = '_';
+            char stem[640];
+            std::snprintf(stem, sizeof(stem), "%s/L%02d_%03zu_%s", ubdir.c_str(), layer, idx, nm.c_str());
+            if (FILE * f = std::fopen((std::string(stem) + ".bin").c_str(), "wb")) {
+                std::fwrite(host.data(), 1, nb, f);
+                std::fclose(f);
+            }
+            if (FILE * f = std::fopen((std::string(stem) + ".meta").c_str(), "w")) {
+                std::fprintf(f, "ub=%d nt=%lld layer=%d index=%zu name=%s op=%s type=%d ne0=%lld ne1=%lld nb=%zu\n",
+                             g_trace_ub, (long long) g_trace_nt, layer, idx,
+                             t->name ? t->name : "?", ggml_op_name(t->op), (int) t->type,
+                             (long long) t->ne[0], (long long) t->ne[1], nb);
+                std::fclose(f);
+            }
+        }
+    };
+
+    bool ids_done = false;
+    for (size_t ni = 0; ni < all->size(); ++ni) {
+        ggml_tensor * nd = (*all)[ni];
+        if (!nd || is_alias_op(nd) || !nd->data) continue;
+        dump_one(nd, ni, -1);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = nd->src[s];
+            if (!src || !src->data || nodeset.count(src)) continue;
+            if (src->op == GGML_OP_NONE) continue;   // weights / token inputs: constant, huge
+            dump_one(src, ni, s);
+        }
+        // Routing: one line per layer (gate/up/down share the same ids tensor).
+        if (!ids_done && nd->op == GGML_OP_MUL_MAT_ID && nd->src[2] && nd->src[2]->data) {
+            const ggml_tensor * ids = nd->src[2];
+            const int64_t k = ids->ne[0];
+            if (k > 0 && k <= 64 && ggml_nbytes(ids) >= (size_t) k * 4) {
+                std::vector<int32_t> v((size_t) k);
+                tensor_read_host(ids, v.data(), 0, (size_t) k * 4);
+                std::fprintf(g_trace_fp, "ub=%d nt=%lld L=%d ids n=%zu", g_trace_ub, (long long) g_trace_nt, layer, ni);
+                for (int64_t j = 0; j < k; ++j) std::fprintf(g_trace_fp, " %d", v[(size_t) j]);
+                std::fputc('\n', g_trace_fp);
+                ids_done = true;
+            }
+        }
+        // Greedy token: argmax of the output logits (decode only).
+        if (g_trace_nt == 1 && nd->name && std::strstr(nd->name, "result_output") &&
+            nd->type == GGML_TYPE_F32 && nd->data && nd->ne[0] > 0 && nd->ne[1] == 1) {
+            const size_t n = (size_t) nd->ne[0];
+            std::vector<float> v(n);
+            tensor_read_host(nd, v.data(), 0, n * sizeof(float));
+            size_t best = 0;
+            float bv = v[0];
+            for (size_t j = 1; j < n; ++j) if (v[j] > bv) { bv = v[j]; best = j; }
+            std::fprintf(g_trace_fp, "ub=%d nt=1 L=%d argmax id=%zu v=%.6g\n",
+                         g_trace_ub, layer, best, (double) bv);
+        }
+    }
+    std::fflush(g_trace_fp);
+}
+// ==== end per-ubatch per-layer trace ====
+
+// Stage trace: read only the tensors that are valid immediately after a stage,
+// so later scratch reuse cannot masquerade as a divergence.
+//   head(L):    ffn_inp-L, ffn_norm-L, ids, and the head input l_out-(L-1)
+//   closure(L): ffn_moe_out-L
+//   tail(L):    l_out-L
+// Enabled by STREAM_MOE_TMP_STAGE_TRACE=1 (with TRACE_DIR + TRACE_LAYERS).
+// One-shot plan dump for the target layer: which nodes are head/tail/closure,
+// their device, and the relays whose consumer layer is this layer.
+static void trace_plan_dump(int32_t layer) {
+    static int last_build = -1;
+    const int build = route_b_build_id();
+    if (build == last_build) return;
+    last_build = build;
+    const moe_layer_plan_t * lp = moe_chain_layer_plan(layer);
+    const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
+    auto dev = [](const ggml_tensor * t) -> std::string {
+        const char * d = t ? route_b_node_device(t) : nullptr;
+        return d ? std::string(d) : std::string("");
+    };
+    std::fprintf(g_trace_fp, "# plan build=%d nt=%lld L%d\n", build, (long long) g_trace_nt, layer);
+    if (lp) {
+        for (const auto * nd : lp->head) std::fprintf(g_trace_fp, "# H %-28s dev=%s\n", nd && nd->name ? nd->name : "?", dev(nd).c_str());
+        for (const auto * nd : lp->tail) std::fprintf(g_trace_fp, "# T %-28s dev=%s\n", nd && nd->name ? nd->name : "?", dev(nd).c_str());
+    }
+    if (ex) for (const auto * nd : ex->compute) std::fprintf(g_trace_fp, "# C %-28s dev=%s\n", nd && nd->name ? nd->name : "?", dev(nd).c_str());
+    const char * keys[] = { "l_out-14", "ffn_moe_out-14", "ffn_inp-14", "ffn_norm-14" };
+    for (const char * nm : keys) {
+        const ggml_tensor * t = nullptr;
+        if (const auto * all = moe_chain_layer_nodes_all(layer))
+            for (const auto * x : *all) if (x && x->name && std::strcmp(x->name, nm) == 0) { t = x; break; }
+        std::fprintf(g_trace_fp, "# K %-20s dev=%s data=%p\n", nm, dev(t).c_str(), t ? t->data : nullptr);
+    }
+    for (const auto & r : route_b_relays()) {
+        if (r.layer != layer && r.layer != layer + 1) continue;
+        std::fprintf(g_trace_fp, "# R layer=%d stage=%d src=%s(%s) dst=%s(%s) dst_data=%p\n", r.layer, r.stage,
+                     r.src && r.src->name ? r.src->name : "?", dev(r.src).c_str(),
+                     r.dst && r.dst->name ? r.dst->name : "?", dev(r.dst).c_str(),
+                     r.dst ? r.dst->data : nullptr);
+    }
+    std::fflush(g_trace_fp);
+    // Decode build: who shares the L14 tail shell's address range?
+    if (g_trace_nt == 1) {
+        const ggml_tensor * shell_t = nullptr;
+        for (const auto & r : route_b_relays()) {
+            if (r.layer == layer && r.stage == ROUTE_B_XFER_TAIL && r.dst) { shell_t = r.dst; break; }
+        }
+        if (shell_t && shell_t->data) {
+            const char * sp = (const char *) shell_t->data;
+            const size_t sn = ggml_nbytes(shell_t);
+            std::fprintf(g_trace_fp, "# SHELL L%d %s data=%p nb=%zu\n", layer,
+                         shell_t->name ? shell_t->name : "?", (void *) sp, sn);
+            for (const auto & r : route_b_relays()) {
+                if (!r.dst || !r.dst->data) continue;
+                const char * dp = (const char *) r.dst->data;
+                const size_t dn = ggml_nbytes(r.dst);
+                if (dp <= sp && sp < dp + dn) {
+                    std::fprintf(g_trace_fp, "# OVERLAP relay layer=%d stage=%d dst=%s data=%p nb=%zu src=%s\n",
+                                 r.layer, r.stage, r.dst->name ? r.dst->name : "?", (void *) dp, dn,
+                                 r.src && r.src->name ? r.src->name : "?");
+                }
+            }
+            for (int L = 0; L < 32; ++L) {
+                const auto * all = moe_chain_layer_nodes_all(L);
+                if (!all) continue;
+                for (const auto * t : *all) {
+                    if (!t || !t->data) continue;
+                    const char * tp = (const char *) t->data;
+                    const size_t tn = ggml_nbytes(t);
+                    if (tp <= sp && sp < tp + tn) {
+                        std::fprintf(g_trace_fp, "# OVERLAP node L=%d %s op=%s data=%p nb=%zu\n", L,
+                                     t->name ? t->name : "?", ggml_op_name(t->op), (void *) tp, tn);
+                    }
+                }
+            }
+            std::fflush(g_trace_fp);
+        }
+    }
+}
+
+static void trace_stage(int32_t layer, const char * stage) {
+    trace_init();
+    if (!g_trace_on || g_trace_done) return;
+    if (layer < 0 || layer >= 32 || !(g_trace_mask & (1u << (unsigned) layer))) return;
+    trace_plan_dump(layer);
+    if (g_trace_nt != 1) return;
+    const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);
+    if (!all) return;
+    auto find = [&](const std::string & nm) -> const ggml_tensor * {
+        for (const auto * t : *all) if (t && t->name && nm == t->name) return t;
+        return nullptr;
+    };
+    auto dump = [&](const char * which, const ggml_tensor * t) {
+        if (!t || !t->data) return;
+        const size_t nb = ggml_nbytes(t);
+        if (nb == 0) return;
+        std::vector<uint8_t> host(nb);
+        tensor_read_host(t, host.data(), 0, nb);
+        const uint64_t h = trace_hash(host.data(), nb);
+        double v0 = 0.0;
+        if (t->type == GGML_TYPE_F32 && nb >= 4) v0 = *(const float *) host.data();
+        else if (t->type == GGML_TYPE_I32 && nb >= 4) v0 = (double) *(const int32_t *) host.data();
+        std::fprintf(g_trace_fp, "stage=%s ub=%d nt=%lld L=%d %s %-24s h=%016llx v0=%.6g nb=%zu\n",
+                     stage, g_trace_ub, (long long) g_trace_nt, layer, which,
+                     t->name ? t->name : "?", (unsigned long long) h, v0, nb);
+    };
+    const std::string L = std::to_string(layer);
+    if (std::strcmp(stage, "head") == 0) {
+        if (layer > 0) dump("in", find("l_out-" + std::to_string(layer - 1)));
+        dump("attn", find("ffn_inp-" + L));
+        dump("cur", find("ffn_norm-" + L));
+        for (const auto * nd : *all) {
+            if (!nd || nd->op != GGML_OP_MUL_MAT_ID || !nd->src[2] || !nd->src[2]->data) continue;
+            const ggml_tensor * ids = nd->src[2];
+            const int64_t k = ids->ne[0];
+            if (k <= 0 || k > 64 || ggml_nbytes(ids) < (size_t) k * 4) break;
+            std::vector<int32_t> v((size_t) k);
+            tensor_read_host(ids, v.data(), 0, (size_t) k * 4);
+            std::fprintf(g_trace_fp, "stage=head ub=%d nt=%lld L=%d ids", g_trace_ub, (long long) g_trace_nt, layer);
+            for (int64_t j = 0; j < k; ++j) std::fprintf(g_trace_fp, " %d", v[(size_t) j]);
+            std::fputc('\n', g_trace_fp);
+            break;
+        }
+    } else if (std::strcmp(stage, "closure") == 0) {
+        dump("moe", find("ffn_moe_out-" + L));
+    } else if (std::strcmp(stage, "tail") == 0) {
+        dump("out", find("l_out-" + L));
+        // The tail graph reads moe_out through the H2D xfer shell; compare the
+        // shell's bytes with the host moe_out captured at the closure stage.
+        for (const auto & r : route_b_relays()) {
+            if (r.layer != layer || r.stage != ROUTE_B_XFER_TAIL || !r.dst) continue;
+            const ggml_tensor * t = r.dst;
+            if (!t->data) break;
+            const size_t nb = ggml_nbytes(t);
+            std::vector<uint8_t> host(nb);
+            tensor_read_host(t, host.data(), 0, nb);
+            double v0 = 0.0;
+            if (t->type == GGML_TYPE_F32 && nb >= 4) v0 = *(const float *) host.data();
+            std::fprintf(g_trace_fp, "stage=%s ub=%d nt=%lld L=%d relay dst_data=%p h=%016llx v0=%.6g nb=%zu\n",
+                         stage, g_trace_ub, (long long) g_trace_nt, layer, t->data,
+                         (unsigned long long) trace_hash(host.data(), nb), v0, nb);
+            break;
+        }
+    }
+    std::fflush(g_trace_fp);
+}
+
 static void dump_all_layer_nodes_debug(int32_t layer) {
+    trace_layer(layer);
     if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && layer >= 0) {
         const std::vector<ggml_tensor*> * all = moe_chain_layer_nodes_all(layer);
         if (all) {
@@ -2887,6 +3264,9 @@ static enum ggml_status exec_dense_head(int32_t layer, ggml_context * ctx,
         LOG_ERROR("stream_moe: dense head failed L" << layer);
         return hst;
     }
+#ifdef STREAM_MOE_TEMP
+    trace_stage(layer, "head");
+#endif
 #ifdef STREAM_MOE_TEMP
     dump_node_hash(layer, "head", dense_head);
 #endif
@@ -3144,6 +3524,8 @@ static enum ggml_status exec_fused_tail_and_head(int32_t layer_tail, int32_t lay
     }
 
 #ifdef STREAM_MOE_TEMP
+    trace_stage(layer_tail, "tail");
+    trace_stage(layer_head, "head");
     dump_node_hash(layer_tail, "tail", dense_tail);
     dump_node_hash(layer_head, "head", dense_head);
     dump_all_layer_nodes_debug(layer_tail);
@@ -3188,6 +3570,7 @@ static enum ggml_status exec_dense_tail(int32_t layer, ggml_context * ctx,
         return tst;
     }
 #ifdef STREAM_MOE_TEMP
+    trace_stage(layer, "tail");
     dump_node_hash(layer, "tail", dense_tail);
     dump_all_layer_nodes_debug(layer);
 #endif
@@ -3231,6 +3614,7 @@ enum ggml_status moe_exec_mul_mat_id(
         }
         g_ubatch_nt = nt;
     }
+    trace_begin_ubatch(g_ubatch_nt);
     static tmr_acc_t g_eval_dec{ "eval_dec" }, g_eval_pre{ "eval_pre" };
     tmr_scope_guard_t _eguard{ (g_ubatch_nt == 1) ? g_eval_dec : g_eval_pre };
 #endif
