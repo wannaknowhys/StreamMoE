@@ -634,6 +634,104 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
     }
 }
 
+// Shared relay selection for the device-segment executor (Tier-1) and the
+// single-device whole-layer graph (Tier-2).
+//
+// A scope selects the relays of one boundary:
+//   - layer / layer_head: the fused pair (layer_head < 0 = not fused)
+//   - seg_has_tail / seg_has_head: which part of the fused pair just flushed
+//     (boundary) or is about to run (incoming)
+//   - incoming: match the relay's DESTINATION device; otherwise its SOURCE
+//   - dev: the device to match
+//   - tail_nodes: for the fused boundary's "produced by the tail" test
+//   - flushed_devs: incoming only; skip relays whose source device was already
+//     flushed in this call (the boundary copy already handled them)
+//   - graph_nodes: incoming only; skip relays whose source is produced inside
+//     the fused graph (Tier-2 head)
+//   - stage: non-fused Tier-1 stage label ("head"/"tail")
+struct relay_scope_t {
+    int32_t layer = -1;
+    int32_t layer_head = -1;
+    bool seg_has_tail = true;
+    bool seg_has_head = true;
+    bool incoming = true;
+    std::string dev;
+    const std::unordered_set<const ggml_tensor*> * tail_nodes = nullptr;
+    const std::unordered_set<const ggml_tensor*> * graph_nodes = nullptr;
+    const std::unordered_set<std::string> * flushed_devs = nullptr;
+    const char * stage = "";
+};
+
+static bool relay_src_in_set(const ggml_tensor * t,
+                             const std::unordered_set<const ggml_tensor*> * set) {
+    if (!set) return false;
+    const ggml_tensor * p = t;
+    while (p) {
+        if (set->count(p)) return true;
+        p = p->view_src;
+    }
+    return false;
+}
+
+static std::vector<const route_b_relay_t*> select_relays(
+        const relay_scope_t & s,
+        std::unordered_set<const route_b_relay_t*> & executed) {
+    std::vector<const route_b_relay_t*> batch;
+    for (const auto & r : route_b_relays()) {
+        if (!r.src || !r.dst) continue;
+        if (executed.count(&r)) continue;
+
+        if (s.layer_head >= 0) {
+            bool match = false;
+            if (s.incoming) {
+                if (r.layer == s.layer && s.seg_has_tail) {
+                    match = (r.stage == ROUTE_B_XFER_TAIL);
+                } else if (r.layer == s.layer_head && s.seg_has_head) {
+                    match = (r.stage == ROUTE_B_XFER_LAYER_FRONT);
+                }
+            } else {
+                if (r.layer == s.layer && s.seg_has_tail) {
+                    match = (r.stage == ROUTE_B_XFER_TAIL);
+                } else if (r.layer == s.layer_head) {
+                    // Relays produced by the tail (e.g. carry to the next layer)
+                    // trigger when the tail portion flushes; relays produced by
+                    // the head (including CLOSURE inputs) only when the head
+                    // flushes.
+                    const bool src_tail = relay_src_in_set(r.src, s.tail_nodes);
+                    if (s.seg_has_tail && r.stage == ROUTE_B_XFER_LAYER_FRONT && src_tail) match = true;
+                    if (s.seg_has_head && (r.stage == ROUTE_B_XFER_LAYER_FRONT || r.stage == ROUTE_B_XFER_CLOSURE) && !src_tail) match = true;
+                }
+            }
+            if (!match) continue;
+        } else {
+            if (r.layer != s.layer) continue;
+            if (s.incoming) {
+                if (std::strcmp(s.stage, "head") == 0 && (r.stage == ROUTE_B_XFER_TAIL || r.stage == ROUTE_B_XFER_CLOSURE)) continue;
+                if (std::strcmp(s.stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
+            } else {
+                if (std::strcmp(s.stage, "head") == 0 && r.stage == ROUTE_B_XFER_TAIL) continue;
+                if (std::strcmp(s.stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
+            }
+        }
+
+        const ggml_tensor * match_t = s.incoming ? r.dst : r.src;
+        const char * d = route_b_node_device(match_t);
+        const std::string key = d ? d : "";
+        if (key != s.dev) continue;
+
+        if (s.incoming) {
+            const char * sd = route_b_node_device(r.src);
+            const std::string src_key = sd ? sd : "";
+            if (s.flushed_devs && s.flushed_devs->count(src_key)) continue;
+            if (s.graph_nodes && relay_src_in_set(r.src, s.graph_nodes)) continue;
+        }
+
+        batch.push_back(&r);
+        executed.insert(&r);
+    }
+    return batch;
+}
+
 // Check if all non-alias compute nodes in a list reside on the given target device.
 static bool is_segment_on_device(const std::vector<ggml_tensor*> & nodes, const std::string & target_dev) {
     if (nodes.empty()) return false;
@@ -700,72 +798,35 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
             tail_nodes.insert(list[i]);
         }
     }
-    auto is_src_in_tail = [&](const ggml_tensor * t) -> bool {
-        const ggml_tensor * p = t;
-        while (p) {
-            if (tail_nodes.count(p)) return true;
-            p = p->view_src;
-        }
-        return false;
-    };
-
     // Execute relay copies from a source device to ALL consumer devices for this
     // layer.  Called at segment boundaries: the source segment has just been
     // flushed, so the producer data is ready; the consumer segments have not
     // started yet.
     auto run_boundary_copies = [&](const std::string & src_dev, bool seg_has_tail, bool seg_has_head) {
-        std::vector<const route_b_relay_t *> batch;
+        relay_scope_t s;
+        s.layer = layer;
+        s.layer_head = is_fused ? layer_head : -1;
+        s.seg_has_tail = seg_has_tail;
+        s.seg_has_head = seg_has_head;
+        s.incoming = false;
+        s.dev = src_dev;
+        s.tail_nodes = &tail_nodes;
+        s.stage = stage;
+        std::vector<const route_b_relay_t *> batch = select_relays(s, executed_relays);
 #ifdef STREAM_MOE_TEMP
-        int matched = 0;
-#endif
-        for (const auto & r : route_b_relays()) {
-            if (!r.src || !r.dst) continue;
-            if (executed_relays.count(&r)) continue;
-
-            if (is_fused) {
-                bool match_layer = false;
-                if (r.layer == layer && seg_has_tail) {
-                    match_layer = (r.stage == ROUTE_B_XFER_TAIL);
-                } else if (r.layer == layer_head) {
-                    // In fused tail-head execution, relays produced by tail (e.g. carry to next layer)
-                    // trigger when the tail portion flushes. Relays produced by head (including
-                    // CLOSURE inputs) must NEVER trigger during tail and only trigger when head flushes.
-                    if (seg_has_tail && r.stage == ROUTE_B_XFER_LAYER_FRONT && is_src_in_tail(r.src)) {
-                        match_layer = true;
-                    }
-                    if (seg_has_head && (r.stage == ROUTE_B_XFER_LAYER_FRONT || r.stage == ROUTE_B_XFER_CLOSURE) && !is_src_in_tail(r.src)) {
-                        match_layer = true;
-                    }
-                }
-                if (!match_layer) continue;
-            } else {
-                if (r.layer != layer) continue;
-                if (std::strcmp(stage, "head") == 0 && r.stage == ROUTE_B_XFER_TAIL) continue;
-                if (std::strcmp(stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
-            }
-
-            // Match: the relay's source is on the just-flushed device.
-            const char * sd = route_b_node_device(r.src);
-            const std::string src_key = (sd ? sd : "");
-            if (src_key != src_dev) continue;
-#ifdef STREAM_MOE_TEMP
-            if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
-                ++matched;
+        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+            for (const auto * r : batch)
                 fprintf(stderr, "[topo_seg] L%d%s %s: copy '%s'(%s) -> '%s'(%s) nb=%zu\n",
                         layer, is_fused ? "+next" : "", stage,
-                        r.src->name ? r.src->name : "?", src_key.empty() ? "CPU" : src_key.c_str(),
-                        r.dst->name ? r.dst->name : "?",
-                        (route_b_node_device(r.dst) ? route_b_node_device(r.dst) : "CPU"),
-                        ggml_nbytes(r.src));
-            }
-#endif
-            batch.push_back(&r);
-            executed_relays.insert(&r);
+                        r->src->name ? r->src->name : "?", src_dev.empty() ? "CPU" : src_dev.c_str(),
+                        r->dst->name ? r->dst->name : "?",
+                        (route_b_node_device(r->dst) ? route_b_node_device(r->dst) : "CPU"),
+                        ggml_nbytes(r->src));
+            if (!batch.empty())
+                fprintf(stderr, "[topo_seg] L%d%s %s: %zu relay(s) from '%s'\n",
+                        layer, is_fused ? "+next" : "", stage, batch.size(),
+                        src_dev.empty() ? "CPU" : src_dev.c_str());
         }
-#ifdef STREAM_MOE_TEMP
-        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
-            fprintf(stderr, "[topo_seg] L%d%s %s: %d relay(s) from '%s'\n",
-                    layer, is_fused ? "+next" : "", stage, matched, src_dev.empty() ? "CPU" : src_dev.c_str());
 #endif
         dispatch_relay_batch(batch, cpu);
     };
@@ -778,57 +839,33 @@ static enum ggml_status topo_segment_execute(ggml_context * ctx, ggml_backend_t 
     std::unordered_set<std::string> flushed_devs;
     auto run_incoming_copies = [&](const std::string & dst_dev, bool will_flush_same_dev,
                                    bool seg_has_tail, bool seg_has_head) {
-        std::vector<const route_b_relay_t *> batch;
+        relay_scope_t s;
+        s.layer = layer;
+        s.layer_head = is_fused ? layer_head : -1;
+        s.seg_has_tail = seg_has_tail;
+        s.seg_has_head = seg_has_head;
+        s.incoming = true;
+        s.dev = dst_dev;
+        s.tail_nodes = &tail_nodes;
+        s.flushed_devs = &flushed_devs;
+        s.stage = stage;
+        std::vector<const route_b_relay_t *> batch = select_relays(s, executed_relays);
 #ifdef STREAM_MOE_TEMP
-        int matched = 0;
-#endif
-        for (const auto & r : route_b_relays()) {
-            if (!r.src || !r.dst) continue;
-            if (executed_relays.count(&r)) continue;
-
-            if (is_fused) {
-                bool match_layer = false;
-                if (r.layer == layer && seg_has_tail) {
-                    match_layer = (r.stage == ROUTE_B_XFER_TAIL);
-                } else if (r.layer == layer_head && seg_has_head) {
-                    match_layer = (r.stage == ROUTE_B_XFER_LAYER_FRONT);
-                }
-                if (!match_layer) continue;
-            } else {
-                if (r.layer != layer) continue;
-                if (std::strcmp(stage, "head") == 0 && (r.stage == ROUTE_B_XFER_TAIL || r.stage == ROUTE_B_XFER_CLOSURE)) continue;
-                if (std::strcmp(stage, "tail") == 0 && r.stage != ROUTE_B_XFER_TAIL) continue;
-            }
-
-            // Match: relay destination is on the about-to-run device.
-            const char * dd = route_b_node_device(r.dst);
-            const std::string dst_key = (dd ? dd : "");
-            if (dst_key != dst_dev) continue;
-
-            // Source device: if it's a device we already flushed in this call,
-            // the outgoing boundary copy already handled it.  Only copy here
-            // when the source is OUTSIDE this call (leaf, or a device not in
-            // our node list).
-            const char * sd = route_b_node_device(r.src);
-            const std::string src_key = (sd ? sd : "");
-            if (flushed_devs.count(src_key)) continue;  // already copied by boundary
-#ifdef STREAM_MOE_TEMP
-            if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
-                ++matched;
+        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
+            for (const auto * r : batch) {
+                const char * sd = route_b_node_device(r->src);
+                const std::string src_key = sd ? sd : "";
                 fprintf(stderr, "[topo_seg] L%d%s %s: incoming '%s'(%s) -> '%s'(%s) nb=%zu\n",
                         layer, is_fused ? "+next" : "", stage,
-                        r.src->name ? r.src->name : "?", src_key.empty() ? "CPU" : src_key.c_str(),
-                        r.dst->name ? r.dst->name : "?", dst_key.empty() ? "CPU" : dst_key.c_str(),
-                        ggml_nbytes(r.src));
+                        r->src->name ? r->src->name : "?", src_key.empty() ? "CPU" : src_key.c_str(),
+                        r->dst->name ? r->dst->name : "?", dst_dev.empty() ? "CPU" : dst_dev.c_str(),
+                        ggml_nbytes(r->src));
             }
-#endif
-            batch.push_back(&r);
-            executed_relays.insert(&r);
+            if (!batch.empty())
+                fprintf(stderr, "[topo_seg] L%d%s %s: %zu incoming relay(s) to '%s'\n",
+                        layer, is_fused ? "+next" : "", stage, batch.size(),
+                        dst_dev.empty() ? "CPU" : dst_dev.c_str());
         }
-#ifdef STREAM_MOE_TEMP
-        if (std::getenv("STREAM_MOE_TMP_DENSE_DEBUG") && matched > 0)
-            fprintf(stderr, "[topo_seg] L%d%s %s: %d incoming relay(s) to '%s'\n",
-                    layer, is_fused ? "+next" : "", stage, matched, dst_dev.empty() ? "CPU" : dst_dev.c_str());
 #endif
         dispatch_relay_batch(batch, cpu, will_flush_same_dev ? dst_dev : "");
     };
