@@ -616,30 +616,45 @@ after the graph returns; byte-identical expected (same nodes, order, buffers).
 **Failure modes:** unsupported head op -> Tier-1 fallback; graph overflow -> hard
 error (never silent drop); 0 tokens -> existing B38 early return.
 
-**H2D sync (the bug this exposed).** The fused graph reads the head's incoming
-shells; the H2D `set_async` batch must be synchronized **before** the graph's
-reads. The old `skip_h2d_sync_dev` (same backend => the next segment's
-completion sync) is too late: the completion sync happens after the graph has
-already read the shells, so the head's positions/mask still held the previous
-head's (alias partner's) values. The tier-2 incoming batch no longer skips; one
-`ggml_backend_synchronize` per batch, before the submit. This is the only
-production change needed (the layout is untouched).
+**H2D sync (what the experiment showed).** Observed: with the skip, the head's
+incoming shells still held the previous head's (alias partner's) values when the
+fused graph read them. With one `ggml_backend_synchronize` after the `set_async`
+batch and before the `graph_compute_async` (A), or with the batch simply not
+skipping (B), the shells hold the head's own values. The tier-2 incoming batch
+therefore no longer skips; one sync per batch. **The backend-side mechanism is
+not established here**: the same-queue "copies before the graph" argument does
+not hold for the `set_async` -> `graph_compute_async` pair on this backend, and
+the completion sync after the graph is too late in practice. The tier-1
+`run_incoming_copies` skip is **not** justified by "its graph is synchronous"
+(a sync graph controls completion, not whether earlier async copies execute
+first); its safety needs a separate investigation.
 
 A/B/C ablations (original per-layer layout, no fill): A (one post-batch sync,
 still skipping) and B (no skip) both restore `ffn_inp-1=9642636a`; C (pre-sync
 only, no post sync) fails (`fcb9d10d`, wrong ids); `full` (pre-fill + per-item
-sync) also passes, so per-item sync is not required. The earlier "explicit sync
-after dispatch still stale" was the debug `tensor_get` calls between the
-dispatch and that sync.
+sync) also passes, so per-item sync is not required. A **candidate, not
+verified**, explanation for the earlier "explicit sync after dispatch still
+stale": the debug `tensor_get` calls between the dispatch and the sync may
+interfere with the transfer state; the A/B/C runs avoid those reads.
 
-**Verification:** `place-c1c2-exp5` stage head 1 at ub=4 matches pre-B1
+**Verification (narrow):** `place-c1c2-exp5` stage head 1 at ub=4 matches pre-B1
 byte-for-byte (`ffn_inp-1 9642636a e08ff17e`, `ffn_norm-1 018037b8 d117fa59`,
 ids `21 39 18 25 11 47 15 42`), text `Hello!`; `run_baseline moe_129_8192_vk`
 PASS (moe/upstream IDENTICAL, KL PASS, places 6 PASS/6 DIFF). The two new DIFFs
-(`place-c1-exp2`, `place-c1c2-exp2`) do not enter the tier-2 fused unit at all
-(`[fuse_tier2]` absent; `single_dev_target` false because the 2 GB pool forces
-CPU rounds), so they are the known place-text variance class, not the head
-fusion.
+(`place-c1-exp2`, `place-c1c2-exp2`) are **not yet explained**: the same-flavor
+bisect (`b14ee43` vs `064651f`) shows their decode t/s essentially unchanged
+(c1-exp2 10.22→10.36, c1c2-exp2 10.35→10.44 tg), so B1 is not active there; their
+text DIFF vs the b14ee43 baseline is not yet localized. The c1c2-exp5 decode tg
+improved **11.45 → 13.02 (+13.7%)** on the same `StreamMoE_dump` flavor, so the
+net effect of B1 (one fewer submission/layer, one sync per head batch) is
+positive at this measurement. Per-layer `moe_out` dumps and the TMR submission
+count are still pending; only one ub/layer was compared. The c1c2 `place-c1c2`
+six-run stability is a closure-host regression check, **not** B1 verification.
+
+**Production gating:** the B1 code is not behind `STREAM_MOE_LATEST`, so the
+production `StreamMoE_dump` runs it (the c1c2-exp5 place PASS includes the B1).
+Per `AGENTS.md` the production flavor is supposed to keep in-progress features
+opt-in; gating B1 with `STREAM_MOE_LATEST` is a pending decision.
 
 **Still open:** the xfer shell layout remains the per-layer two-slot with
 cross-layer reuse; the alias is a real hazard but not this bug's cause. Unit +

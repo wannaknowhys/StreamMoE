@@ -522,23 +522,34 @@ RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
 **失败模式：** head 算子不支持 → Tier-1 回退；图溢出 → 硬错误（禁止静默丢）；0 token →
 现有 B38 提前返回。
 
-**H2D sync（这次暴露的 bug）。** fused 图读 head 的 incoming shell 之前，H2D
-`set_async` 批次必须先 sync。原 `skip_h2d_sync_dev`（同一 backend → 下一段完成时 sync）
-太晚：完成 sync 发生在图已经读完 shell 之后，所以 head 的 positions/mask 仍是上一个 head
-（alias 伙伴）的旧值。Tier-2 incoming 不再 skip；每批一次 `ggml_backend_synchronize`，在提交
-之前。这是唯一必要的生产改动（布局未动）。
+**H2D sync（实验观察）。** 观察到：skip 时，fused 图读到的 head incoming shell 仍是上一个
+head（alias 伙伴）的旧值；在 `set_async` 批次之后、`graph_compute_async` 之前加一次
+`ggml_backend_synchronize`（A），或干脆不 skip（B），shell 就是 head 自己的值。Tier-2 incoming
+因此不再 skip；每批一次 sync。**backend 侧机制尚未确认**：在这条路径上，“同一队列里拷贝先于图”
+不成立（`set_async` → `graph_compute_async`），图之后的完成 sync 在实践中太晚。Tier-1
+`run_incoming_copies` 的 skip **不能**用“它的图是同步的”来辩护（同步图只管完成时机，管不了
+更早的 async 拷贝是否先执行）；它的安全性需要单独查。
 
 A/B/C 消融（原始 per-layer 布局，不预填）：A（入队后一次 sync，仍 skip）和 B（不 skip）都恢复
 `ffn_inp-1=9642636a`；C（只有前置 sync）失败（`fcb9d10d`、ids 错）；`full`（预填 + 每 item
-sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 sync 仍旧”是 dispatch 与 sync
-之间的调试 `tensor_get` 破坏了 transfer 状态。
+sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 sync 仍旧”的一个**候选解释（未
+验证）**是 dispatch 与 sync 之间的调试 `tensor_get` 可能干扰 transfer 状态；A/B/C 都避开了这些读。
 
-**验证：** `place-c1c2-exp5` 的 head 1 stage（ub=4）与 B1 前逐字节一致
+**验证（范围窄）：** `place-c1c2-exp5` 的 head 1 stage（ub=4）与 B1 前逐字节一致
 （`ffn_inp-1 9642636a e08ff17e`、`ffn_norm-1 018037b8 d117fa59`、ids
 `21 39 18 25 11 47 15 42`），文本 `Hello!`；`run_baseline moe_129_8192_vk` PASS
 （moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。新增的 2 个 DIFF
-（`place-c1-exp2`/`place-c1c2-exp2`）根本没有进 Tier-2 fused（`[fuse_tier2]` 不出现；2GB
-池产生 CPU round → `single_dev_target=false`），属于已知的 place 文本差异类，与 head 融合无关。
+（`place-c1-exp2`/`place-c1c2-exp2`）**暂未解释**：同 flavor bisect（`b14ee43` vs
+`064651f`）显示它们的 decode t/s 基本不变（c1-exp2 10.22→10.36、c1c2-exp2
+10.35→10.44 tg），说明 B1 在那边没有生效；它们相对 b14ee43 的文本差异尚未定位。
+c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**，同一个 `StreamMoE_dump` flavor
+下 B1 的净效果（每层少一次提交、每个 head 批次一次 sync）在本测量中为正。逐层
+`moe_out` dump 与 TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2`
+的 6 次稳定性是 closure-host 回归检查，**不是** B1 验证。
+
+**Production gating：** B1 代码没有放在 `STREAM_MOE_LATEST` 后面，所以 production
+`StreamMoE_dump` 会跑它（c1c2-exp5 的 place PASS 包含 B1）。按 `AGENTS.md`，production flavor
+应保持 in-progress 功能 opt-in；给 B1 加 `STREAM_MOE_LATEST` gate 是一个待定决策。
 
 **待做：** xfer shell 布局仍是 per-layer 两槽 + 跨层复用；alias 是真实隐患，但不是本 bug 的
 根因。unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 的先后
