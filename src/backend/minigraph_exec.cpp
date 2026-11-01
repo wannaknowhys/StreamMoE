@@ -2669,6 +2669,10 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                     ok = false;
                 }
                 can_fuse_head = ok;
+#ifdef STREAM_MOE_TEMP
+                // TEMP ablation: force B1 off on the same build.
+                if (std::getenv("STREAM_MOE_TMP_NO_HEAD_FUSE")) can_fuse_head = false;
+#endif
             }
         }
 

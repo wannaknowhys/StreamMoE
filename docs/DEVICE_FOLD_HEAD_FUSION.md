@@ -643,25 +643,36 @@ ids `21 39 18 25 11 47 15 42`), text `Hello!`; `run_baseline moe_129_8192_vk`
 PASS (moe/upstream IDENTICAL, KL PASS, places 6 PASS/6 DIFF). The same-flavor
 bisect (`b14ee43` vs `064651f`, fresh `run_baseline` on both) gives: b14ee43
 8 PASS/4 DIFF (DIFF: `c1-exp2`, `c1`, `c1c2`, `c2`); 064651f 6 PASS/6 DIFF (the
-same four plus **`c1c2-exp1`** and **`c1c2-exp2`**). So the two **new** DIFFs are
-`place-c1c2-exp1`/`place-c1c2-exp2`, not `place-c1-exp2` (which is DIFF on both).
-Their decode t/s is unchanged (c1c2-exp2 10.35→10.44 tg; c1c2-exp1 not measured),
-so B1 is not active there; the cause must be one of the other 064651f changes
-(the incoming/outgoing `select_relays` refactor and the tail-append overflow
-handling are used by non-fused paths too) or run variability, and it is **not
-yet localized**. The bench output texts of the three places differ between the
-two builds (content lines, not just the timing header). The c1c2-exp5 decode tg
-improved **11.45 → 13.02 (+13.7%)** on the same `StreamMoE_dump` flavor, so the
-net effect of B1 (one fewer submission/layer, one sync per head batch) is
-positive at this measurement (one run per side; the whole 064651f delta, not B1
-alone). Per-layer `moe_out` dumps and the TMR submission count are still pending;
-only one ub/layer was compared. The c1c2 `place-c1c2` six-run stability is a
-closure-host regression check, **not** B1 verification.
+same four plus **`c1c2-exp1`** and **`c1c2-exp2`**). The two **new** DIFFs are
+`place-c1c2-exp1`/`place-c1c2-exp2` (not `place-c1-exp2`, DIFF on both).
 
-**Production gating:** the B1 code is not behind `STREAM_MOE_LATEST`, so the
-production `StreamMoE_dump` runs it (the c1c2-exp5 place PASS includes the B1).
-Per `AGENTS.md` the production flavor is supposed to keep in-progress features
-opt-in; gating B1 with `STREAM_MOE_LATEST` is a pending decision.
+**The new DIFFs are caused by B1.** On the same 064651f build, with B1 forced on
+and off (`STREAM_MOE_TMP_NO_HEAD_FUSE`): B1 on -> both `c1c2-exp1` and
+`c1c2-exp2` **DIFF**; B1 off -> both **PASS**. Their decode t/s is unchanged
+(e.g. c1c2-exp2 10.35->10.44 tg on vs off), so this is a **text correctness**
+regression, not a speed one, and it is **nondeterministic**: two repeats of the
+B1-on run give different text hashes (`6BFD...` vs `FBDC...`, `C298...` vs
+`D30B...`). The diverging-token top-2 logit gap is still to be measured (the
+bench does not expose logits directly; a server logprobs path is needed). This
+invalidates the earlier "B1 not active there" claim (the `[fuse_tier2]` probe and
+identical t/s did not prove inactivity).
+
+The c1c2-exp5 decode tg improved **11.45 -> 13.02 (+13.7%)** on the same
+`StreamMoE_dump` flavor, so the net effect of B1 (one fewer submission/layer,
+one sync per head batch) is positive at this measurement (one run per side; the
+whole 064651f delta, not B1 alone). Per-layer `moe_out` dumps and the TMR
+submission count are still pending; only one ub/layer was compared. The c1c2
+`place-c1c2` six-run stability is a closure-host regression check, **not** B1
+verification.
+
+**Production gating (temporary state):** the B1 code is not behind
+`STREAM_MOE_LATEST`, so the production `StreamMoE_dump` currently runs it (the
+c1c2-exp5 place PASS includes the B1). Per `AGENTS.md` the production flavor is
+supposed to keep in-progress features opt-in. The user decided **not to gate
+yet**; the two comparisons come first: (1) the same 064651f build with B1 on and
+off, running `place-c1c2-exp1`/`place-c1c2-exp2`; (2) the same build three times
+to see whether the DIFF is stable, plus the top-2 logit gap at the diverging
+token. Until then the production default-on B1 is a **temporary state**.
 
 **Still open:** the xfer shell layout remains the per-layer two-slot with
 cross-layer reuse; the alias is a real hazard but not this bug's cause. Unit +

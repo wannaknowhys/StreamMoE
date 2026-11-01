@@ -541,19 +541,27 @@ sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 syn
 （moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。同 flavor bisect
 （`b14ee43` vs `064651f`，两边都重新跑了 `run_baseline`）：b14ee43 是 8 PASS/4 DIFF
 （DIFF：`c1-exp2`、`c1`、`c1c2`、`c2`），064651f 是 6 PASS/6 DIFF（同样四个再加
-**`c1c2-exp1`** 和 **`c1c2-exp2`**）。所以**新增**的两个是 `place-c1c2-exp1`/`place-c1c2-exp2`，
-不是 `place-c1-exp2`（它两边都 DIFF）。二者 decode t/s 基本不变（c1c2-exp2 10.35→10.44 tg；
-c1c2-exp1 未测），说明 B1 在那边没生效；原因只能是 064651f 的其它改动（incoming/outgoing
-`select_relays` 重构、tail append 溢出处理，这些非融合路径也走）或 run 波动，**尚未定位**。
-两次 bench 的三个 place 输出文本不同（是内容行，不只是时间戳头）。c1c2-exp5 的 decode tg
-**11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` flavor；每边只跑一次，且是整个 064651f 的
-delta，不只是 B1），B1 的净效果在本测量中为正。逐层 `moe_out` dump 与 TMR 提交次数仍待补；
-目前只对了一个 ub/layer。c1c2 `place-c1c2` 的 6 次稳定性是 closure-host 回归检查，**不是**
-B1 验证。
+**`c1c2-exp1`** 和 **`c1c2-exp2`**）。**新增的是 `place-c1c2-exp1`/`place-c1c2-exp2`**，
+不是 `place-c1-exp2`（它两边都 DIFF）。
 
-**Production gating：** B1 代码没有放在 `STREAM_MOE_LATEST` 后面，所以 production
-`StreamMoE_dump` 会跑它（c1c2-exp5 的 place PASS 包含 B1）。按 `AGENTS.md`，production flavor
-应保持 in-progress 功能 opt-in；给 B1 加 `STREAM_MOE_LATEST` gate 是一个待定决策。
+**这两个新增 DIFF 是 B1 造成的。** 同一个 064651f build，B1 强制开/关
+（`STREAM_MOE_TMP_NO_HEAD_FUSE`）：B1 on → 两个都 **DIFF**；B1 off → 两个都 **PASS**。
+decode t/s 不变（如 c1c2-exp2 on/off 都是 10.35→10.44 tg），所以是**文本正确性**回归、不是
+速度问题，而且是**不确定性的**：B1 on 重复两次文本哈希不同（`6BFD...` vs `FBDC...`、
+`C298...` vs `D30B...`）。分歧 token 的 top-2 logit 差还没测（bench 不直接暴露 logits，需要
+server logprobs 路径）。这推翻了上一轮“B1 在那边没生效”的判断（`[fuse_tier2]` 探针和相同
+t/s 都不能证明没生效）。
+
+c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` flavor；每边一次，
+且是整个 064651f 的 delta，不只是 B1），B1 的净效果在本测量中为正。逐层 `moe_out` dump 与
+TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2` 的 6 次稳定性是 closure-host
+回归检查，**不是** B1 验证。
+
+**Production gating（临时状态）：** B1 代码没放在 `STREAM_MOE_LATEST` 后，production
+`StreamMoE_dump` 目前会跑它（c1c2-exp5 的 place PASS 包含 B1）。按 `AGENTS.md` production
+应保持 in-progress 功能 opt-in。用户已决定**先不挂 gate**；先做两个对照：① 同一 064651f
+build 上 B1 开/关各跑 `place-c1c2-exp1`/`place-c1c2-exp2`；② 同一 build 跑 3 次看 DIFF 是否
+稳定，并在分歧 token 看 top-2 logit 差。在此之前 production 默认开 B1 是**临时状态**。
 
 **待做：** xfer shell 布局仍是 per-layer 两槽 + 跨层复用；alias 是真实隐患，但不是本 bug 的
 根因。unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 的先后
