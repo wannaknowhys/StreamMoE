@@ -161,6 +161,15 @@ nondeterminism (2026-10-27..29, localized with `STREAM_MOE_TMP_STAGE_TRACE` +
 because a sync separates the calls; only the tail and head of one fused segment
 coexist.
 
+**H2D sync before the fused graph (2026-11-01).** The fused
+`[closure+tail+head]` graph is submitted with `graph_compute_async`, so the
+head's incoming H2D `set_async` batch must be synchronized before the submit.
+The old `skip_h2d_sync_dev` assumption ("same backend => the next segment's
+completion sync orders the copies") is false here: the graph reads the shells
+before its completion sync, leaving the head's positions/mask at the previous
+head's (alias partner's) values. The tier-2 incoming batch therefore does not
+skip; one sync per batch. The xfer layout itself is unchanged.
+
 ## 4. Reuse the existing packing
 
 Extract the best-fit-decreasing interval packing currently in

@@ -570,13 +570,13 @@ host fold fallback; `moe_out` non-contiguous/host -> host fold fallback.
 
 ### 7.2 B1 - head fusion (Tier-2)
 
-**Current path (why it is dead):** the tail fusion is built at
-[:2491-2512](src/backend/minigraph_exec.cpp:2491), then
-`can_fuse_head_next = false` is hard-coded at
-[:2526](src/backend/minigraph_exec.cpp:2526) with the aliasing comment
-[:2514-2526](src/backend/minigraph_exec.cpp:2514). B0b removed that reason (unit
-window + `sync` region). The ids readback is not a blocker: it happens after the
-graph returns, exactly where the per-layer sync already is.
+**Implemented (2026-11-01).** `can_fuse_head_next` is no longer hard-coded
+false: the tier-2 `single_dt->gf` carries
+`[closure(L) twins][tail(L)][head(L+1)]` and is submitted once with
+`graph_compute_async`. The head's incoming goes through the shared
+`select_relays` (`relay_scope_t`); outgoing through one `select_relays` call;
+`out_fused_head_next` makes the caller skip `exec_dense_head`. The xfer layout is
+still the per-layer two-slot stage split (4.6b), unchanged.
 
 **Scope:** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
 `plan_head_next != nullptr`; everything else keeps the Tier-1 path.
@@ -616,10 +616,35 @@ after the graph returns; byte-identical expected (same nodes, order, buffers).
 **Failure modes:** unsupported head op -> Tier-1 fallback; graph overflow -> hard
 error (never silent drop); 0 tokens -> existing B38 early return.
 
-**Verification:** per-layer `moe_out`/hidden dumps byte-identical to B0b; TMR
-`head` bucket 1 call/token and 1 submission/layer; places 12/12; `run_baseline`
-PASS. Expected: -1 submission/layer (~0.2-0.3 ms on RX590, larger once CUDA
-replay exists).
+**H2D sync (the bug this exposed).** The fused graph reads the head's incoming
+shells; the H2D `set_async` batch must be synchronized **before** the graph's
+reads. The old `skip_h2d_sync_dev` (same backend => the next segment's
+completion sync) is too late: the completion sync happens after the graph has
+already read the shells, so the head's positions/mask still held the previous
+head's (alias partner's) values. The tier-2 incoming batch no longer skips; one
+`ggml_backend_synchronize` per batch, before the submit. This is the only
+production change needed (the layout is untouched).
+
+A/B/C ablations (original per-layer layout, no fill): A (one post-batch sync,
+still skipping) and B (no skip) both restore `ffn_inp-1=9642636a`; C (pre-sync
+only, no post sync) fails (`fcb9d10d`, wrong ids); `full` (pre-fill + per-item
+sync) also passes, so per-item sync is not required. The earlier "explicit sync
+after dispatch still stale" was the debug `tensor_get` calls between the
+dispatch and that sync.
+
+**Verification:** `place-c1c2-exp5` stage head 1 at ub=4 matches pre-B1
+byte-for-byte (`ffn_inp-1 9642636a e08ff17e`, `ffn_norm-1 018037b8 d117fa59`,
+ids `21 39 18 25 11 47 15 42`), text `Hello!`; `run_baseline moe_129_8192_vk`
+PASS (moe/upstream IDENTICAL, KL PASS, places 6 PASS/6 DIFF). The two new DIFFs
+(`place-c1-exp2`, `place-c1c2-exp2`) do not enter the tier-2 fused unit at all
+(`[fuse_tier2]` absent; `single_dev_target` false because the 2 GB pool forces
+CPU rounds), so they are the known place-text variance class, not the head
+fusion.
+
+**Still open:** the xfer shell layout remains the per-layer two-slot with
+cross-layer reuse; the alias is a real hazard but not this bug's cause. Unit +
+liveness-interval packing and the `fused_units=0`/`build_layer_plans` order are
+future work.
 
 ### 7.3 Order
 

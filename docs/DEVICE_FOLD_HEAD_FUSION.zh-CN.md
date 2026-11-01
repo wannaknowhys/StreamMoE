@@ -485,12 +485,11 @@ RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
 
 ### 7.2 B1 —— head 融合（Tier-2）
 
-**当前路径（为什么是死的）**：tail 融合建在
-[:2491-2512](src/backend/minigraph_exec.cpp:2491)，随后
-`can_fuse_head_next = false` 被硬编码在
-[:2526](src/backend/minigraph_exec.cpp:2526)，注释（别名理由）在
-[:2514-2526](src/backend/minigraph_exec.cpp:2514)。B0b 已经消掉了那个理由（单元窗口 +
-`sync` 区）。ids 回读不是阻塞：它在图返回之后读，正好是当前每层同步所在的位置。
+**已落地（2026-11-01）。** `can_fuse_head_next` 不再硬编码 false：Tier-2 的
+`single_dt->gf` 装 `[closure(L) twins][tail(L)][head(L+1)]`，一次 `graph_compute_async`
+提交。head 的 incoming 走共享 `select_relays`（`relay_scope_t`）；outgoing 一次
+`select_relays`；`out_fused_head_next` 让调用侧跳过 `exec_dense_head`。xfer 布局仍是
+4.6b 的 per-layer 两槽 stage 划分，未改。
 
 **范围：** `single_dev_target` + `can_fuse_tail` + `next_layer == layer + 1` +
 `plan_head_next != nullptr`；其余保持 Tier-1 路径。
@@ -523,9 +522,27 @@ RX590 上即使零断点，decode 上限也就 20~40 t/s。目标（P100/CUDA）
 **失败模式：** head 算子不支持 → Tier-1 回退；图溢出 → 硬错误（禁止静默丢）；0 token →
 现有 B38 提前返回。
 
-**验证：** 逐层 `moe_out`/hidden dump 对 B0b 逐字节一致；TMR `head` 桶 1 次/token、每层
-1 次提交；places 12/12；`run_baseline` PASS。预期每层少 1 次提交（RX590 约 0.2-0.3ms，
-CUDA replay 之后更大）。
+**H2D sync（这次暴露的 bug）。** fused 图读 head 的 incoming shell 之前，H2D
+`set_async` 批次必须先 sync。原 `skip_h2d_sync_dev`（同一 backend → 下一段完成时 sync）
+太晚：完成 sync 发生在图已经读完 shell 之后，所以 head 的 positions/mask 仍是上一个 head
+（alias 伙伴）的旧值。Tier-2 incoming 不再 skip；每批一次 `ggml_backend_synchronize`，在提交
+之前。这是唯一必要的生产改动（布局未动）。
+
+A/B/C 消融（原始 per-layer 布局，不预填）：A（入队后一次 sync，仍 skip）和 B（不 skip）都恢复
+`ffn_inp-1=9642636a`；C（只有前置 sync）失败（`fcb9d10d`、ids 错）；`full`（预填 + 每 item
+sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 sync 仍旧”是 dispatch 与 sync
+之间的调试 `tensor_get` 破坏了 transfer 状态。
+
+**验证：** `place-c1c2-exp5` 的 head 1 stage（ub=4）与 B1 前逐字节一致
+（`ffn_inp-1 9642636a e08ff17e`、`ffn_norm-1 018037b8 d117fa59`、ids
+`21 39 18 25 11 47 15 42`），文本 `Hello!`；`run_baseline moe_129_8192_vk` PASS
+（moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。新增的 2 个 DIFF
+（`place-c1-exp2`/`place-c1c2-exp2`）根本没有进 Tier-2 fused（`[fuse_tier2]` 不出现；2GB
+池产生 CPU round → `single_dev_target=false`），属于已知的 place 文本差异类，与 head 融合无关。
+
+**待做：** xfer shell 布局仍是 per-layer 两槽 + 跨层复用；alias 是真实隐患，但不是本 bug 的
+根因。unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 的先后
+留待后续。
 
 ### 7.3 顺序
 

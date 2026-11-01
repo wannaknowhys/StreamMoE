@@ -1,7 +1,13 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-10-29（**c1c2 文本随机性根因：xfer 槽位重叠 + 修复**；详见下方 2026-10-29 补记）。
+> **最近更新**：2026-11-01（**B1 Tier-2 head(L+1) 融合落地 + H2D sync 修复**；详见下方 2026-11-01 补记）。
+> **2026-11-01 补记（B1 Tier-2 head(L+1) 融合落地 + H2D sync 修复）**：
+> - **B1**：Tier-2 的 `single_dt->gf` 现在装 `[closure(L) twins][tail(L)][head(L+1)]`，一次 `graph_compute_async` 提交；head 的 incoming 走共享 `select_relays`，outgoing 一次 `select_relays`，`out_fused_head_next` 让调用侧跳过 `exec_dense_head`。xfer 布局仍是 B1 前的 per-layer 两槽（未改）。
+> - **根因（哨兵 + A/B/C 消融）**：fused 图读 head 的 incoming shell 之前，H2D `set_async` 批次必须 sync。原 `skip_h2d_sync_dev` 的“下一段完成时 sync”在图已经读完 shell 之后才发生，head 的 positions/mask 仍是上一个 head（alias 伙伴）的旧值。A（入队后一次 sync，仍 skip）和 B（不 skip）都恢复到 `ffn_inp-1=9642636a`；C（只有前置 sync）失败；`full`（预填 + 每 item sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 sync 仍旧”是 dispatch 与 sync 之间的调试 `tensor_get` 破坏了 transfer 状态。
+> - **修复**：Tier-2 incoming 不再 skip，每批一次 `ggml_backend_synchronize`，在提交 fused 图之前。生产只改这一处，布局未动。
+> - **验证**：`place-c1c2-exp5` 的 head 1 stage 与 B1 前逐字节一致（`ffn_inp-1=9642636a`、`ffn_norm-1=018037b8`、ids `21 39 18 25 11 47 15 42`），文本 `Hello!`；`run_baseline moe_129_8192_vk` PASS（moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。新增的 2 个 DIFF（`place-c1-exp2`/`place-c1c2-exp2`）根本没有进 Tier-2 fused（`[fuse_tier2]` 不出现；2GB 池产生 CPU round → `single_dev_target=false`），属于已知的 place 文本差异类，与 head 融合无关。
+> - **待做**：xfer 仍是 per-layer 两槽 + 跨层复用（alias 是真实隐患，但不是本 bug 的根因）；unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 先后留待后续。
 > **2026-10-29 补记（c1c2 文本随机性 / 重复词）**：
 > - **根因**：fused `tail(L)+head(L+1)` 图在段前派发 head 的 incoming H2D relay，此时 tail 的 `moe_out` shell 仍活着；xfer 区域原来按层复用同一组 offset，layer L+1 的 64KB `ffn_moe_weighted` shell（0x3C640..0x4C640）覆盖了 layer L 的 8KB `moe_out` shell（0x4C600），head relay 覆盖其前 16 个 float。tail 输出 = 被覆盖的 `moe_out` + `ffn_inp`，stale 值取决于槽位旧内容 → 不同 run 文本不同，1B 模型进一步退化成重复词。
 > - **定位手段**：TEMP 的 `STREAM_MOE_TMP_STAGE_TRACE`（head/closure/tail 分段 hash + ids）、`STREAM_MOE_TMP_RELAY_DBG`（src/staging/dst 首元素）、`STREAM_MOE_TMP_TRACE_DIR` 的 `# SHELL/# OVERLAP` 地址扫描；首个有效分歧在 layer 14，`relay[0] != moe[0]` 且 `l_out[0] = relay[0] + ffn_inp[0]`。

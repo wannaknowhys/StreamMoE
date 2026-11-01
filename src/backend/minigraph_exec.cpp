@@ -548,17 +548,77 @@ static void dispatch_relay_batch(const std::vector<const route_b_relay_t *> & ba
                 }
             }
 #endif
+#ifdef STREAM_MOE_TEMP
+            // Sentinel ablations (STREAM_MOE_TMP_SENTINEL_MODE):
+            //   full = pre-fill + per-item sync
+            //   A    = no fill, one sync after the batch
+            //   B    = no fill, one sync after the batch; Tier-2 incoming not skipped
+            //   C    = pre-fill only, no post sync
+            const char * _smode = std::getenv("STREAM_MOE_TMP_SENTINEL_MODE");
+            const bool _s_fill = _smode && (std::strcmp(_smode, "full") == 0 || std::strcmp(_smode, "C") == 0);
+            const bool _s_read = _smode && (std::strcmp(_smode, "full") == 0 || std::strcmp(_smode, "A") == 0 ||
+                                            std::strcmp(_smode, "C") == 0);
+            const bool _s_peritem = _smode && std::strcmp(_smode, "full") == 0;
+            const bool _s_sync = _smode && (std::strcmp(_smode, "full") == 0 || std::strcmp(_smode, "A") == 0);
+            if (_s_fill) {
+                for (const auto & item : items) {
+                    if (!item.dst || !item.dst->data || item.nbytes == 0) continue;
+                    std::vector<uint8_t> pat(item.nbytes, 0xA5);
+                    ggml_backend_tensor_set(item.dst, pat.data(), 0, item.nbytes);
+                }
+                ggml_backend_synchronize(be);
+            }
+#endif
             // Enqueue asynchronous transfers to device
             for (const auto & item : items) {
                 char * stage_ptr = static_cast<char *>(p_stage) + item.offset;
                 ggml_backend_tensor_set_async(be, item.dst, stage_ptr, 0, item.nbytes);
             }
+#ifdef STREAM_MOE_TEMP
+            if (_s_read) {
+                if (_s_sync && !_s_peritem) ggml_backend_synchronize(be);
+                for (const auto & item : items) {
+                    if (!item.dst || !item.dst->data || item.nbytes == 0) continue;
+                    if (_s_peritem) ggml_backend_synchronize(be);
+                    std::vector<uint8_t> sv(item.nbytes, 0), dv(item.nbytes, 0);
+                    tensor_read_host(item.src, sv.data(), 0, item.nbytes);
+                    tensor_read_host(item.dst, dv.data(), 0, item.nbytes);
+                    const bool landed = std::memcmp(sv.data(), dv.data(), item.nbytes) == 0;
+                    const bool pat = item.nbytes >= 2 ? (dv[0] == 0xA5 && dv[1] == 0xA5)
+                                                      : (item.nbytes == 1 && dv[0] == 0xA5);
+                    std::fprintf(stderr, "[sentinel] %-22s nb=%zu landed=%d pattern=%d src0=%02x%02x dst0=%02x%02x dst_data=%p\n",
+                                 item.src && item.src->name ? item.src->name : "?", item.nbytes,
+                                 landed ? 1 : 0, pat ? 1 : 0,
+                                 item.nbytes > 0 ? (unsigned) sv[0] : 0, item.nbytes > 1 ? (unsigned) sv[1] : 0,
+                                 item.nbytes > 0 ? (unsigned) dv[0] : 0, item.nbytes > 1 ? (unsigned) dv[1] : 0,
+                                 item.dst->data);
+                }
+            }
+#endif
             // Synchronize device once for the batch unless the following segment computes on the same device
             if (dev_name && skip_h2d_sync_dev == dev_name) {
                 // Next segment will compute on this backend and synchronize at completion
             } else {
                 ggml_backend_synchronize(be);
             }
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TMP_RELAY_DBG")) {
+                for (const auto & item : items) {
+                    char * sp = static_cast<char *>(p_stage) + item.offset;
+                    int32_t s_i = -1, t_i = -1, d_i = -1;
+                    float s_f = 0.0f, t_f = 0.0f, d_f = 0.0f;
+                    tensor_read_host(item.src, &s_i, 0, 4);
+                    std::memcpy(&t_i, sp, 4);
+                    tensor_read_host(item.dst, &d_i, 0, 4);
+                    std::memcpy(&s_f, &s_i, 4);
+                    std::memcpy(&t_f, &t_i, 4);
+                    std::memcpy(&d_f, &d_i, 4);
+                    fprintf(stderr, "[relayh2d] %-20s src=%p s=%d(%.6g) st=%d(%.6g) dst=%p ddata=%p d=%d(%.6g) nb=%zu\n",
+                            item.src->name ? item.src->name : "?", (const void *) item.src,
+                            s_i, s_f, t_i, t_f, (const void *) item.dst, item.dst->data, d_i, d_f, item.nbytes);
+                }
+            }
+#endif
 #ifdef STREAM_MOE_TEMP
             if (std::getenv("STREAM_MOE_TMP_RELAY_DBG")) {
                 for (const auto & item : items) {
@@ -2018,6 +2078,10 @@ static void fix_view_buffers(ggml_cgraph * gf) {
     }
 }
 
+#ifdef STREAM_MOE_TEMP
+static void dbg_leaf6(const char * where, int32_t layer);
+#endif
+
 // Whole-layer compact-chain bucket engine (the only executor). The round list
 // comes from build_mix_plan (real per-pool token-subset rounds; a single RAM
 // pool degenerates to one full round). Each round builds a compact chain on
@@ -2565,42 +2629,169 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             }
         }
 
+        // Head(L+1) fusion (B1): optional - if it cannot join the same device
+        // graph, keep the tail-only fusion and let exec_dense_head run the head.
+        bool can_fuse_head = false;
+        size_t tail_need = 0;
+        size_t head_need = 0;
         if (can_fuse_tail) {
-            // 1. Dispatch incoming relays for Tail(L) targeting single_dev_name
-            std::vector<const route_b_relay_t *> incoming_tail;
-            for (const auto & r : route_b_relays()) {
-                if (!r.src || !r.dst || executed_relays.count(&r)) continue;
-                if (r.layer != layer || r.stage != ROUTE_B_XFER_TAIL) continue;
-                const char * dd = route_b_node_device(r.dst);
-                const std::string dst_key = (dd ? dd : "");
-                if (dst_key != single_dev_name) continue;
-                incoming_tail.push_back(&r);
-                executed_relays.insert(&r);
+            for (const auto * nd : plan_tail->tail) {
+                if (nd && !is_alias_op(nd) && nd->data && nd->op != GGML_OP_NONE) ++tail_need;
             }
-            dispatch_relay_batch(incoming_tail, cpu, single_dev_name);
+            // The tail is required; dropping a node would silently produce a
+            // wrong graph. Fail loudly instead of the old silent n_nodes check.
+            if (single_dt->gf->n_nodes + tail_need > single_dt->gf->size) {
+                fprintf(stderr, "[tier2] tail overflow L%d: need %zu nodes, capacity %d\n",
+                        layer, (size_t) single_dt->gf->n_nodes + tail_need, single_dt->gf->size);
+                return GGML_STATUS_FAILED;
+            }
+            if (plan_head_next && !plan_head_next->head.empty()) {
+                bool ok = is_segment_on_device(plan_head_next->head, single_dev_name);
+                if (ok) {
+                    for (const auto * nd : plan_head_next->head) {
+                        if (!nd || is_alias_op(nd) || nd->op == GGML_OP_NONE) continue;
+                        if (!nd->data || !ggml_backend_supports_op(single_dt->be, nd)) {
+                            ok = false;
+                            break;
+                        }
+                        ++head_need;
+                    }
+                }
+                if (ok && single_dt->gf->n_nodes + tail_need + head_need > single_dt->gf->size) {
+                    static bool head_overflow_logged = false;
+                    if (!head_overflow_logged) {
+                        head_overflow_logged = true;
+                        fprintf(stderr, "[tier2] head overflow L%d: need %zu nodes, capacity %d; "
+                                        "falling back to a separate head\n",
+                                layer, (size_t) single_dt->gf->n_nodes + tail_need + head_need,
+                                single_dt->gf->size);
+                    }
+                    ok = false;
+                }
+                can_fuse_head = ok;
+            }
+        }
 
-            // 2. Append Tail(L) nodes to t.gf
-            for (ggml_tensor * nd : plan_tail->tail) {
-                if (!nd || is_alias_op(nd) || !nd->data || nd->op == GGML_OP_NONE) continue;
-                if (single_dt->gf->n_nodes < single_dt->gf->size) {
-                    single_dt->gf->nodes[single_dt->gf->n_nodes++] = nd;
+        if (can_fuse_tail) {
+            std::unordered_set<const ggml_tensor*> fused_tail_nodes;
+            std::unordered_set<const ggml_tensor*> fused_graph_nodes;
+            for (const auto * nd : plan_tail->tail) {
+                if (!nd) continue;
+                fused_tail_nodes.insert(nd);
+                fused_graph_nodes.insert(nd);
+            }
+            if (can_fuse_head) {
+                for (const auto * nd : plan_head_next->head) {
+                    if (nd) fused_graph_nodes.insert(nd);
+                }
+                const moe_layer_exec_t * ex_head = moe_chain_layer_exec(next_layer);
+                if (ex_head) fix_layer_input_layouts(ex_head);
+            }
+
+            // 1. Incoming relays for the whole graph: Tail(L) (TAIL) and, when
+            //    fused, Head(L+1) (LAYER_FRONT). Skip relays whose source is
+            //    produced inside the graph (tail -> head edges are internal).
+            //    skip_h2d_sync_dev: the graph is submitted on this device and
+            //    synchronized before the next H2D batch can reuse the staging.
+            relay_scope_t rs;
+            rs.layer = layer;
+            rs.layer_head = can_fuse_head ? next_layer : -1;
+            rs.seg_has_tail = true;
+            rs.seg_has_head = can_fuse_head;
+            rs.incoming = true;
+            rs.dev = single_dev_name;
+            rs.tail_nodes = &fused_tail_nodes;
+            rs.graph_nodes = can_fuse_head ? &fused_graph_nodes : nullptr;
+            rs.stage = "tail";
+            std::vector<const route_b_relay_t *> incoming = select_relays(rs, executed_relays);
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TIER2_DEBUG")) {
+                fprintf(stderr, "[tier2] L%d incoming=%zu can_head=%d\n", layer, incoming.size(), can_fuse_head ? 1 : 0);
+                for (const auto * r : incoming) {
+                    int32_t sv0 = -1, sv1 = -1;
+                    if (r->src && r->src->data) {
+                        tensor_read_host(r->src, &sv0, 0, 4);
+                        if (ggml_nbytes(r->src) >= 8) tensor_read_host(r->src, &sv1, 4, 4);
+                    }
+                    fprintf(stderr, "[tier2]   '%s'(%s) src=%p sdata=%p v=%d,%d -> dst=%p(%s) stage=%d nb=%zu\n",
+                            r->src && r->src->name ? r->src->name : "?", route_b_node_device(r->src),
+                            (const void *) r->src, r->src ? r->src->data : nullptr, sv0, sv1,
+                            (const void *) r->dst, r->dst && r->dst->name ? r->dst->name : "?", route_b_node_device(r->dst),
+                            r->stage, r->src ? ggml_nbytes(r->src) : 0);
                 }
             }
-            out_fused_tail = true;
+#endif
+            // The fused graph below is submitted with graph_compute_async; the
+            // set_async copies are not ordered before its reads unless the H2D
+            // batch is synchronized here. The skip's "synchronize at completion"
+            // happens after the graph's reads, so do not skip for this batch.
+            dispatch_relay_batch(incoming, cpu);
+#ifdef STREAM_MOE_TEMP
+            dbg_leaf6("b1-incoming", next_layer);
+#endif
+#ifdef STREAM_MOE_TEMP
+            if (std::getenv("STREAM_MOE_TIER2_DEBUG") && can_fuse_head) {
+                ggml_backend_synchronize(single_dt->be);
+                fprintf(stderr, "[tier2] L%d incoming=%zu dst shells (after sync):\n", layer, incoming.size());
+                for (const auto * r : incoming) {
+                    if (!r->dst || !r->dst->data) continue;
+                    int32_t dv0 = -1, dv1 = -1;
+                    const size_t nb = std::min<size_t>(8, ggml_nbytes(r->dst));
+                    tensor_read_host(r->dst, &dv0, 0, 4);
+                    if (nb >= 8) tensor_read_host(r->dst, &dv1, 4, 4);
+                    fprintf(stderr, "[tier2]   %-24s src=%p sdata=%p -> dst=%p ddata=%p dst_nb=%zu v=%d,%d\n",
+                            r->src && r->src->name ? r->src->name : "?",
+                            (const void *) r->src, r->src ? r->src->data : nullptr,
+                            (const void *) r->dst, r->dst->data, ggml_nbytes(r->dst), dv0, dv1);
+                }
+                if (plan_head_next) {
+                    for (auto * nd : plan_head_next->head) {
+                        if (!nd || nd->op != GGML_OP_ROPE || !nd->src[1]) continue;
+                        const ggml_tensor * p = nd->src[1];
+                        int32_t v0 = -1, v1 = -1;
+                        tensor_read_host(p, &v0, 0, 4);
+                        if (ggml_nbytes(p) >= 8) tensor_read_host(p, &v1, 4, 4);
+                        fprintf(stderr, "[tier2] rope %s pos=%p(pos data=%p) v=%d,%d nb=%zu\n",
+                                nd->name ? nd->name : "?", (const void *) p, p->data, v0, v1, ggml_nbytes(p));
+                    }
+                }
+            }
+#endif
 
-            // Note on Head(L+1) fusion:
-            // Forward-fusing Head(L+1) into layer L's device graph is intentionally
-            // not performed here because:
-            //   1. Scratch arena reuse: In layout_arena, non-carry scratch space is
-            //      reused across layers (plan.scratch_size = max_L(lb_L)). Merging
-            //      Head(L+1) with MoE(L)+Tail(L) into a single cgraph causes GPU
-            //      scratch memory aliasing between layer L and layer L+1.
-            //   2. Router host synchronization: Head(L+1) computes router top-k
-            //      ids(L+1), which the host CPU must read to pin expert weights
-            //      for layer L+1 before MoE(L+1) can begin.
-            // Therefore, fusing MoE(L) + Tail(L) into a single hardware queue
-            // submission achieves the true "single-break per layer" architecture.
-            can_fuse_head_next = false;
+            // 2. Append Tail(L), then Head(L+1), to the same device graph.
+            for (ggml_tensor * nd : plan_tail->tail) {
+                if (!nd || is_alias_op(nd) || !nd->data || nd->op == GGML_OP_NONE) continue;
+                single_dt->gf->nodes[single_dt->gf->n_nodes++] = nd;
+            }
+            out_fused_tail = true;
+            if (can_fuse_head) {
+                for (ggml_tensor * nd : plan_head_next->head) {
+                    if (!nd || is_alias_op(nd) || !nd->data || nd->op == GGML_OP_NONE) continue;
+                    single_dt->gf->nodes[single_dt->gf->n_nodes++] = nd;
+                }
+                out_fused_head_next = true;
+            }
+            can_fuse_head_next = can_fuse_head;
+#ifdef STREAM_MOE_TEMP
+            // Sentinel: re-read the incoming shells right before the fused graph
+            // is submitted, to catch a copy that landed and was later overwritten.
+            if (std::getenv("STREAM_MOE_TMP_SENTINEL_GRAPH")) {
+                for (const auto * r : incoming) {
+                    if (!r->src || !r->dst || !r->dst->data) continue;
+                    const size_t nb = std::min(ggml_nbytes(r->src), ggml_nbytes(r->dst));
+                    if (nb == 0) continue;
+                    ggml_backend_synchronize(single_dt->be);
+                    std::vector<uint8_t> sv(nb, 0), dv(nb, 0);
+                    tensor_read_host(r->src, sv.data(), 0, nb);
+                    tensor_read_host(r->dst, dv.data(), 0, nb);
+                    std::fprintf(stderr, "[sentinel-graph] %-22s nb=%zu landed=%d src0=%02x%02x dst0=%02x%02x\n",
+                                 r->src->name ? r->src->name : "?", nb,
+                                 std::memcmp(sv.data(), dv.data(), nb) == 0 ? 1 : 0,
+                                 nb > 0 ? (unsigned) sv[0] : 0, nb > 1 ? (unsigned) sv[1] : 0,
+                                 nb > 0 ? (unsigned) dv[0] : 0, nb > 1 ? (unsigned) dv[1] : 0);
+                }
+            }
+#endif
         }
 #ifdef STREAM_MOE_TEMP
         if (std::getenv("STREAM_MOE_TIER2_DEBUG") || std::getenv("STREAM_MOE_TMP_DENSE_DEBUG")) {
@@ -2824,43 +3015,32 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
 #ifdef STREAM_MOE_TEMP
     { _tt.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _ch_t0).count(); _tt.n++; }
 #endif
-    // Dispatch outgoing boundary copies for fused segments if any
+    // Dispatch outgoing boundary copies for the fused segment (tail + optional head).
     if (out_fused_tail && single_dt) {
-        std::vector<const route_b_relay_t *> outgoing_tail;
-        for (const auto & r : route_b_relays()) {
-            if (!r.src || !r.dst || executed_relays.count(&r)) continue;
-            if (r.layer != layer || r.stage != ROUTE_B_XFER_TAIL) continue;
-            const char * sd = route_b_node_device(r.src);
-            const std::string src_key = (sd ? sd : "");
-            if (src_key != single_dev_name) continue;
-            outgoing_tail.push_back(&r);
-            executed_relays.insert(&r);
+        std::unordered_set<const ggml_tensor*> tail_nodes;
+        for (const auto * nd : plan_tail->tail) {
+            if (nd) tail_nodes.insert(nd);
         }
-        dispatch_relay_batch(outgoing_tail, cpu);
+        relay_scope_t rs;
+        rs.layer = layer;
+        rs.layer_head = out_fused_head_next ? next_layer : -1;
+        rs.seg_has_tail = true;
+        rs.seg_has_head = out_fused_head_next;
+        rs.incoming = false;
+        rs.dev = single_dev_name;
+        rs.tail_nodes = &tail_nodes;
+        rs.stage = "tail";
+        std::vector<const route_b_relay_t *> outgoing = select_relays(rs, executed_relays);
+        dispatch_relay_batch(outgoing, cpu);
 #ifdef STREAM_MOE_TEMP
         if (plan_tail) {
             dump_node_hash(layer, "tail", plan_tail->tail);
             dump_all_layer_nodes_debug(layer);
         }
-#endif
-    }
-
-    if (out_fused_head_next && single_dt) {
-        std::vector<const route_b_relay_t *> outgoing_head;
-        for (const auto & r : route_b_relays()) {
-            if (!r.src || !r.dst || executed_relays.count(&r)) continue;
-            if (r.layer != next_layer) continue;
-            if (r.stage != ROUTE_B_XFER_LAYER_FRONT && r.stage != ROUTE_B_XFER_CLOSURE) continue;
-            const char * sd = route_b_node_device(r.src);
-            const std::string src_key = (sd ? sd : "");
-            if (src_key != single_dev_name) continue;
-            outgoing_head.push_back(&r);
-            executed_relays.insert(&r);
-        }
-        dispatch_relay_batch(outgoing_head, cpu);
-#ifdef STREAM_MOE_TEMP
-        if (plan_head_next) {
+        if (out_fused_head_next && plan_head_next) {
             dump_node_hash(next_layer, "head", plan_head_next->head);
+            dump_all_layer_nodes_debug(next_layer);
+            trace_stage(next_layer, "head");
         }
 #endif
     }
@@ -2971,6 +3151,25 @@ static void trace_begin_ubatch(int64_t nt) {
     g_trace_nt = nt;
     if (g_trace_ub_max > 0 && g_trace_ub > g_trace_ub_max) g_trace_done = true;
 }
+
+#ifdef STREAM_MOE_TEMP
+static void dbg_leaf6(const char * where, int32_t layer) {
+    if (!std::getenv("STREAM_MOE_TIER2_DEBUG")) return;
+    if (layer < 0 || layer >= 32) return;
+    const ggml_tensor * seen = nullptr;
+    for (const auto & r : route_b_relays()) {
+        if (r.layer != layer || !r.src || !r.src->name) continue;
+        if (std::strcmp(r.src->name, "leaf_6") != 0) continue;
+        if (r.src == seen || !r.src->data) continue;
+        seen = r.src;
+        int32_t v0 = -1, v1 = -1;
+        tensor_read_host(r.src, &v0, 0, 4);
+        if (ggml_nbytes(r.src) >= 8) tensor_read_host(r.src, &v1, 4, 4);
+        fprintf(stderr, "[leafdbg] %-26s L%d ptr=%p data=%p v=%d,%d nb=%zu\n",
+                where, layer, (const void *) r.src, r.src->data, v0, v1, ggml_nbytes(r.src));
+    }
+}
+#endif
 
 static void trace_layer(int32_t layer) {
     if (std::getenv("STREAM_MOE_TMP_STAGE_TRACE")) return;   // stage mode: no full-layer scan
@@ -3302,6 +3501,9 @@ static enum ggml_status exec_dense_head(int32_t layer, ggml_context * ctx,
         return hst;
     }
 #ifdef STREAM_MOE_TEMP
+    dbg_leaf6("head-done", layer);
+#endif
+#ifdef STREAM_MOE_TEMP
     trace_stage(layer, "head");
 #endif
 #ifdef STREAM_MOE_TEMP
@@ -3367,6 +3569,11 @@ static enum ggml_status exec_moe_closure(int32_t layer, ggml_context * ctx,
     out_fused_head_next = false;
     const moe_layer_exec_t * ex = moe_chain_layer_exec(layer);
     if (!ex || ex->compute.empty()) return GGML_STATUS_SUCCESS;
+
+#ifdef STREAM_MOE_TEMP
+    dbg_leaf6("closure-start", layer);
+    dbg_leaf6("closure-start-next", next_layer);
+#endif
 
 #ifdef STREAM_MOE_TEMP
     int64_t _n_t = 0;
@@ -3495,6 +3702,10 @@ static enum ggml_status exec_moe_closure(int32_t layer, ggml_context * ctx,
 
     const enum ggml_status st = exec_layer_burst_chain_buckets(layer, ctx, cpu, sched, ex, pins, ids, n_k, n_t, ids_compact,
                                                                executed_relays, next_layer, out_fused_tail, out_fused_head_next);
+#ifdef STREAM_MOE_TEMP
+    dbg_leaf6("closure-post-burst", layer);
+    dbg_leaf6("closure-post-burst-next", next_layer);
+#endif
 #ifdef STREAM_MOE_TEMP
     if (const moe_layer_plan_t * plan = moe_chain_layer_plan(layer)) {
         dump_node_hash(layer, "moe", plan->head);
