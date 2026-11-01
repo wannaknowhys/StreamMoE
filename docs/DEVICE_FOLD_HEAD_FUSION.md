@@ -640,16 +640,23 @@ interfere with the transfer state; the A/B/C runs avoid those reads.
 **Verification (narrow):** `place-c1c2-exp5` stage head 1 at ub=4 matches pre-B1
 byte-for-byte (`ffn_inp-1 9642636a e08ff17e`, `ffn_norm-1 018037b8 d117fa59`,
 ids `21 39 18 25 11 47 15 42`), text `Hello!`; `run_baseline moe_129_8192_vk`
-PASS (moe/upstream IDENTICAL, KL PASS, places 6 PASS/6 DIFF). The two new DIFFs
-(`place-c1-exp2`, `place-c1c2-exp2`) are **not yet explained**: the same-flavor
-bisect (`b14ee43` vs `064651f`) shows their decode t/s essentially unchanged
-(c1-exp2 10.22→10.36, c1c2-exp2 10.35→10.44 tg), so B1 is not active there; their
-text DIFF vs the b14ee43 baseline is not yet localized. The c1c2-exp5 decode tg
+PASS (moe/upstream IDENTICAL, KL PASS, places 6 PASS/6 DIFF). The same-flavor
+bisect (`b14ee43` vs `064651f`, fresh `run_baseline` on both) gives: b14ee43
+8 PASS/4 DIFF (DIFF: `c1-exp2`, `c1`, `c1c2`, `c2`); 064651f 6 PASS/6 DIFF (the
+same four plus **`c1c2-exp1`** and **`c1c2-exp2`**). So the two **new** DIFFs are
+`place-c1c2-exp1`/`place-c1c2-exp2`, not `place-c1-exp2` (which is DIFF on both).
+Their decode t/s is unchanged (c1c2-exp2 10.35→10.44 tg; c1c2-exp1 not measured),
+so B1 is not active there; the cause must be one of the other 064651f changes
+(the incoming/outgoing `select_relays` refactor and the tail-append overflow
+handling are used by non-fused paths too) or run variability, and it is **not
+yet localized**. The bench output texts of the three places differ between the
+two builds (content lines, not just the timing header). The c1c2-exp5 decode tg
 improved **11.45 → 13.02 (+13.7%)** on the same `StreamMoE_dump` flavor, so the
 net effect of B1 (one fewer submission/layer, one sync per head batch) is
-positive at this measurement. Per-layer `moe_out` dumps and the TMR submission
-count are still pending; only one ub/layer was compared. The c1c2 `place-c1c2`
-six-run stability is a closure-host regression check, **not** B1 verification.
+positive at this measurement (one run per side; the whole 064651f delta, not B1
+alone). Per-layer `moe_out` dumps and the TMR submission count are still pending;
+only one ub/layer was compared. The c1c2 `place-c1c2` six-run stability is a
+closure-host regression check, **not** B1 verification.
 
 **Production gating:** the B1 code is not behind `STREAM_MOE_LATEST`, so the
 production `StreamMoE_dump` runs it (the c1c2-exp5 place PASS includes the B1).

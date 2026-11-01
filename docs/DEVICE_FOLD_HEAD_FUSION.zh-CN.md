@@ -538,14 +538,18 @@ sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 syn
 **验证（范围窄）：** `place-c1c2-exp5` 的 head 1 stage（ub=4）与 B1 前逐字节一致
 （`ffn_inp-1 9642636a e08ff17e`、`ffn_norm-1 018037b8 d117fa59`、ids
 `21 39 18 25 11 47 15 42`），文本 `Hello!`；`run_baseline moe_129_8192_vk` PASS
-（moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。新增的 2 个 DIFF
-（`place-c1-exp2`/`place-c1c2-exp2`）**暂未解释**：同 flavor bisect（`b14ee43` vs
-`064651f`）显示它们的 decode t/s 基本不变（c1-exp2 10.22→10.36、c1c2-exp2
-10.35→10.44 tg），说明 B1 在那边没有生效；它们相对 b14ee43 的文本差异尚未定位。
-c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**，同一个 `StreamMoE_dump` flavor
-下 B1 的净效果（每层少一次提交、每个 head 批次一次 sync）在本测量中为正。逐层
-`moe_out` dump 与 TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2`
-的 6 次稳定性是 closure-host 回归检查，**不是** B1 验证。
+（moe/upstream IDENTICAL、KL PASS、places 6 PASS/6 DIFF）。同 flavor bisect
+（`b14ee43` vs `064651f`，两边都重新跑了 `run_baseline`）：b14ee43 是 8 PASS/4 DIFF
+（DIFF：`c1-exp2`、`c1`、`c1c2`、`c2`），064651f 是 6 PASS/6 DIFF（同样四个再加
+**`c1c2-exp1`** 和 **`c1c2-exp2`**）。所以**新增**的两个是 `place-c1c2-exp1`/`place-c1c2-exp2`，
+不是 `place-c1-exp2`（它两边都 DIFF）。二者 decode t/s 基本不变（c1c2-exp2 10.35→10.44 tg；
+c1c2-exp1 未测），说明 B1 在那边没生效；原因只能是 064651f 的其它改动（incoming/outgoing
+`select_relays` 重构、tail append 溢出处理，这些非融合路径也走）或 run 波动，**尚未定位**。
+两次 bench 的三个 place 输出文本不同（是内容行，不只是时间戳头）。c1c2-exp5 的 decode tg
+**11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` flavor；每边只跑一次，且是整个 064651f 的
+delta，不只是 B1），B1 的净效果在本测量中为正。逐层 `moe_out` dump 与 TMR 提交次数仍待补；
+目前只对了一个 ub/layer。c1c2 `place-c1c2` 的 6 次稳定性是 closure-host 回归检查，**不是**
+B1 验证。
 
 **Production gating：** B1 代码没有放在 `STREAM_MOE_LATEST` 后面，所以 production
 `StreamMoE_dump` 会跑它（c1c2-exp5 的 place PASS 包含 B1）。按 `AGENTS.md`，production flavor
