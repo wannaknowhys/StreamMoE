@@ -657,16 +657,22 @@ stripping the `RUN`/`DATE`/pp/tg lines, the two (mislabeled) outputs differ in 5
 stripped-text comparison is the valid one. **The two deviating exp1 samples are the
 earliest pair, one B1-on and one B1-off**: `18-43-40` (B1-on) has 89 lines and
 `18-48-26` (B1-off) has 87 lines, while the later 3 B1-on + 3 B1-off runs are all
-the same 86-line text (`0FB557...`). This is an **early-window state dependency**
-(e.g. cold-cache expert placement), not a B1-off low-frequency variant; the
-cold-start (RAMMap) reproduction is pending. The Tier-1 skip / outgoing-relay
-hypothesis is **not supported** at this point. Also, "B1-on and B1-off have the
-same bench text on exp1/exp5" means **no token flip**, not "no numeric change":
-a small numeric perturbation only shows when it hits a near-tie. The exp2's bench
-text **does** differ (On `F4B4AA...` 107 lines vs Off `0739A8...` 96 lines). The
-exp5 stage trace (B1-on vs B1-off, multiple layers/ubs) is needed to quantify the
-per-layer maxAbs; the short-prompt places (exp1 B1-on DIFF / B1-off PASS) and the
-long bench use different prompts, so they do not contradict each other. The
+the same 86-line text (`0FB557...`). A **hypothesis, not established**: an
+exp1-specific early-window state dependency (exp1 has the smallest Vulkan pool, so
+expert-placement timing would be the most sensitive); the exp2's early samples
+are normal (18-43's exp2 = later `F4B4AA...`; 18-48's exp2 = later `0739A8...`).
+The cold-start (RAMMap) reproduction is pending. Binary confound: the later 6
+runs may be a different dbg binary (rebuilt after the gate change); however the
+19:10/19:15 pair is pre-gate and stable too, so the early-window hypothesis still
+has support, but "earliest pair vs later 6" is not the only evidence. The Tier-1
+skip / outgoing-relay hypothesis is **not supported** at this point. Also, "B1-on
+and B1-off have the same bench text on exp1/exp5" means **no token flip**, not
+"no numeric change": a small numeric perturbation only shows when it hits a
+near-tie. The exp2's bench text **does** differ (On `F4B4AA...` 107 lines vs Off
+`0739A8...` 96 lines). The exp5 stage trace (B1-on vs B1-off, multiple
+layers/ubs) is needed to quantify the per-layer maxAbs; the short-prompt places
+(exp1 B1-on DIFF / B1-off PASS) and the long bench use different prompts, so they
+do not contradict each other. The
 earlier "two B1-on repeats differ" claim was **wrongly labelled**: the
 18-43-40 / 18-48-26 outputs are the **B1-on / B1-off** calls (each `--runs`
 call actually ran once; the logs contain one `== 10 turns` per engine), and
