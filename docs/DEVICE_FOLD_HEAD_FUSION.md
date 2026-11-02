@@ -654,13 +654,15 @@ regression, not a speed one. The B1-on repeats differ in the **model text**:
 after stripping the `RUN`/`DATE`/pp/tg lines, two B1-on runs differ in 50
 (exp1) / 71 (exp2) content lines. The earlier raw-file hash comparison was
 **invalid evidence** (the file contains per-run header/timing lines); the
-stripped-text comparison is the valid one. The B1-off repeats are still
-untested, so the precise claim is: **two B1-on runs differ**, while the B1-off
-short-prompt places have passed 4/4 (B0b, 10-29, b14, this run) and the B1-on
-places have DIFFed 3/3. The first-divergence position (per turn) and the
-diverging-token top-2 logit gap are still to be measured. This invalidates the
-earlier "B1 not active there" claim (the `[fuse_tier2]` probe and identical t/s
-did not prove inactivity).
+stripped-text comparison is the valid one. **B1-off repeats are stable**: two
+B1-off runs have identical stripped text (both places); **B1-on repeats differ**
+at the stripped line 11 (exp1) / 19 (exp2), i.e. in the first turns. So the
+mixed-pool/CPU-round noise hypothesis is out, and the run-to-run text variation
+is specifically a **B1-on** effect. The B1-off short-prompt places have passed
+4/4 (B0b, 10-29, b14, this run) and the B1-on places have DIFFed 3/3. The
+diverging-token top-2 logit gap and the per-layer first-diverging tensor are
+still to be measured. This invalidates the earlier "B1 not active there" claim
+(the `[fuse_tier2]` probe and identical t/s did not prove inactivity).
 
 The c1c2-exp5 decode tg improved **11.45 -> 13.02 (+13.7%)** on the same
 `StreamMoE_dump` flavor, so the net effect of B1 (one fewer submission/layer,

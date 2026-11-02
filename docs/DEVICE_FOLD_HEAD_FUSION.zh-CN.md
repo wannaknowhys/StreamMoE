@@ -549,10 +549,12 @@ sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 syn
 decode t/s 不变（如 c1c2-exp2 on/off 都是 10.35→10.44 tg），所以是**文本正确性**回归、不是
 速度问题。B1-on 重复的**模型文本**不同：去掉 `RUN`/`DATE`/pp/tg 行后，两次 B1-on 在
 exp1 差 50 行、exp2 差 71 行内容。之前整份文件哈希的对比是**无效证据**（文件含每次必变的
-头部/计时行）；stripped-text 对比才是有效证据。**B1-off 的重复还没测**，所以严格说法是：
-**两次 B1-on 不同**；而 B1-off 的短 prompt places 已 4/4 PASS（B0b、10-29、b14、本次），
-B1-on 的 places 3/3 DIFF。首个分歧位置（按 turn）和分歧 token 的 top-2 logit 差还没测。
-这推翻了上一轮“B1 在那边没生效”的判断（`[fuse_tier2]` 探针和相同 t/s 都不能证明没生效）。
+头部/计时行）；stripped-text 对比才是有效证据。**B1-off 重复是稳定的**：两次 B1-off 的 stripped 文本完全
+相同（两个 place 都是）；**B1-on 重复不同**，首个分歧在 stripped 第 11 行（exp1）/第 19 行
+（exp2），即前几轮。所以混合池/CPU round 的噪声假说排除，run-to-run 文本变化是 **B1-on
+特有**的。B1-off 的短 prompt places 已 4/4 PASS（B0b、10-29、b14、本次），B1-on 的 places
+3/3 DIFF。分歧 token 的 top-2 logit 差和逐层首个分歧张量还没测。这推翻了上一轮“B1 在那边
+没生效”的判断（`[fuse_tier2]` 探针和相同 t/s 都不能证明没生效）。
 
 c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` flavor；每边一次，
 且是整个 064651f 的 delta，不只是 B1），B1 的净效果在本测量中为正。逐层 `moe_out` dump 与
