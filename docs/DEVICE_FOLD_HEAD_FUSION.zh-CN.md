@@ -549,8 +549,15 @@ sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 syn
 decode t/s 不变（如 c1c2-exp2 on/off 都是 10.35→10.44 tg），所以是**文本正确性**回归、不是
 速度问题。B1-on 重复的**模型文本**不同：去掉 `RUN`/`DATE`/pp/tg 行后，两次 B1-on 在
 exp1 差 50 行、exp2 差 71 行内容。之前整份文件哈希的对比是**无效证据**（文件含每次必变的
-头部/计时行）；stripped-text 对比才是有效证据。**B1-off 重复是稳定的**：两次 B1-off（19:10 / 19:15）的
-stripped 文本完全相同（两个 place）。之前“两次 B1-on 重复不同”的标签是**错的**：
+头部/计时行）；stripped-text 对比才是有效证据。**两个偏离的 exp1 样本是最早的一对，一个 B1-on、一个
+B1-off**：`18-43-40`（B1-on）89 行，`18-48-26`（B1-off）87 行，而后来的 3 次 B1-on + 3 次
+B1-off 全部是同一个 86 行文本（`0FB557...`）。这是**早期窗口的状态依赖**（例如冷缓存下的专家
+落池时序），不是 B1-off 的低频变体；冷启动（RAMMap 清 standby）复现待做。Tier-1 skip /
+outgoing relay 的假说目前**没有证据支持**。另外，“B1-on 与 B1-off 在 exp1/exp5 上 bench 文本
+相同”只说明**没翻 token**，不等于“数值没变化”：小扰动只有撞上近似平局才显形。exp2 的 bench
+文本**确实不同**（On `F4B4AA...` 107 行 vs Off `0739A8...` 96 行）。exp5 的 stage trace（B1-on
+vs B1-off，多层/多 ub）用来量化逐层 maxAbs；短 prompt places（exp1 B1-on DIFF / B1-off PASS）
+和长 bench prompt 不同，两者不矛盾。之前“两次 B1-on 重复不同”的标签是**错的**：
 18-43-40 / 18-48-26 是 **B1-on / B1-off** 两次调用（每次 `--runs` 实际只跑一遍，日志里每个
 engine 只有一条 `== 10 turns`），且 18-48-26 的 exp2 与已知 B1-off 的 19-10-22 完全相同。
 所以实测事实是 **B1-on 与 B1-off 不同**（首个 stripped 分歧 exp1 第 11 行、exp2 第 19 行），

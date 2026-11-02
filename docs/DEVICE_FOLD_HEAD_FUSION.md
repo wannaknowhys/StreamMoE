@@ -654,8 +654,19 @@ regression, not a speed one. **B1-on vs B1-off differ** in the model text: after
 stripping the `RUN`/`DATE`/pp/tg lines, the two (mislabeled) outputs differ in 50
 (exp1) / 71 (exp2) content lines. The earlier raw-file hash comparison was
 **invalid evidence** (the file contains per-run header/timing lines); the
-stripped-text comparison is the valid one. **B1-off repeats are stable**: two
-B1-off runs (19:10 / 19:15) have identical stripped text for both places. The
+stripped-text comparison is the valid one. **The two deviating exp1 samples are the
+earliest pair, one B1-on and one B1-off**: `18-43-40` (B1-on) has 89 lines and
+`18-48-26` (B1-off) has 87 lines, while the later 3 B1-on + 3 B1-off runs are all
+the same 86-line text (`0FB557...`). This is an **early-window state dependency**
+(e.g. cold-cache expert placement), not a B1-off low-frequency variant; the
+cold-start (RAMMap) reproduction is pending. The Tier-1 skip / outgoing-relay
+hypothesis is **not supported** at this point. Also, "B1-on and B1-off have the
+same bench text on exp1/exp5" means **no token flip**, not "no numeric change":
+a small numeric perturbation only shows when it hits a near-tie. The exp2's bench
+text **does** differ (On `F4B4AA...` 107 lines vs Off `0739A8...` 96 lines). The
+exp5 stage trace (B1-on vs B1-off, multiple layers/ubs) is needed to quantify the
+per-layer maxAbs; the short-prompt places (exp1 B1-on DIFF / B1-off PASS) and the
+long bench use different prompts, so they do not contradict each other. The
 earlier "two B1-on repeats differ" claim was **wrongly labelled**: the
 18-43-40 / 18-48-26 outputs are the **B1-on / B1-off** calls (each `--runs`
 call actually ran once; the logs contain one `== 10 turns` per engine), and
