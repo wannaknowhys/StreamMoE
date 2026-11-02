@@ -672,14 +672,15 @@ submission count are still pending; only one ub/layer was compared. The c1c2
 `place-c1c2` six-run stability is a closure-host regression check, **not** B1
 verification.
 
-**Production gating (temporary state):** the B1 code is not behind
-`STREAM_MOE_LATEST`, so the production `StreamMoE_dump` currently runs it (the
-c1c2-exp5 place PASS includes the B1). Per `AGENTS.md` the production flavor is
-supposed to keep in-progress features opt-in. The user decided **not to gate
-yet**; the two comparisons come first: (1) the same 064651f build with B1 on and
-off, running `place-c1c2-exp1`/`place-c1c2-exp2`; (2) the same build three times
-to see whether the DIFF is stable, plus the top-2 logit gap at the diverging
-token. Until then the production default-on B1 is a **temporary state**.
+**Production gating (gated, 2026-11-01).** The B1 head fusion is now behind
+`#ifdef STREAM_MOE_LATEST`: the production `StreamMoE_dump` does not compile it,
+while `StreamMoE_latest`/`StreamMoE_dump_dbg` keep it on (and the TEMP
+`STREAM_MOE_TMP_NO_HEAD_FUSE` switch remains for same-build on/off on the dbg).
+Because `run_baseline`'s dual build does not include the latest flavor, the
+places are also run on the dbg flavor (`verify_places --flavor
+StreamMoE_dump_dbg`) so B1 does not fall out of regression coverage. Expected:
+production places return to the B1-off set (8 PASS/4 DIFF; c1c2-exp1/exp2 PASS);
+the dbg places are the B1-on set (6 PASS/6 DIFF).
 
 **Still open:** the xfer shell layout remains the per-layer two-slot with
 cross-layer reuse; the alias is a real hazard but not this bug's cause. Unit +

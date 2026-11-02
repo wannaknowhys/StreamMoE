@@ -2645,6 +2645,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                         layer, (size_t) single_dt->gf->n_nodes + tail_need, single_dt->gf->size);
                 return GGML_STATUS_FAILED;
             }
+#ifdef STREAM_MOE_LATEST
             if (plan_head_next && !plan_head_next->head.empty()) {
                 bool ok = is_segment_on_device(plan_head_next->head, single_dev_name);
                 if (ok) {
@@ -2674,6 +2675,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 if (std::getenv("STREAM_MOE_TMP_NO_HEAD_FUSE")) can_fuse_head = false;
 #endif
             }
+#endif
         }
 
         if (can_fuse_tail) {
@@ -2684,6 +2686,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 fused_tail_nodes.insert(nd);
                 fused_graph_nodes.insert(nd);
             }
+#ifdef STREAM_MOE_LATEST
             if (can_fuse_head) {
                 for (const auto * nd : plan_head_next->head) {
                     if (nd) fused_graph_nodes.insert(nd);
@@ -2691,6 +2694,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 const moe_layer_exec_t * ex_head = moe_chain_layer_exec(next_layer);
                 if (ex_head) fix_layer_input_layouts(ex_head);
             }
+#endif
 
             // 1. Incoming relays for the whole graph: Tail(L) (TAIL) and, when
             //    fused, Head(L+1) (LAYER_FRONT). Skip relays whose source is
@@ -2768,6 +2772,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 single_dt->gf->nodes[single_dt->gf->n_nodes++] = nd;
             }
             out_fused_tail = true;
+#ifdef STREAM_MOE_LATEST
             if (can_fuse_head) {
                 for (ggml_tensor * nd : plan_head_next->head) {
                     if (!nd || is_alias_op(nd) || !nd->data || nd->op == GGML_OP_NONE) continue;
@@ -2775,6 +2780,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                 }
                 out_fused_head_next = true;
             }
+#endif
             can_fuse_head_next = can_fuse_head;
 #ifdef STREAM_MOE_TEMP
             // Sentinel: re-read the incoming shells right before the fused graph

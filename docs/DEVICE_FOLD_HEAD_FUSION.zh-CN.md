@@ -561,11 +561,13 @@ c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` f
 TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2` 的 6 次稳定性是 closure-host
 回归检查，**不是** B1 验证。
 
-**Production gating（临时状态）：** B1 代码没放在 `STREAM_MOE_LATEST` 后，production
-`StreamMoE_dump` 目前会跑它（c1c2-exp5 的 place PASS 包含 B1）。按 `AGENTS.md` production
-应保持 in-progress 功能 opt-in。用户已决定**先不挂 gate**；先做两个对照：① 同一 064651f
-build 上 B1 开/关各跑 `place-c1c2-exp1`/`place-c1c2-exp2`；② 同一 build 跑 3 次看 DIFF 是否
-稳定，并在分歧 token 看 top-2 logit 差。在此之前 production 默认开 B1 是**临时状态**。
+**Production gating（已挂 gate，2026-11-01）：** B1 head 融合现在放在
+`#ifdef STREAM_MOE_LATEST` 后：production `StreamMoE_dump` 不编译它，`StreamMoE_latest`/
+`StreamMoE_dump_dbg` 保持开启（dbg 上仍可用 TEMP 的 `STREAM_MOE_TMP_NO_HEAD_FUSE` 做同 build
+开/关）。因为 `run_baseline` 的 dual 不含 latest flavor，places 也同时在 dbg flavor 上跑
+（`verify_places --flavor StreamMoE_dump_dbg`），避免 B1 脱离回归覆盖。预期：production places
+回到 B1-off 集合（8 PASS/4 DIFF；c1c2-exp1/exp2 PASS），dbg places 是 B1-on 集合
+（6 PASS/6 DIFF）。
 
 **待做：** xfer shell 布局仍是 per-layer 两槽 + 跨层复用；alias 是真实隐患，但不是本 bug 的
 根因。unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 的先后
