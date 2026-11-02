@@ -554,9 +554,10 @@ stripped 文本完全相同（两个 place）。之前“两次 B1-on 重复不�
 18-43-40 / 18-48-26 是 **B1-on / B1-off** 两次调用（每次 `--runs` 实际只跑一遍，日志里每个
 engine 只有一条 `== 10 turns`），且 18-48-26 的 exp2 与已知 B1-off 的 19-10-22 完全相同。
 所以实测事实是 **B1-on 与 B1-off 不同**（首个 stripped 分歧 exp1 第 11 行、exp2 第 19 行），
-不是重复不稳定。**B1-on 的重复一致性尚未测**，需要三次独立 `--runs 1`、各自独立输出目录。
-“B1-on 非确定性”的说法撤回。gate 退出条件因此改成：**B1-on 输出与 B1-off 一致，或在
-teacher-forcing 的 top-1/KL 门内**，而不是“稳定且 PASS”（确定性的 B1 变化会每次都 DIFF）。
+不是重复不稳定。**B1-on 是确定性的**：三次独立 `--runs 1` 跑出的 stripped 文本在三个 place 上
+完全相同（exp1 `0FB557...`、exp2 `F4B4AA...`、exp5 `80843B...`），“B1-on 非确定性”的说法
+完全撤回。B1-on 与 B1-off 的差异是**确定性**变化；退出条件因此是 **B1-on 输出与 B1-off 一致，
+或在 teacher-forcing 的 top-1/KL 门内**，不是“稳定且 PASS”（B1-on 稳定，但 exp1/exp2 仍 DIFF）。
 首个分歧张量的 maxAbs（B1-on vs B1-off 的 stage trace）用来区分舍入级和旧数据；分歧 token 的
 top-2 logit 差是次要检查。
 
