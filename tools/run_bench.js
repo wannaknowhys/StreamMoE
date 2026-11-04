@@ -63,12 +63,15 @@ function parseArgv() {
         else if (a[i] === '--models' || a[i] === '--model') p.models = a[++i];
         else if (a[i] === '--engines' || a[i] === '--engine') p.engines = a[++i];
         else if (a[i] === '--tasks' || a[i] === '--task') p.tasks = a[++i];
+    else if (a[i] === '--max-turns') p.maxTurns = parseInt(a[++i], 10);
+    else if (a[i] === '--temperature') p.temperature = parseFloat(a[++i]);
         else if (a[i] === '--port') p.port = Number(a[++i]);
         else if (a[i] === '--health-timeout') p.healthTimeout = Number(a[++i]) * 1000;
         else if (a[i] === '--out') p.out = a[++i];
     }
     return p;
 }
+const P = parseArgv();
 
 function resolveSpecPath(nameOrPath, category) {
     if (fs.existsSync(nameOrPath)) return nameOrPath;
@@ -310,14 +313,14 @@ function statsOf(t) {
 
 // Single-shot /completion. cache_prompt=false: every call re-prefills.
 async function postCompletion(port, prompt, nPredict) {
-    const j = await postJson(port, '/completion', { prompt, n_predict: nPredict, temperature: 0, cache_prompt: false, stream: false });
+    const j = await postJson(port, '/completion', { prompt, n_predict: nPredict, temperature: (P.temperature ?? 0), cache_prompt: false, stream: false });
     if (j.error) return { error: String(j.error.message || j.error) };
     return Object.assign(statsOf(j.timings || {}), { content: j.content || '' });
 }
 
 // Chained /v1/chat/completions. cache_prompt=true: real multi-turn reuse.
 async function postChat(port, messages, nPredict) {
-    const j = await postJson(port, '/v1/chat/completions', { model: 'm', messages, max_tokens: nPredict, temperature: 0, cache_prompt: true, stream: false });
+    const j = await postJson(port, '/v1/chat/completions', { model: 'm', messages, max_tokens: nPredict, temperature: (P.temperature ?? 0), cache_prompt: true, stream: false });
     if (j.error) return { error: String(j.error.message || j.error) };
     const msg = j.choices && j.choices[0] && j.choices[0].message;
     return Object.assign(statsOf(j.timings || {}), { content: msg ? (msg.content || '') : '' });
@@ -428,7 +431,8 @@ async function runOne(run, port, healthTimeout, txtFile = null) {
             const turnTps = [];
             const ppTps = [];
             let totalPrompt = 0, totalGen = 0;
-            for (let i = 0; i < feed.maxTurns; i++) {
+            const _maxTurns = (P.maxTurns > 0) ? Math.min(feed.maxTurns, P.maxTurns) : feed.maxTurns;
+            for (let i = 0; i < _maxTurns; i++) {
                 const { system, prompt } = feed.lines[i];
                 if (system && String(system).trim()) messages.push({ role: 'system', content: system });
                 messages.push({ role: 'user', content: prompt });
@@ -436,7 +440,7 @@ async function runOne(run, port, healthTimeout, txtFile = null) {
                 if (r.error) throw new Error('turn ' + (i + 1) + ': ' + r.error);
                 messages.push({ role: 'assistant', content: r.content });
 
-                writeTxt(`--- [Turn ${i + 1}/${feed.maxTurns}] (prompt: ${r.prompt_n} tok, pp: ${fmt(r.prompt_tps, 1)}, tg: ${fmt(r.decode_tps)}) ---`);
+                writeTxt(`--- [Turn ${i + 1}/${_maxTurns}] (prompt: ${r.prompt_n} tok, pp: ${fmt(r.prompt_tps, 1)}, tg: ${fmt(r.decode_tps)}) ---`);
                 if (system && String(system).trim()) {
                     writeTxt(`[System]:\n${system}\n`);
                 }
@@ -451,7 +455,7 @@ async function runOne(run, port, healthTimeout, txtFile = null) {
                 ppTps.push(r.prompt_tps);
                 totalPrompt += r.prompt_n || 0;
                 totalGen += r.gen_n || 0;
-                console.log(`  turn ${i + 1}/${feed.maxTurns}  prompt=${r.prompt_n}  pp=${fmt(r.prompt_tps, 1)}  tg=${fmt(r.decode_tps)}`);
+                console.log(`  turn ${i + 1}/${_maxTurns}  prompt=${r.prompt_n}  pp=${fmt(r.prompt_tps, 1)}  tg=${fmt(r.decode_tps)}`);
             }
             const agg = {
                 turns: records.filter((r) => r.kind === 'turn').length,
@@ -481,7 +485,7 @@ async function runOne(run, port, healthTimeout, txtFile = null) {
 }
 
 (async () => {
-    const p = parseArgv();
+    const p = P;
     if (!p.models || !p.engines || !p.tasks) {
         console.error('usage: node tools/run_bench.js [--flavors <spec[,...]>] --models <spec[,...]> --engines <spec[,...]> --tasks <spec[,...]> [--port N] [--health-timeout S] [--out FILE]');
         process.exit(2);
@@ -535,3 +539,8 @@ async function runOne(run, port, healthTimeout, txtFile = null) {
     console.log('[run_bench] results: ' + out);
     console.log('[run_bench] txt outputs: ' + txtOutDir);
 })();
+
+
+
+
+

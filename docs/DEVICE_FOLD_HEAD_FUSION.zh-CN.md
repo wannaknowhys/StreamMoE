@@ -544,11 +544,19 @@ sync）也过，说明 per-item sync 非必需。之前“dispatch 后显式 syn
 **`c1c2-exp1`** 和 **`c1c2-exp2`**）。**新增的是 `place-c1c2-exp1`/`place-c1c2-exp2`**，
 不是 `place-c1-exp2`（它两边都 DIFF）。
 
-**这两个新增 DIFF 是 B1 造成的。** 同一个 064651f build，B1 强制开/关
+**这两个新增 DIFF 是 B1 造成的（最终结论）。** 注入实验（同 build、ub=6 的
+`ffn_norm-13` 双向替换；同侧自注入作正控，`l_out-13` 不变）表明 B1 **不改变 MoE 执行**：
+它在 L13 的影响等价于 `ffn_norm-13` 的 **2.4e-7 输入差**，同一 MoE 把它放大到 `l_out-13` 的
+~1e-3（残差 2.27e-7 与 `ffn_inp-13` 的 2.36e-7 一致）。**放大机制未明**（q8_1 已查：
+0/2048 翻码）；**2.4e-7 的来源未定位**（ub=3 的 45 个持久张量全同；首个哈希差在 ub=6 L13；
+L12 无设备 tail，`l_out-12` 未记录）；**首个翻转 token/top-2 差未测**。ub=6 L13 这一个事件
+单独不改变最终文本（交叉注入保持目标侧文本），文本差异来自累计事件或更晚步骤；“近似平局”是
+假说。不对执行器/ALU 下结论。同一个 064651f build，B1 强制开/关
 （`STREAM_MOE_TMP_NO_HEAD_FUSE`）：B1 on → 两个都 **DIFF**；B1 off → 两个都 **PASS**。
 decode t/s 不变（如 c1c2-exp2 on/off 都是 10.35→10.44 tg），所以是**文本正确性**回归、不是
-速度问题。B1-on 重复的**模型文本**不同：去掉 `RUN`/`DATE`/pp/tg 行后，两次 B1-on 在
-exp1 差 50 行、exp2 差 71 行内容。之前整份文件哈希的对比是**无效证据**（文件含每次必变的
+速度问题。之前“两次 B1-on 重复不同”的标签是**错的**：18-43-40 / 18-48-26 是 **B1-on / B1-off**
+两次调用（每次 `--runs` 实际只跑一遍，日志里每个 engine 只有一条 `== 10 turns`），且 18-48-26
+的 exp2 与已知 B1-off 的 19-10-22 完全相同。整份文件哈希的对比是**无效证据**（文件含每次必变的
 头部/计时行）；stripped-text 对比才是有效证据。**两个偏离的 exp1 样本是最早的一对，一个 B1-on、一个
 B1-off**：`18-43-40`（B1-on）89 行，`18-48-26`（B1-off）87 行，而后来的 3 次 B1-on + 3 次
 B1-off 全部是同一个 86 行文本（`0FB557...`）。**假说，尚未证实**：这是 **exp1 特有**的早期
@@ -557,8 +565,8 @@ exp2 = 后来的 `F4B4AA...`；18-48 的 exp2 = 后来的 `0739A8...`）。冷�
 复现待做。**二进制混杂**：后来的 6 次可能用的是 gate 修改后重编的 dbg 二进制；但 19:10/19:15
 这一对是 gate 前的旧二进制、也稳定，所以早期窗口假说仍有支持，只是“最早一对 vs 后来 6 次”
 不是唯一依据。Tier-1 skip / outgoing relay 的假说目前**没有证据支持**。另外，“B1-on 与
-B1-off 在 exp1/exp5 上 bench 文本相同”只说明**没翻 token**，不等于“数值没变化”：小扰动只有
-撞上近似平局才显形。exp2 的 bench 文本**确实不同**（On `F4B4AA...` 107 行 vs Off `0739A8...`
+B1-off 在 exp1/exp5 上 bench 文本相同”只说明 ub=6 L13 事件单独没改变最终文本；文本差异来自
+累计事件或更晚步骤，不是已证实的近似平局。exp2 的 bench 文本**确实不同**（On `F4B4AA...` 107 行 vs Off `0739A8...`
 96 行）。exp5 的 stage trace（B1-on vs B1-off，多层/多 ub）用来量化逐层 maxAbs；短 prompt
 places（exp1 B1-on DIFF / B1-off PASS）和长 bench prompt 不同，两者不矛盾。之前“两次 B1-on 重复不同”的标签是**错的**：
 18-43-40 / 18-48-26 是 **B1-on / B1-off** 两次调用（每次 `--runs` 实际只跑一遍，日志里每个
@@ -568,21 +576,24 @@ engine 只有一条 `== 10 turns`），且 18-48-26 的 exp2 与已知 B1-off �
 完全相同（exp1 `0FB557...`、exp2 `F4B4AA...`、exp5 `80843B...`），“B1-on 非确定性”的说法
 完全撤回。B1-on 与 B1-off 的差异是**确定性**变化；退出条件因此是 **B1-on 输出与 B1-off 一致，
 或在 teacher-forcing 的 top-1/KL 门内**，不是“稳定且 PASS”（B1-on 稳定，但 exp1/exp2 仍 DIFF）。
-首个分歧张量的 maxAbs（B1-on vs B1-off 的 stage trace）用来区分舍入级和旧数据；分歧 token 的
-top-2 logit 差是次要检查。
+首个分歧张量已经测了（注入：B1 在 L13 的影响是 `ffn_norm-13` 的 2.4e-7 输入差；同一 MoE 放大到
+1e-3；机制未明；2.4e-7 来源未定位）。分歧 token 的 top-2 logit 差仍未测。
 
 c1c2-exp5 的 decode tg **11.45 → 13.02（+13.7%）**（同 `StreamMoE_dump` flavor；每边一次，
 且是整个 064651f 的 delta，不只是 B1），B1 的净效果在本测量中为正。逐层 `moe_out` dump 与
 TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2` 的 6 次稳定性是 closure-host
 回归检查，**不是** B1 验证。
 
-**Production gating（已挂 gate，2026-11-01）：** B1 head 融合现在放在
-`#ifdef STREAM_MOE_LATEST` 后：production `StreamMoE_dump` 不编译它，`StreamMoE_latest`/
-`StreamMoE_dump_dbg` 保持开启（dbg 上仍可用 TEMP 的 `STREAM_MOE_TMP_NO_HEAD_FUSE` 做同 build
-开/关）。因为 `run_baseline` 的 dual 不含 latest flavor，places 也同时在 dbg flavor 上跑
-（`verify_places --flavor StreamMoE_dump_dbg`），避免 B1 脱离回归覆盖。预期：production places
-回到 B1-off 集合（8 PASS/4 DIFF；c1c2-exp1/exp2 PASS），dbg places 是 B1-on 集合
-（6 PASS/6 DIFF）。
+**Production gating（已撤 gate，2026-11-02/03）：** `#ifdef STREAM_MOE_LATEST` gate 已删除，
+B1 head 融合现在无条件编译，production `StreamMoE_dump` 会跑它。`run_baseline
+moe_129_8192_vk` 在 B1 开下 PASS（cos/IDENTICAL/KL/smoke），places 6 PASS/6 DIFF。places
+判据现在由 `check_place_repeat.js` 支撑：同配置重复跑一致性（FAIL；3 次、前 2 轮、预热丢弃、
+输出需 2+ turn / 无 `[ERROR]` / 目录新鲜）、每 engine 输出 hash 变化（WARN；hash 即当前确定性
+输出，所以 `ByrEEEE` 这类确定性回归会以 hash 变化暴露）、旧逐字 places 保留为冒烟检查。
+teacher-forcing top-1/KL 暂缓：输出 hash 告警已覆盖回归检测，省掉校准成本。正控：温度 0.7 会
+FAIL（判据能抓非确定性）；固定 mag=1 的 `ffn_norm-13` 扰动下 3 次仍相同、但输出 hash 变化
+（WARN）；未扰动的 production 连续两次 PASS 且 hash 相同。**注意：** 重复跑一致性抓不到确定性
+错误——那类只能靠输出 hash 变化告警。
 
 **待做：** xfer shell 布局仍是 per-layer 两槽 + 跨层复用；alias 是真实隐患，但不是本 bug 的
 根因。unit + liveness 区间打包、`fused_units=0`/`build_layer_plans` 与 `layout_arena` 的先后
@@ -592,3 +603,4 @@ TMR 提交次数仍待补；目前只对了一个 ub/layer。c1c2 `place-c1c2` �
 
 先 B1（B0b 的直接延续，不需要新的数据搬运），再 A（混合池路径）；两者独立。CUDA replay /
 P100 实测在两者之后。
+

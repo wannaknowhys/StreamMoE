@@ -646,7 +646,22 @@ bisect (`b14ee43` vs `064651f`, fresh `run_baseline` on both) gives: b14ee43
 same four plus **`c1c2-exp1`** and **`c1c2-exp2`**). The two **new** DIFFs are
 `place-c1c2-exp1`/`place-c1c2-exp2` (not `place-c1-exp2`, DIFF on both).
 
-**The new DIFFs are caused by B1.** On the same 064651f build, with B1 forced on
+**The new DIFFs are caused by B1 (final finding).** The injection experiment (the
+same-build ub=6 `ffn_norm-13` swapped across builds; a same-side self-injection
+as the positive control, `l_out-13` unchanged) shows that B1 **does not change
+the MoE execution**: its effect at L13 is equivalent to a **2.4e-7 input
+difference** in `ffn_norm-13`, which the same MoE amplifies to ~1e-3 in
+`l_out-13` (the residual 2.27e-7 matches `ffn_inp-13`'s own 2.36e-7).
+**The amplification mechanism is unknown** (the q8_1 path was checked: 0/2048
+code flips); **the source of the 2.4e-7 difference is unlocated** (ub=3's 45
+persistent tensors are identical; the first hash difference is at ub=6 L13; L12
+has no device tail, so `l_out-12` is not recorded); **the first flipped token /
+top-2 gap is unmeasured**. The ub=6 L13 event alone does not change the final
+text (the cross-injected runs keep the target side's text), so the text
+difference comes from accumulated events or a later step; "near-tie" is a
+hypothesis, not evidence. No executor/ALU conclusion is drawn.
+
+On the same 064651f build, with B1 forced on
 and off (`STREAM_MOE_TMP_NO_HEAD_FUSE`): B1 on -> both `c1c2-exp1` and
 `c1c2-exp2` **DIFF**; B1 off -> both **PASS**. Their decode t/s is unchanged
 (e.g. c1c2-exp2 10.35->10.44 tg on vs off), so this is a **text correctness**
@@ -666,9 +681,9 @@ runs may be a different dbg binary (rebuilt after the gate change); however the
 19:10/19:15 pair is pre-gate and stable too, so the early-window hypothesis still
 has support, but "earliest pair vs later 6" is not the only evidence. The Tier-1
 skip / outgoing-relay hypothesis is **not supported** at this point. Also, "B1-on
-and B1-off have the same bench text on exp1/exp5" means **no token flip**, not
-"no numeric change": a small numeric perturbation only shows when it hits a
-near-tie. The exp2's bench text **does** differ (On `F4B4AA...` 107 lines vs Off
+and B1-off have the same bench text on exp1/exp5" means the ub=6 L13 event alone
+did not change the final text; the text difference comes from accumulated events
+or a later step, not from a proven near-tie. The exp2's bench text **does** differ (On `F4B4AA...` 107 lines vs Off
 `0739A8...` 96 lines). The exp5 stage trace (B1-on vs B1-off, multiple
 layers/ubs) is needed to quantify the per-layer maxAbs; the short-prompt places
 (exp1 B1-on DIFF / B1-off PASS) and the long bench use different prompts, so they
@@ -685,9 +700,10 @@ places (exp1 `0FB557...`, exp2 `F4B4AA...`, exp5 `80843B...`), so the earlier
 difference is a **deterministic** change; the exit condition is therefore
 **B1-on output equals B1-off, or is inside the teacher-forcing top-1/KL gate**,
 not "stable and PASS" (the B1-on is stable but exp1/exp2 still DIFF). The
-first-diverging tensor maxAbs (stage trace B1-on vs B1-off) will tell whether
-this is rounding-level or stale data, and the
-diverging-token top-2 logit gap is a secondary check.
+first-diverging tensor has been measured (the injection: B1's L13 effect is the
+2.4e-7 `ffn_norm-13` input difference; the same MoE amplifies it to 1e-3; the
+mechanism is unknown; the source of the 2.4e-7 is unlocated). The
+diverging-token top-2 logit gap is still unmeasured.
 
 The c1c2-exp5 decode tg improved **11.45 -> 13.02 (+13.7%)** on the same
 `StreamMoE_dump` flavor, so the net effect of B1 (one fewer submission/layer,
@@ -697,15 +713,22 @@ submission count are still pending; only one ub/layer was compared. The c1c2
 `place-c1c2` six-run stability is a closure-host regression check, **not** B1
 verification.
 
-**Production gating (gated, 2026-11-01).** The B1 head fusion is now behind
-`#ifdef STREAM_MOE_LATEST`: the production `StreamMoE_dump` does not compile it,
-while `StreamMoE_latest`/`StreamMoE_dump_dbg` keep it on (and the TEMP
-`STREAM_MOE_TMP_NO_HEAD_FUSE` switch remains for same-build on/off on the dbg).
-Because `run_baseline`'s dual build does not include the latest flavor, the
-places are also run on the dbg flavor (`verify_places --flavor
-StreamMoE_dump_dbg`) so B1 does not fall out of regression coverage. Expected:
-production places return to the B1-off set (8 PASS/4 DIFF; c1c2-exp1/exp2 PASS);
-the dbg places are the B1-on set (6 PASS/6 DIFF).
+**Production gating (ungated, 2026-11-02/03).** The `#ifdef STREAM_MOE_LATEST`
+gate was removed: the B1 head fusion is now compiled unconditionally and the
+production `StreamMoE_dump` runs it. `run_baseline moe_129_8192_vk` passes with
+B1 on (cos/IDENTICAL/KL/smoke), places 6 PASS/6 DIFF. The places criteria are now
+backed by `check_place_repeat.js`: same-config repeat consistency (FAIL; 3 runs,
+2 turns, warm-up discarded, output validated for 2+ turns / no `[ERROR]` / fresh
+dir), per-engine output-hash change (WARN; the hash is the current deterministic
+output, so a deterministic regression such as the `ByrEEEE` case shows up as a
+hash change), and the old exact-text places stay as a smoke check. The
+teacher-forcing top-1/KL is deferred: the output-hash warning covers the
+regression-detection need without the calibration cost. Positive controls: the
+temperature-0.7 run FAILs (the criterion detects nondeterminism); a fixed mag=1
+`ffn_norm-13` perturbation keeps the 3 runs identical but changes the output hash
+(WARN); the unperturbed production passes twice with the same hashes.
+**Caveat:** the repeat-consistency gate catches nondeterministic races but not
+deterministic errors -- those rely on the output-hash change warning.
 
 **Still open:** the xfer shell layout remains the per-layer two-slot with
 cross-layer reuse; the alias is a real hazard but not this bug's cause. Unit +
@@ -716,3 +739,4 @@ future work.
 
 B1 first (direct continuation of B0b, no new data movement), then A (mixed-pool
 path); they are independent. CUDA replay / P100 measurements come after both.
+

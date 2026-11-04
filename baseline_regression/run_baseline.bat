@@ -141,6 +141,9 @@ if "%SM_OLMOE%"=="" (
 ) else (
     node "%BR%\tools\verify_places.js" --flavor StreamMoE --models "%ROOT%\tools\run_specs\models\olmoe.json" --tasks "%ROOT%\tools\run_specs\tasks\hi.json" --baseline "%BR%\baseline\olmoe_hi_baseline.txt" --temp-override 0
     if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
+    echo [7b/8] repeat-consistency gate, 2 turns, same-config text stability ...
+    node "%BR%\tools\check_place_repeat.js" --flavor StreamMoE_dump --engines place-c1-exp2,place-c1c2-exp1,place-c1c2-exp2,place-c1c2-exp5 --runs 3 --turns 2
+    if errorlevel 1 ( echo [-] place repeat-consistency FAILED & set PASS=0 )
 )
 
 echo.
