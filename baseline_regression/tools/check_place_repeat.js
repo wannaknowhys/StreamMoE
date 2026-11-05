@@ -28,6 +28,7 @@ let engineFilter = null;
 let runs = 3;
 let turns = 2;
 let updateBaseline = false;
+let acceptChanges = false;
 let temperature = null;
 for (let i = 0; i < args.length; i++) {
     if (args[i] === '--flavor') flavor = args[++i];
@@ -35,6 +36,7 @@ for (let i = 0; i < args.length; i++) {
     else if (args[i] === '--runs') runs = parseInt(args[++i], 10);
     else if (args[i] === '--turns') turns = parseInt(args[++i], 10);
     else if (args[i] === '--update-baseline') updateBaseline = true;
+    else if (args[i] === '--accept') { acceptChanges = true; updateBaseline = true; }
     else if (args[i] === '--temperature') temperature = parseFloat(args[++i]);
 }
 
@@ -120,14 +122,19 @@ for (const engine of engines) {
         baseline[key] = h;
         console.log(`[NEW]  ${engine}: ${runs} runs identical, baseline recorded ${h} (not a PASS yet)`);
     } else if (baseline[key] !== h) {
-        console.log(`[WARN] ${engine}: output hash changed ${baseline[key]} -> ${h} (${runs} runs still identical)`);
-        warnings++;
+        if (acceptChanges) {
+            baseline[key] = h;
+            console.log(`[ACCEPT] ${engine}: hash ${baseline[key]} -> ${h} (accepted, update-baseline)`);
+        } else {
+            console.log(`[WARN] ${engine}: output hash changed ${baseline[key]} -> ${h} (${runs} runs still identical; use --accept to rebaseline)`);
+            warnings++;
+        }
     } else {
         console.log(`[PASS] ${engine}: ${runs} runs identical (hash ${h})`);
     }
 }
 if (updateBaseline) { fs.writeFileSync(baselineFile, JSON.stringify(baseline, null, 2)); console.log(`[baseline] written ${baselineFile}`); }
-console.log(failures === 0 ? `RESULT: ${warnings ? 'PASS (with warnings)' : 'PASS'} (repeat-consistency, ${engines.length} engines, ${turns} turns)` : `RESULT: FAIL (${failures} engines)`);
+console.log(failures === 0 ? `RESULT: ${warnings ? `PASS (with ${warnings} warning${warnings === 1 ? '' : 's'})` : 'PASS'} (repeat-consistency, ${engines.length} engines, ${turns} turns)` : `RESULT: FAIL (${failures} engines)`);
 process.exit(failures === 0 ? 0 : 1);
 
 
