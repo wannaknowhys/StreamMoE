@@ -121,12 +121,14 @@ for (const engine of engines) {
     if (!(key in baseline)) {
         baseline[key] = h;
         console.log(`[NEW]  ${engine}: ${runs} runs identical, baseline recorded ${h} (not a PASS yet)`);
+        warnings++;
     } else if (baseline[key] !== h) {
+        const old = baseline[key];
         if (acceptChanges) {
             baseline[key] = h;
-            console.log(`[ACCEPT] ${engine}: hash ${baseline[key]} -> ${h} (accepted, update-baseline)`);
+            console.log(`[ACCEPT] ${engine}: hash ${old} -> ${h} (accepted, update-baseline)`);
         } else {
-            console.log(`[WARN] ${engine}: output hash changed ${baseline[key]} -> ${h} (${runs} runs still identical; use --accept to rebaseline)`);
+            console.log(`[WARN] ${engine}: output hash changed ${old} -> ${h} (${runs} runs still identical; use --accept to rebaseline)`);
             warnings++;
         }
     } else {
@@ -135,7 +137,7 @@ for (const engine of engines) {
 }
 if (updateBaseline) { fs.writeFileSync(baselineFile, JSON.stringify(baseline, null, 2)); console.log(`[baseline] written ${baselineFile}`); }
 console.log(failures === 0 ? `RESULT: ${warnings ? `PASS (with ${warnings} warning${warnings === 1 ? '' : 's'})` : 'PASS'} (repeat-consistency, ${engines.length} engines, ${turns} turns)` : `RESULT: FAIL (${failures} engines)`);
-process.exit(failures === 0 ? 0 : 1);
+process.exit(failures !== 0 ? 1 : (warnings !== 0 ? 2 : 0));
 
 
 

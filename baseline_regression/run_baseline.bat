@@ -143,7 +143,11 @@ if "%SM_OLMOE%"=="" (
     if errorlevel 1 ( echo [-] olmoe place regression detected divergence & set PASS=0 )
     echo [7b/8] repeat-consistency gate, 2 turns, same-config text stability ...
     node "%BR%\tools\check_place_repeat.js" --flavor StreamMoE_dump --engines place-c1-exp2,place-c1c2-exp1,place-c1c2-exp2,place-c1c2-exp5 --runs 3 --turns 2
-    if errorlevel 1 ( echo [-] place repeat-consistency FAILED & set PASS=0 )
+    if errorlevel 2 (
+        echo [WARN] repeat-consistency gate has warnings, see the 7b output above
+    ) else if errorlevel 1 (
+        echo [-] place repeat-consistency FAILED & set PASS=0
+    )
 )
 
 echo.
