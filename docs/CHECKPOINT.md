@@ -1,7 +1,8 @@
 # StreamMoE 项目检查点 (CHECKPOINT.md)
 
 > **用途**：opencode 会话上下文被压缩/重开时，先读本文件 + `docs/PROJECT_STRUCTURE.md` + `patches/README.md` 恢复状态。
-> **最近更新**：2026-11-01（**B1 Tier-2 head(L+1) 融合落地 + H2D sync 修复**；详见下方 2026-11-01 补记）。
+> **最近更新**：2026-11-08（A 交接文档入库：`docs/A_TIER1_FUSION_HANDOFF.md`；快照脚本 `tools/run_trace_engine.ps1`；A 本体未开工）。
+> **2026-11-08 补记（A 交接）**：A = 把 B1 的 tail(L)+head(L+1) 融合推广到多目标（c1c2 Tier-1，closure 在 host）。范围、改前基线、快照缺口、阶段 1 设计见 [`docs/A_TIER1_FUSION_HANDOFF.md`](A_TIER1_FUSION_HANDOFF.md)。已核实：`fused_units` 已不在 `src/`；快照 48 = 16×3，只有 `moe_out`/`ffn_inp`/`ffn_norm`，**没有 `l_out`/head 输入/`ids`/weights/residual**；prefill ub 因 `trace_stage` 的 `g_trace_nt != 1` 提前 return 而取不到；`build_layer_plans`（`:1323`）在 `layout_arena`（`:1512`）之前，但首次 prefill build 是否两者都执行仍未核实。阶段 1 结论：直接做无条件的 unit + liveness 打包，第一步先验证调用链（TEMP 打印 `g_build_id` + plan 数）。
 > **2026-11-01 补记（B1 Tier-2 head(L+1) 融合落地 + H2D sync 修复）**：
 > - **B1**：Tier-2 的 `single_dt->gf` 现在装 `[closure(L) twins][tail(L)][head(L+1)]`，一次 `graph_compute_async` 提交；head 的 incoming 走共享 `select_relays`，outgoing 一次 `select_relays`，`out_fused_head_next` 让调用侧跳过 `exec_dense_head`。xfer 布局仍是 B1 前的 per-layer 两槽（未改）。
 > - **观测（哨兵 + A/B/C 消融）**：跳过 skip 时，fused 图读到的 head incoming shell 仍是上一个 head（alias 伙伴）的旧值；入队后一次 sync（A）或不 skip（B）都恢复。**backend 侧机制未确认**（“同一队列拷贝先于图”在这条 `set_async` → `graph_compute_async` 路径上不成立；图后的完成 sync 在实践中太晚）。Tier-1 `run_incoming_copies` 的 skip 不能以“图是同步的”辩护（同步图只管完成时机），需单独查。之前“dispatch 后显式 sync 仍旧”的候选解释是调试 `tensor_get` 干扰 transfer 状态，**未验证**；A/B/C 避开了这些读。
