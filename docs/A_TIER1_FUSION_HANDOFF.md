@@ -57,7 +57,7 @@
 
 - `run_baseline` 全 PASS（§1）。
 - 逐张量字节快照（改前基线，**不要覆盖**）：`temp/baseline_aa12290_ub6`，`MANIFEST.txt` 记录 commit/命令行/ub；sha256 清单已入库 `tools/snapshot_aa12290_ub6.sha256`（48 行）。脚本 `tools/run_trace_engine.ps1` 遇到 Root 里有 `MANIFEST.txt` 会拒绝覆盖。新快照请用新 Root（例如 `temp/snap_new`）。
-- 同一份代码上取两份独立快照（`snap_a`/`snap_b`），Python 逐文件 sha256 对比，**48/48 逐字节一致**（只说明可复现，不说明灵敏）。
+- 同一份代码上取两份独立快照（`temp/baseline_aa12290_ub6` 与 `temp/baseline_aa12290_ub6_rep`），`tools/compare_snapshots.py` 逐文件 sha256 对比，**48/48 逐字节一致**（只说明可复现，不说明灵敏）。用法：`python tools/compare_snapshots.py DIR_A DIR_B`，或 `python tools/compare_snapshots.py DIR --list tools/snapshot_aa12290_ub6.sha256`。
 
 **快照缺口（已核实，2026-11-08）：**
 
@@ -85,7 +85,7 @@
 ## 6. 工具、约定与踩过的坑
 
 - 构建：`.\build.bat llamalibs dual`；dbg：`.\build.bat llamalibs StreamMoE_dump_dbg`（flavor 名 `StreamMoE_dump_dbg`，TEMP 代码放在 `#ifdef STREAM_MOE_TEMP` 里，提交前删干净）。
-- 快照：`tools/run_trace_engine.ps1`（已入库）；`temp/snap_*/MANIFEST.txt` 记 commit/命令行/ub。
+- 快照：`tools/run_trace_engine.ps1`（已入库）；`temp/baseline_aa12290_ub6/MANIFEST.txt` 记 commit/命令行/ub（该 command 是历史记录，复现请换新 Root）。
 - 纪律：`third_party/llama.cpp` 子模块永不 commit；`scripts/verify_convert_matrix.bat` 有一份与本线无关的未提交改动，别带进来；每步验证完 commit + push；LF→CRLF 警告无害。
 - 坑：批处理在 `if (...)` 括号块里 `echo` 不能带括号；改 JS 模板字符串用 edit 工具，不要用 PowerShell `-replace`（反引号会被吃掉）；比较哈希必须同一个函数、同一输入范围（上次拿 MD5 去比 sha256）；看日志别只看 `-Last 3`（进程内 seed 会推进）；每个新 gate 都要有会 FAIL/WARN 的正控；汇报的结论要附同一口径的证据，没验证的写成「未核实」。
 
@@ -117,4 +117,5 @@
 2. 源码顺序本来就是先 plan 后 layout；真正的未知是「首次 prefill build 时两者是否都执行、`layout_arena` 是否消费 plan」。这一步用 TEMP 打印 `g_build_id` + plan 数就能确认，属于阶段 1 的第一个子步骤，不是一条独立岔路。
 3. 文档 §3 已定方向：布局无条件使用，不再叠「能融合走新序/不能走旧序」的谓词；中间先修顺序再看，等于写一个会被单元打包覆盖掉的过渡态。
 4. 约束：阶段 1 第一步先验证调用链（不改代码），确认 plan 在 layout 前已非空且被消费，然后再做区间打包；否则区间是空的。
+
 
