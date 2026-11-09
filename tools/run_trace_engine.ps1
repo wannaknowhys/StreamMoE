@@ -14,6 +14,9 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $tag = "$Engine" + $(if ($Off) { '_off' } else { '_on' })
 if (-not $Root) { $Root = Join-Path $repo "temp\trace_$tag" }
+if (Test-Path (Join-Path $Root 'MANIFEST.txt')) {
+    throw "refusing to overwrite snapshot $Root (has MANIFEST.txt); use a new -Root"
+}
 if (Test-Path $Root) { Remove-Item $Root -Recurse -Force }
 New-Item -ItemType Directory -Path $Root | Out-Null
 

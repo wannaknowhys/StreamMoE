@@ -56,14 +56,14 @@
 **改前基线（在 `aa12290` 未改动代码上）：**
 
 - `run_baseline` 全 PASS（§1）。
-- 逐张量字节快照：`pwsh -NoProfile -File tools/run_trace_engine.ps1 -Engine place-c1c2-exp5 -Runs 1 -UbRanges 6-6 -Bin 1 -Root temp/snap_a`（脚本已入库：`tools/run_trace_engine.ps1`；输出在 `temp/snap_a/run_01/ub0006/*.bin`；`temp/` 在 `.gitignore` 第 31 行）。`temp/snap_a/MANIFEST.txt` 记录 commit、命令行、ub。
+- 逐张量字节快照（改前基线，**不要覆盖**）：`temp/baseline_aa12290_ub6`，`MANIFEST.txt` 记录 commit/命令行/ub；sha256 清单已入库 `tools/snapshot_aa12290_ub6.sha256`（48 行）。脚本 `tools/run_trace_engine.ps1` 遇到 Root 里有 `MANIFEST.txt` 会拒绝覆盖。新快照请用新 Root（例如 `temp/snap_new`）。
 - 同一份代码上取两份独立快照（`snap_a`/`snap_b`），Python 逐文件 sha256 对比，**48/48 逐字节一致**（只说明可复现，不说明灵敏）。
 
 **快照缺口（已核实，2026-11-08）：**
 
 - 48 = 16 层 × 3，分别是 `L*_closure_moe_ffn_moe_out-*`、`L*_head_attn_ffn_inp-*`、`L*_head_cur_ffn_norm-*`。**没有 `l_out`、没有 head 输入 `l_out-(L-1)`、没有 `ids`、没有 closure 读的 weights/residual。**
-- 原因（`minigraph_exec.cpp:3403` 起）：`trace_stage` 里 `dump("in", find("l_out-"+(layer-1)))` 和 `dump("out", find("l_out-"+L))` 用的 `find` 在 `moe_chain_layer_nodes_all(L)` 里找不到跨层张量，所以 `in`/`out` 分支不写 BIN。补快照要改取法（从 `g_layer_nodes[L-1]` 或上一层 tail 列表取）。
-- **prefill ub 目前取不到 stage dump**：`trace_stage` 第 3363 行 `if (g_trace_nt != 1) return;`，prefill 的 nt>1 直接返回。要补 prefill 快照，先放开这个条件（只对 dump 生效，不影响计数）。
+- 缺失原因的**推测（未读 `find` 定义和 `moe_chain_layer_nodes_all` 确认）**：`trace_stage:3403` 的 `dump("in", find("l_out-"+(layer-1)))` 和 `:3421` 的 `dump("out", find("l_out-"+L))` 用的 `find` 可能只在 `moe_chain_layer_nodes_all(L)` 里找，跨层张量不在本层列表。补快照前先读这两处定义确认取法。
+- **prefill ub 目前取不到 stage dump**：`trace_stage` 第 3363 行 `if (g_trace_nt != 1) return;`，prefill 的 nt>1 直接返回。另一个函数 `:3183` 已经是 `if (g_trace_nt != 1 && !g_trace_prefill) return;`，且 `run_trace_engine.ps1` 本来就设置 `STREAM_MOE_TMP_TRACE_PREFILL`；`trace_stage` 的修法很可能就是照抄这一条件（只对 dump 生效，不影响计数）。
 - `ids` 有逐层文本行（`minigraph_exec.cpp` 约 3082 行的 `trace_layer` 路径），可以单独按文本对比，或给 `trace_stage` 加 `ids` 的 BIN 写盘。
 - 两份快照一致只说明**可复现**，不说明**灵敏**。要做一个正控：故意改动某个张量（例如临时往 `ffn_norm-13` 加固定噪声），确认快照对比会报 diff。
 
@@ -117,3 +117,4 @@
 2. 源码顺序本来就是先 plan 后 layout；真正的未知是「首次 prefill build 时两者是否都执行、`layout_arena` 是否消费 plan」。这一步用 TEMP 打印 `g_build_id` + plan 数就能确认，属于阶段 1 的第一个子步骤，不是一条独立岔路。
 3. 文档 §3 已定方向：布局无条件使用，不再叠「能融合走新序/不能走旧序」的谓词；中间先修顺序再看，等于写一个会被单元打包覆盖掉的过渡态。
 4. 约束：阶段 1 第一步先验证调用链（不改代码），确认 plan 在 layout 前已非空且被消费，然后再做区间打包；否则区间是空的。
+
