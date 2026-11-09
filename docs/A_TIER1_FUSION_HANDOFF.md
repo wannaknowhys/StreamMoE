@@ -56,7 +56,7 @@
 **改前基线（在 `aa12290` 未改动代码上）：**
 
 - `run_baseline` 全 PASS（§1）。
-- 逐张量字节快照（改前基线，**不要覆盖**）：`temp/baseline_aa12290_ub6`，`MANIFEST.txt` 记录 commit/命令行/ub；sha256 清单已入库 `tools/snapshot_aa12290_ub6.sha256`（48 行）。脚本 `tools/run_trace_engine.ps1` 遇到 Root 里有 `MANIFEST.txt` 会拒绝覆盖。新快照请用新 Root（例如 `temp/snap_new`）。
+- 逐张量字节快照（改前基线，**不要覆盖**）：`temp/baseline_aa12290_ub6`，`MANIFEST.txt` 记录 commit/命令行/ub；sha256 清单已入库 `tools/snapshot_aa12290_ub6.sha256`（48 行）。脚本 `tools/run_trace_engine.ps1` 遇到 Root 里有 `MANIFEST.txt` 会拒绝覆盖（退出码 1）。新快照请用新 Root（例如 `temp/snap_new`）。`temp/` 里的 `.bin` 不入库；如果丢失，只能在 `aa12290` 上重建 dbg（`build.bat llamalibs StreamMoE_dump_dbg`）再取快照，然后用入库的 sha256 清单核对。
 - 同一份代码上取两份独立快照（`temp/baseline_aa12290_ub6` 与 `temp/baseline_aa12290_ub6_rep`），`tools/compare_snapshots.py` 逐文件 sha256 对比，**48/48 逐字节一致**（只说明可复现，不说明灵敏）。用法：`python tools/compare_snapshots.py DIR_A DIR_B`，或 `python tools/compare_snapshots.py DIR --list tools/snapshot_aa12290_ub6.sha256`。
 
 **快照缺口（已核实，2026-11-08）：**
@@ -117,5 +117,6 @@
 2. 源码顺序本来就是先 plan 后 layout；真正的未知是「首次 prefill build 时两者是否都执行、`layout_arena` 是否消费 plan」。这一步用 TEMP 打印 `g_build_id` + plan 数就能确认，属于阶段 1 的第一个子步骤，不是一条独立岔路。
 3. 文档 §3 已定方向：布局无条件使用，不再叠「能融合走新序/不能走旧序」的谓词；中间先修顺序再看，等于写一个会被单元打包覆盖掉的过渡态。
 4. 约束：阶段 1 第一步先验证调用链（不改代码），确认 plan 在 layout 前已非空且被消费，然后再做区间打包；否则区间是空的。
+
 
 
