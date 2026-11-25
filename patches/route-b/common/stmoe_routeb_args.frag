@@ -100,7 +100,7 @@
         {"--dense-placement"}, "<C1:dev,C2:dev>",
         "StreamMoE: dense placement (docs/DENSE_PLACEMENT.md). C1 = per-layer dense "
         "(all layers), C2 = global dense (output layer; alias GLOBAL). dev = RAM | CPU | "
-        "Vulkan0 | ... Empty = all dense on CPU. Standard llama.cpp-style placement options are rejected "
+        "Vulkan0 | CUDA0 | ... Empty = all dense on CPU. Standard llama.cpp-style placement options are rejected "
         "under --expert-backend; use --dense-placement and --moe-expert-pools. KV cache placement follows C1.",
         [](common_params & params, const std::string & value) {
             params.dense_placement = value;
@@ -109,7 +109,7 @@
 
     add_opt(common_arg(
         {"--moe-expert-pools"}, "DEV:MB,...",
-        "StreamMoE: MAIN model expert pools as <device>:<MB> comma list, e.g. RAM:8192,Vulkan0:5120",
+        "StreamMoE: MAIN model expert pools as <device>:<MB> comma list, e.g. RAM:8192,Vulkan0:5120,CUDA0:4096",
         [](common_params & params, const std::string & value) {
             params.moe_expert_pools.clear();
             size_t start = 0;
@@ -118,7 +118,10 @@
                 std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
                 if (!tok.empty()) {
                     params.moe_expert_pools.push_back(tok);
-                    if (tok.rfind("RAM:", 0) != 0 && tok.rfind("CPU:", 0) != 0) {
+                    // STMOE_VK_FORCE_MAX only applies to Vulkan pools: it sets
+                    // GGML_VK_FORCE_MAX_BUFFER_SIZE for the Vulkan backend. A
+                    // CUDA0 (or other) token must not touch the Vulkan env var.
+                    if (tok.rfind("Vulkan", 0) == 0) {
                         const size_t cl = tok.find(':');
                         if (cl != std::string::npos) STMOE_VK_FORCE_MAX(std::strtoull(tok.c_str() + cl + 1, nullptr, 10));
                     }
@@ -139,7 +142,10 @@
                 std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
                 if (!tok.empty()) {
                     params.moe_draft_expert_pools.push_back(tok);
-                    if (tok.rfind("RAM:", 0) != 0 && tok.rfind("CPU:", 0) != 0) {
+                    // STMOE_VK_FORCE_MAX only applies to Vulkan pools: it sets
+                    // GGML_VK_FORCE_MAX_BUFFER_SIZE for the Vulkan backend. A
+                    // CUDA0 (or other) token must not touch the Vulkan env var.
+                    if (tok.rfind("Vulkan", 0) == 0) {
                         const size_t cl = tok.find(':');
                         if (cl != std::string::npos) STMOE_VK_FORCE_MAX(std::strtoull(tok.c_str() + cl + 1, nullptr, 10));
                     }

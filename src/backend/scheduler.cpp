@@ -135,8 +135,10 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     }
 
     // Device (VRAM) regions: appended slot runs on top of the RAM sub-pools.
-    // A region must carry a usable host-mapped base; anything else is skipped
-    // with a warning (the pool still runs on CPU RAM alone).
+    // A region must carry a usable base; a null base is skipped with a
+    // warning (the pool still runs on CPU RAM alone). The base is a host
+    // pointer when the region is host-mapped (Vulkan) or a device address
+    // when it is not (CUDA, DMA only - see host_mapped).
     uint32_t max_pool = 0;
     for (const auto& reg : vregions) {
         if (reg.base == nullptr || reg.group >= n_groups || reg.n_slots == 0) {
@@ -153,6 +155,7 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
         sp.n_slots = reg.n_slots;
         sp.expert_size = es;
         sp.base = reg.base;
+        sp.host_mapped = reg.host_mapped;
         sp.dev_buf = reg.buf;
         fill_cols(sp, reg.group, reg.n_slots);
         subpools_.push_back(std::move(sp));
@@ -281,6 +284,13 @@ bool expert_scheduler::submit_move(uint32_t layer, uint32_t expert,
             cp.dev_buf = ssp->dev_buf;
             cp.dev_off = static_cast<size_t>(cp.src - ssp->base);
         }
+        // r2v: DMA into the device destination instead of memcpying to a
+        // device address on the host (which would crash). The offset is the
+        // same pointer arithmetic on device addresses (numerically correct).
+        if (dsp->pool != 0 && dsp->dev_buf) {
+            cp.dst_dev_buf = dsp->dev_buf;
+            cp.dst_dev_off = static_cast<size_t>(cp.dst - dsp->base);
+        }
         t.cols.push_back(cp);
     }
 #ifdef STREAM_MOE_TEMP
@@ -310,24 +320,65 @@ void expert_scheduler::move_worker_main() {
             move_submit_.pop_front();
         }
         // per-column copy. A device (vram) source goes through that pool's
-        // registered DMA reader (transfer queue / cuda DtoH); RAM sources (and
-        // device pools without a reader) are a plain memcpy of the host map.
-        // Never touches the scheduler control plane.
+        // registered DMA reader (transfer queue / cuda DtoH); a device
+        // destination goes through that pool's DMA writer (cuda HtoD). RAM
+        // ends (and host-mapped device pools without a callback) are a plain
+        // memcpy of the host map. The DMA callbacks are async: enqueue every
+        // column first, then wait once for the whole move (one event wait per
+        // move, not one per column). Never touches the scheduler control plane.
         const uint64_t cp0 = tsc_now();
         uint64_t dma_ns = 0, mc_ns = 0;
         const pool_dma_read_fn dma_read =
             (t.src_pool > 0 && t.src_pool <= MAX_DEVICE_POOLS) ? pool_dma_read_[t.src_pool - 1] : nullptr;
+        const pool_dma_write_fn dma_write =
+            (t.dst_pool > 0 && t.dst_pool <= MAX_DEVICE_POOLS) ? pool_dma_write_[t.dst_pool - 1] : nullptr;
+        const pool_dma_wait_fn dma_wait_src =
+            (t.src_pool > 0 && t.src_pool <= MAX_DEVICE_POOLS) ? pool_dma_wait_[t.src_pool - 1] : nullptr;
+        const pool_dma_wait_fn dma_wait_dst =
+            (t.dst_pool > 0 && t.dst_pool <= MAX_DEVICE_POOLS) ? pool_dma_wait_[t.dst_pool - 1] : nullptr;
+        // (wait fn, token) pairs for the columns enqueued above; waited once
+        // below, in submission order.
+        std::vector<std::pair<pool_dma_wait_fn, pool_dma_token_t>> pending;
+        bool move_failed = false;
         for (const auto& cp : t.cols) {
             if (cp.dev_buf && dma_read) {
                 const uint64_t d0 = tsc_now();
-                dma_read(cp.dev_buf, cp.dev_off, cp.dst, cp.bytes);
+                pool_dma_token_t tok = dma_read(cp.dev_buf, cp.dev_off, cp.dst, cp.bytes);
                 dma_ns += tsc_now() - d0;
+                if (tok) pending.emplace_back(dma_wait_src, tok);
+            } else if (cp.dst_dev_buf && dma_write) {
+                const uint64_t d0 = tsc_now();
+                pool_dma_token_t tok = dma_write(cp.dst_dev_buf, cp.dst_dev_off, cp.src, cp.bytes);
+                dma_ns += tsc_now() - d0;
+                if (tok) pending.emplace_back(dma_wait_dst, tok);
+            } else if (cp.dev_buf || cp.dst_dev_buf) {
+                // A device address with no DMA path: there is no host map to
+                // fall back to, and memcpying a device address on the host
+                // would crash. Log loudly and skip the column (setup bug:
+                // the pool's callbacks were not registered).
+                LOG_ERROR("expert_scheduler: move L" << t.layer << " E" << t.expert
+                          << " has a device column with no DMA callback (pool "
+                          << t.src_pool << "->" << t.dst_pool << ") - column skipped");
+                move_failed = true;
             } else {
                 const uint64_t d0 = tsc_now();
                 std::memcpy(cp.dst, cp.src, cp.bytes);
                 mc_ns += tsc_now() - d0;
             }
         }
+        // One wait for the whole move: the DMA work was enqueued for all
+        // columns first, so the copies overlap instead of serializing.
+        for (const auto& p : pending) {
+            const uint64_t d0 = tsc_now();
+            if (p.first && !p.first(p.second)) move_failed = true;
+            dma_ns += tsc_now() - d0;
+        }
+        if (move_failed) {
+            LOG_ERROR("expert_scheduler: move L" << t.layer << " E" << t.expert
+                      << " pool " << t.src_pool << "->" << t.dst_pool
+                      << " completed with DMA errors (content may be stale)");
+        }
+        t.failed = move_failed;
         t.done_tsc = tsc_now();
         SCHED_DIAG("sched: move L" << t.layer << " E" << t.expert
                   << (dma_ns ? " dma=" + std::to_string(tsc_delta_ns(dma_ns) / 1000) + "us" : "")
@@ -352,12 +403,28 @@ void expert_scheduler::drain_moves() {
             t = std::move(move_done_.front());
             move_done_.pop_front();
         }
-        // dst slot: IO_INFLIGHT (reserved at submit) -> READY; dir entry lands.
-        slots_[t.dst_slot].mark_ready();
-        dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_READY, t.dst_slot);
-        // If this move's target was an active B item (r2v placement for a request
-        // in flight), account it exactly like a DIO settle; otherwise no-op.
-        active_settle(t.layer, t.expert, t.dst_slot);
+        if (t.failed) {
+            // A column could not be copied (no DMA path / DMA error): the dst
+            // slot holds stale or missing content, so it must NOT become
+            // READY. Fail it like a failed DIO load (dir ABSENT so a later
+            // retry can reload from disk) and fail the active request if this
+            // move was its B item.
+            slots_[t.dst_slot].mark_failed();
+            dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
+            LOG_ERROR("expert_scheduler: move L" << t.layer << " E" << t.expert
+                      << " pool " << t.src_pool << " -> " << t.dst_pool << " failed");
+            if (active_present_ && t.layer == active_layer_ &&
+                bit_test(active_still_need_, t.expert)) {
+                active_fail("async move failed");
+            }
+        } else {
+            // dst slot: IO_INFLIGHT (reserved at submit) -> READY; dir entry lands.
+            slots_[t.dst_slot].mark_ready();
+            dir_->transition(t.layer, t.expert, t.dst_pool, EXPERT_READY, t.dst_slot);
+            // If this move's target was an active B item (r2v placement for a request
+            // in flight), account it exactly like a DIO settle; otherwise no-op.
+            active_settle(t.layer, t.expert, t.dst_slot);
+        }
         // src slot: content copied away (was EVICTING / exclusive during the
         // move). Release it to EMPTY so a requeued alloc can reuse it. If the
         // move was a r2v the src was a RAM copy that is now redundant - releasing
@@ -598,7 +665,12 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
         // device region with 69 slots puts the down column at mod 4096 = 2048).
         // Fall back to the staging path when the target is misaligned (every
         // slice keeps its staging bytes reserved either way).
+        // Direct DIO into the column slot needs a host-writable destination.
+        // A non-host-mapped slot (CUDA) has a device address as its slot
+        // base: DIO cannot write there, so every slice goes to staging and
+        // drain hands the bytes to the DMA writer (begin_htod).
         bool use_direct = sl.direct;
+        if (osp && !osp->host_mapped) use_direct = false;
         if (use_direct) {
             const uint8_t* dst = slot_col_mem(slot, sl.column);
             if (!dst) { t->failed = true; break; }
@@ -717,6 +789,147 @@ void expert_scheduler::active_clear_state() {
     active_stall_armed_ = false;
 }
 
+void expert_scheduler::settle_loaded(async_load_t* t) {
+    // Shared settle tail of drain_completions (DIO done) and drain_htod
+    // (HtoD done): mark the slot READY (or FAILED) + dir entry + M5 active
+    // accounting, then free the ring element.
+    if (!t->failed) {
+        slots_[t->slot].mark_ready();
+        dir_->set(t->layer, t->expert, t->pool, t->slot);
+        n_misses_.fetch_add(1, std::memory_order_relaxed);
+        SCHED_DIAG("sched: loaded L" << t->layer << " E" << t->expert
+                  << " -> pool " << t->pool << " slot " << t->slot
+                  << " (staging_mask=" << (unsigned)t->staging_mask << ")"
+                  << " dio=" << (t->dio_tsc > t->req_tsc ? tsc_delta_ns(t->dio_tsc - t->req_tsc) / 1000 : 0) << "us");
+    } else {
+        slots_[t->slot].mark_failed();
+        // Revert LOADING -> ABSENT so a later retry can reload the
+        // expert (an ABSENT dir entry is what triggers a new load). A
+        // FAILED dir state would make accept skip it forever.
+        dir_->transition(t->layer, t->expert, t->pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
+        LOG_ERROR("expert_scheduler: async load failed for L" << t->layer << " E" << t->expert);
+    }
+    // M5 settle accounting: a load for the active request (B subset)
+    // that just became READY -> pin for exec (refcount+1, RAII ledger,
+    // done bump). At zero n_left active_finish wakes exec once. exec
+    // never re-pins B - the pin happens HERE on the owner thread.
+    if (!t->failed && active_present_ && t->layer == active_layer_ &&
+        bit_test(active_still_need_, t->expert)) {
+        active_settle(t->layer, t->expert, t->slot);
+    } else if (t->failed && active_present_ && t->layer == active_layer_ &&
+               bit_test(active_still_need_, t->expert)) {
+        // A B load hard-failed: all-or-nothing. Release the already
+        // pinned B slots, set failed, wake exec once.
+        active_fail("async load failed");
+    }
+    // Non-active settles (prefetch / legacy) just mark READY - nothing to wake.
+    t->done_tsc = tsc_now();   // [TMR] slot settled (ready or failed)
+    const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
+    const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
+    load_free_.push_back(idx);
+    load_in_use_[idx] = 0;
+}
+
+void expert_scheduler::begin_htod(async_load_t* t) {
+    // Enqueue the staging -> device copies for every staged slice, then
+    // park the load on the HtoD-pending list. The ring element (and its
+    // staging bytes) must stay allocated until drain_htod settles it.
+    const subpool_t* osp = subpool_of_slot(static_cast<int32_t>(t->slot));
+    const pool_dma_write_fn dma_write =
+        (t->pool > 0 && t->pool <= MAX_DEVICE_POOLS) ? pool_dma_write_[t->pool - 1] : nullptr;
+    const pool_dma_wait_fn dma_wait =
+        (t->pool > 0 && t->pool <= MAX_DEVICE_POOLS) ? pool_dma_wait_[t->pool - 1] : nullptr;
+    const pool_dma_poll_fn dma_poll =
+        (t->pool > 0 && t->pool <= MAX_DEVICE_POOLS) ? pool_dma_poll_[t->pool - 1] : nullptr;
+    if (!osp || !osp->dev_buf || !dma_write) {
+        LOG_ERROR("expert_scheduler: no DMA writer for pool " << t->pool
+                  << " - HtoD for L" << t->layer << " E" << t->expert << " cannot run");
+        t->failed = true;
+        settle_loaded(t);
+        return;
+    }
+    htod_pending_t p;
+    p.load = t;
+    p.wait = dma_wait;
+    p.poll = dma_poll;
+    for (uint32_t s = 0; s < t->plan.num_tensors; ++s) {
+        if (!(t->staging_mask & (uint8_t)(1u << s))) {
+            // A non-host-mapped slot forces every slice to staging; a slice
+            // that is not staged here was never read anywhere - fail loudly
+            // instead of silently leaving a hole in the device slot.
+            LOG_ERROR("expert_scheduler: HtoD slice " << s << " L" << t->layer
+                      << " E" << t->expert << " is not staged (pool " << t->pool << ")");
+            t->failed = true;
+            break;
+        }
+        const auto& sl = t->plan.slices[s];
+        size_t col_off = 0, col_stride = 0;
+        if (!osp->column_at(sl.column, col_off, col_stride)) {
+            LOG_ERROR("expert_scheduler: HtoD column " << sl.column << " not in pool " << t->pool);
+            t->failed = true;
+            break;
+        }
+        const size_t dev_off = col_off +
+            static_cast<size_t>(t->slot - osp->slot_begin) * col_stride + sl.copy_dst_offset;
+        pool_dma_token_t tok = dma_write(osp->dev_buf, dev_off,
+                                         t->staging + sl.copy_src_offset, sl.copy_byte_len);
+        if (tok) p.tokens.push_back(tok);
+    }
+    if (t->failed) {
+        // A slice could not be addressed: reap any tokens already enqueued,
+        // then fail the load (its staging bytes are freed with the element).
+        for (pool_dma_token_t tok : p.tokens) {
+            if (p.wait) p.wait(tok);
+        }
+        settle_loaded(t);
+        return;
+    }
+    if (!p.tokens.empty() && (!dma_wait || !dma_poll)) {
+        // The writer returned async tokens but the pool has no wait/poll
+        // callbacks to observe them: a broken registration. Reap what we
+        // can and fail the load rather than leaking the tokens.
+        LOG_ERROR("expert_scheduler: HtoD tokens without wait/poll callbacks (pool " << t->pool << ")");
+        for (pool_dma_token_t tok : p.tokens) {
+            if (p.wait) p.wait(tok);
+        }
+        t->failed = true;
+        settle_loaded(t);
+        return;
+    }
+    SCHED_DIAG("sched: HtoD L" << t->layer << " E" << t->expert
+              << " -> pool " << t->pool << " slot " << t->slot
+              << " (" << p.tokens.size() << " async copie(s))");
+    htod_pending_.push_back(std::move(p));
+}
+
+bool expert_scheduler::drain_htod() {
+    // Poll every pending HtoD: a load settles (READY + active accounting +
+    // ring free) once all its copies report complete. Non-blocking: a load
+    // whose copies are still in flight stays parked for the next tick.
+    bool settled_any = false;
+    for (auto it = htod_pending_.begin(); it != htod_pending_.end();) {
+        bool all_done = true;
+        for (pool_dma_token_t tok : it->tokens) {
+            if (it->poll && !it->poll(tok)) { all_done = false; break; }
+        }
+        if (!all_done) { ++it; continue; }
+        // Reap (destroy) the tokens, then settle the load.
+        bool ok = true;
+        for (pool_dma_token_t tok : it->tokens) {
+            if (it->wait && !it->wait(tok)) ok = false;
+        }
+        async_load_t* t = it->load;
+        it = htod_pending_.erase(it);
+        if (!ok) {
+            LOG_ERROR("expert_scheduler: HtoD wait failed for L" << t->layer << " E" << t->expert);
+            t->failed = true;
+        }
+        settle_loaded(t);
+        settled_any = true;
+    }
+    return settled_any;
+}
+
 void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
     // IOCP has no batch completion - we aggregate per async_load_t via `pending`.
     for (uint32_t i = 0; i < n; ++i) {
@@ -727,51 +940,32 @@ void expert_scheduler::drain_completions(aio_req_t** done, uint32_t n) {
         } else if (!t->failed && (t->staging_mask & (uint8_t)(1u << slice))) {
             // plan.direct but the runtime destination was not 4K aligned: the
             // read went to staging, so copy payload to the column slot now.
-            const auto& sl = t->plan.slices[slice];
-            const uint8_t* dst = slot_col_mem(static_cast<int32_t>(t->slot), sl.column);
-            if (dst) {
-                std::memcpy(const_cast<uint8_t*>(dst) + sl.copy_dst_offset,
-                            t->staging + sl.copy_src_offset, sl.copy_byte_len);
+            // A non-host-mapped slot (CUDA) has a device address as its slot
+            // base: never memcpy into it on the host. Its staged slices are
+            // moved by begin_htod at pending == 0 instead.
+            const subpool_t* osp = subpool_of_slot(static_cast<int32_t>(t->slot));
+            if (!osp || osp->host_mapped) {
+                const auto& sl = t->plan.slices[slice];
+                const uint8_t* dst = slot_col_mem(static_cast<int32_t>(t->slot), sl.column);
+                if (dst) {
+                    std::memcpy(const_cast<uint8_t*>(dst) + sl.copy_dst_offset,
+                                t->staging + sl.copy_src_offset, sl.copy_byte_len);
+                }
             }
         }
         --t->pending;
         if (t->pending == 0) {
             t->dio_tsc = tsc_now();   // [TMR] all sub-tensor DIO reads complete
-            if (!t->failed) {
-                slots_[t->slot].mark_ready();
-                dir_->set(t->layer, t->expert, t->pool, t->slot);
-                n_misses_.fetch_add(1, std::memory_order_relaxed);
-                SCHED_DIAG("sched: loaded L" << t->layer << " E" << t->expert
-                          << " -> pool " << t->pool << " slot " << t->slot
-                          << " (staging_mask=" << (unsigned)t->staging_mask << ")"
-                          << " dio=" << (t->dio_tsc > t->req_tsc ? tsc_delta_ns(t->dio_tsc - t->req_tsc) / 1000 : 0) << "us");
+            const subpool_t* osp = subpool_of_slot(static_cast<int32_t>(t->slot));
+            if (!t->failed && osp && !osp->host_mapped) {
+                // The bytes are all in staging; the slot is a device address.
+                // Hand them to the DMA writer now; the load settles (READY +
+                // active accounting + ring free) in drain_htod once the HtoD
+                // copies complete. The slot stays LOADING until then.
+                begin_htod(t);
             } else {
-                slots_[t->slot].mark_failed();
-                // Revert LOADING -> ABSENT so a later retry can reload the
-                // expert (an ABSENT dir entry is what triggers a new load). A
-                // FAILED dir state would make accept skip it forever.
-                dir_->transition(t->layer, t->expert, t->pool, EXPERT_ABSENT, SLOT_UNASSIGNED);
-                LOG_ERROR("expert_scheduler: async DIO load failed for L" << t->layer << " E" << t->expert);
+                settle_loaded(t);
             }
-            // M5 settle accounting: a load for the active request (B subset)
-            // that just became READY -> pin for exec (refcount+1, RAII ledger,
-            // done bump). At zero n_left active_finish wakes exec once. exec
-            // never re-pins B - the pin happens HERE on the owner thread.
-            if (!t->failed && active_present_ && t->layer == active_layer_ &&
-                bit_test(active_still_need_, t->expert)) {
-                active_settle(t->layer, t->expert, t->slot);
-            } else if (t->failed && active_present_ && t->layer == active_layer_ &&
-                       bit_test(active_still_need_, t->expert)) {
-                // A B load hard-failed: all-or-nothing. Release the already
-                // pinned B slots, set failed, wake exec once.
-                active_fail("async load failed");
-            }
-            // Non-active settles (prefetch / legacy) just mark READY - nothing to wake.
-            t->done_tsc = tsc_now();   // [TMR] slot settled (ready or failed)
-            const size_t off = static_cast<size_t>(reinterpret_cast<uint8_t*>(t) - load_pool_);
-            const uint32_t idx = static_cast<uint32_t>(off / load_stride_);
-            load_free_.push_back(idx);
-            load_in_use_[idx] = 0;
         }
     }
 }
@@ -1131,6 +1325,12 @@ void global_expert_scheduler::worker_loop() {
                     t->sched->drain_completions(&done[i], 1);
                 }
             }
+        }
+        // 1b. settle HtoD-pending loads (Phase 2): a load that targeted a
+        // non-host-mapped slot finishes here, once its staging -> device
+        // copies complete (polled, never blocking the scheduler thread).
+        for (auto* s : snap) {
+            if (s->is_running() && s->drain_htod()) any = true;
         }
         // 2. accept alloc requests from every registered pool.
         for (auto* s : snap) {

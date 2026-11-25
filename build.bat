@@ -65,6 +65,9 @@ rem   upstream_dump         -> prefill_export   (prefill export, no vulkan basel
 rem   upstream_vulkan_dump  -> prefill_export   (prefill export + vulkan, for Vulkan0 comparison)
 rem   StreamMoE_dump        -> route_b,prefill_export + vulkan (full StreamMoE export,
 rem                            with the Vulkan0 device-pool path; vs upstream_dump)
+rem   StreamMoE_cuda        -> route_b + vulkan + cuda (dual-backend tag: the
+rem                            CUDA0 device-pool path via async DMA; the P100
+rem                            runs CUDA because TCC hides it from Vulkan)
 rem   StreamMoE_latest      -> StreamMoE_dump + STREAM_MOE_LATEST (in-progress
 rem                            features default ON, NO diagnostics). The build to
 rem                            run when reproducing a feature bug.
@@ -79,6 +82,7 @@ if "%TAG%"=="upstream_vulkan_dump" set STREAM_MOE_FEATURES=prefill_export
 if "%TAG%"=="StreamMoE_dump"       set STREAM_MOE_FEATURES=route_b,prefill_export
 if "%TAG%"=="StreamMoE_latest"     set STREAM_MOE_FEATURES=route_b,prefill_export
 if "%TAG%"=="StreamMoE_dump_dbg"   set STREAM_MOE_FEATURES=route_b,prefill_export
+if "%TAG%"=="StreamMoE_cuda"       set STREAM_MOE_FEATURES=route_b
 rem ---- in-progress compile-time feature switches --------------------------
 rem   STREAM_MOE_LATEST = the "latest features" macro: in-progress features (e.g.
 rem   compact interval packing) default ON. Set by the StreamMoE_latest and
@@ -122,10 +126,13 @@ if "%TAG%"=="StreamMoE_dump"       set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE_latest"     set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE_dump_dbg"   set GGML_VULKAN_DEFAULT=ON
 if "%TAG%"=="StreamMoE"            set GGML_VULKAN_DEFAULT=ON
+if "%TAG%"=="StreamMoE_cuda"       set GGML_VULKAN_DEFAULT=ON
 rem env GGML_VULKAN=OFF still overrides (e.g. to rebuild a CPU-only StreamMoE_dump
 rem for an IDENTICAL baseline regression - see baseline_regression/README.md).
 if "%GGML_VULKAN%"=="" set GGML_VULKAN=%GGML_VULKAN_DEFAULT%
-if "%GGML_CUDA%"==""  set GGML_CUDA=OFF
+set GGML_CUDA_DEFAULT=OFF
+if "%TAG%"=="StreamMoE_cuda" set GGML_CUDA_DEFAULT=ON
+if "%GGML_CUDA%"==""  set GGML_CUDA=%GGML_CUDA_DEFAULT%
 if "%GGML_HIP%"==""   set GGML_HIP=OFF
 if "%GGML_METAL%"=="" set GGML_METAL=OFF
 if "%GGML_SYCL%"==""  set GGML_SYCL=OFF
@@ -142,6 +149,14 @@ if "%GGML_VULKAN%"=="ON" (
     set PATH=!NINJA_DIR!;!CLANG_DIR!;!PATH!
     set VULKAN_TOOLCHAIN_ARGS=
 ) else set VULKAN_TOOLCHAIN_ARGS=
+rem CUDA toolchain (Phase 2): nvcc's host compiler must be VS2019's cl (MSVC
+rem 14.29) - nvcc 12.6 refuses VS 18's cl, and -allow-unsupported-compiler
+rem makes cudafe++ crash (see F:/Dev/cuda-toolkit-install/NVCC_RECIPE.md).
+rem Single-line ifs (no parenthesised block): the (x86) in the VS2019 path
+rem would terminate a (...) block early, like the PATH comment above.
+rem Use full paths: the MCP shell env does not see CUDA_PATH.
+if "%GGML_CUDA%"=="ON" set CUDA_TOOLCHAIN_ARGS=-DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/bin/nvcc.exe" -DCMAKE_CUDA_HOST_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/14.29.30133/bin/Hostx64/x64/cl.exe" -DCMAKE_CUDA_ARCHITECTURES=60 -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6"
+if not "%GGML_CUDA%"=="ON" set CUDA_TOOLCHAIN_ARGS=
 "%CMAKE%" -S third_party/llama.cpp -B "%LLAMA_BUILD%" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^
     -DCMAKE_C_COMPILER=%CLANG% ^
@@ -158,7 +173,7 @@ if "%GGML_VULKAN%"=="ON" (
     -DSTREAM_MOE_FEATURES="%STREAM_MOE_FEATURES%" ^
     -DOpenMP_C_FLAGS=-Xclang;-fopenmp -DOpenMP_CXX_FLAGS=-Xclang;-fopenmp ^
     -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp ^
-    -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS%
+    -DOpenMP_libomp_LIBRARY=%LIBOMP% %VULKAN_TOOLCHAIN_ARGS% %CUDA_TOOLCHAIN_ARGS%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 "%NINJA%" -C "%LLAMA_BUILD%" llama llama-cli llama-server
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
@@ -197,6 +212,11 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
     exit /b 1
 )
 echo [StreamMoE] Configuring + building tests (tag %TAG%) ...
+rem The CUDA device test (test_device_cuda) needs to know whether this tag
+rem builds ggml-cuda: derive it from the tag the same way :llamalibs does
+rem (env GGML_CUDA still overrides).
+if "%GGML_CUDA%"=="" if "%TAG%"=="StreamMoE_cuda" set GGML_CUDA=ON
+if "%GGML_CUDA%"=="" set GGML_CUDA=OFF
 "%CMAKE%" -S . -B "%OUT%\cmake" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=%NINJA% ^
     -DCMAKE_C_COMPILER=%CLANG% ^
@@ -205,12 +225,14 @@ echo [StreamMoE] Configuring + building tests (tag %TAG%) ...
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DLLAMA_BUILD_DIR="%CD%\%LLAMA_BUILD%" ^
-    -DSTREAMMOE_LIBOMP=%LIBOMP%
+    -DSTREAMMOE_LIBOMP=%LIBOMP% ^
+    -DSTREAMMOE_TEST_CUDA=%GGML_CUDA% ^
+    -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo [StreamMoE] Building unit-test executables ...
 rem test_async_dio is DISABLED (SoA refactor - see CMakeLists.txt) - keep the
 rem list in sync with the enabled test targets there.
-"%NINJA%" -C "%OUT%\cmake" test_moe_loader test_profiler test_scheduler test_slot test_mix_plan test_scatter_plan
+"%NINJA%" -C "%OUT%\cmake" test_moe_loader test_profiler test_scheduler test_slot test_mix_plan test_scatter_plan test_device_cuda
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 copy /Y "%LIBOMP_DLL%" "%OUT%\bin\libomp.dll" >nul
 echo [StreamMoE] Running ctest ...
@@ -343,6 +365,8 @@ echo   llamalibs StreamMoE_latest - latest features ON, no diagnostics
 echo                                (build\StreamMoE_latest)
 echo   llamalibs StreamMoE_dump_dbg - latest features + STREAM_MOE_TEMP diagnostic
 echo                                code (build\StreamMoE_dump_dbg; debug only)
+echo   llamalibs StreamMoE_cuda     - route-B + vulkan + cuda dual-backend tag
+echo                                (build\StreamMoE_cuda; CUDA0 device pool via async DMA)
 echo   build.bat convert        - build C++ converter (build^<tag^>\bin\stream_moe_convert.exe)
 echo   build.bat harness ^<tag^> ^<name^> - build diagnostics\^<name^>.cpp harness (build^<tag^>\bin\^<name^>.exe)
 echo   build.bat history ^<commit^> ^<tag...^> - history binary: worktree checkout + historical

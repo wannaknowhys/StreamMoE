@@ -26,6 +26,16 @@ if(STREAM_MOE_FEATURES MATCHES "route_b")
         target_sources(${TARGET} PRIVATE
             ${STREAM_MOE_SRC}/backend/device_vulkan.cpp)
     endif()
+    # Device interface: CUDA ops only when the vendored build enables
+    # ggml-cuda, otherwise the CUDA runtime symbols are unavailable.
+    # device_cuda.cpp is a plain .cpp linked against cudart (no .cu file).
+    if(GGML_CUDA)
+        target_compile_definitions(${TARGET} PRIVATE STREAMMOE_HAVE_CUDA=1)
+        target_sources(${TARGET} PRIVATE
+            ${STREAM_MOE_SRC}/backend/device_cuda.cpp)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+    endif()
     # Async DIO backend by platform: IOCP (Windows) vs pread/io_uring (POSIX).
     if (WIN32)
         target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_win.cpp)

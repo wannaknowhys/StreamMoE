@@ -34,12 +34,16 @@
 namespace stream_moe {
 
 // A device (non-RAM) expert region added on top of the CPU-RAM pool: one
-// contiguous run of slot-aligned whole-expert blocks, host-mapped so the
-// scheduler can load/move expert bytes straight into it.
+// contiguous run of slot-aligned whole-expert blocks. When host_mapped is
+// true, `base` is a host pointer and the scheduler can load/move expert bytes
+// straight into it (Vulkan); when false, `base` is a device address and the
+// bytes only move through the pool's DMA reader/writer (CUDA).
 struct vram_region_t {
     uint32_t  pool   = 1;   // device pool index (0 = CPU RAM is not a region)
     uint32_t  group  = 0;   // expert group this region serves
-    uint8_t*  base   = nullptr;   // host-mapped base (nullptr -> region skipped)
+    uint8_t*  base   = nullptr;   // region base: host map, or device address
+                                  // when host_mapped is false (nullptr -> skipped)
+    bool      host_mapped = true; // false: base is a device address (DMA only)
     uint32_t  n_slots = 0;
     void*     buf    = nullptr;   // device buffer handle (executor tensor shells)
 };
@@ -66,6 +70,10 @@ struct move_task_t {
     uint32_t dst_pool = 0, dst_slot = 0;
     uint64_t req_tsc = 0;      // [TMR] submit time
     uint64_t done_tsc = 0;     // [TMR] memcpy finished
+    bool failed = false;       // set by the move worker when a column could
+                               // not be copied (no DMA path / DMA error);
+                               // drain_moves then fails the dst slot instead
+                               // of marking it READY.
     struct copy_t {
         const uint8_t* src = nullptr;   // column slice source (resolved)
         uint8_t*       dst = nullptr;   // column slice destination (resolved)
@@ -77,10 +85,21 @@ struct move_task_t {
         // into the dst. `dev_buf` = the source region's device buffer (null =>
         // RAM src, plain memcpy); `dev_off` = byte offset inside that buffer (=
         // src - region base, since a vram region's host map starts at buffer
-        // offset 0). A device pool without a registered reader falls back to
-        // the host-map memcpy.
+        // offset 0). A host-mapped device pool without a registered reader
+        // falls back to the host-map memcpy; a non-host-mapped pool (CUDA)
+        // without a reader has no host map to fall back to, so the worker
+        // logs an error and skips the column instead of memcpying a device
+        // address on the host.
         void*  dev_buf = nullptr;
         size_t dev_off = 0;
+        // r2v DMA: when the DESTINATION lives on a device region, the worker
+        // dispatches to the destination pool's registered DMA writer (cuda
+        // HtoD; a Vulkan dst is host-mapped so its writer is a memcpy).
+        // `dst_dev_buf` = the destination region's device buffer (null =>
+        // RAM dst, plain memcpy); `dst_dev_off` = byte offset inside it (=
+        // dst - region base).
+        void*  dst_dev_buf = nullptr;
+        size_t dst_dev_off = 0;
     };
     std::vector<copy_t> cols;  // one per tensor column
     expert_scheduler* owner = nullptr;  // scheduler owning both pools
@@ -178,20 +197,46 @@ public:
     // after the move worker reports completions. dst slot -> READY + dir READY;
     // src slot released for reuse. Single-threaded (global scheduler thread).
     void drain_moves();
+    // Poll the HtoD-pending list (Phase 2, global scheduler thread): settle
+    // every load whose staging -> device copies all completed. Returns true
+    // when anything settled.
+    bool drain_htod();
 
-    // ---- device -> host column reader (multi-backend) ----------------------
+    // ---- async DMA callbacks (multi-backend, Phase 2) ----------------------
     // A device (vram) expert source is copied by the move worker through a
     // per-pool DMA read callback, not a host memcpy of the rebar map (~0.02
     // GB/s host read vs ~14 GB/s via the backend's transfer queue). The
-    // callback is registered by the pool owner (route_b_inject) at bind time:
-    // pool 0 (CPU RAM) never uses it, every non-RAM pool may have its own
-    // (vulkan and cuda each provide a read function; both can coexist). The
-    // scheduler stays backend-agnostic - it only dispatches (pool, dev_buf,
-    // off, dst, bytes) to the registered reader. A missing reader falls back
-    // to a plain host memcpy of `src` (the host map) so the pool still works.
-    using pool_dma_read_fn = void (*)(void* dev_buf, size_t off, void* dst, size_t bytes);
+    // callbacks are registered by the pool owner (route_b_inject) at bind
+    // time: pool 0 (CPU RAM) never uses them, every non-RAM pool may have
+    // its own (vulkan and cuda each provide their own; both can coexist).
+    // The scheduler stays backend-agnostic - it only dispatches
+    // (pool, dev_buf, off, dst/src, bytes) to the registered callbacks.
+    //
+    // Async contract (Phase 2): the read/write callbacks ENQUEUE a copy and
+    // return a completion token (nullptr = already complete, e.g. CPU
+    // memcpy / sync Vulkan read). They never block. The caller observes
+    // completion through the wait callback (blocking reap: waits, then
+    // destroys the token) or the poll callback (non-blocking check; the
+    // token stays valid until wait reaps it). A missing reader/writer falls
+    // back to a plain host memcpy of the host map - but only for host-mapped
+    // pools; a non-host-mapped pool (CUDA) has no host map, so a missing
+    // callback there is a setup error and the copy is skipped (logged).
+    using pool_dma_token_t = void*;
+    using pool_dma_read_fn  = pool_dma_token_t (*)(void* dev_buf, size_t off, void* dst, size_t bytes);
+    using pool_dma_write_fn = pool_dma_token_t (*)(void* dev_buf, size_t off, const void* src, size_t bytes);
+    using pool_dma_wait_fn  = bool (*)(pool_dma_token_t token);
+    using pool_dma_poll_fn  = bool (*)(pool_dma_token_t token);
     void set_pool_dma_read(uint32_t pool, pool_dma_read_fn fn) {
         if (pool > 0 && pool <= MAX_DEVICE_POOLS) pool_dma_read_[pool - 1] = fn;
+    }
+    void set_pool_dma_write(uint32_t pool, pool_dma_write_fn fn) {
+        if (pool > 0 && pool <= MAX_DEVICE_POOLS) pool_dma_write_[pool - 1] = fn;
+    }
+    void set_pool_dma_wait(uint32_t pool, pool_dma_wait_fn fn) {
+        if (pool > 0 && pool <= MAX_DEVICE_POOLS) pool_dma_wait_[pool - 1] = fn;
+    }
+    void set_pool_dma_poll(uint32_t pool, pool_dma_poll_fn fn) {
+        if (pool > 0 && pool <= MAX_DEVICE_POOLS) pool_dma_poll_[pool - 1] = fn;
     }
 
     // Bitmap helpers (bit e of a layer's expert bitmap).
@@ -222,7 +267,9 @@ public:
         uint32_t slot_begin = 0;
         uint32_t n_slots    = 0;
         size_t   expert_size = 0;  // total bytes per expert = sum of column strides
-        uint8_t* base       = nullptr;   // region base (RAM pool or vram host map)
+        uint8_t* base       = nullptr;   // region base (RAM pool, vram host map,
+                                          // or a device address when !host_mapped)
+        bool     host_mapped = true;     // false: base is a device address (DMA only)
         void*    dev_buf    = nullptr;   // device buffer handle (executor shells)
         std::vector<column_t> cols;      // per-tensor SoA columns (ORDER, group topo order)
         // Column (off, stride) of the branch tag in this sub-pool, else false.
@@ -315,6 +362,16 @@ private:
     int32_t alloc_or_evict(uint32_t layer, uint32_t expert, uint32_t pool);
     async_load_t* start_async_load(int32_t slot, uint32_t layer, uint32_t expert);
     void clear_directory(uint32_t layer, uint32_t expert);
+    // Settle a load whose DIO reads all completed (pending == 0): mark the
+    // slot READY (or FAILED) + dir entry + M5 active accounting, then free
+    // the ring element. Shared tail of drain_completions and drain_htod.
+    void settle_loaded(async_load_t* t);
+    // Enqueue the staging -> device HtoD copies for a load that targeted a
+    // non-host-mapped slot (Phase 2): DIO cannot write into device addresses,
+    // so the bytes sit in staging until this step moves them. The load's ring
+    // element stays allocated until drain_htod settles it. On a missing DMA
+    // writer the load fails (settle_loaded with failed set).
+    void begin_htod(async_load_t* t);
     async_load_t* load_task(uint32_t idx) {
         return reinterpret_cast<async_load_t*>(load_pool_ + static_cast<size_t>(idx) * load_stride_);
     }
@@ -367,7 +424,10 @@ private:
     // makes the move worker fall back to a host memcpy. Multiple backends
     // (vulkan + cuda) coexist as separate entries.
     static constexpr uint32_t MAX_DEVICE_POOLS = 8;
-    pool_dma_read_fn pool_dma_read_[MAX_DEVICE_POOLS] = {};
+    pool_dma_read_fn  pool_dma_read_[MAX_DEVICE_POOLS] = {};
+    pool_dma_write_fn pool_dma_write_[MAX_DEVICE_POOLS] = {};
+    pool_dma_wait_fn  pool_dma_wait_[MAX_DEVICE_POOLS] = {};
+    pool_dma_poll_fn  pool_dma_poll_[MAX_DEVICE_POOLS] = {};
 
     // Async-load ringbuffer pool: preallocated contiguous aligned block, element
     // stride = 4K-aligned header + 4K-aligned staging size. max_in_flight = pool
@@ -381,6 +441,19 @@ private:
     uint8_t* load_pool_ = nullptr;
     std::vector<uint32_t> load_free_;   // free element indices (LIFO)
     std::vector<uint8_t>  load_in_use_;
+
+    // HtoD-pending loads (Phase 2): a load that targeted a non-host-mapped
+    // slot (CUDA) has its bytes in staging after DIO completes; the HtoD
+    // copies are enqueued by begin_htod and their completion is polled by
+    // drain_htod on the scheduler thread. The load's ring element stays
+    // allocated (and its slot stays LOADING) until drain_htod settles it.
+    struct htod_pending_t {
+        async_load_t*   load = nullptr;
+        pool_dma_wait_fn wait = nullptr;
+        pool_dma_poll_fn poll = nullptr;
+        std::vector<pool_dma_token_t> tokens;   // one per enqueued copy
+    };
+    std::deque<htod_pending_t> htod_pending_;
 
     // Eviction scoring state (scheduler thread owns):
     //   recency = max(0, cur_token - last_used_token)   (dir_ holds last_used)

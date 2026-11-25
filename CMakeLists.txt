@@ -1,4 +1,4 @@
-﻿# StreamMoE build rules (single source of truth for the build).
+# StreamMoE build rules (single source of truth for the build).
 # Consumed via cmake: Windows -> cmake -G Ninja + ninja (build.bat); Linux -> cmake + make (Makefile).
 # Pre-req: vendored libllama static libs in <build>/<tag>/llama-build (see `llamalibs`).
 
@@ -114,6 +114,36 @@ add_test(NAME test_mix_plan COMMAND test_mix_plan WORKING_DIRECTORY ${CMAKE_CURR
 add_executable(test_scatter_plan src/backend/scatter_plan.cpp tests/test_scatter_plan.cpp)
 streammoe_inc(test_scatter_plan)
 add_test(NAME test_scatter_plan COMMAND test_scatter_plan WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# test_device_cuda: async DMA through the device interface (Phase 2). Built
+# for every tag; without STREAMMOE_TEST_CUDA (set by build.bat :test from the
+# tag) it prints SKIP and exits 0. With CUDA it exercises the real path on
+# the P100 (ggml CUDA buffer + cudart round-trip + asyncness probe).
+add_executable(test_device_cuda src/backend/device_iface.cpp tests/test_device_cuda.cpp)
+streammoe_target(test_device_cuda)
+if(STREAMMOE_TEST_CUDA)
+    target_compile_definitions(test_device_cuda PRIVATE STREAMMOE_HAVE_CUDA=1)
+    target_sources(test_device_cuda PRIVATE src/backend/device_cuda.cpp)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(test_device_cuda PRIVATE CUDA::cudart)
+    # ggml_backend_load_all() pulls the backend registry (ggml.lib), whose
+    # constructor references the compiled-in backends reg functions. Those
+    # live in the backend libs, so link them when the llamalibs build
+    # produced them (llama.cpp fixed build layout: ggml/src/<be>/<be>.lib).
+    foreach(_be_lib ggml-cuda/ggml-cuda ggml-vulkan/ggml-vulkan)
+        if(EXISTS "${LLAMA_BUILD_DIR}/ggml/src/${_be_lib}.lib")
+            target_link_libraries(test_device_cuda PRIVATE "${LLAMA_BUILD_DIR}/ggml/src/${_be_lib}.lib")
+        endif()
+    endforeach()
+    # ggml-cuda objects may also need cuBLAS and the CUDA driver library.
+    target_link_libraries(test_device_cuda PRIVATE CUDA::cublas CUDA::cuda_driver)
+    # ggml-vulkan needs the Vulkan loader library.
+    if(EXISTS "${LLAMA_BUILD_DIR}/ggml/src/ggml-vulkan/ggml-vulkan.lib")
+        find_package(Vulkan REQUIRED)
+        target_link_libraries(test_device_cuda PRIVATE Vulkan::Vulkan)
+    endif()
+endif()
+add_test(NAME test_device_cuda COMMAND test_device_cuda WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ---- converter (pure C++; replaces tools/stream_moe_layout.js + convertd) ----
 add_executable(stream_moe_convert
