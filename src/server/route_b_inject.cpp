@@ -265,14 +265,14 @@ llama_model_tensor_buft_override* route_b_setup(
         // Hand the device regions to the scheduler so its slot space covers
         // the VRAM blocks too (device pool 1, 2, ... in the order the backends
         // were initialised above). A host-mapped backend (Vulkan) hands over
-        // its host pointer; a backend without a host map whose DMA writer
-        // works on device addresses (CUDA) hands over the device address
-        // instead (host_offset) and marks the region host_mapped = false, so
-        // the scheduler only moves bytes through the pool's DMA reader/writer
-        // and never dereferences the base on host. Any other backend without
-        // a host map (e.g. a Vulkan buffer that fell back to pure
-        // device-local memory) is skipped: its DMA writer is a host-map
-        // memcpy and cannot serve the region.
+        // its host pointer; a backend without a host map hands over the
+        // device address instead (host_offset) and marks the region
+        // host_mapped = false, so the scheduler only moves bytes through the
+        // pool's DMA reader/writer and never dereferences the base on host.
+        // That covers CUDA (cudaMemcpyAsync) and Vulkan without a host map
+        // (stmoe_vk_dma_write: transfer-queue staging, see the DMA frag) -
+        // a region is only skipped when its backend has no DMA writer at
+        // all, which cannot serve the region either way.
         std::vector<vram_region_t> vregions;
         for (size_t si = 0; si < pool->vram_segs.size(); ++si) {
             const auto& seg = pool->vram_segs[si];
@@ -288,20 +288,22 @@ llama_model_tensor_buft_override* route_b_setup(
             if (host_map) {
                 r.base = static_cast<uint8_t*>(host_map);
                 r.host_mapped = true;
-            } else if (stmoe_dev_kind_from_name(seg.dev.c_str()) == STMOE_DEV_CUDA) {
-                // CUDA device memory has no host map by design; the DMA
-                // writer (cudaMemcpyAsync) moves bytes into the device
-                // address, so a DMA-only region is usable.
+            } else if (stmoe_dev_dma_writer(stmoe_dev_kind_from_name(seg.dev.c_str())) != nullptr) {
+                // No host map: DMA-only region. The DMA writer moves bytes
+                // into the device address (CUDA: cudaMemcpyAsync; Vulkan:
+                // stmoe_vk_dma_write via the transfer queue), so the region
+                // is usable without a host map. The base is the device
+                // address (CUDA) or the fake base (Vulkan host_offset) -
+                // never dereferenced on host, only used for offset
+                // arithmetic in the scheduler's DMA paths.
                 r.base = static_cast<uint8_t*>(stmoe_dev_buffer_host_offset(seg.buf, 0));
                 r.host_mapped = false;
             } else {
-                // No host map and no DMA-only write path: the Vulkan DMA
-                // writer is a memcpy into the host map, so a region
-                // without one would silently copy nothing while its slots
-                // are still marked READY (degenerate generation, no error).
-                // Skip the region (Phase 1 behaviour); the pool runs on
-                // CPU RAM alone.
-                std::fprintf(stderr, "route B: device pool '%s' has no host map and no DMA-only write path - region skipped, pool runs on RAM\n", seg.dev.c_str());
+                // No host map and no DMA writer for this backend: the region
+                // cannot be served - skip it (the pool runs on CPU RAM
+                // alone) rather than registering slots that can never be
+                // filled.
+                std::fprintf(stderr, "route B: device pool '%s' has no host map and no DMA writer - region skipped, pool runs on RAM\n", seg.dev.c_str());
                 continue;
             }
             r.n_slots = static_cast<uint32_t>(seg.n_slots);

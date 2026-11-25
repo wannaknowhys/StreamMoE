@@ -283,6 +283,34 @@ Gemma 回归 FAIL（2026-11-24 22:16–22:39，耗时 22:41，日志 `temp\run-b
 
 **结论：Phase 2 已提交并 push（见 §12-10）。** 本次回归的 FAIL 记录保留在上文作历史，BLOCKER 已关闭（§12-11）。
 
+### 7.4 真正的 Vulkan HtoD 写路径 + B36 floor 放宽（2026-11-25）
+
+用户 2026-11-25 00:07 批准"一起做了吧"：最终形态 Vulkan HtoD 写路径与 B36 放宽同一次改动。5 个文件（`git diff --stat`：152+/69-）：
+
+- **任务 A——Vulkan HtoD 写路径**：`patches/route-b/common/stmoe_routeb_vk_dma.frag` 加 `stmoe_vk_dma_write`（包 vendored `ggml_vk_buffer_write` 同步版，`ggml-vulkan.cpp:8512`；host-visible 时直接 memcpy 进 map，device-local 时 staging + transfer-queue copy + fence 等待，与读路径完全对称；`bytes==0` 返回 true，无效 handle 返回 false）；`src/backend/device_vulkan.cpp` 的 `dma_write` 改调它，失败时返回哨兵 token（`dma_wait` 报 false，`dma_poll` 报 true），加载/搬迁失败收敛、不再把空槽标 READY；`src/server/route_b_inject.cpp` 里无 host map 的区不再按 kind 特判——有 DMA writer 的后端（Vulkan/CUDA）都注册 DMA-only 区（`host_mapped=false`，base 为设备地址或 fake base，仅作偏移算术），仅无 writer 的后端跳过 + 警告。minigraph H2D（pinned staging + `dispatch_relay_batch`）未动。
+- **任务 B——B36 floor 放宽**：`src/backend/scheduler.cpp` init 的 floor 校验改为按组判定：每组一整层的 floor 由 RAM **或**任一 device region 满足其一即可；没有任何一方能放下一层时仍 fail-fast，报错写明新规则。无 RAM 槽的组即无 LLC 状态：`alloc_or_evict` 的 v2r demote 找不到 RAM 目的地时直接 drop device 副本（内容仍可从盘读回），驱逐本身成功，不空转、不死等；`ram_floor[i]==0` 的组 carve 时不做 `ns >= per_layer` 钳制（可 0 RAM 槽）；总 RAM commit 为 0 时跳过 `alloc_aligned`（`pool_base_=nullptr`，RAM 子池 base 保持 nullptr、槽区间为空，从不解引用）。
+
+构建（2026-11-25 00:19–00:51）：`build.bat llamalibs StreamMoE` exit 0（ggml-vulkan.cpp 重编，frag 已编入）；`llamalibs StreamMoE_cuda` exit 0；`llamalibs StreamMoE_dump` exit 0；`llamalibs upstream_dump` 全量重编 exit 0（build 目录先删：frag 在 `#ifdef STREAM_MOE_ROUTE_B` 内，upstream_dump 不编它，ninja 无事可做，但 freshness 门按 patches/ mtime 判 stale，见下）。
+
+单元测试（日志 `temp\shell-20261125-052320-8852-742400.log`）：StreamMoE **7/7**；StreamMoE_cuda 首跑 6/7——`test_device_cuda` 以 0xC0000135（DLL 缺失）失败，零输出：MCP shell 环境陈旧，PATH 里无 CUDA bin（Machine PATH 的 CUDA 项是 2026-11-24 20:52 后加的，长驻 shell 看不到）。与本次改动无关（失败在加载器，main 未执行；改动未碰 CUDA 代码、未加新 DLL 依赖）。PATH 前置 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin` 后重跑 **7/7**，`test_device_cuda.exe` 直跑也全 PASS（P100 真跑：512 MiB 分配、DtoH 回环一致、大 DtoH 41ms）。**教训：MCP shell 里跑 CUDA tag 测试/程序，一律先前置 CUDA bin。**
+
+A/B/C/D 冒烟（启动器 `temp\smoke-repro3.ps1`，日志 `temp\smoke-repro3-{A,B,C,D}.log`，OlmoE，`-p hi -st -n 16 --temp 0`，全部 exit 0，16.9s）：
+
+| 组 | 二进制 | 池子 | 池子行 | 生成 |
+| :-- | :-- | :-- | :-- | :-- |
+| A | StreamMoE（新） | `RAM:8192,Vulkan0:2048` | `Expert pool: 1586 slots across 2 expert groups (RAM 3720 MB committed; 2 device region(s))`，device 子池 [1024,1586) 共 562 槽，base 0x1000 | ✅ `Hello! How can I help you today? ...` |
+| B | main（Phase 1） | `RAM:13312` | 1024 slots，0 device regions | ✅ 同上 |
+| C | StreamMoE（新） | `RAM:13312` | 1024 slots，0 device regions | ✅ 同上 |
+| D | StreamMoE（新） | `RAM:1,Vulkan0:2048`（纯 VRAM） | `Expert pool: 562 slots across 2 expert groups (RAM 0 MB committed; 2 device region(s))`，RAM 子池 [0,0) 空区间，base 0x0000000000000000 | ✅ 同上，无 init 报错 |
+
+A 的关键点：Vulkan0 区真正注册了（2 device regions），且生成正常——device 槽里的权重是真实写进去的（若 HtoD 仍是空写，会复现 B40 的 `"2020"×16`）。D 的关键点：B36 的 `"too small: needs at least 983 MB"` 不再出现；RAM 0 MB 提交、零 RAM 槽、无 LLC，生成正常，驱逐走 drop 路径，无挂死。A/D 均无 "region skipped" 警告。
+
+DeepSeek CUDA0 重跑（`temp\p2wrap-ds-cuda5.ps1`，日志 `temp\p2wrap-ds-cuda5.log`，DS_EXIT=0，4m52s）：`device pool 'CUDA0' got 1020/1024 MB (planned 1020 MB) groups:0:80/80`，`Expert pool: 2650 slots ... (RAM 32767 MB committed; 1 device region(s))`，`hi` 回复 `Okay, the user just said "hi". This is a very simple and common greeting. ...`。首跑曾以 0xC0000135 在 8s 内失败（同上：MCP shell PATH 无 CUDA bin），前置 CUDA bin 后重跑通过。0.1 t/s 是污染数字（P100 限功 150W + 并发科研任务占卡），只认正确性。
+
+Gemma 回归重跑 PASS（2026-11-25 00:50 起，日志 `temp\run-baseline-vk-dma.log`，第 1264 行 `RESULT: PASS - all baseline and place regression checks passed`）：[3/8] PASS（cos 门；expert history 3460/61920 differ，首个 #23；upstream IDENTICAL）；[4/8] KL PASS（阈值 4.5，max_KL 0.4027535）；[5/8] kv_cos rows=258 comparable=3870 cos_min=0.990300；[6/8] 1/33 未解释；[7/8] olmoe place 12 引擎全跑（6 处 minor fp 精度差异）；[7b/8] **PASS**（repeat-consistency，4 引擎，2 turns）；[8/8] smoke **PASS**（5.44s，`Hello! How can I help you today?`）。[3/8]–[6/8] 数字与 19:22 / 23:39 两次 PASS 完全相同。首跑在 freshness 门被拦（upstream_dump 23:17:52 编，frag 00:19:17 改，判 stale），按 22:07 前例全量重编 upstream_dump 后通过；moe 侧一次通过。
+
+**结论：最终形态已落地并验证（见 §12-11、§12-12）。** B36 → FIXED（`docs/BUG_TRACKER.md`），B40 的后续工作项关闭。
+
 ---
 
 ## 8. 导出（`tools\run_export.js` / `muliti_test.bat`）
@@ -360,8 +388,8 @@ scripts\run_long_horizon_test.bat zh memwatch  rem 指定 build tag
 | 8 | 用户惯例“OlmoE 单 task 全 placement；Gemma/DeepSeek 单 placement 单任务” | 用户口述，已记录（§9）；尚未逐条实测验证 |
 | 9 | Phase 2 前置：nvcc host 编译器 | ✅ **已解决并验证（2026-11-24 19:10–19:11）**：VS2019 vcvars（v16.11.63）+ nvcc 全路径 + `-ccbin` VS2019 cl（MSVC 14.29.30133）`-arch=sm_60` 编 `test_sm60.cu` exit 0，P100 上跑 exit 0（`KERNEL OK`）。配方在 `F:\Dev\cuda-toolkit-install\NVCC_RECIPE.md`（+ `compile-vs2019.bat`）；Phase 2 CMake 用 `-DCMAKE_CUDA_HOST_COMPILER=<VS2019 cl 路径>`，`CMAKE_CUDA_ARCHITECTURES` 含 60。铁律：VS2019 cl 只给 nvcc 当 host 编译器，主构建仍用 clang-cl，asan 仍用 VS 18；**不要再试 `-allow-unsupported-compiler` + VS 18**（cudafe++ 0xC0000005 已证实不可行） |
 | 10 | Phase 1 / Phase 2 提交状态 | ✅ **Phase 1 已提交**（`201b3fc` "Phase 1: backend-agnostic device_iface (CPU/Vulkan) + B33 fix"）；✅ **Phase 2 已提交并 push**（"Phase 2: async DMA device_iface (CPU/Vulkan/CUDA) + Vulkan no-host-map fix"，见 §7.3） |
-| 11 | **Phase 2 回归 FAIL：Vulkan0 专家池退化生成（BLOCKER）** | ✅ **已修复并验证，CLOSED**（2026-11-24 23:14 fix，23:26 回归 PASS）：根因见 B40（`route_b_inject.cpp` 把无 host map 的 Vulkan 区误注册成 DMA-only；`dma_write` 零字节静默完成）。修复：仅 CUDA 注册 DMA-only，无 host map 的其他后端跳过 region + 警告；`device_vulkan.cpp` 的 `dma_write` 无 map 时大声报错。A/B/C 全过，Gemma 回归 PASS，DeepSeek CUDA0 重跑 PASS。剩余工作：真正的 Vulkan HtoD（§12-12）；当前 skip 只是过渡，不是最终形态 |
-| 12 | 真正的 Vulkan HtoD 写路径（最终形态） | 🔴 **OPEN，后续工作**：当前 skip-region 修复只是**恢复/过渡**（Vulkan0 池子回落到 RAM，专家没上卡），**绝不是最终方案**。最终形态：在 `patches/route-b/common/stmoe_routeb_vk_dma.frag` 里加 `stmoe_vk_dma_write`，包 vendored 的 `ggml_vk_buffer_write`（`ggml-vulkan.cpp:8512` 同步，async 版 `:8470`；非 host-visible 时走 transfer-queue staging + fence 等待，和读路径完全对称；frag include 点 `:18877` 在其后，可见性没问题）；`device_vulkan.cpp` 的 `dma_write` 改调它；`route_b_inject.cpp` 里 Vulkan 无 host map 的区不用跳过，可注册成真正的 DMA-only 区，专家真正住进 RX 590。注意：minigraph 的 H2D（`minigraph_exec.cpp` pinned staging + `dispatch_relay_batch`）早就存在，那是跨设备 relay（搬 activation/张量）的路；缺的只是专家池的 DMA 写，不要写成"写路径从来没做过" |
+| 11 | **Phase 2 回归 FAIL：Vulkan0 专家池退化生成（BLOCKER）** | ✅ **已修复并验证，CLOSED**（2026-11-24 23:14 fix，23:26 回归 PASS）：根因见 B40（`route_b_inject.cpp` 把无 host map 的 Vulkan 区误注册成 DMA-only；`dma_write` 零字节静默完成）。修复：仅 CUDA 注册 DMA-only，无 host map 的其他后端跳过 region + 警告；`device_vulkan.cpp` 的 `dma_write` 无 map 时大声报错。A/B/C 全过，Gemma 回归 PASS，DeepSeek CUDA0 重跑 PASS。✅ 最终形态已于 2026-11-25 落地（见 §7.4）：`stmoe_vk_dma_write`（包 `ggml_vk_buffer_write`）+ B36 floor 放宽；A/B/C/D 全过（含纯 VRAM），Gemma 回归 PASS，DeepSeek CUDA0 重跑 PASS。 |
+| 12 | 真正的 Vulkan HtoD 写路径（最终形态） | ✅ **已完成并验证（2026-11-25，见 §7.4）**：`patches/route-b/common/stmoe_routeb_vk_dma.frag` 加 `stmoe_vk_dma_write`（包 `ggml_vk_buffer_write` 同步版；非 host-visible 时 transfer-queue staging + fence 等待，与读对称）；`device_vulkan.cpp` 的 `dma_write` 改调它，写失败返回哨兵 token（`dma_wait` 报失败，`dma_poll` 报完成），不再静默空完成；`route_b_inject.cpp` 里有 DMA writer 的后端无 host map 时都注册 DMA-only 区（Vulkan + CUDA），仅无 writer 的后端跳过。验证：Vulkan0:2048 池 2 device regions / 562 device slots，生成正常；纯 VRAM `RAM:1,Vulkan0:2048` 可跑；Gemma 回归 PASS；DeepSeek CUDA0 重跑 PASS。minigraph H2D 未动。 |
 
 ---
 
@@ -384,3 +412,8 @@ scripts\run_long_horizon_test.bat zh memwatch  rem 指定 build tag
 | 22:16–22:39 | Gemma C1:Vulkan0 回归（Phase 2 代码） | **FAIL**（`RESULT: FAIL - see above`）：[3/8]–[6/8] 与 19:22 PASS 完全相同；[7b/8] 4 引擎 FAIL（18 行）；[8/8] smoke FAIL（"2020"×16）。Vulkan0 退化生成，Phase 2 **未提交、未 push**；分项与二分见 §7.3 |
 | 23:17 起（8m32s） | Gemma C1:Vulkan0 回归重跑（fix 后） | **PASS**（`RESULT: PASS - all baseline and place regression checks passed`，日志 `temp\run-baseline-vk-fix.log` 第 1268 行，GEMMA_EXIT=0）：[3/8]–[6/8] 与 19:22 相同；[7b/8] PASS（4 warnings）；[8/8] smoke PASS（3.86s）。Phase 2 已提交并 push；分项见 §7.3 |
 | fix 后重跑 | DeepSeek CUDA0 重跑 | **exit 0**，2m20s，CUDA0 池 1020/1024 MB，出 token（0.4 t/s，150W + 并发负载下测得，只认正确性）；日志 `temp\p2wrap-ds-cuda4.log` |
+| 2026-11-25 00:19–00:51 | dma_write + B36 构建 | `llamalibs StreamMoE` / `StreamMoE_cuda` / `StreamMoE_dump` / `upstream_dump`（全量）全部 exit 0 |
+| 2026-11-25 ~00:23 | 单元测试 | StreamMoE 7/7；StreamMoE_cuda 7/7（CUDA bin 前置后重跑；首跑 6/7 是 MCP shell PATH 缺 CUDA bin，`test_device_cuda` 0xC0000135） |
+| 2026-11-25 ~00:27 | A/B/C/D 冒烟（OlmoE） | A：2 device regions，生成正常；D：纯 VRAM（RAM 0 MB 提交），生成正常、无 init 报错；B/C 对照正常；全部 exit 0 |
+| 2026-11-25 00:32–00:37 | DeepSeek CUDA0 重跑 | **exit 0**，4m52s，CUDA0 池 1020/1024 MB，出 token（0.1 t/s，150W + 并发负载下测得，只认正确性）；日志 `temp\p2wrap-ds-cuda5.log` |
+| 2026-11-25 00:50 起 | Gemma C1:Vulkan0 回归（dma_write + B36 代码） | **PASS**（`RESULT: PASS`，日志 `temp\run-baseline-vk-dma.log` 第 1264 行）：[3/8]–[6/8] 与 19:22 / 23:39 相同；[7b/8] PASS（4 引擎，2 turns）；[8/8] smoke PASS（5.44s） |

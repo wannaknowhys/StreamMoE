@@ -71,9 +71,13 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     // decode may pin any subset of one layer, and eviction cannot reclaim slots
     // pinned by the very layer being computed - a group smaller than one full
     // layer deadlocks (NO_VICTIM requeue storm) once a layer's active set
-    // exceeds the group. Spare budget (pool - sum of floors) is split by byte
-    // fraction so multi-layer groups keep eviction head-room. If the pool cannot
-    // even meet the floors, fail fast at init instead of deadlocking at runtime.
+    // exceeds the group. The floor is per group, not per pool: it is met by
+    // the RAM sub-pool OR by any device region of the group (a group with no
+    // RAM slots at all has no LLC - its device experts are dropped, never
+    // demoted, when evicted; see alloc_or_evict). Spare budget (pool - sum of
+    // RAM floors) is split by byte fraction so multi-layer groups keep
+    // eviction head-room. If no side can meet a group's floor, fail fast at
+    // init instead of deadlocking at runtime.
     uint64_t total_bytes = 0;
     for (const auto& g : topo.groups) total_bytes += g.total_bytes;
     if (total_bytes == 0) {
@@ -82,19 +86,29 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     }
 
     const uint32_t per_layer = topo.n_expert;   // experts per layer = one layer's worst-case active set
-    size_t sum_floor = 0;
+    // Realized device slots per group (mirror the region-append skip rules
+    // below: null base, out-of-range group, or zero slots count as absent).
+    std::vector<uint32_t> dev_slots(topo.groups.size(), 0);
+    for (const auto& reg : vregions) {
+        if (reg.base == nullptr || reg.group >= topo.groups.size() || reg.n_slots == 0) continue;
+        dev_slots[reg.group] += reg.n_slots;
+    }
+    size_t sum_ram_floor = 0;
     std::vector<size_t> floor_bytes(topo.groups.size());
+    std::vector<size_t> ram_floor(topo.groups.size(), 0);
     for (size_t i = 0; i < topo.groups.size(); ++i) {
         floor_bytes[i] = static_cast<size_t>(per_layer) * topo.groups[i].expert_size;
-        sum_floor += floor_bytes[i];
+        const size_t dev_bytes = static_cast<size_t>(dev_slots[i]) * topo.groups[i].expert_size;
+        ram_floor[i] = (dev_bytes >= floor_bytes[i]) ? 0 : floor_bytes[i];
+        sum_ram_floor += ram_floor[i];
     }
-    if (sum_floor > pool_bytes) {
+    if (sum_ram_floor > pool_bytes) {
         LOG_ERROR("expert_scheduler: pool " << (pool_bytes / (1024 * 1024)) << " MB too small: needs at least "
-                  << (sum_floor / (1024 * 1024)) << " MB to hold one full expert layer per group ("
-                  << per_layer << " experts/layer). Increase --moe-ram-pool.");
+                  << (sum_ram_floor / (1024 * 1024)) << " MB in RAM to hold one full expert layer per group ("
+                  << per_layer << " experts/layer) that no device pool covers. A group's floor can be met by RAM or by any device region of the group - increase --moe-ram-pool or the device pool.");
         return false;
     }
-    const size_t spare = pool_bytes - sum_floor;
+    const size_t spare = pool_bytes - sum_ram_floor;
 
     num_slots_ = 0;
     const size_t n_groups = topo.groups.size();
@@ -116,12 +130,15 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     };
     for (size_t i = 0; i < n_groups; ++i) {
         const auto& g = topo.groups[i];
-        // floor + byte-fraction share of the spare (double to avoid 64-bit overflow)
-        size_t budget = floor_bytes[i] + static_cast<size_t>(
+        // RAM floor (0 when a device region covers the group) + byte-fraction
+        // share of the spare (double to avoid 64-bit overflow)
+        size_t budget = ram_floor[i] + static_cast<size_t>(
             static_cast<double>(spare) * (static_cast<double>(g.total_bytes) / static_cast<double>(total_bytes)));
         uint32_t ns = static_cast<uint32_t>(budget / g.expert_size);
         const uint32_t g_experts_total = static_cast<uint32_t>(g.layers.size()) * per_layer;
-        if (ns < per_layer) ns = per_layer;             // never below one full layer
+        // never below one full layer - but only for groups whose floor is on
+        // RAM; a device-covered group may have zero RAM slots (no LLC).
+        if (ram_floor[i] > 0 && ns < per_layer) ns = per_layer;
         if (ns > g_experts_total) ns = g_experts_total; // never more than the group's real experts
         subpool_t sp;
         sp.pool = 0;
@@ -137,8 +154,8 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     // Device (VRAM) regions: appended slot runs on top of the RAM sub-pools.
     // A region must carry a usable base; a null base is skipped with a
     // warning (the pool still runs on CPU RAM alone). The base is a host
-    // pointer when the region is host-mapped (Vulkan) or a device address
-    // when it is not (CUDA, DMA only - see host_mapped).
+    // pointer when the region is host-mapped, or a device address (CUDA) /
+    // the fake base (Vulkan) when it is not (DMA only - see host_mapped).
     uint32_t max_pool = 0;
     for (const auto& reg : vregions) {
         if (reg.base == nullptr || reg.group >= n_groups || reg.n_slots == 0) {
@@ -172,10 +189,18 @@ bool expert_scheduler::init(const moe_model_topology_t& topo, async_dio_engine& 
     }
     pool_bytes_ = total_commit;
 
-    pool_base_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(pool_bytes_));
-    if (!pool_base_) {
-        LOG_ERROR("expert_scheduler: pool alloc failed for " << (pool_bytes_ / (1024 * 1024)) << " MB");
-        return false;
+    // A pool with no RAM slots at all (pure device config) commits nothing:
+    // alloc_aligned(0) returns nullptr by design, so skip the allocation
+    // instead of failing init. RAM sub-pool bases stay nullptr; they are
+    // never dereferenced (their slot ranges are empty).
+    if (total_commit > 0) {
+        pool_base_ = static_cast<uint8_t*>(async_dio_engine::alloc_aligned(pool_bytes_));
+        if (!pool_base_) {
+            LOG_ERROR("expert_scheduler: pool alloc failed for " << (pool_bytes_ / (1024 * 1024)) << " MB");
+            return false;
+        }
+    } else {
+        pool_base_ = nullptr;
     }
     uint8_t* b = pool_base_;
     for (auto& sp : subpools_) {
@@ -607,8 +632,10 @@ int32_t expert_scheduler::alloc_or_evict(uint32_t layer, uint32_t expert, uint32
                 dir_->transition(v_layer, v_expert, 0, EXPERT_ABSENT, SLOT_UNASSIGNED);
                 slots_[dst].release_to_empty();
             }
-            // RAM full/pinned: fall through to dropping the device copy (the
-            // content stays readable from disk).
+            // RAM full/pinned - or the group has no RAM slots at all (no
+            // LLC): fall through to dropping the device copy (the content
+            // stays readable from disk). The eviction itself still succeeds,
+            // so a device pool without RAM behind it can always make room.
         }
     }
 
@@ -666,9 +693,10 @@ async_load_t* expert_scheduler::start_async_load(int32_t slot, uint32_t layer, u
         // Fall back to the staging path when the target is misaligned (every
         // slice keeps its staging bytes reserved either way).
         // Direct DIO into the column slot needs a host-writable destination.
-        // A non-host-mapped slot (CUDA) has a device address as its slot
-        // base: DIO cannot write there, so every slice goes to staging and
-        // drain hands the bytes to the DMA writer (begin_htod).
+        // A non-host-mapped slot (CUDA / Vulkan DMA-only) has a device
+        // address as its slot base: DIO cannot write there, so every slice
+        // goes to staging and drain hands the bytes to the DMA writer
+        // (begin_htod).
         bool use_direct = sl.direct;
         if (osp && !osp->host_mapped) use_direct = false;
         if (use_direct) {

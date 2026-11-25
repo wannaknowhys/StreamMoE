@@ -37,7 +37,8 @@ namespace stream_moe {
 // contiguous run of slot-aligned whole-expert blocks. When host_mapped is
 // true, `base` is a host pointer and the scheduler can load/move expert bytes
 // straight into it (Vulkan); when false, `base` is a device address and the
-// bytes only move through the pool's DMA reader/writer (CUDA).
+// bytes only move through the pool's DMA reader/writer (CUDA, or Vulkan
+// without a host map).
 struct vram_region_t {
     uint32_t  pool   = 1;   // device pool index (0 = CPU RAM is not a region)
     uint32_t  group  = 0;   // expert group this region serves
@@ -93,11 +94,11 @@ struct move_task_t {
         void*  dev_buf = nullptr;
         size_t dev_off = 0;
         // r2v DMA: when the DESTINATION lives on a device region, the worker
-        // dispatches to the destination pool's registered DMA writer (cuda
-        // HtoD; a Vulkan dst is host-mapped so its writer is a memcpy).
-        // `dst_dev_buf` = the destination region's device buffer (null =>
-        // RAM dst, plain memcpy); `dst_dev_off` = byte offset inside it (=
-        // dst - region base).
+        // dispatches to the destination pool's registered DMA writer (CUDA
+        // HtoD; Vulkan HtoD via the transfer queue, or a memcpy when the
+        // Vulkan dst is host-mapped). `dst_dev_buf` = the destination
+        // region's device buffer (null => RAM dst, plain memcpy);
+        // `dst_dev_off` = byte offset inside it (= dst - region base).
         void*  dst_dev_buf = nullptr;
         size_t dst_dev_off = 0;
     };
