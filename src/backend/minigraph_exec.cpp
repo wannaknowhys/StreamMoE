@@ -4,6 +4,7 @@
 #include "backend/mix_split.h"
 #include "backend/scatter_plan.h"
 #include "backend/tensor_io.h"
+#include "backend/device_iface.h"
 #include "common/logger.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -39,9 +40,6 @@
 #include <sys/stat.h>
 #endif
 
-// ggml-vulkan route-B extensions.
-void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
-void* stmoe_vk_buffer_host_offset(ggml_backend_buffer_t buffer, size_t off);
 
 namespace stream_moe {
 
@@ -1540,7 +1538,7 @@ struct bucket_build_t {
         if (!b) { t->data = nullptr; return; }
         cc.owned.push_back(b);
         t->buffer = b;
-        t->data = cc.dev ? stmoe_vk_buffer_host_offset(b, 0)
+        t->data = cc.dev ? stmoe_dev_buffer_host_offset(b, 0)
                          : ggml_backend_buffer_get_base(b);
     }
     // Bind a fresh output tensor to the current target. Layout tensors (twins)
@@ -1553,7 +1551,7 @@ struct bucket_build_t {
                 if (ex && ex->layout_ok && seq >= 0 &&
                     seq < (int64_t) ex->out_off.size() && ex->out_off[(size_t) seq] >= 0) {
                     t->buffer = cc.dev->arena;
-                    t->data   = stmoe_vk_buffer_host_offset(cc.dev->arena, (size_t) ex->out_off[(size_t) seq]);
+                    t->data   = stmoe_dev_buffer_host_offset(cc.dev->arena, (size_t) ex->out_off[(size_t) seq]);
                     return;
                 }
             } else {
@@ -1596,7 +1594,7 @@ static ggml_tensor * bucket_upload_leaf(chain_ctx_t & c, enum ggml_type type,
         }
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
-        l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+        l->data   = stmoe_dev_buffer_host_offset(c.dev->stage, off);
         // Backend-agnostic upload into the stage buffer (iron rule). The fake
         // base pointer makes the stage buffer's set_tensor resolve `off`.
         tensor_write_host(l, host_data, 0, bytes);
@@ -1647,7 +1645,7 @@ static ggml_tensor * bucket_source_leaf(chain_ctx_t & c, const ggml_tensor * src
         }
         c.dev->stage_used = off + bytes;
         l->buffer = c.dev->stage;
-        l->data   = stmoe_vk_buffer_host_offset(c.dev->stage, off);
+        l->data   = stmoe_dev_buffer_host_offset(c.dev->stage, off);
         if (src_host && src->data) {
             tensor_write_host(l, src->data, 0, bytes);
         } else if (src->buffer) {
@@ -1841,7 +1839,7 @@ static ggml_tensor * bucket_ext_leaf(bucket_build_t & b, const ggml_tensor * m) 
             ggml_tensor * l = ggml_new_tensor_4d(c.ctx, m->type, m->ne[0], m->ne[1], m->ne[2], m->ne[3]);
             for (int i = 0; i < 4; ++i) l->nb[i] = m->nb[i];
             l->buffer = rbuf;
-            l->data   = stmoe_vk_buffer_host_offset(rbuf, static_cast<size_t>(off));
+            l->data   = stmoe_dev_buffer_host_offset(rbuf, static_cast<size_t>(off));
             return l;
         }
     }
@@ -1927,7 +1925,7 @@ static ggml_tensor * append_mm_bucket(bucket_build_t & b, ggml_tensor * nd) {
     if (c.dev) {
         ggml_backend_buffer_t wbuf = reinterpret_cast<ggml_backend_buffer_t>(sp->dev_buf);
         w3d->buffer = wbuf;
-        w3d->data   = stmoe_vk_buffer_host_offset(wbuf, col_off);
+        w3d->data   = stmoe_dev_buffer_host_offset(wbuf, col_off);
     } else {
         w3d->data   = sp->base + col_off;
     }
@@ -2411,7 +2409,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
             t.acc->data   = moe_out->data;
         } else {
             t.acc->buffer = t.arena;
-            t.acc->data   = stmoe_vk_buffer_host_offset(t.arena, t.acc_off);
+            t.acc->data   = stmoe_dev_buffer_host_offset(t.arena, t.acc_off);
         }
         const std::vector<float> zeros(acc_sz, 0.0f);   // zero acc_d on the device
         ggml_backend_tensor_set(t.acc, zeros.data(), 0, acc_bytes);
@@ -2449,8 +2447,8 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                     ggml_context * bctx = ggml_init(ip);
                     ggml_tensor * a = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, d, k);
                     ggml_tensor * b = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, d, k);
-                    a->buffer = dt.arena; a->data = stmoe_vk_buffer_host_offset(dt.arena, 0);
-                    b->buffer = dt.arena; b->data = stmoe_vk_buffer_host_offset(dt.arena, (size_t) (d * k) * 4);
+                    a->buffer = dt.arena; a->data = stmoe_dev_buffer_host_offset(dt.arena, 0);
+                    b->buffer = dt.arena; b->data = stmoe_dev_buffer_host_offset(dt.arena, (size_t) (d * k) * 4);
                     ggml_tensor * node = ggml_acc_inplace(bctx, a, b, (size_t) d * 4, (size_t) d * k * 4, (size_t) d * k * 4, 0);
                     ggml_cgraph * gf = ggml_new_graph(bctx);
                     ggml_build_forward_expand(gf, node);
@@ -2461,7 +2459,7 @@ static enum ggml_status exec_layer_burst_chain_buckets(int32_t layer, ggml_conte
                     ggml_init_params ip = { 8u * 1024u * 1024u, nullptr, true };
                     ggml_context * bctx = ggml_init(ip);
                     ggml_tensor * b = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, k, d);
-                    b->buffer = dt.arena; b->data = stmoe_vk_buffer_host_offset(dt.arena, 0);
+                    b->buffer = dt.arena; b->data = stmoe_dev_buffer_host_offset(dt.arena, 0);
                     ggml_tensor * node = ggml_sum_rows(bctx, b);
                     ggml_cgraph * gf = ggml_new_graph(bctx);
                     ggml_build_forward_expand(gf, node);

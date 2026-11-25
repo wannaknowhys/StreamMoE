@@ -4,6 +4,7 @@
 #include "backend/route_b_chain.h"
 #include "backend/scheduler.h"
 #include "backend/tensor_io.h"
+#include "backend/device_iface.h"
 #include "common/logger.h"
 
 #include "ggml-backend-impl.h"
@@ -14,8 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 
-// ggml-vulkan route-B extension: host mapping of a host-visible buffer.
-void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
 #include <string>
 #include <vector>
 
@@ -443,7 +442,7 @@ bool ensure_buffer(ggml_backend_buffer_t& buf, size_t& cap, uint8_t*& map,
         return false;
     }
     cap = need;
-    map = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(buf));   // null when not host-mapped
+    map = static_cast<uint8_t*>(stmoe_dev_buffer_host_ptr(buf));   // null when not host-mapped
     return true;
 }
 } // namespace
@@ -485,7 +484,7 @@ void stream_moe_backend_replicate_leaf(const ggml_tensor* t) {
         if (found) continue;
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(e.stage_buft, bytes);
         if (!buf) continue;
-        void* dev = stmoe_vk_buffer_host_ptr(buf);
+        void* dev = stmoe_dev_buffer_host_ptr(buf);
         if (!dev) { ggml_backend_buffer_free(buf); continue; }
         // Backend-agnostic read: the source leaf may live on a device backend
         // (e.g. C1:Vulkan0). Never dereference t->data on the host.

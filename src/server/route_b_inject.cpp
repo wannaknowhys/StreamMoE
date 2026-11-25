@@ -2,6 +2,7 @@
 #include "../../third_party/llama.cpp/src/tsc_timer.h"
 
 #include "backend/moe_backend.h"
+#include "backend/device_iface.h"
 #include "backend/route_b_chain.h"
 #include "backend/scheduler.h"
 #include "common/types.h"
@@ -18,11 +19,6 @@
 #include <vector>
 #include <unordered_map>
 
-// ggml-vulkan route-B extension: host mapping of a host-visible buffer, and the
-// transfer-queue DMA read used by the scheduler's v2r move worker (per-pool
-// device reader, see expert_scheduler::set_pool_dma_read).
-void* stmoe_vk_buffer_host_ptr(ggml_backend_buffer_t buffer);
-void  stmoe_vk_dma_read(void* vram_buffer, size_t off, void* dst, size_t bytes);
 
 namespace stream_moe {
 
@@ -281,7 +277,7 @@ llama_model_tensor_buft_override* route_b_setup(
             vram_region_t r;
             r.pool = static_cast<uint32_t>(dev_idx) + 1;
             r.group = seg.group;
-            r.base = static_cast<uint8_t*>(stmoe_vk_buffer_host_ptr(seg.buf));
+            r.base = static_cast<uint8_t*>(stmoe_dev_buffer_host_ptr(seg.buf));
             r.n_slots = static_cast<uint32_t>(seg.n_slots);
             r.buf = seg.buf;
             vregions.push_back(r);
@@ -292,9 +288,9 @@ llama_model_tensor_buft_override* route_b_setup(
             std::fprintf(stderr, "route B: scheduler init failed\n");
             return nullptr;
         }
-        // Register each device pool's DMA reader with the scheduler. The pool
-        // owner decides the reader by backend (vulkan transfer queue today; a
-        // cuda backend registers its own cudaMemcpyDtoH reader when it lands).
+        // Register each device pool's DMA reader with the scheduler. The reader
+        // is chosen by device kind through the device interface (CPU: memcpy,
+        // Vulkan: transfer queue; CUDA lands in Phase 2).
         // Multiple device pools coexist as separate per-pool table entries.
         for (const auto& seg : pool->vram_segs) {
             int dev_idx = -1;
@@ -303,8 +299,10 @@ llama_model_tensor_buft_override* route_b_setup(
             }
             if (dev_idx < 0) continue;
             const uint32_t pid = static_cast<uint32_t>(dev_idx) + 1;
-            if (seg.dev.compare(0, 6, "Vulkan") == 0) {
-                pool->sched->set_pool_dma_read(pid, stmoe_vk_dma_read);
+            const stmoe_dev_kind dev_kind = stmoe_dev_kind_from_name(seg.dev.c_str());
+            stmoe_dev_dma_read_fn_t dma_read = stmoe_dev_dma_reader(dev_kind);
+            if (dma_read) {
+                pool->sched->set_pool_dma_read(pid, dma_read);
             } else {
                 std::fprintf(stderr, "route B: no DMA reader for device pool '%s' (pool %u) - v2r falls back to host map\n",
                              seg.dev.c_str(), pid);

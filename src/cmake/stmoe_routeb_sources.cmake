@@ -8,6 +8,7 @@ if(STREAM_MOE_FEATURES MATCHES "route_b")
         ${STREAM_MOE_SRC}/server/route_b_inject.cpp
         ${STREAM_MOE_SRC}/backend/moe_backend.cpp
         ${STREAM_MOE_SRC}/backend/minigraph_exec.cpp
+        ${STREAM_MOE_SRC}/backend/device_iface.cpp
         ${STREAM_MOE_SRC}/backend/mix_split.cpp
         ${STREAM_MOE_SRC}/backend/scatter_plan.cpp
         ${STREAM_MOE_SRC}/backend/scheduler.cpp
@@ -17,6 +18,14 @@ if(STREAM_MOE_FEATURES MATCHES "route_b")
         ${STREAM_MOE_SRC}/loader/model_builder.cpp
         ${STREAM_MOE_SRC}/loader/topo_builder.cpp
         ${STREAM_MOE_SRC}/pool/expert_stats.cpp)
+    # Device interface: Vulkan ops only when the vendored build enables
+    # ggml-vulkan, otherwise the stmoe_vk_* symbols do not exist and a
+    # CPU-only build would fail to link (BUG_TRACKER B33).
+    if(GGML_VULKAN)
+        target_compile_definitions(${TARGET} PRIVATE STREAMMOE_HAVE_VULKAN=1)
+        target_sources(${TARGET} PRIVATE
+            ${STREAM_MOE_SRC}/backend/device_vulkan.cpp)
+    endif()
     # Async DIO backend by platform: IOCP (Windows) vs pread/io_uring (POSIX).
     if (WIN32)
         target_sources(${TARGET} PRIVATE ${STREAM_MOE_SRC}/io/async_dio_win.cpp)

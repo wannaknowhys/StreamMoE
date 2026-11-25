@@ -202,6 +202,7 @@ echo [StreamMoE] Configuring + building tests (tag %TAG%) ...
     -DCMAKE_C_COMPILER=%CLANG% ^
     -DCMAKE_CXX_COMPILER=%CLANGXX% ^
     -DCMAKE_RC_COMPILER=%RC% ^
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DLLAMA_BUILD_DIR="%CD%\%LLAMA_BUILD%" ^
     -DSTREAMMOE_LIBOMP=%LIBOMP%
@@ -268,6 +269,7 @@ if not exist "%LLAMA_BUILD%\src\llama.lib" (
     -DCMAKE_C_COMPILER=%CLANG% ^
     -DCMAKE_CXX_COMPILER=%CLANGXX% ^
     -DCMAKE_RC_COMPILER=%RC% ^
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DLLAMA_BUILD_DIR="%CD%\%LLAMA_BUILD%" ^
     -DSTREAMMOE_LIBOMP=%LIBOMP%
